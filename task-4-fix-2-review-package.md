@@ -1,0 +1,10 @@
+# Task 4 Fix Round 2
+
+Reviewer verdict after round 1: no Critical; five Important items remain. Apply a narrow TDD fix to Task 4 only.
+
+1. Make `ready` fail-closed. Require explicit, auditable evidence that all publication gates pass: fixed disclosure cutoff, 2026-08-31 market coverage, disclosed-universe coverage >=95%, core-cell completeness >=95%, governance/event review passed, formal V2 seven-dimensional features/scores ready, and a final score-run/finalization marker. An arbitrary nonempty bool/string/dict is not final evidence. A ready artifact may legitimately have zero pool members, but the counts must be explicitly supplied. Add a contradictory `state=final`/failed-gates test that remains blocked.
+2. Distinguish pre-cutoff blocked from post-cutoff blocked. If `cutoff_passed` is false, never say the cutoff has passed; render partial/pre-cutoff with the actual attempted-block reasons. Add both lifecycle cases.
+3. Add a bounded lifecycle dataset and canonical source containing at least pipeline_state, cutoff_passed, market_ready, both 95% metrics, governance/event, formal-feature readiness, final marker/evidence status and derived lifecycle state. Bind lifecycle quantitative/status Markdown to it so claims are reproducible.
+4. Redact any local absolute POSIX path, not a selected root whitelist, plus Windows drive/UNC paths, while preserving valid public `http://` and `https://` URLs exactly. Add `/etc`, `/workspace`, `/data`, `/srv`, UNC and valid HTTPS regression tests.
+5. Give operational rows the same audit metadata as source status: full reviewed count, shown count, truncated flag and selection rule. Prioritize formal blocked reasons first, then circuit/errors, then next actions; truncation may never hide a formal publication blocker behind ordinary source errors. Reflect the selection in subtitle/source metadata and tests.
+6. Run Task4 + full regression + canonical validator for partial/pre-cutoff-blocked/post-cutoff-blocked/ready. Update `task-4-report.md`; do not package HTML, edit other tasks or access network.

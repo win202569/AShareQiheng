@@ -1,0 +1,144 @@
+{
+  "batches": [
+    {
+      "dataset": "security_master",
+      "fetched_at_utc": "2026-08-28T17:19:06.106244+00:00",
+      "hash": "d039b426060271db5f7b00fc246a86bb3f9483013f54213b30d154c48cdf9700",
+      "job_id": "76d50a6e-d1e8-4c9e-b49d-e241d89e7beb",
+      "path": "C:\\Users\\Lenovo\\Documents\\Codex\\2026-08-28\\gen\\work\\a_share_pipeline\\data\\raw\\baostock\\security_master\\2026-08-28\\d039b426060271db5f7b00fc246a86bb3f9483013f54213b30d154c48cdf9700.json",
+      "request_fingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "rows": 8928,
+      "source": "baostock",
+      "source_version": "00.9.30",
+      "status": "succeeded",
+      "task_key": "baostock:security_master:2026-08-29"
+    },
+    {
+      "dataset": "trade_dates",
+      "fetched_at_utc": "2026-08-28T17:19:08.126141+00:00",
+      "hash": "d246a5bb99fce3e8ed9c3fb5669d4f993eb9f40098b8a49aaded179cce8b6ff8",
+      "job_id": "77ba1f4e-4df9-4afc-b70d-6209c0ea44af",
+      "path": "C:\\Users\\Lenovo\\Documents\\Codex\\2026-08-28\\gen\\work\\a_share_pipeline\\data\\raw\\baostock\\trade_dates\\2026-08-28\\d246a5bb99fce3e8ed9c3fb5669d4f993eb9f40098b8a49aaded179cce8b6ff8.json",
+      "request_fingerprint": "9e16d64b3e86055a9e9a53b3d78ed3a093809fd889bd3300c03eecfc732031da",
+      "rows": 6,
+      "source": "baostock",
+      "source_version": "00.9.30",
+      "status": "succeeded",
+      "task_key": "baostock:trade_dates:2026-08-29"
+    },
+    {
+      "dataset": "disclosure_schedule",
+      "fetched_at_utc": "2026-08-28T17:19:12.353570+00:00",
+      "hash": "ca2cb0b30c90fbb52c27c9ffe7bf6e5c3eee6108c2f597b2f4d8c527f3ced13e",
+      "job_id": "535370b1-4d86-48b9-b2cf-7cfb917d89fb",
+      "path": "C:\\Users\\Lenovo\\Documents\\Codex\\2026-08-28\\gen\\work\\a_share_pipeline\\data\\raw\\akshare\\disclosure_schedule\\2026-08-28\\ca2cb0b30c90fbb52c27c9ffe7bf6e5c3eee6108c2f597b2f4d8c527f3ced13e.json",
+      "request_fingerprint": "e69da56124bc70469d57f78ab2929ab4eef9f3f615e704eea61fcea8610cdbec",
+      "rows": 5550,
+      "source": "akshare",
+      "source_version": "1.18.94",
+      "status": "succeeded",
+      "task_key": "akshare:disclosure_schedule:2026-08-29"
+    },
+    {
+      "dataset": "performance_report",
+      "fetched_at_utc": "2026-08-28T17:20:06.028618+00:00",
+      "hash": "387f1e9d65fc3a49866a55501688bd2f53c038739850dde0f92f25c48c736589",
+      "job_id": "de273fa0-7a96-4be7-b113-4425a8899811",
+      "path": "C:\\Users\\Lenovo\\Documents\\Codex\\2026-08-28\\gen\\work\\a_share_pipeline\\data\\raw\\akshare\\performance_report\\2026-08-28\\387f1e9d65fc3a49866a55501688bd2f53c038739850dde0f92f25c48c736589.json",
+      "request_fingerprint": "beceb879f3a9ec6c7f57f9ce50dd53f4cf25df6ed1182789deefeee27165b0ad",
+      "rows": 11190,
+      "source": "akshare",
+      "source_version": "1.18.94",
+      "status": "succeeded",
+      "task_key": "akshare:performance_report:2026-08-29"
+    },
+    {
+      "dataset": "daily",
+      "fetched_at_utc": "2026-08-28T17:20:11.526088+00:00",
+      "hash": "2f21936b01855068193127aa908f88de06b2724c6dadeadb4c68a84145a945aa",
+      "job_id": "f1a8f692-6448-45a1-b1e0-3368ee9755ca",
+      "path": "C:\\Users\\Lenovo\\Documents\\Codex\\2026-08-28\\gen\\work\\a_share_pipeline\\data\\raw\\baostock\\daily\\2026-08-28\\2f21936b01855068193127aa908f88de06b2724c6dadeadb4c68a84145a945aa.json",
+      "request_fingerprint": "494e7c619fef2ebc27af5962fa46cf3d68cda16959875c0019762c9919b8f29e",
+      "rows": 5,
+      "source": "baostock",
+      "source_version": "00.9.30",
+      "status": "succeeded",
+      "task_key": "baostock:daily:SH600000:2026-08-28:2026-08-29"
+    },
+    {
+      "dataset": "balance_sheet",
+      "fetched_at_utc": "2026-08-28T17:21:00.551741+00:00",
+      "hash": "046aed93108ad6c0abeea4d6f2bc2bb930a6f05ef23bada1248d97c84e80f060",
+      "job_id": "d4b2793b-2a58-4f8c-a306-c37c9e89989b",
+      "path": "C:\\Users\\Lenovo\\Documents\\Codex\\2026-08-28\\gen\\work\\a_share_pipeline\\data\\raw\\akshare\\balance_sheet\\2026-08-28\\046aed93108ad6c0abeea4d6f2bc2bb930a6f05ef23bada1248d97c84e80f060.json",
+      "request_fingerprint": "ee8b42b824899691dcab12a8db44b05d7d957ec47ca2991d8d727a083e5af5a7",
+      "rows": 105,
+      "source": "akshare",
+      "source_version": "1.18.94",
+      "status": "succeeded",
+      "task_key": "akshare:financial:SH600000:2026-08-29"
+    },
+    {
+      "dataset": "profit_sheet",
+      "fetched_at_utc": "2026-08-28T17:23:29.621785+00:00",
+      "hash": "f999b0866145afa545c4176ee261d6ce69458a0b253eede09f35faa80defdd17",
+      "job_id": "d4b2793b-2a58-4f8c-a306-c37c9e89989b",
+      "path": "C:\\Users\\Lenovo\\Documents\\Codex\\2026-08-28\\gen\\work\\a_share_pipeline\\data\\raw\\akshare\\profit_sheet\\2026-08-28\\f999b0866145afa545c4176ee261d6ce69458a0b253eede09f35faa80defdd17.json",
+      "request_fingerprint": "ee8b42b824899691dcab12a8db44b05d7d957ec47ca2991d8d727a083e5af5a7",
+      "rows": 108,
+      "source": "akshare",
+      "source_version": "1.18.94",
+      "status": "succeeded",
+      "task_key": "akshare:financial:SH600000:2026-08-29"
+    },
+    {
+      "dataset": "cash_flow_sheet",
+      "fetched_at_utc": "2026-08-28T17:30:32.425351+00:00",
+      "hash": "cb1c57872b5ca6e43a0ef3b2190d733e0ad29647c777c7174c4ea314faabc786",
+      "job_id": "d4b2793b-2a58-4f8c-a306-c37c9e89989b",
+      "path": "C:\\Users\\Lenovo\\Documents\\Codex\\2026-08-28\\gen\\work\\a_share_pipeline\\data\\raw\\akshare\\cash_flow_sheet\\2026-08-28\\cb1c57872b5ca6e43a0ef3b2190d733e0ad29647c777c7174c4ea314faabc786.json",
+      "request_fingerprint": "ee8b42b824899691dcab12a8db44b05d7d957ec47ca2991d8d727a083e5af5a7",
+      "rows": 92,
+      "source": "akshare",
+      "source_version": "1.18.94",
+      "status": "succeeded",
+      "task_key": "akshare:financial:SH600000:2026-08-29"
+    },
+    {
+      "dataset": "akshare:spot_snapshot:2026-08-29",
+      "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+      "job_id": "cf5b1562-dc9c-4c74-b0dd-cec0cfd28441",
+      "source": "akshare",
+      "status": "retryable_failed"
+    }
+  ],
+  "generated_at_utc": "2026-08-28T17:30:58.215519+00:00",
+  "latest_completed_trading_date": "2026-08-28",
+  "mode": "online",
+  "next_step": "retry retryable_failed batches; do not treat pending dates as empty data",
+  "requested_shanghai_date": "2026-08-29",
+  "requested_shanghai_date_status": "pending",
+  "schema_version": 1,
+  "trading_calendar_evidence": [
+    {
+      "calendar_date": "2026-08-24",
+      "is_trading_day": "1"
+    },
+    {
+      "calendar_date": "2026-08-25",
+      "is_trading_day": "1"
+    },
+    {
+      "calendar_date": "2026-08-26",
+      "is_trading_day": "1"
+    },
+    {
+      "calendar_date": "2026-08-27",
+      "is_trading_day": "1"
+    },
+    {
+      "calendar_date": "2026-08-28",
+      "is_trading_day": "1"
+    }
+  ]
+}

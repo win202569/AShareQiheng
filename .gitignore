@@ -1,0 +1,52 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Virtual environments and local package artifacts
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Collected datasets and runtime state under /data are intentionally versioned.
+# This preserves crawl results and incremental progress across environments.
+/report/artifact.json
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.part
+*.bak
+*.swp
+*~
+
+# Notebook, IDE, and operating-system metadata
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# JavaScript dependencies, if report tooling is extended locally
+node_modules/
