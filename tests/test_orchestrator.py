@@ -13,6 +13,7 @@ from unittest.mock import patch
 from ashare_pipeline.deep_worker import (
     CandidateContext,
     STATEMENT_DATASETS,
+    deep_statement_key,
 )
 from ashare_pipeline.feature_contract import canonical_sha256
 from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
@@ -349,6 +350,144 @@ class OrchestratorTestCase(unittest.TestCase):
         )
         self.assertEqual(current["status"], "succeeded")
 
+    def test_cached_long_calendar_reuse_verifies_exact_snapshot_without_refetch(self):
+        for failure_mode in (
+            "tampered",
+            "missing_file",
+            "missing_ref",
+            "missing_result",
+            "wrong_result",
+        ):
+            with self.subTest(failure_mode=failure_mode):
+                data_root = self.base / failure_mode / "data"
+                database = data_root / "state.sqlite3"
+                bao, ak = FakeBaoSource(), FakeAKSource()
+                _, first_code = orchestrator.run_command(
+                    data_root,
+                    database,
+                    "bootstrap",
+                    online=True,
+                    now_cn="2026-08-29T20:00:00+08:00",
+                    sources=(bao, ak),
+                )
+                self.assertEqual(first_code, 0)
+                store = StateStore(database)
+                repository = SnapshotRepository(data_root, store)
+                calendar = repository.find_exact(
+                    "baostock",
+                    "trade_dates",
+                    {"start_date": "2021-01-01", "end_date": "2026-09-08"},
+                )
+                self.assertIsNotNone(calendar)
+                calendar_path = repository.project_root / calendar.payload_path
+                if failure_mode == "tampered":
+                    calendar_path.write_text("{}", encoding="utf-8")
+                elif failure_mode == "missing_file":
+                    calendar_path.unlink()
+                elif failure_mode == "missing_ref":
+                    with closing(sqlite3.connect(database)) as connection:
+                        connection.execute(
+                            "DELETE FROM source_snapshot WHERE id=?", (calendar.id,)
+                        )
+                        connection.commit()
+                else:
+                    current_key = orchestrator._feature_calendar_job_key(
+                        orchestrator._now_cn("2026-08-29T20:00:00+08:00")
+                    )
+                    cached_result = {"batches": []}
+                    if failure_mode == "wrong_result":
+                        cached_result["batches"] = [
+                            {
+                                "source": "baostock",
+                                "dataset": "trade_dates",
+                                "request": {
+                                    "start_date": "2026-08-24",
+                                    "end_date": "2026-09-08",
+                                },
+                            }
+                        ]
+                    with closing(sqlite3.connect(database)) as connection:
+                        connection.execute(
+                            "UPDATE job SET result_json=? WHERE idempotency_key=?",
+                            (json.dumps(cached_result), current_key),
+                        )
+                        connection.commit()
+
+                with self.assertRaisesRegex(OSError, "calendar|snapshot|hash|payload"):
+                    orchestrator.run_command(
+                        data_root,
+                        database,
+                        "incremental",
+                        online=True,
+                        now_cn="2026-08-29T20:01:00+08:00",
+                        sources=(bao, ak),
+                    )
+                self.assertEqual(bao.calls["trade_dates"], 1)
+
+    def test_versioned_calendar_job_rejects_nonexact_or_multiple_batches(self):
+        exact = exact_calendar_batch()
+        cases = {
+            "wrong_source": batch(
+                "akshare", "trade_dates", list(exact.records), dict(exact.request)
+            ),
+            "wrong_dataset": batch(
+                "baostock", "security_master", list(exact.records), dict(exact.request)
+            ),
+            "wrong_request": batch(
+                "baostock",
+                "trade_dates",
+                list(exact.records),
+                {"start_date": "2026-08-24", "end_date": "2026-09-08"},
+            ),
+            "multiple": {"first": exact, "second": exact},
+        }
+        for label, response in cases.items():
+            with self.subTest(label=label):
+                data_root = self.base / label / "data"
+                database = data_root / "state.sqlite3"
+                bao, ak = FakeBaoSource(), FakeAKSource()
+
+                def malformed_fetch(start_date, end_date, *, value=response):
+                    bao.calls["trade_dates"] += 1
+                    bao.trade_date_requests.append((start_date, end_date))
+                    return value
+
+                bao.fetch_trade_dates = malformed_fetch
+                payload, code = orchestrator.run_command(
+                    data_root,
+                    database,
+                    "bootstrap",
+                    online=True,
+                    now_cn="2026-08-29T20:00:00+08:00",
+                    sources=(bao, ak),
+                )
+
+                self.assertEqual(code, 0)
+                store = StateStore(database)
+                current_key = orchestrator._feature_calendar_job_key(
+                    orchestrator._now_cn("2026-08-29T20:00:00+08:00")
+                )
+                current = next(
+                    job
+                    for job in store.list_jobs()
+                    if job["idempotency_key"] == current_key
+                )
+                self.assertNotEqual(current["status"], "succeeded")
+                self.assertFalse(
+                    any(
+                        item.get("dataset") == "trade_dates"
+                        and item.get("status") == "succeeded"
+                        for item in payload["source_batches"]
+                    )
+                )
+                self.assertIsNone(
+                    SnapshotRepository(data_root, store).find_exact(
+                        "baostock",
+                        "trade_dates",
+                        {"start_date": "2021-01-01", "end_date": "2026-09-08"},
+                    )
+                )
+
     def test_offline_deep_constructs_no_source(self):
         write_candidate_documents(self.root, {"SH600001": "包装印刷"})
         with patch(
@@ -511,7 +650,9 @@ class OrchestratorTestCase(unittest.TestCase):
         )
         store.enqueue_job(
             "deep_statement",
-            "current-first-enqueue-hash-is-irrelevant",
+            deep_statement_key(
+                "SH600001", "balance_sheet", "2026-06-30", "2026-08-29"
+            ),
             {
                 **common,
                 "dataset": "balance_sheet",
@@ -543,6 +684,89 @@ class OrchestratorTestCase(unittest.TestCase):
         self.assertEqual(progress["deep_statement_job_counts"]["profit_sheet"], {})
         self.assertEqual(progress["deep_statement_job_counts"]["cash_flow_sheet"], {})
         self.assertEqual(len(progress["incomplete_candidates"]), 1)
+
+    def test_progress_uses_only_canonical_current_parent_and_statement_slots(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        current_hash = context.performance_input_hashes["SH600001"]
+        current_parent_key = f"deep_financial:SH600001:{current_hash}"
+        store.enqueue_job(
+            "deep_financial",
+            "historical-parent",
+            {
+                "security_id": "SH600001",
+                "input_hash": "c" * 64,
+                "report_period": "2026-06-30",
+            },
+        )
+        store.enqueue_job(
+            "deep_financial",
+            current_parent_key,
+            {
+                "security_id": "SH600001",
+                "input_hash": current_hash,
+                "report_period": "2026-06-30",
+            },
+        )
+        store.enqueue_job(
+            "deep_financial",
+            "corrupt-current-parent",
+            {
+                "security_id": "SH600001",
+                "input_hash": current_hash,
+                "report_period": "2026-06-30",
+            },
+        )
+        orchestrator.enqueue_daily_statement_jobs(
+            store, context, "2026-06-30", "2026-08-29"
+        )
+        corrupt_statement = store.enqueue_job(
+            "deep_statement",
+            "corrupt-current-balance-slot",
+            {
+                "security_id": "SH600001",
+                "dataset": "balance_sheet",
+                "report_period": "2026-06-30",
+                "candidate_set_hash": context.candidate_set_hash,
+                "performance_input_hash": current_hash,
+                "request_version": FINANCIAL_REQUEST_VERSION,
+                "refresh_date": "2026-08-29",
+            },
+        )
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            connection.execute(
+                "UPDATE job SET status='terminal_failed',last_error_json=? WHERE id=?",
+                (json.dumps({"error_classification": "worker_error"}), corrupt_statement),
+            )
+            connection.commit()
+
+        progress = orchestrator.build_deep_progress(
+            self.root,
+            store,
+            SnapshotRepository(self.root, store),
+            context,
+            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+        )
+
+        self.assertEqual(progress["deep_parent_job_counts"], {"pending": 1})
+        self.assertEqual(
+            progress["deep_statement_job_counts"],
+            {
+                "balance_sheet": {"pending": 1},
+                "profit_sheet": {"pending": 1},
+                "cash_flow_sheet": {"pending": 1},
+            },
+        )
+        self.assertEqual(progress["unknown_failure_count"], 2)
+        self.assertEqual(
+            progress["incomplete_candidates"][0]["job_states"], ["pending"]
+        )
+        self.assertEqual(
+            progress["incomplete_candidates"][0]["error_classifications"],
+            ["pending"],
+        )
 
     def test_progress_classifies_current_circuits_expired_leases_and_unknown_failures(self):
         write_candidate_documents(

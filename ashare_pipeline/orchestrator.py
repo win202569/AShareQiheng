@@ -303,8 +303,39 @@ def _collect_online(
         job = store.get_job(job_id)
         if job is None:
             return [{"source": source, "dataset": dataset, "status": "pending", "job_id": job_id}]
-        if job["status"] == "succeeded" and job.get("result"):
-            prior_batches = list(job["result"].get("batches", []))
+        if job["status"] == "succeeded":
+            result = job.get("result")
+            prior_batches = (
+                list(result.get("batches", [])) if isinstance(result, dict) else []
+            )
+            if dataset == "trade_dates":
+                calendar = calendar_repository.find_exact(
+                    "baostock", "trade_dates", calendar_request
+                )
+                if calendar is None:
+                    raise OSError("cached feature calendar snapshot is missing")
+                try:
+                    verified = calendar_repository.read_verified(calendar)
+                except (OSError, ValueError, UnicodeError) as error:
+                    raise OSError(
+                        "cached feature calendar snapshot verification failed"
+                    ) from error
+                _require_exact_calendar_batch([verified.batch], calendar_request)
+                if len(prior_batches) != 1 or not isinstance(
+                    prior_batches[0], dict
+                ):
+                    raise OSError("cached feature calendar result is missing")
+                prior = prior_batches[0]
+                if (
+                    prior.get("source") != "baostock"
+                    or prior.get("dataset") != "trade_dates"
+                    or prior.get("request") != calendar_request
+                    or prior.get("hash") != calendar.payload_hash
+                    or prior.get("path") != calendar.payload_path
+                ):
+                    raise OSError(
+                        "cached feature calendar result does not match its snapshot"
+                    )
             if prior_batches:
                 return [
                     {"source": source, "status": "succeeded", "cached": True, **item}
@@ -354,22 +385,27 @@ def _collect_online(
             collected = collect()
             items = list(collected.values()) if isinstance(collected, dict) else [collected]
             if dataset == "trade_dates":
+                calendar_batch = _require_exact_calendar_batch(
+                    items, calendar_request
+                )
                 persisted = []
-                for item in items:
-                    ref, created = calendar_repository.persist(item)
-                    persisted.append(
-                        {
-                            "dataset": ref.dataset,
-                            "source": ref.source,
-                            "source_version": item.source_version,
-                            "request": item.request,
-                            "rows": ref.row_count,
-                            "hash": ref.payload_hash,
-                            "path": ref.payload_path,
-                            "semantic_hash": _hash(_semantic_batch_payload(item)),
-                            "created": created,
-                        }
-                    )
+                ref, created = calendar_repository.persist(calendar_batch)
+                calendar_repository.read_verified(ref)
+                persisted.append(
+                    {
+                        "dataset": ref.dataset,
+                        "source": ref.source,
+                        "source_version": calendar_batch.source_version,
+                        "request": calendar_batch.request,
+                        "rows": ref.row_count,
+                        "hash": ref.payload_hash,
+                        "path": ref.payload_path,
+                        "semantic_hash": _hash(
+                            _semantic_batch_payload(calendar_batch)
+                        ),
+                        "created": created,
+                    }
+                )
             else:
                 persisted = [
                     _persist_batch(root, db, store, snapshots, item) for item in items
@@ -391,6 +427,19 @@ def _collect_online(
             if classification == "blocked":
                 circuit_breakers.add(source)
     return batches, errors, sorted(circuit_breakers), recovered_expired
+
+
+def _require_exact_calendar_batch(items: list[Any], request: dict[str, str]) -> Any:
+    if len(items) != 1:
+        raise ValueError("feature calendar response must contain exactly one batch")
+    item = items[0]
+    if (
+        getattr(item, "source", None) != "baostock"
+        or getattr(item, "dataset", None) != "trade_dates"
+        or getattr(item, "request", None) != request
+    ):
+        raise ValueError("feature calendar response does not match the exact request")
+    return item
 
 
 def _curated_document(
@@ -813,14 +862,32 @@ def build_deep_progress(
     report_period = "2026-06-30"
     members = set(context.members)
     jobs = store.list_jobs()
-    parent_jobs = [
-        job
-        for job in jobs
-        if job.get("kind") == "deep_financial"
-        and isinstance(job.get("payload"), dict)
-        and job["payload"].get("security_id") in members
-    ]
-    current_jobs = [
+    parent_jobs_by_member: dict[str, dict[str, object]] = {}
+    corruption_count = 0
+    for job in jobs:
+        payload = job.get("payload")
+        if job.get("kind") != "deep_financial" or not isinstance(payload, dict):
+            continue
+        security_id = payload.get("security_id")
+        if (
+            security_id not in members
+            or payload.get("report_period") != report_period
+            or payload.get("input_hash")
+            != context.performance_input_hashes[security_id]
+        ):
+            continue
+        expected_key = (
+            f"deep_financial:{security_id}:"
+            f"{context.performance_input_hashes[security_id]}"
+        )
+        if job.get("idempotency_key") != expected_key:
+            corruption_count += 1
+            continue
+        if security_id in parent_jobs_by_member:
+            raise ValueError("duplicate canonical current deep parent slot")
+        parent_jobs_by_member[security_id] = job
+    parent_jobs = list(parent_jobs_by_member.values())
+    scoped_statement_jobs = [
         job
         for job in jobs
         if job.get("kind") == "deep_statement"
@@ -831,10 +898,22 @@ def build_deep_progress(
         and job["payload"].get("request_version") == FINANCIAL_REQUEST_VERSION
         and job["payload"].get("refresh_date") == refresh_date
     ]
-    jobs_by_slot = {
-        (job["payload"]["security_id"], job["payload"]["dataset"]): job
-        for job in current_jobs
-    }
+    jobs_by_slot: dict[tuple[str, str], dict[str, object]] = {}
+    for job in scoped_statement_jobs:
+        payload = job["payload"]
+        security_id = payload["security_id"]
+        dataset = payload["dataset"]
+        expected_key = deep_statement_key(
+            security_id, dataset, report_period, refresh_date
+        )
+        if job.get("idempotency_key") != expected_key:
+            corruption_count += 1
+            continue
+        slot = (security_id, dataset)
+        if slot in jobs_by_slot:
+            raise ValueError("duplicate canonical current statement slot")
+        jobs_by_slot[slot] = job
+    current_jobs = list(jobs_by_slot.values())
     statement_job_counts = {
         dataset: _counts(
             [
@@ -914,7 +993,7 @@ def build_deep_progress(
         "target_period_missing",
         "unverified_snapshot",
     }
-    unknown_failures = sum(
+    unknown_failures = corruption_count + sum(
         1
         for job in current_jobs
         if job.get("status") in {"retryable_failed", "terminal_failed"}
