@@ -6,7 +6,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from .feature_contract import canonical_sha256
+from .feature_contract import canonical_sha256, require_aware_utc
 from .snapshot_store import SnapshotStore
 from .sources import FetchBatch
 from .state_store import StateStore
@@ -42,18 +42,22 @@ class SnapshotRepository:
         self.project_root = self.data_root.parent
         self.state_store = state_store
         self.snapshot_store = snapshot_store or SnapshotStore(self.data_root)
+        if self.snapshot_store.root.resolve() != self.data_root:
+            raise ValueError("snapshot store root must match repository data root")
 
     def persist(self, batch: FetchBatch) -> tuple[SnapshotRef, bool]:
+        request_fingerprint = canonical_sha256(batch.request)
+        fetched_at = require_aware_utc(batch.fetched_at_utc, "snapshot fetched_at")
         target, digest, _ = self.snapshot_store.write(batch)
         relative_path = self._project_relative_data_path(target)
         snapshot_id, created = self.state_store.record_snapshot(
             batch.source,
             batch.dataset,
-            canonical_sha256(batch.request),
+            request_fingerprint,
             digest,
             relative_path,
             len(batch.records),
-            batch.fetched_at_utc,
+            fetched_at,
         )
         snapshot = self.get(snapshot_id)
         if snapshot is None:
@@ -89,11 +93,19 @@ class SnapshotRepository:
     def read_verified(self, snapshot: SnapshotRef) -> VerifiedSnapshot:
         path = self._resolve_payload_path(snapshot.payload_path)
         batch = self.snapshot_store.read_verified(path, snapshot.payload_hash)
+        try:
+            fetched_at_matches = (
+                require_aware_utc(batch.fetched_at_utc, "payload fetched_at")
+                == require_aware_utc(snapshot.fetched_at, "snapshot fetched_at")
+            )
+        except ValueError as error:
+            raise OSError("snapshot database metadata does not match verified payload") from error
         if (
             batch.source != snapshot.source
             or batch.dataset != snapshot.dataset
             or canonical_sha256(batch.request) != snapshot.request_fingerprint
             or len(batch.records) != snapshot.row_count
+            or not fetched_at_matches
         ):
             raise OSError("snapshot database metadata does not match verified payload")
         return VerifiedSnapshot(snapshot, batch)
@@ -110,15 +122,17 @@ class SnapshotRepository:
     def _resolve_payload_path(self, payload_path: str) -> Path:
         if not isinstance(payload_path, str) or not payload_path:
             raise ValueError("snapshot payload path is required")
-        candidate = Path(payload_path)
-        if candidate.is_absolute() or PureWindowsPath(payload_path).is_absolute():
-            return candidate.resolve()
-        posix_parts = PurePosixPath(payload_path).parts
-        if ".." in candidate.parts or ".." in posix_parts:
+        posix_path = PurePosixPath(payload_path)
+        if Path(payload_path).is_absolute() or PureWindowsPath(payload_path).is_absolute() or posix_path.is_absolute():
+            return Path(payload_path).resolve()
+        if "\\" in payload_path:
+            raise ValueError("relative snapshot path must not contain a backslash")
+        posix_parts = posix_path.parts
+        if ".." in posix_parts:
             raise ValueError("relative snapshot paths cannot include parent traversal")
         if not posix_parts or posix_parts[0] != "data":
             raise ValueError("relative snapshot path must stay inside the project data directory")
-        resolved = (self.project_root / candidate).resolve()
+        resolved = self.project_root.joinpath(*posix_parts).resolve()
         try:
             resolved.relative_to(self.data_root)
         except ValueError as error:

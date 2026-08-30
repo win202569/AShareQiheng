@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -158,6 +159,32 @@ class SnapshotRepositoryTestCase(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "hash"):
             self.repository.read_verified(self.repository.get(snapshot.id))
 
+    def test_read_verified_rejects_payload_fetch_time_that_differs_from_database(self):
+        snapshot, _ = self.repository.persist(
+            statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+        )
+        path = self.project_root / snapshot.payload_path
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["fetched_at_utc"] = "2030-01-01T00:00:00+00:00"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with self.assertRaisesRegex(OSError, "metadata"):
+            self.repository.read_verified(snapshot)
+
+    def test_read_verified_rejects_database_fetch_time_that_differs_from_payload(self):
+        snapshot, _ = self.repository.persist(
+            statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+        )
+        with closing(sqlite3.connect(self.data_root / "state.sqlite3")) as connection:
+            connection.execute(
+                "UPDATE source_snapshot SET fetched_at = ? WHERE id = ?",
+                ("2030-01-01T00:00:00+00:00", snapshot.id),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(OSError, "metadata"):
+            self.repository.read_verified(self.repository.get(snapshot.id))
+
     def test_persist_records_a_project_relative_data_path(self):
         snapshot, _ = self.repository.persist(
             statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
@@ -195,6 +222,49 @@ class SnapshotRepositoryTestCase(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "relative"):
             self.repository.read_verified(self.repository.get(snapshot_id))
+
+    def test_read_verified_rejects_any_backslash_in_new_relative_paths(self):
+        batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+        _, digest, _ = self.snapshot_store.write(batch)
+        for payload_path in (
+            "data/raw\\akshare/balance_sheet/file.json",
+            "data\\raw\\akshare\\balance_sheet\\file.json",
+        ):
+            snapshot_id, _ = self.state_store.record_snapshot(
+                batch.source,
+                batch.dataset,
+                canonical_sha256(batch.request),
+                digest,
+                payload_path,
+                len(batch.records),
+                batch.fetched_at_utc,
+            )
+            with self.assertRaisesRegex(ValueError, "backslash"):
+                self.repository.read_verified(self.repository.get(snapshot_id))
+
+    def test_constructor_rejects_an_injected_snapshot_store_for_another_root(self):
+        other_root = self.project_root / "other-data"
+
+        with self.assertRaisesRegex(ValueError, "root"):
+            SnapshotRepository(
+                self.data_root, self.state_store, SnapshotStore(other_root)
+            )
+
+    def test_persist_rejects_unsafe_components_without_creating_outside_data(self):
+        unsafe = FetchBatch(
+            "../../escaped",
+            "balance_sheet",
+            {"symbol": "SH600001", "report_period": "2026-06-30"},
+            [{"TOTAL_ASSETS": 100.0}],
+            "2026-08-29T00:00:00+00:00",
+            "1.0",
+            {},
+        )
+
+        with self.assertRaisesRegex(ValueError, "component"):
+            self.repository.persist(unsafe)
+
+        self.assertEqual(list(self.project_root.rglob("*.json")), [])
 
     def test_read_verified_rejects_relative_symlink_escape(self):
         batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
