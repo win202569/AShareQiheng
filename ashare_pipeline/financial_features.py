@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import math
+import re
 from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -24,6 +25,13 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 _CALENDAR_START = date(2021, 1, 1)
 _CALENDAR_END = date(2026, 9, 7)
 _MISSING_UPDATED_AT = datetime.min.replace(tzinfo=timezone.utc)
+_EXACT_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SOURCE_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?$"
+)
+_SECURITY_CODE = re.compile(r"^\d{6}$")
+_SECUCODE = re.compile(r"^(\d{6})\.(SH|SZ)$")
 
 
 def _deep_freeze(value: object) -> object:
@@ -77,7 +85,7 @@ class FactSelection:
 
 
 def _parse_date(value: object, field: str) -> date:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or _EXACT_DATE.fullmatch(value) is None:
         raise ValueError(f"{field} must be an ISO date")
     try:
         return date.fromisoformat(value)
@@ -102,20 +110,25 @@ def trading_days_from_batch(batch: FetchBatch) -> tuple[date, ...]:
         raise ValueError("trade calendar records must be a non-empty list")
 
     flags_by_date: dict[date, bool] = {}
+    observed_dates: list[date] = []
     for row in batch.records:
         if not isinstance(row, Mapping) or not {"calendar_date", "is_trading_day"}.issubset(row):
             raise ValueError("trade calendar row is missing required fields")
         session_date = _parse_date(row["calendar_date"], "calendar_date")
         if not start <= session_date <= end:
             raise ValueError("trade calendar row falls outside the requested range")
+        if session_date in flags_by_date:
+            raise ValueError("trade calendar contains a duplicate date")
         raw_flag = row["is_trading_day"]
         if isinstance(raw_flag, bool) or raw_flag not in (0, 1, "0", "1"):
             raise ValueError("is_trading_day must be exactly 0 or 1")
         is_session = raw_flag in (1, "1")
-        previous = flags_by_date.get(session_date)
-        if previous is not None and previous != is_session:
-            raise ValueError("trade calendar has contradictory duplicate rows")
         flags_by_date[session_date] = is_session
+        observed_dates.append(session_date)
+    expected_count = (end - start).days + 1
+    expected_dates = {start + timedelta(days=offset) for offset in range(expected_count)}
+    if len(observed_dates) != expected_count or set(observed_dates) != expected_dates:
+        raise ValueError("trade calendar must cover every requested date exactly once")
     sessions = tuple(sorted(item for item, is_session in flags_by_date.items() if is_session))
     if not sessions:
         raise ValueError("trade calendar contains no trading sessions")
@@ -132,36 +145,53 @@ def _source_time(
         if allow_none:
             return None, None
         raise ValueError(f"{field} is required")
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value:
         raise ValueError(f"{field} must be an ISO date or timestamp")
-    text = value.strip()
+    text = value
     try:
-        if len(text) == 10:
+        if _EXACT_DATE.fullmatch(text) is not None:
             local_date = date.fromisoformat(text)
             parsed = datetime.combine(local_date, time(23, 59, 59), SHANGHAI)
-        else:
+        elif _SOURCE_TIMESTAMP.fullmatch(text) is not None:
             parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=SHANGHAI)
             local_date = parsed.astimezone(SHANGHAI).date()
+        else:
+            raise ValueError
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field} must be an ISO date or timestamp") from exc
     return parsed.astimezone(timezone.utc).isoformat(), local_date
 
 
-def _security_code(row: Mapping[str, object]) -> str | None:
-    raw = row.get("SECURITY_CODE") or row.get("SECUCODE")
-    if raw is None or isinstance(raw, bool):
-        return None
-    text = str(raw).strip()
-    if not text:
-        return None
-    code = text.split(".")[0]
-    if code.startswith(("SH", "SZ")):
-        code = code[2:]
-    if not code.isdigit() or len(code) > 6:
-        return None
-    return code.zfill(6)
+def _security_identity(
+    row: Mapping[str, object], expected_security_id: str
+) -> tuple[str | None, str | None]:
+    raw_code = row.get("SECURITY_CODE")
+    raw_secucode = row.get("SECUCODE")
+    if raw_code in (None, "") and raw_secucode in (None, ""):
+        return None, "statement_security_missing"
+
+    code: str | None = None
+    full_id: str | None = None
+    if raw_code not in (None, ""):
+        if not isinstance(raw_code, str) or _SECURITY_CODE.fullmatch(raw_code) is None:
+            return None, "statement_security_invalid"
+        code = raw_code
+    if raw_secucode not in (None, ""):
+        if not isinstance(raw_secucode, str):
+            return None, "statement_security_invalid"
+        match = _SECUCODE.fullmatch(raw_secucode)
+        if match is None:
+            return None, "statement_security_invalid"
+        secucode_code, exchange = match.groups()
+        full_id = f"{exchange}{secucode_code}"
+        if code is not None and code != secucode_code:
+            return None, "statement_security_mismatch"
+    normalized = full_id or f"{expected_security_id[:2]}{code}"
+    if normalized != expected_security_id:
+        return normalized, "statement_security_mismatch"
+    return normalized, None
 
 
 def _canonicalizable(value: object) -> object:
@@ -213,23 +243,25 @@ def build_financial_facts(
         if not isinstance(row, Mapping):
             issues.append(QualityIssue("error", "statement_row_invalid", {"row_index": index}))
             return FactBuildResult((), tuple(issues))
-        code = _security_code(row)
-        if code is None:
+        observed_id, identity_error = _security_identity(row, expected_security_id)
+        if identity_error == "statement_security_missing":
             issues.append(QualityIssue(
                 "error", "statement_security_missing",
                 {"expected": expected_security_id, "row_hash": _record_sort_key(row)},
             ))
             return FactBuildResult((), tuple(issues))
-        if not expected_security_id.endswith(code):
+        if identity_error is not None:
             issues.append(QualityIssue(
-                "error", "statement_security_mismatch",
-                {"expected": expected_security_id, "observed_code": code},
+                "error", identity_error,
+                {"expected": expected_security_id, "observed_security_id": observed_id},
             ))
             return FactBuildResult((), tuple(issues))
         report_date = row.get("REPORT_DATE")
-        period = classify_period(
-            str(report_date or "")[:10], row.get("REPORT_DATE_NAME"), row.get("REPORT_TYPE")
-        )
+        try:
+            normalized_report_date = _parse_date(report_date, "REPORT_DATE").isoformat()
+        except ValueError:
+            normalized_report_date = ""
+        period = classify_period(normalized_report_date, row.get("REPORT_DATE_NAME"), row.get("REPORT_TYPE"))
         if period is None:
             issues.append(QualityIssue(
                 "error", "statement_report_date_invalid",
@@ -319,7 +351,9 @@ def build_financial_facts(
     return FactBuildResult(tuple(sorted(facts, key=lambda item: item.id)), tuple(issues))
 
 
-def _utc_datetime(value: str, field: str) -> datetime:
+def _utc_datetime(value: object, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be an ISO timestamp string")
     return datetime.fromisoformat(require_aware_utc(value, field))
 
 

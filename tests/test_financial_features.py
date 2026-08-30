@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 import json
-import math
 from pathlib import Path
 import random
 import tempfile
@@ -74,6 +71,14 @@ def _validate_fixture_structure(root: Path) -> None:
         raise ValueError("invalid trade calendar fixture")
     if request.get("start_date", "") > "2021-01-01" or request.get("end_date", "") < "2026-09-07":
         raise ValueError("trade calendar fixture does not span required range")
+    start = date.fromisoformat(request["start_date"])
+    end = date.fromisoformat(request["end_date"])
+    calendar_dates = [date.fromisoformat(row["calendar_date"]) for row in records]
+    expected_count = (end - start).days + 1
+    if len(calendar_dates) != expected_count or set(calendar_dates) != {
+        start + timedelta(days=offset) for offset in range(expected_count)
+    }:
+        raise ValueError("trade calendar fixture must cover every date exactly once")
     trading_days_from_batch(FetchBatch(
         calendar["source"], calendar["dataset"], request, records,
         calendar["fetched_at_utc"], calendar["source_version"], calendar["metadata"],
@@ -283,6 +288,65 @@ class FinancialFactSelectionTests(unittest.TestCase):
                 self.assertEqual(result.facts, ())
                 self.assertEqual(result.issues[-1].code, code)
 
+    def test_report_date_rejects_noncanonical_iso_lexical_forms(self):
+        invalid_dates = (
+            "2025-12-31junk", "20251231", "2025-W52-3", " 2025-12-31",
+            "2025-12-31 ", "2025/12/31", "garbage",
+        )
+        for report_date in invalid_dates:
+            with self.subTest(report_date=report_date):
+                result = build_financial_facts(
+                    one_row_batch(report_date=report_date, TOTAL_ASSETS=1.0),
+                    source_snapshot_id="strict-report-date", expected_security_id="SH600001",
+                    trading_days=(date(2026, 4, 1),), created_at_utc="2026-04-01T08:00:00+00:00",
+                )
+                self.assertEqual(result.facts, ())
+                self.assertEqual(result.issues[-1].code, "statement_report_date_invalid")
+
+    def test_source_dates_reject_compact_week_suffix_and_malformed_separators(self):
+        invalid_dates = (
+            "20260331", "2026-W14-2", "2026-03-31junk", "2026/03/31",
+            "2026-03-31X12:00:00", "2026-03-31T12-00-00", " 2026-03-31",
+        )
+        for field in ("notice", "update"):
+            for invalid in invalid_dates:
+                with self.subTest(field=field, invalid=invalid):
+                    values = {"notice": "2026-03-31", "update": None}
+                    values[field] = invalid
+                    result = build_financial_facts(
+                        one_row_batch(**values, TOTAL_ASSETS=1.0),
+                        source_snapshot_id="strict-source-date", expected_security_id="SH600001",
+                        trading_days=(date(2026, 4, 1),), created_at_utc="2026-04-01T08:00:00+00:00",
+                    )
+                    self.assertEqual(result.facts, ())
+                    self.assertEqual(result.issues[-1].code, "statement_source_date_invalid")
+
+    def test_source_timestamp_accepts_explicit_iso_form_without_date_only_rewrite(self):
+        result = build_financial_facts(
+            one_row_batch(notice="2026-03-31T12:34:56+08:00", TOTAL_ASSETS=1.0),
+            source_snapshot_id="timestamp", expected_security_id="SH600001",
+            trading_days=(date(2026, 4, 1),), created_at_utc="2026-04-01T08:00:00+00:00",
+        )
+        self.assertEqual(result.facts[0].announced_at_utc, "2026-03-31T04:34:56+00:00")
+
+    def test_secucode_exchange_suffix_and_dual_identity_must_match_expected(self):
+        cases = (
+            ({"SECURITY_CODE": None, "SECUCODE": "600001.SZ"}, "statement_security_mismatch"),
+            ({"SECURITY_CODE": "600001", "SECUCODE": "600001.SZ"}, "statement_security_mismatch"),
+            ({"SECURITY_CODE": "600001", "SECUCODE": "600002.SH"}, "statement_security_mismatch"),
+            ({"SECURITY_CODE": None, "SECUCODE": "600001.BAD"}, "statement_security_invalid"),
+        )
+        for identity, expected_code in cases:
+            with self.subTest(identity=identity):
+                batch = one_row_batch(TOTAL_ASSETS=1.0)
+                batch.records[0].update(identity)
+                result = build_financial_facts(
+                    batch, source_snapshot_id="identity", expected_security_id="SH600001",
+                    trading_days=(date(2026, 4, 1),), created_at_utc="2026-04-01T08:00:00+00:00",
+                )
+                self.assertEqual(result.facts, ())
+                self.assertEqual(result.issues[-1].code, expected_code)
+
     def test_fy_h1_quarters_and_other_periods_are_all_retained(self):
         report_dates = (
             ("2025-12-31", "FY"), ("2026-06-30", "H1"),
@@ -343,18 +407,37 @@ class FinancialFactSelectionTests(unittest.TestCase):
         self.assertEqual(selected.facts, ())
         self.assertEqual(selected.blockers, ("snapshot_fetch_time_missing",))
 
+    def test_non_string_and_malformed_snapshot_fetch_times_fail_closed(self):
+        for invalid in (123, True, ["2026-04-01T09:00:00+00:00"], "not-a-time"):
+            with self.subTest(invalid=invalid):
+                selected = select_visible_facts(
+                    (fact_version(snapshot="bad-time"),),
+                    as_of_utc="2026-04-02T00:00:00+00:00",
+                    snapshot_fetched_at={"bad-time": invalid},
+                )
+                self.assertEqual(selected.facts, ())
+                self.assertEqual(selected.blockers, ("snapshot_fetch_time_invalid",))
+
 
 class TradeCalendarTests(unittest.TestCase):
+    @staticmethod
+    def complete_records():
+        start = date(2021, 1, 1)
+        end = date(2026, 9, 7)
+        records = []
+        current = start
+        while current <= end:
+            records.append({"calendar_date": current.isoformat(), "is_trading_day": "0"})
+            current += timedelta(days=1)
+        for session in (date(2026, 8, 28), date(2026, 8, 31)):
+            records[(session - start).days]["is_trading_day"] = "1"
+        return records
+
     def calendar_batch(self, *, records=None, request=None, dataset="trade_dates"):
         return FetchBatch(
             "baostock", dataset,
             request or {"start_date": "2021-01-01", "end_date": "2026-09-07"},
-            records or [
-                {"calendar_date": "2026-08-31", "is_trading_day": "1"},
-                {"calendar_date": "2026-08-30", "is_trading_day": "0"},
-                {"calendar_date": "2026-08-28", "is_trading_day": "1"},
-                {"calendar_date": "2026-08-28", "is_trading_day": "1"},
-            ],
+            self.complete_records() if records is None else records,
             "2026-08-30T00:00:00+00:00", "test", {"verified_snapshot_id": "calendar-a"},
         )
 
@@ -363,6 +446,27 @@ class TradeCalendarTests(unittest.TestCase):
             trading_days_from_batch(self.calendar_batch()),
             (date(2026, 8, 28), date(2026, 8, 31)),
         )
+
+    def test_calendar_accepts_complete_shuffled_batch_and_sorts_sessions(self):
+        records = self.complete_records()
+        random.Random(17).shuffle(records)
+        self.assertEqual(
+            trading_days_from_batch(self.calendar_batch(records=records)),
+            (date(2026, 8, 28), date(2026, 8, 31)),
+        )
+
+    def test_calendar_rejects_interior_hole_duplicate_and_missing_endpoint(self):
+        complete = self.complete_records()
+        cases = (
+            complete[:100] + complete[101:],
+            complete[:100] + [dict(complete[100])] + complete[100:],
+            complete[1:],
+            complete[:-1],
+        )
+        for records in cases:
+            with self.subTest(row_count=len(records)):
+                with self.assertRaises(ValueError):
+                    trading_days_from_batch(self.calendar_batch(records=records))
 
     def test_calendar_rejects_wrong_dataset_malformed_rows_flags_and_range(self):
         invalid_batches = (
@@ -382,7 +486,7 @@ class TradeCalendarTests(unittest.TestCase):
 
 class FinancialFixtureStructureTests(unittest.TestCase):
     def copied_fixture_root(self) -> tuple[tempfile.TemporaryDirectory, Path]:
-        temporary = tempfile.TemporaryDirectory(dir=Path.cwd() / ".tmp-tests")
+        temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
         for name in (*STATEMENT_FIXTURES, "trade_calendar_2021_2026.json"):
             (root / name).write_text((FIXTURE_ROOT / name).read_text(encoding="utf-8"), encoding="utf-8")
@@ -433,6 +537,25 @@ class FinancialFixtureStructureTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "does not span required range"):
                 _validate_fixture_structure(root)
+
+    def test_validator_rejects_trade_calendar_interior_hole(self):
+        temporary, root = self.copied_fixture_root()
+        with temporary:
+            path = root / "trade_calendar_2021_2026.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            del payload["records"][len(payload["records"]) // 2]
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "every date exactly once"):
+                _validate_fixture_structure(root)
+
+    def test_validator_accepts_complete_shuffled_trade_calendar(self):
+        temporary, root = self.copied_fixture_root()
+        with temporary:
+            path = root / "trade_calendar_2021_2026.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            random.Random(23).shuffle(payload["records"])
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            _validate_fixture_structure(root)
 
 
 if __name__ == "__main__":
