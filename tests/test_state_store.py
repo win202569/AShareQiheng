@@ -184,6 +184,43 @@ class StateStoreTestCase(unittest.TestCase):
             }
         self.assertEqual(tables, {"run"})
 
+    def test_initialize_rejects_v2_check_with_changed_string_literal_case(self) -> None:
+        corrupt_path = Path(self.tempdir.name) / "uppercase-check.sqlite3"
+        schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
+        corrupt_sql = schema_sql.replace(
+            "CHECK (status IN ('pending','running','succeeded','retryable_failed','terminal_failed'))",
+            "CHECK (status IN ('PENDING','running','succeeded','retryable_failed','terminal_failed'))",
+            1,
+        )
+        self.assertNotEqual(corrupt_sql, schema_sql)
+        with closing(sqlite3.connect(corrupt_path)) as connection:
+            connection.executescript(corrupt_sql)
+
+        with self.assertRaisesRegex(RuntimeError, "v2 schema"):
+            StateStore(corrupt_path).initialize()
+
+        with closing(sqlite3.connect(corrupt_path)) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+        self.assertNotIn("schema_migration", tables)
+        self.assertTrue({"financial_fact", "feature_set", "feature_value"}.isdisjoint(tables))
+
+    def test_ddl_normalization_preserves_escaped_single_quoted_literals(self) -> None:
+        canonical = "CREATE TABLE Sample (value TEXT CHECK(value='It''s Ready'))"
+        outside_case_and_spacing = "create table sample(value text check ( value = 'It''s Ready' ) )"
+        changed_literal = "create table sample(value text check ( value = 'it''s ready' ) )"
+
+        self.assertEqual(
+            StateStore._normalized_ddl(canonical),
+            StateStore._normalized_ddl(outside_case_and_spacing),
+        )
+        self.assertNotEqual(
+            StateStore._normalized_ddl(canonical),
+            StateStore._normalized_ddl(changed_literal),
+        )
+
     def test_initialize_rejects_migration_ledgers_other_than_two_or_two_three(self) -> None:
         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
         for index, versions in enumerate(((3,), (2, 4), (2, 3, 4))):
@@ -221,6 +258,35 @@ class StateStoreTestCase(unittest.TestCase):
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
                 [(2,), (3,)],
             )
+
+    def test_initialize_rolls_back_v3_when_approved_index_name_is_preoccupied(self) -> None:
+        legacy_path = Path(self.tempdir.name) / "wrong-index.sqlite3"
+        schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.executescript(schema_sql)
+            connection.execute("CREATE INDEX feature_set_latest_idx ON job(id)")
+
+        with self.assertRaisesRegex(RuntimeError, "v3 schema"):
+            StateStore(legacy_path).initialize()
+
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            indexes = dict(
+                connection.execute(
+                    """SELECT name, tbl_name FROM sqlite_master
+                    WHERE type='index' AND name IN (
+                        'financial_fact_lookup_idx',
+                        'financial_fact_snapshot_idx',
+                        'feature_set_latest_idx'
+                    )"""
+                )
+            )
+        self.assertNotIn("schema_migration", tables)
+        self.assertTrue({"financial_fact", "feature_set", "feature_value"}.isdisjoint(tables))
+        self.assertEqual(indexes, {"feature_set_latest_idx": "job"})
 
     def test_v3_foreign_keys_reject_missing_snapshot_and_feature_set(self) -> None:
         with closing(sqlite3.connect(self.db_path)) as connection:

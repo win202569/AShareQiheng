@@ -265,10 +265,54 @@ class StateStore:
 
     @staticmethod
     def _normalized_ddl(sql: str) -> str:
-        normalized = "".join(sql.lower().split()).rstrip(";")
-        return normalized.replace("createtableifnotexists", "createtable").replace(
-            "createindexifnotexists", "createindex"
-        )
+        tokens: list[str] = []
+        index = 0
+        while index < len(sql):
+            character = sql[index]
+            if character.isspace():
+                index += 1
+                continue
+            if character == "'":
+                literal_start = index
+                index += 1
+                while index < len(sql):
+                    if sql[index] != "'":
+                        index += 1
+                        continue
+                    if index + 1 < len(sql) and sql[index + 1] == "'":
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                tokens.append(sql[literal_start:index])
+                continue
+            if character.isalnum() or character in "_$":
+                token_start = index
+                index += 1
+                while index < len(sql) and (sql[index].isalnum() or sql[index] in "_$"):
+                    index += 1
+                tokens.append(sql[token_start:index].lower())
+                continue
+            tokens.append(character.lower())
+            index += 1
+
+        if tokens and tokens[-1] == ";":
+            tokens.pop()
+        normalized: list[str] = []
+        index = 0
+        while index < len(tokens):
+            if (
+                tokens[index:index + 3] == ["if", "not", "exists"]
+                and (
+                    normalized[-2:] in (["create", "table"], ["create", "index"])
+                    or normalized[-3:] == ["create", "unique", "index"]
+                )
+            ):
+                index += 3
+                continue
+            normalized.append(tokens[index])
+            index += 1
+        return " ".join(normalized)
 
     @classmethod
     def _assert_schema_ddl(
@@ -302,6 +346,12 @@ class StateStore:
     def _apply_v3_migration(cls, connection: sqlite3.Connection) -> None:
         for statement in (*_V3_TABLE_DDL.values(), *_V3_INDEX_DDL.values()):
             connection.execute(statement)
+        cls._assert_schema_ddl(
+            connection,
+            _V3_TABLE_DDL,
+            _V3_INDEX_DDL,
+            "v3 schema",
+        )
         connection.execute(
             "INSERT INTO schema_migration(version, applied_at) VALUES (3, ?)",
             (_utc_now(),),
