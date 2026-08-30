@@ -147,12 +147,13 @@ def _validated_document(
         except (TypeError, ValueError) as error:
             raise ValueError(f"{label} records must be canonical JSON") from error
 
-    if "records_hash" in document:
-        stored_hash = _require_sha256(
-            document["records_hash"], f"{label} records_hash"
-        )
-        if stored_hash != canonical_sha256(records):
-            raise ValueError(f"{label} records_hash does not match records")
+    if "records_hash" not in document:
+        raise ValueError(f"{label} records_hash is required")
+    stored_hash = _require_sha256(
+        document["records_hash"], f"{label} records_hash"
+    )
+    if stored_hash != canonical_sha256(records):
+        raise ValueError(f"{label} records_hash does not match records")
     return normalized_inputs, records
 
 
@@ -326,7 +327,7 @@ def _followups_preserving_first_enqueue(
 ) -> tuple[JobSpec, ...]:
     existing_by_key = {
         job["idempotency_key"]: job
-        for job in store.list_jobs(["deep_statement"])
+        for job in store.list_jobs()
     }
     followups: list[JobSpec] = []
     for spec in requested:
@@ -334,7 +335,24 @@ def _followups_preserving_first_enqueue(
         if existing is None:
             followups.append(spec)
             continue
+        if existing["kind"] != spec.kind:
+            raise ValueError(
+                "existing deep statement job does not match requested spec"
+            )
         _validate_statement_payload(existing["payload"])
+        requested_payload = spec.payload
+        if any(
+            existing["payload"][field] != requested_payload[field]
+            for field in (
+                "security_id",
+                "dataset",
+                "report_period",
+                "refresh_date",
+            )
+        ):
+            raise ValueError(
+                "existing deep statement payload does not match requested spec"
+            )
         followups.append(
             JobSpec(existing["kind"], existing["idempotency_key"], existing["payload"])
         )

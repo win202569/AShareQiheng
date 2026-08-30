@@ -401,10 +401,114 @@ class DeepWorkerTestCase(unittest.TestCase):
                 reported_target_period={"SH600001": True},
             )
 
+    def test_prefilter_document_requires_records_hash(self) -> None:
+        prefilter, performance = candidate_documents({"SH600001": "包装印刷"})
+        del prefilter["records_hash"]
+
+        with self.assertRaisesRegex(ValueError, "prefilter records_hash"):
+            build_candidate_context(prefilter, performance)
+
+    def test_prefilter_document_rejects_malformed_records_hash(self) -> None:
+        prefilter, performance = candidate_documents({"SH600001": "包装印刷"})
+        prefilter["records_hash"] = "not-a-digest"
+
+        with self.assertRaisesRegex(ValueError, "prefilter records_hash"):
+            build_candidate_context(prefilter, performance)
+
+    def test_prefilter_document_rejects_mismatched_records_hash(self) -> None:
         prefilter, performance = candidate_documents({"SH600001": "包装印刷"})
         prefilter["records_hash"] = "0" * 64
+
         with self.assertRaisesRegex(ValueError, "records_hash"):
             build_candidate_context(prefilter, performance)
+
+    def test_performance_document_requires_records_hash(self) -> None:
+        prefilter, performance = candidate_documents({"SH600001": "包装印刷"})
+        del performance["records_hash"]
+
+        with self.assertRaisesRegex(ValueError, "performance records_hash"):
+            build_candidate_context(prefilter, performance)
+
+    def test_performance_document_rejects_malformed_records_hash(self) -> None:
+        prefilter, performance = candidate_documents({"SH600001": "包装印刷"})
+        performance["records_hash"] = "not-a-digest"
+
+        with self.assertRaisesRegex(ValueError, "performance records_hash"):
+            build_candidate_context(prefilter, performance)
+
+    def test_performance_document_rejects_mismatched_records_hash(self) -> None:
+        prefilter, performance = candidate_documents({"SH600001": "包装印刷"})
+        performance["records_hash"] = "0" * 64
+
+        with self.assertRaisesRegex(ValueError, "performance records_hash"):
+            build_candidate_context(prefilter, performance)
+
+    def _assert_existing_statement_mismatch_fails_closed(
+        self,
+        *,
+        payload_field: str | None = None,
+        replacement: object | None = None,
+        existing_kind: str = "deep_statement",
+    ) -> None:
+        context = candidate_context({"SH600001"})
+        requested = statement_job_specs(
+            context,
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_cn_date=REFRESH_DATE,
+        )[0]
+        existing_payload = requested.payload
+        if payload_field is not None:
+            existing_payload[payload_field] = replacement
+        self.store.enqueue_job(
+            existing_kind,
+            requested.idempotency_key,
+            existing_payload,
+        )
+        parent_id = self.store.enqueue_job(
+            "deep_financial",
+            f"legacy:mismatch:{payload_field or 'kind'}",
+            {"security_id": "SH600001", "report_period": REPORT_PERIOD},
+        )
+
+        with self.assertRaisesRegex(ValueError, "existing deep statement"):
+            expand_deep_parents(
+                self.store,
+                context,
+                as_of_cn_date=REFRESH_DATE,
+                worker_id="planner",
+            )
+
+        self.assertEqual(self.store.get_job(parent_id)["status"], "running")
+        self.assertEqual(
+            len(self.store.list_jobs(["deep_statement"])),
+            0 if existing_kind != "deep_statement" else 1,
+        )
+
+    def test_existing_statement_security_must_match_requested_key(self) -> None:
+        self._assert_existing_statement_mismatch_fails_closed(
+            payload_field="security_id", replacement="SH600002"
+        )
+
+    def test_existing_statement_dataset_must_match_requested_key(self) -> None:
+        self._assert_existing_statement_mismatch_fails_closed(
+            payload_field="dataset", replacement="profit_sheet"
+        )
+
+    def test_existing_statement_period_must_match_requested_key(self) -> None:
+        self._assert_existing_statement_mismatch_fails_closed(
+            payload_field="report_period", replacement="2025-12-31"
+        )
+
+    def test_existing_statement_refresh_date_must_match_requested_key(self) -> None:
+        self._assert_existing_statement_mismatch_fails_closed(
+            payload_field="refresh_date", replacement="2026-08-28"
+        )
+
+    def test_existing_statement_kind_must_match_requested_spec(self) -> None:
+        self._assert_existing_statement_mismatch_fails_closed(
+            existing_kind="feature_build"
+        )
 
 
 if __name__ == "__main__":
