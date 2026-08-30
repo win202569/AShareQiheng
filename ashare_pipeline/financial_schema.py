@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 import math
 import re
 from typing import Any, Literal, Mapping
@@ -32,6 +32,12 @@ FACT_UNITS = frozenset({"CNY", "shares", "ratio", "CNY_per_share"})
 PERIOD_KINDS = frozenset({"FY", "H1", "Q1", "Q3", "OTHER"})
 NATURES = frozenset({"instant", "duration"})
 _SECURITY_ID = re.compile(r"^(?:SH|SZ)\d{6}$")
+_PERIOD_KIND_BY_MONTH_DAY = {
+    (12, 31): "FY",
+    (6, 30): "H1",
+    (3, 31): "Q1",
+    (9, 30): "Q3",
+}
 
 
 @dataclass(frozen=True)
@@ -53,12 +59,7 @@ def classify_period(
         return None
     period_end = parsed.isoformat()
     month_day = (parsed.month, parsed.day)
-    period_kind = {
-        (12, 31): "FY",
-        (6, 30): "H1",
-        (3, 31): "Q1",
-        (9, 30): "Q3",
-    }.get(month_day, "OTHER")
+    period_kind = _PERIOD_KIND_BY_MONTH_DAY.get(month_day, "OTHER")
     return PeriodInfo(
         period_start=date(parsed.year, 1, 1).isoformat(),
         period_end=period_end,
@@ -124,6 +125,12 @@ _FIELD_RULES: tuple[FieldRule, ...] = (
     FieldRule("cash_flow", "debt_financing_cash", ("ISSUE_BOND",), "CNY", "duration"),
     FieldRule("cash_flow", "debt_repayment_cash", ("PAY_DEBT_CASH",), "CNY", "duration"),
 )
+
+# The tracked Eastmoney cash-flow snapshots expose no dedicated, auditable share-repurchase field.
+# Mixed fields such as PAY_OTHER_FINANCE must not be presented as a repurchase payment.
+UNMAPPED_COMMON_FACTS: dict[str, str] = {
+    "share_repurchase_cash": "source_field_unavailable",
+}
 
 
 def field_rules(statement: StatementKind | str) -> tuple[FieldRule, ...]:
@@ -213,6 +220,11 @@ class FinancialFact:
         period_kind = data["period_kind"]
         if period_kind not in PERIOD_KINDS:
             raise ValueError("invalid period_kind")
+        expected_period_kind = _PERIOD_KIND_BY_MONTH_DAY.get(
+            (date.fromisoformat(period_end).month, date.fromisoformat(period_end).day), "OTHER"
+        )
+        if period_kind != expected_period_kind:
+            raise ValueError("period_kind must match period_end")
         nature = data["nature"]
         if nature not in NATURES:
             raise ValueError("invalid nature")
@@ -220,6 +232,8 @@ class FinancialFact:
             raise ValueError("instant facts cannot have period_start")
         if nature == "duration" and period_start is None:
             raise ValueError("duration facts require period_start")
+        if nature == "duration" and period_start != f"{period_end[:4]}-01-01":
+            raise ValueError("duration period_start must be the report year's January 1")
         if period_start is not None and period_start > period_end:
             raise ValueError("period_start cannot be after period_end")
         raw_value = data["value"]
@@ -243,6 +257,12 @@ class FinancialFact:
         source_updated = data["source_updated_at_utc"]
         if source_updated is not None:
             source_updated = require_aware_utc(source_updated, "source_updated_at_utc")
+        announced_at = require_aware_utc(data["announced_at_utc"], "announced_at_utc")
+        effective_at = require_aware_utc(data["effective_at_utc"], "effective_at_utc")
+        if datetime.fromisoformat(effective_at) < datetime.fromisoformat(announced_at):
+            raise ValueError("effective_at_utc cannot be earlier than announced_at_utc")
+        if source_updated is not None and datetime.fromisoformat(effective_at) < datetime.fromisoformat(source_updated):
+            raise ValueError("effective_at_utc cannot be earlier than source_updated_at_utc")
         return {
             "security_id": security_id,
             "statement": statement,
@@ -253,8 +273,8 @@ class FinancialFact:
             "value": numeric_value,
             "unit": unit,
             "nature": nature,
-            "announced_at_utc": require_aware_utc(data["announced_at_utc"], "announced_at_utc"),
-            "effective_at_utc": require_aware_utc(data["effective_at_utc"], "effective_at_utc"),
+            "announced_at_utc": announced_at,
+            "effective_at_utc": effective_at,
             "source_updated_at_utc": source_updated,
             "source_snapshot_id": source_snapshot_id,
             "source_field": source_field,

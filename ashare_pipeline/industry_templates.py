@@ -16,7 +16,7 @@ _COMMON_FINANCIAL_SLOTS = (
     "contract_assets", "inventory", "notes_payable", "accounts_payable", "contract_liabilities",
     "share_capital", "goodwill", "operating_cash_flow", "capital_expenditure", "cash_dividends",
     "interest_paid", "acquisition_cash_paid", "disposal_long_asset_cash", "equity_financing_cash",
-    "debt_financing_cash", "debt_repayment_cash",
+    "debt_financing_cash", "debt_repayment_cash", "share_repurchase_cash",
 )
 
 
@@ -94,7 +94,6 @@ INDUSTRY_TO_TEMPLATE: dict[str, str] = {
     "其他电源设备Ⅱ": "general_nonfinancial",
     "汽车零部件": "general_nonfinancial",
     "塑料": "general_nonfinancial",
-    "文娱用品": "general_nonfinancial",
     "文娱用品": "general_nonfinancial",
     "物流": "general_nonfinancial",
     "小家电": "general_nonfinancial",

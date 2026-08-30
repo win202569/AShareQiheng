@@ -8,6 +8,7 @@ from ashare_pipeline.financial_schema import (
     FINANCIAL_REQUEST_VERSION,
     MAPPING_VERSION,
     FinancialFact,
+    UNMAPPED_COMMON_FACTS,
     classify_period,
     field_rules,
 )
@@ -76,6 +77,23 @@ class FinancialSchemaTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             FinancialFact.create(**fact_fields(nature="instant", period_start="2025-01-01"))
 
+    def test_financial_fact_rejects_directly_constructed_inconsistent_periods_and_effective_times(self):
+        invalid_facts = (
+            {"period_end": "2026-03-31", "period_kind": "FY"},
+            {"period_start": "2025-02-01"},
+            {
+                "announced_at_utc": "2026-04-01T08:00:00+00:00",
+                "effective_at_utc": "2026-04-01T07:00:00+00:00",
+            },
+            {
+                "source_updated_at_utc": "2026-04-02T08:00:00+00:00",
+                "effective_at_utc": "2026-04-02T07:00:00+00:00",
+            },
+        )
+        for overrides in invalid_facts:
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                FinancialFact.create(**fact_fields(**overrides))
+
     def test_field_rules_cover_approved_facts_without_financial_misclassification(self):
         rules = {
             rule.metric_key: rule
@@ -89,6 +107,8 @@ class FinancialSchemaTests(unittest.TestCase):
         self.assertEqual(rules["operating_cost"].source_fields, ("TOTAL_OPERATE_COST", "OPERATE_COST"))
         self.assertEqual(rules["short_term_debt"].source_fields, ("SHORT_LOAN", "SHORT_FIN_PAYABLE"))
         self.assertEqual(rules["operating_cash_flow"].source_fields, ("NETCASH_OPERATE", "OPERATE_NETCASH_BALANCE"))
+        self.assertNotIn("share_repurchase_cash", rules)
+        self.assertEqual(UNMAPPED_COMMON_FACTS["share_repurchase_cash"], "source_field_unavailable")
         self.assertTrue({
             "revenue", "operating_cost", "operating_profit", "total_profit", "income_tax",
             "net_profit", "parent_net_profit", "deduct_parent_net_profit", "interest_expense",
@@ -103,6 +123,11 @@ class FinancialSchemaTests(unittest.TestCase):
         industrial_sources = {source for rule in rules.values() for source in rule.source_fields}
         self.assertFalse({"DEPOSIT", "TRADING_LIAB", "INSURANCE_RESERVE"} & industrial_sources)
 
+    def test_nonfinancial_templates_keep_the_unmapped_share_repurchase_slot(self):
+        for industry in ("房地产开发", "工业金属", "电力", "半导体", "包装印刷"):
+            with self.subTest(industry=industry):
+                self.assertIn("share_repurchase_cash", resolve_template(industry).financial_slots)
+
     def test_registry_has_no_implicit_general_fallback(self):
         self.assertEqual(resolve_template("半导体").template_id, "rd_growth")
         self.assertEqual(resolve_template("房地产开发").template_id, "real_estate_high_leverage")
@@ -115,10 +140,13 @@ class FinancialSchemaTests(unittest.TestCase):
         prefilter = json.loads(Path("data/curated/prefilter.json").read_text(encoding="utf-8"))
         candidate_industries = {record["industry"] for record in prefilter["records"]}
         fixture_industries = set(fixture["candidate_industries"])
+        expected_templates = fixture["candidate_templates"]
         self.assertEqual(fixture_industries, candidate_industries)
+        self.assertEqual(set(expected_templates), candidate_industries)
         for industry in fixture_industries:
             with self.subTest(industry=industry):
                 self.assertIn(industry, INDUSTRY_TO_TEMPLATE)
+                self.assertEqual(INDUSTRY_TO_TEMPLATE[industry], expected_templates[industry])
 
 
 if __name__ == "__main__":
