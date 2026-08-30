@@ -86,6 +86,28 @@ class FeatureContractTests(unittest.TestCase):
         restored = FeatureBundle.from_dict(bundle().to_dict())
         self.assertEqual(restored.to_dict(), bundle().to_dict())
 
+    def test_bundle_defensively_freezes_nested_inputs(self):
+        raw_dimensions = dimensions()
+        raw_counts = {"timestamp": 0, "date_only": 1}
+        raw_blockers = ["formal_industry_mapping_missing"]
+        candidate = FeatureBundle(
+            1, CONTRACT_VERSION, "SH600001", "2026-06-30",
+            "2026-08-29T16:00:00+00:00", "c" * 64,
+            IndustryContext("eastmoney-provisional", None, "包装印刷", "general_nonfinancial", "template-registry-v1", False),
+            "1" * 64, "partial", 0.5,
+            ConfidenceInputs(0.5, raw_counts, 3, True, None), raw_dimensions,
+            raw_blockers, False)
+        before = (candidate.to_dict(), candidate.bundle_hash())
+        raw_dimensions["G"] = raw_dimensions["V"]
+        raw_counts["timestamp"] = 99
+        raw_blockers.append("changed-after-construction")
+        self.assertEqual((candidate.to_dict(), candidate.bundle_hash()), before)
+
+    def test_dimension_rejects_duplicate_key_and_period(self):
+        value = FeatureValue("g.sample", 0.0, "ratio", "2026H1", "observed", "observed-v1", (evidence(),), None)
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            DimensionInput("partial", (value, value))
+
 
 if __name__ == "__main__":
     unittest.main()

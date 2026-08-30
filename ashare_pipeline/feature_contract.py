@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from typing import Any, Mapping
+from types import MappingProxyType
 
 CONTRACT_VERSION = "feature-contract-v1"
 DIMENSIONS = ("G", "V", "M", "EQ", "FS", "CA", "T")
@@ -134,6 +135,9 @@ class DimensionInput:
         values = tuple(self.values)
         if any(not isinstance(item, FeatureValue) for item in values):
             raise ValueError("dimension values must contain FeatureValue values")
+        keys = [(item.key, item.period_key) for item in values]
+        if len(keys) != len(set(keys)):
+            raise ValueError("duplicate feature key and period")
         states = {item.status for item in values}
         if self.status == "missing" and states - {"missing"}:
             raise ValueError("missing dimension cannot contain observed values")
@@ -188,7 +192,7 @@ class ConfidenceInputs:
         if self.formal_confidence is not None:
             raise ValueError("formal_confidence must be None")
         object.__setattr__(self, "data_completeness_ratio", ratio)
-        object.__setattr__(self, "date_precision_counts", dict(self.date_precision_counts))
+        object.__setattr__(self, "date_precision_counts", MappingProxyType(dict(self.date_precision_counts)))
 
     def to_dict(self) -> dict[str, Any]:
         return {"data_completeness_ratio": self.data_completeness_ratio,
@@ -219,6 +223,8 @@ class FeatureBundle:
     is_formal_score_ready: bool = False
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "dimension_inputs", MappingProxyType(dict(self.dimension_inputs)))
+        object.__setattr__(self, "blockers", tuple(self.blockers))
         self.validate()
 
     def validate(self) -> None:
