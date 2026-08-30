@@ -2,19 +2,29 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 import json
+import math
 from pathlib import Path
 import random
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from ashare_pipeline.feature_contract import canonical_sha256
+import ashare_pipeline.financial_features as financial_features_module
+
+from ashare_pipeline.feature_contract import DIMENSIONS, canonical_sha256
 from ashare_pipeline.financial_features import (
+    FORMULA_VERSION,
     QualityIssue,
+    build_feature_bundle,
     build_financial_facts,
+    feature_input_hash,
+    positive_cagr,
     select_visible_facts,
+    symmetric_growth,
     trading_days_from_batch,
 )
 from ashare_pipeline.financial_schema import FinancialFact, MAPPING_VERSION
+from ashare_pipeline.industry_templates import TEMPLATE_VERSION, resolve_template
 from ashare_pipeline.sources import FetchBatch
 
 
@@ -28,6 +38,145 @@ STATEMENT_FIXTURES = (
     "bank_statements.json",
     "real_estate_statements.json",
 )
+
+PERIOD_KEYS = {
+    "2021-12-31": "FY2021",
+    "2022-12-31": "FY2022",
+    "2023-12-31": "FY2023",
+    "2024-12-31": "FY2024",
+    "2025-12-31": "FY2025",
+    "2025-06-30": "2025H1",
+    "2026-06-30": "2026H1",
+}
+
+INSTANT_METRICS = {
+    "cash", "total_assets", "total_liabilities", "parent_equity", "total_equity",
+    "short_term_debt", "current_portion_long_term_debt", "long_term_debt",
+    "bonds_payable", "lease_liabilities", "notes_receivable", "accounts_receivable",
+    "contract_assets", "inventory", "notes_payable", "accounts_payable",
+    "contract_liabilities", "share_capital", "goodwill",
+}
+
+BALANCE_METRICS = INSTANT_METRICS
+CASH_FLOW_METRICS = {
+    "operating_cash_flow", "capital_expenditure", "cash_dividends", "interest_paid",
+    "acquisition_cash_paid", "disposal_long_asset_cash", "equity_financing_cash",
+    "debt_financing_cash", "debt_repayment_cash", "share_repurchase_cash",
+}
+
+
+def bundle_fact(metric_key: str, period_end: str, value: float, *, serial: int = 0) -> FinancialFact:
+    nature = "instant" if metric_key in INSTANT_METRICS else "duration"
+    statement = (
+        "balance" if metric_key in BALANCE_METRICS
+        else "cash_flow" if metric_key in CASH_FLOW_METRICS
+        else "income"
+    )
+    period_kind = "FY" if period_end.endswith("12-31") else "H1"
+    return FinancialFact.create(
+        security_id="SH600001",
+        statement=statement,
+        metric_key=metric_key,
+        period_start=None if nature == "instant" else f"{period_end[:4]}-01-01",
+        period_end=period_end,
+        period_kind=period_kind,
+        value=value,
+        unit="shares" if metric_key == "share_capital" else "CNY",
+        nature=nature,
+        announced_at_utc="2026-03-31T15:59:59+00:00",
+        effective_at_utc="2026-04-01T07:00:00+00:00",
+        source_updated_at_utc=None,
+        source_snapshot_id=f"snapshot-{period_end}-{metric_key}-{serial}",
+        source_field=metric_key.upper(),
+        raw_row_hash=canonical_sha256({"metric": metric_key, "period": period_end, "value": value, "serial": serial}),
+        mapping_version=MAPPING_VERSION,
+        created_at="2026-08-29T00:00:00+00:00",
+    )
+
+
+def hand_checked_general_facts(*, fy2025_revenue: float = 1_000.0) -> tuple[FinancialFact, ...]:
+    values_by_period = {
+        "2024-12-31": {
+            "total_assets": 800.0, "total_equity": 400.0, "cash": 100.0,
+            "short_term_debt": 100.0, "current_portion_long_term_debt": 100.0,
+            "long_term_debt": 100.0, "bonds_payable": 100.0, "lease_liabilities": 100.0,
+        },
+        "2025-12-31": {
+            "revenue": fy2025_revenue, "operating_cost": 600.0, "total_profit": 200.0,
+            "interest_expense": 50.0, "income_tax": 40.0, "net_profit": 130.0,
+            "operating_cash_flow": 150.0, "capital_expenditure": 20.0,
+            "total_assets": 1_000.0, "total_equity": 600.0, "cash": 100.0,
+            "short_term_debt": 100.0, "current_portion_long_term_debt": 100.0,
+            "long_term_debt": 100.0, "bonds_payable": 100.0, "lease_liabilities": 100.0,
+            "notes_receivable": 20.0, "accounts_receivable": 80.0,
+            "contract_assets": 30.0, "inventory": 70.0, "notes_payable": 15.0,
+            "accounts_payable": 55.0, "contract_liabilities": 10.0,
+        },
+    }
+    return tuple(
+        bundle_fact(metric, period, value)
+        for period, values in values_by_period.items()
+        for metric, value in values.items()
+    )
+
+
+def complete_general_facts() -> tuple[FinancialFact, ...]:
+    facts = []
+    for index, period_end in enumerate(PERIOD_KEYS, start=1):
+        for metric in resolve_template("包装印刷").financial_slots:
+            value = 10.0 + index
+            if metric == "revenue":
+                value = 100.0 + index * 10.0
+            elif metric == "operating_cost":
+                value = 60.0 + index
+            elif metric == "total_profit":
+                value = 20.0 + index
+            elif metric == "income_tax":
+                value = 4.0
+            elif metric == "interest_expense":
+                value = 2.0
+            elif metric == "net_profit":
+                value = 18.0 + index
+            elif metric == "operating_cash_flow":
+                value = 20.0 + index
+            elif metric == "capital_expenditure":
+                value = 5.0
+            elif metric == "cash":
+                value = 50.0
+            elif metric == "total_assets":
+                value = 800.0 + index * 100.0
+            elif metric == "total_liabilities":
+                value = 300.0
+            elif metric in {"total_equity", "parent_equity"}:
+                value = 500.0 + index * 100.0
+            elif metric in {
+                "short_term_debt", "current_portion_long_term_debt", "long_term_debt",
+                "bonds_payable", "lease_liabilities",
+            }:
+                value = 10.0
+            facts.append(bundle_fact(metric, period_end, value, serial=index))
+    return tuple(facts)
+
+
+def build_bundle_with_overrides(**overrides):
+    arguments = {
+        "security_id": "SH600001",
+        "report_period": "2026-06-30",
+        "as_of_utc": "2026-08-29T16:00:00+00:00",
+        "candidate_set_hash": "c" * 64,
+        "source_industry_name": "包装印刷",
+        "facts": complete_general_facts(),
+        "fact_blockers": (),
+        "statement_snapshot_hashes": {
+            "balance_sheet": "1" * 64,
+            "profit_sheet": "2" * 64,
+            "cash_flow_sheet": "3" * 64,
+        },
+        "trade_calendar_snapshot_hash": "4" * 64,
+        "reported_target_period": True,
+    }
+    arguments.update(overrides)
+    return build_feature_bundle(**arguments)
 
 
 def _validate_fixture_structure(root: Path) -> None:
@@ -556,6 +705,282 @@ class FinancialFixtureStructureTests(unittest.TestCase):
             random.Random(23).shuffle(payload["records"])
             path.write_text(json.dumps(payload), encoding="utf-8")
             _validate_fixture_structure(root)
+
+
+class FinancialFormulaTests(unittest.TestCase):
+    def test_growth_edges_do_not_invent_denominators(self):
+        self.assertAlmostEqual(symmetric_growth(120.0, 100.0), 18.181818181818183)
+        self.assertEqual(symmetric_growth(100.0, -100.0), 200.0)
+        self.assertIsNone(symmetric_growth(0.0, 0.0))
+        self.assertAlmostEqual(positive_cagr(100.0, 133.1, 3), 10.0)
+        self.assertIsNone(positive_cagr(0.0, 133.1, 3))
+        self.assertIsNone(positive_cagr(100.0, -1.0, 3))
+        self.assertIsNone(positive_cagr(100.0, 133.1, 0))
+
+    def test_growth_helpers_fail_closed_on_nonfinite_values(self):
+        for invalid in (math.nan, math.inf, -math.inf):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(symmetric_growth(invalid, 1.0))
+                self.assertIsNone(positive_cagr(1.0, invalid, 1))
+
+
+class FeatureInputHashTests(unittest.TestCase):
+    def hash_arguments(self):
+        return {
+            "security_id": "SH600001",
+            "report_period": "2026-06-30",
+            "as_of_utc": "2026-08-29T16:00:00+00:00",
+            "candidate_set_hash": "c" * 64,
+            "statement_snapshot_hashes": {
+                "balance_sheet": "1" * 64,
+                "profit_sheet": "2" * 64,
+                "cash_flow_sheet": "3" * 64,
+            },
+            "trade_calendar_snapshot_hash": "4" * 64,
+        }
+
+    def test_hash_matches_the_exact_declared_canonical_payload(self):
+        expected = canonical_sha256({
+            "security_id": "SH600001",
+            "report_period": "2026-06-30",
+            "as_of_utc": "2026-08-29T16:00:00+00:00",
+            "candidate_set_hash": "c" * 64,
+            "statement_snapshot_hashes": {
+                "balance_sheet": "1" * 64,
+                "profit_sheet": "2" * 64,
+                "cash_flow_sheet": "3" * 64,
+            },
+            "trade_calendar_snapshot_hash": "4" * 64,
+            "contract_version": "feature-contract-v1",
+            "mapping_version": "eastmoney-financial-mapping-v1",
+            "template_version": "template-registry-v1",
+            "formula_version": "financial-derived-v1",
+        })
+        self.assertEqual(feature_input_hash(**self.hash_arguments()), expected)
+
+    def test_omitted_statement_key_equals_explicit_null_but_real_snapshot_changes_hash(self):
+        arguments = self.hash_arguments()
+        omitted = dict(arguments["statement_snapshot_hashes"])
+        del omitted["cash_flow_sheet"]
+        explicit_null = {**omitted, "cash_flow_sheet": None}
+        real = {**omitted, "cash_flow_sheet": "f" * 64}
+        self.assertEqual(
+            feature_input_hash(**{**arguments, "statement_snapshot_hashes": omitted}),
+            feature_input_hash(**{**arguments, "statement_snapshot_hashes": explicit_null}),
+        )
+        self.assertNotEqual(
+            feature_input_hash(**{**arguments, "statement_snapshot_hashes": explicit_null}),
+            feature_input_hash(**{**arguments, "statement_snapshot_hashes": real}),
+        )
+
+    def test_hash_is_sensitive_to_each_runtime_and_version_dependency(self):
+        arguments = self.hash_arguments()
+        baseline = feature_input_hash(**arguments)
+        changes = {
+            "security_id": "SZ600001",
+            "report_period": "2025-12-31",
+            "as_of_utc": "2026-08-30T16:00:00+00:00",
+            "candidate_set_hash": "d" * 64,
+            "trade_calendar_snapshot_hash": "5" * 64,
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                self.assertNotEqual(feature_input_hash(**{**arguments, field: value}), baseline)
+        for dataset in ("balance_sheet", "profit_sheet", "cash_flow_sheet"):
+            with self.subTest(dataset=dataset):
+                snapshots = {**arguments["statement_snapshot_hashes"], dataset: "9" * 64}
+                self.assertNotEqual(
+                    feature_input_hash(**{**arguments, "statement_snapshot_hashes": snapshots}),
+                    baseline,
+                )
+        for constant in ("CONTRACT_VERSION", "MAPPING_VERSION", "TEMPLATE_VERSION", "FORMULA_VERSION"):
+            with self.subTest(constant=constant), patch.object(financial_features_module, constant, f"changed-{constant}"):
+                self.assertNotEqual(feature_input_hash(**arguments), baseline)
+
+    def test_hash_rejects_nan_instead_of_serializing_it(self):
+        arguments = self.hash_arguments()
+        with self.assertRaises(ValueError):
+            feature_input_hash(**{
+                **arguments,
+                "statement_snapshot_hashes": {"balance_sheet": math.nan},
+            })
+
+
+class FeatureBundleBuildTests(unittest.TestCase):
+    @staticmethod
+    def values(bundle):
+        return {
+            value.key: value
+            for dimension in bundle.dimension_inputs.values()
+            for value in dimension.values
+        }
+
+    @staticmethod
+    def replace_fact(facts, metric_key, period_end, value):
+        return tuple(
+            bundle_fact(metric_key, period_end, value, serial=99)
+            if fact.metric_key == metric_key and fact.period_end == period_end
+            else fact
+            for fact in facts
+        )
+
+    def test_general_bundle_computes_hand_checked_inputs(self):
+        bundle = build_bundle_with_overrides(facts=hand_checked_general_facts())
+        values = {key: item.value for key, item in self.values(bundle).items()}
+        self.assertEqual(values["m.gross_profit.FY2025"], 400.0)
+        self.assertEqual(values["m.ebit.FY2025"], 250.0)
+        self.assertEqual(values["m.effective_tax_rate.FY2025"], 0.2)
+        self.assertEqual(values["m.nopat.FY2025"], 200.0)
+        self.assertEqual(values["ca.fcf.FY2025"], 130.0)
+        self.assertEqual(values["fs.interest_bearing_debt.FY2025"], 500.0)
+        self.assertEqual(values["fs.net_debt.FY2025"], 400.0)
+        self.assertEqual(values["m.invested_capital.FY2025"], 1_000.0)
+        self.assertEqual(values["m.operating_working_capital.FY2025"], 120.0)
+        self.assertAlmostEqual(values["eq.total_accruals.FY2025"], -20.0 / 900.0)
+        self.assertAlmostEqual(values["m.roic.FY2025"], 200.0 / 900.0)
+        self.assertEqual(values["m.gross_margin.FY2025"], 0.4)
+
+    def test_tax_rate_is_bounded_and_invalid_ratio_denominators_fail_closed(self):
+        negative_tax = self.replace_fact(hand_checked_general_facts(), "income_tax", "2025-12-31", -10.0)
+        excessive_tax = self.replace_fact(hand_checked_general_facts(), "income_tax", "2025-12-31", 200.0)
+        zero_profit = self.replace_fact(hand_checked_general_facts(), "total_profit", "2025-12-31", 0.0)
+        zero_revenue = hand_checked_general_facts(fy2025_revenue=0.0)
+        for facts, expected in ((negative_tax, 0.0), (excessive_tax, 0.5)):
+            with self.subTest(expected=expected):
+                values = self.values(build_bundle_with_overrides(facts=facts))
+                self.assertEqual(values["m.effective_tax_rate.FY2025"].value, expected)
+        self.assertEqual(
+            self.values(build_bundle_with_overrides(facts=zero_profit))["m.effective_tax_rate.FY2025"].status,
+            "missing",
+        )
+        self.assertEqual(
+            self.values(build_bundle_with_overrides(facts=zero_revenue))["m.gross_margin.FY2025"].status,
+            "missing",
+        )
+
+    def test_zero_average_assets_and_negative_average_invested_capital_fail_closed(self):
+        facts = self.replace_fact(hand_checked_general_facts(), "total_assets", "2024-12-31", -1_000.0)
+        values = self.values(build_bundle_with_overrides(facts=facts))
+        self.assertEqual(values["eq.total_accruals.FY2025"].status, "missing")
+        facts = self.replace_fact(hand_checked_general_facts(), "total_equity", "2024-12-31", -2_000.0)
+        values = self.values(build_bundle_with_overrides(facts=facts))
+        self.assertEqual(values["m.roic.FY2025"].status, "missing")
+
+    def test_fact_blockers_survive_verbatim_and_keep_bundle_blocked(self):
+        bundle = build_bundle_with_overrides(
+            fact_blockers=(
+                "trade_calendar_missing_next_session", "conflicting_fact_versions",
+                "conflicting_fact_versions",
+            )
+        )
+        self.assertEqual(bundle.blockers, (
+            "conflicting_fact_versions",
+            "formal_industry_mapping_missing",
+            "trade_calendar_missing_next_session",
+        ))
+        self.assertEqual(bundle.financial_status, "blocked")
+
+    def test_complete_financial_inputs_are_ready_despite_formal_mapping_blocker(self):
+        bundle = build_bundle_with_overrides()
+        self.assertEqual(bundle.financial_status, "financial_ready")
+        self.assertEqual(bundle.financial_coverage, 1.0)
+        self.assertEqual(tuple(bundle.dimension_inputs), DIMENSIONS)
+        self.assertEqual(bundle.blockers, ("formal_industry_mapping_missing",))
+        self.assertIsNone(bundle.confidence_inputs.formal_confidence)
+        self.assertFalse(bundle.is_formal_score_ready)
+        self.assertNotIn("score", bundle.to_dict())
+        serialized = json.dumps(bundle.to_dict(), ensure_ascii=False)
+        for forbidden in ('"S0"', '"Sc"', '"pool"', '"buy"', '"sell"'):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_each_required_period_is_required_for_financial_ready(self):
+        complete = complete_general_facts()
+        for period_end in PERIOD_KEYS:
+            with self.subTest(period_end=period_end):
+                incomplete = tuple(fact for fact in complete if fact.period_end != period_end)
+                bundle = build_bundle_with_overrides(facts=incomplete)
+                self.assertEqual(bundle.financial_status, "partial")
+                self.assertLess(bundle.financial_coverage, 1.0)
+
+    def test_bank_has_zero_applicable_slots_and_no_industrial_debt_or_roic(self):
+        bundle = build_bundle_with_overrides(source_industry_name="银行")
+        keys = set(self.values(bundle))
+        self.assertEqual(bundle.financial_status, "blocked")
+        self.assertEqual(bundle.financial_coverage, 0.0)
+        self.assertFalse(any("interest_bearing_debt" in key or ".roic." in key for key in keys))
+
+    def test_real_estate_uses_registered_high_leverage_financial_inputs(self):
+        bundle = build_bundle_with_overrides(source_industry_name="房地产开发")
+        values = self.values(bundle)
+        self.assertEqual(bundle.industry.template_id, "real_estate_high_leverage")
+        self.assertIn("fs.interest_bearing_debt.FY2025", values)
+        self.assertIn("m.roic.FY2025", values)
+
+    def test_unclassified_template_blocks_instead_of_falling_back(self):
+        bundle = build_bundle_with_overrides(source_industry_name="不存在行业")
+        self.assertEqual(bundle.industry.template_id, "unclassified")
+        self.assertIn("industry_template_unclassified", bundle.blockers)
+        self.assertEqual(bundle.financial_status, "blocked")
+
+    def test_v_and_t_are_missing_containers_and_ca_only_has_accounting_allocation_inputs(self):
+        bundle = build_bundle_with_overrides()
+        for dimension in ("V", "T"):
+            self.assertEqual(bundle.dimension_inputs[dimension].status, "missing")
+            self.assertEqual(bundle.dimension_inputs[dimension].values, ())
+        allowed_ca_fragments = {
+            "fcf", "capital_expenditure", "cash_dividends", "interest_paid",
+            "acquisition_cash_paid", "disposal_long_asset_cash",
+            "equity_financing_cash", "debt_financing_cash", "debt_repayment_cash",
+            "share_repurchase_cash",
+        }
+        for value in bundle.dimension_inputs["CA"].values:
+            self.assertIn(value.key.split(".")[1], allowed_ca_fragments)
+
+    def test_coverage_counts_observed_and_derived_and_excludes_not_applicable(self):
+        bundle = build_bundle_with_overrides(facts=hand_checked_general_facts())
+        applicable = [
+            value
+            for dimension in bundle.dimension_inputs.values()
+            for value in dimension.values
+            if value.status != "not_applicable"
+        ]
+        complete = [value for value in applicable if value.status in {"observed", "derived"}]
+        self.assertAlmostEqual(bundle.financial_coverage, len(complete) / len(applicable))
+
+    def test_missing_snapshot_and_post_cutoff_reported_target_add_exact_blockers(self):
+        snapshots = {"balance_sheet": "1" * 64, "profit_sheet": "2" * 64}
+        before = build_bundle_with_overrides(
+            statement_snapshot_hashes=snapshots,
+            as_of_utc="2026-08-31T15:59:59+00:00",
+        )
+        after = build_bundle_with_overrides(
+            statement_snapshot_hashes=snapshots,
+            as_of_utc="2026-08-31T16:00:00+00:00",
+        )
+        not_reported = build_bundle_with_overrides(
+            statement_snapshot_hashes=snapshots,
+            as_of_utc="2026-08-31T16:00:00+00:00",
+            reported_target_period=False,
+        )
+        self.assertNotIn("reported_but_statement_missing", before.blockers)
+        self.assertIn("reported_but_statement_missing", after.blockers)
+        self.assertNotIn("reported_but_statement_missing", not_reported.blockers)
+
+    def test_missing_calendar_blocks_and_fact_order_is_deterministic(self):
+        facts = list(complete_general_facts())
+        first = build_bundle_with_overrides(facts=facts, trade_calendar_snapshot_hash=None)
+        random.Random(31).shuffle(facts)
+        second = build_bundle_with_overrides(facts=facts, trade_calendar_snapshot_hash=None)
+        self.assertIn("trade_calendar_missing", first.blockers)
+        self.assertEqual(first.to_dict(), second.to_dict())
+        self.assertEqual(first.bundle_hash(), second.bundle_hash())
+
+    def test_bundle_remains_deeply_immutable(self):
+        bundle = build_bundle_with_overrides()
+        with self.assertRaises(TypeError):
+            bundle.dimension_inputs["G"] = bundle.dimension_inputs["V"]
+        with self.assertRaises((AttributeError, TypeError)):
+            bundle.dimension_inputs["G"].values += bundle.dimension_inputs["G"].values[:1]
 
 
 if __name__ == "__main__":
