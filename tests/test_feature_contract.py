@@ -108,6 +108,48 @@ class FeatureContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             DimensionInput("partial", (value, value))
 
+    def test_input_ready_accepts_ready_values_mixed_with_not_applicable(self):
+        observed = FeatureValue(
+            "g.observed", 1.0, "ratio", "FY2022", "observed", "observed-v1",
+            (evidence(),), None,
+        )
+        derived = FeatureValue(
+            "g.derived", 2.0, "ratio", "FY2022", "derived", "derived-v1",
+            (evidence(),), None,
+        )
+        not_applicable = FeatureValue(
+            "g.not_applicable", None, "ratio", "FY2021", "not_applicable",
+            "derived-v1", (), "frozen_window_no_opening_period",
+        )
+        candidate = DimensionInput("input_ready", (observed, derived, not_applicable))
+        self.assertEqual(candidate.status, "input_ready")
+        self.assertEqual(
+            {value.status for value in candidate.values},
+            {"observed", "derived", "not_applicable"},
+        )
+
+    def test_input_ready_rejects_missing_or_blocked_applicable_values(self):
+        observed = FeatureValue(
+            "g.observed", 1.0, "ratio", "FY2022", "observed", "observed-v1",
+            (evidence(),), None,
+        )
+        for status in ("missing", "blocked"):
+            with self.subTest(status=status), self.assertRaisesRegex(ValueError, "input_ready"):
+                incomplete = FeatureValue(
+                    f"g.{status}", None, "ratio", "FY2021", status,
+                    "derived-v1", (), f"{status}_reason",
+                )
+                DimensionInput("input_ready", (observed, incomplete))
+
+    def test_input_ready_requires_at_least_one_observed_or_derived_value(self):
+        not_applicable = FeatureValue(
+            "g.not_applicable", None, "ratio", "FY2021", "not_applicable",
+            "derived-v1", (), "frozen_window_no_opening_period",
+        )
+        for values in ((), (not_applicable,)):
+            with self.subTest(values=values), self.assertRaisesRegex(ValueError, "input_ready"):
+                DimensionInput("input_ready", values)
+
 
 if __name__ == "__main__":
     unittest.main()

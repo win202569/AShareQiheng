@@ -629,6 +629,25 @@ def _missing_value(
     )
 
 
+def _not_applicable_value(
+    dimension: str,
+    metric_key: str,
+    period_key: str,
+    unit: str,
+    reason: str,
+) -> FeatureValue:
+    return FeatureValue(
+        key=f"{dimension.lower()}.{metric_key}.{period_key}",
+        value=None,
+        unit=unit,
+        period_key=period_key,
+        status="not_applicable",
+        formula_version=FORMULA_VERSION,
+        evidence=(),
+        missing_reason=reason,
+    )
+
+
 def _derived_value(
     dimension: str,
     metric_key: str,
@@ -683,9 +702,12 @@ def _dimension_status(values: Sequence[FeatureValue], *, blocked: bool) -> str:
     if not values:
         return "not_applicable"
     states = {item.status for item in values}
-    if states <= {"observed", "derived"}:
+    applicable_states = states - {"not_applicable"}
+    if not applicable_states:
+        return "not_applicable"
+    if applicable_states <= {"observed", "derived"}:
         return "input_ready"
-    if states == {"missing"}:
+    if applicable_states == {"missing"}:
         return "missing"
     return "partial"
 
@@ -794,6 +816,13 @@ def _add_period_formulas(
 
     opening_period = _OPENING_PERIOD.get(period_end)
     if opening_period is None:
+        reason = "frozen_window_no_opening_period"
+        dimensions["EQ"].append(_not_applicable_value(
+            "EQ", "total_accruals", period_key, "ratio", reason
+        ))
+        dimensions["M"].append(_not_applicable_value(
+            "M", "roic", period_key, "ratio", reason
+        ))
         return
     assets = _period_facts(facts_by_key, period_end, ("net_profit", "operating_cash_flow", "total_assets"))
     opening_assets = facts_by_key.get(("total_assets", opening_period))
@@ -967,7 +996,11 @@ def assemble_bundle_from_registered_slots(
     })
     mapping_consistent = (
         all(fact.mapping_version == MAPPING_VERSION for fact in facts)
-        and not ({"conflicting_fact_units", "conflicting_fact_versions"} & financial_blocker_set)
+        and not ({
+            "conflicting_fact_units",
+            "conflicting_fact_versions",
+            "financial_fact_mapping_version_mismatch",
+        } & financial_blocker_set)
     )
     return FeatureBundle(
         schema_version=1,
@@ -1013,12 +1046,21 @@ def build_feature_bundle(
     trade_calendar_snapshot_hash: str | None,
     reported_target_period: bool,
 ) -> FeatureBundle:
-    selected = tuple(sorted(facts, key=lambda item: (
-        item.metric_key, item.period_end, item.effective_at_utc, item.id
-    )))
     template = resolve_template(source_industry_name)
     financial_blockers = set(fact_blockers)
     formal_blockers = {"formal_industry_mapping_missing"}
+    supplied_facts = tuple(facts)
+    if any(fact.security_id != security_id for fact in supplied_facts):
+        financial_blockers.add("financial_fact_security_mismatch")
+    if any(fact.mapping_version != MAPPING_VERSION for fact in supplied_facts):
+        financial_blockers.add("financial_fact_mapping_version_mismatch")
+    selected = tuple(sorted(
+        (
+            fact for fact in supplied_facts
+            if fact.security_id == security_id and fact.mapping_version == MAPPING_VERSION
+        ),
+        key=lambda item: (item.metric_key, item.period_end, item.effective_at_utc, item.id),
+    ))
     if template.template_id == "unclassified":
         financial_blockers.add("industry_template_unclassified")
     if trade_calendar_snapshot_hash is None:

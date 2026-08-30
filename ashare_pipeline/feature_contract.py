@@ -143,8 +143,9 @@ class DimensionInput:
             raise ValueError("missing dimension cannot contain observed values")
         if self.status == "not_applicable" and states - {"not_applicable"}:
             raise ValueError("not_applicable dimension has inconsistent values")
-        if self.status == "input_ready" and states & {"missing", "blocked", "not_applicable"}:
-            raise ValueError("input_ready dimension has incomplete values")
+        if self.status == "input_ready":
+            if states & {"missing", "blocked"} or not states & {"observed", "derived"}:
+                raise ValueError("input_ready dimension has incomplete values")
         object.__setattr__(self, "values", values)
 
     def to_dict(self) -> dict[str, Any]:

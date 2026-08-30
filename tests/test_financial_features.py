@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import ashare_pipeline.financial_features as financial_features_module
+import ashare_pipeline.financial_schema as financial_schema_module
 
 from ashare_pipeline.feature_contract import DIMENSIONS, canonical_sha256
 from ashare_pipeline.financial_features import (
@@ -177,6 +178,13 @@ def build_bundle_with_overrides(**overrides):
     }
     arguments.update(overrides)
     return build_feature_bundle(**arguments)
+
+
+def rebuild_fact(fact: FinancialFact, **overrides) -> FinancialFact:
+    fields = fact.to_record()
+    fields.pop("id")
+    fields.update(overrides)
+    return FinancialFact.create(**fields)
 
 
 def _validate_fixture_structure(root: Path) -> None:
@@ -892,6 +900,88 @@ class FeatureBundleBuildTests(unittest.TestCase):
         serialized = json.dumps(bundle.to_dict(), ensure_ascii=False)
         for forbidden in ('"S0"', '"Sc"', '"pool"', '"buy"', '"sell"'):
             self.assertNotIn(forbidden, serialized)
+
+    def test_fy2021_average_formula_slots_are_explicitly_not_applicable(self):
+        bundle = build_bundle_with_overrides()
+        values = self.values(bundle)
+        for key in ("eq.total_accruals.FY2021", "m.roic.FY2021"):
+            with self.subTest(key=key):
+                value = values[key]
+                self.assertEqual(value.status, "not_applicable")
+                self.assertIsNone(value.value)
+                self.assertEqual(value.unit, "ratio")
+                self.assertEqual(value.evidence, ())
+                self.assertEqual(value.missing_reason, "frozen_window_no_opening_period")
+        applicable = [
+            value
+            for dimension in bundle.dimension_inputs.values()
+            for value in dimension.values
+            if value.status != "not_applicable"
+        ]
+        self.assertEqual(len(applicable), 361)
+        self.assertEqual(bundle.financial_coverage, 1.0)
+        self.assertEqual(bundle.financial_status, "financial_ready")
+        self.assertEqual(bundle.dimension_inputs["M"].status, "input_ready")
+        self.assertEqual(bundle.dimension_inputs["EQ"].status, "input_ready")
+
+    def test_cross_security_facts_are_filtered_blocked_and_never_become_evidence(self):
+        wrong_facts = tuple(
+            rebuild_fact(fact, security_id="SZ000001")
+            for fact in complete_general_facts()
+        )
+        wrong_ids = {fact.id for fact in wrong_facts}
+        bundle = build_bundle_with_overrides(facts=wrong_facts)
+        evidence_ids = {
+            evidence.financial_fact_id
+            for dimension in bundle.dimension_inputs.values()
+            for value in dimension.values
+            for evidence in value.evidence
+        }
+        self.assertEqual(bundle.financial_status, "blocked")
+        self.assertIn("financial_fact_security_mismatch", bundle.blockers)
+        self.assertTrue(evidence_ids.isdisjoint(wrong_ids))
+        self.assertEqual(bundle.financial_coverage, 0.0)
+
+    def test_mixed_security_facts_filter_wrong_inputs_and_keep_bundle_blocked(self):
+        correct = complete_general_facts()
+        wrong = tuple(
+            rebuild_fact(fact, security_id="SZ000001")
+            for fact in correct[:8]
+        )
+        wrong_ids = {fact.id for fact in wrong}
+        bundle = build_bundle_with_overrides(facts=(*correct, *wrong))
+        evidence_ids = {
+            evidence.financial_fact_id
+            for dimension in bundle.dimension_inputs.values()
+            for value in dimension.values
+            for evidence in value.evidence
+        }
+        self.assertEqual(bundle.financial_status, "blocked")
+        self.assertIn("financial_fact_security_mismatch", bundle.blockers)
+        self.assertTrue(evidence_ids.isdisjoint(wrong_ids))
+        self.assertEqual(bundle.financial_coverage, 1.0)
+
+    def test_old_mapping_facts_are_filtered_and_mapping_inconsistency_blocks(self):
+        old_mapping = "eastmoney-financial-mapping-v0"
+        current_facts = complete_general_facts()
+        with patch.object(financial_schema_module, "MAPPING_VERSION", old_mapping):
+            old_facts = tuple(
+                rebuild_fact(fact, mapping_version=old_mapping)
+                for fact in current_facts
+            )
+        old_ids = {fact.id for fact in old_facts}
+        bundle = build_bundle_with_overrides(facts=old_facts)
+        evidence_ids = {
+            evidence.financial_fact_id
+            for dimension in bundle.dimension_inputs.values()
+            for value in dimension.values
+            for evidence in value.evidence
+        }
+        self.assertEqual(bundle.financial_status, "blocked")
+        self.assertIn("financial_fact_mapping_version_mismatch", bundle.blockers)
+        self.assertFalse(bundle.confidence_inputs.mapping_consistent)
+        self.assertTrue(evidence_ids.isdisjoint(old_ids))
+        self.assertEqual(bundle.financial_coverage, 0.0)
 
     def test_each_required_period_is_required_for_financial_ready(self):
         complete = complete_general_facts()
