@@ -323,7 +323,7 @@ git commit -m "feat: define auditable seven-dimension feature contract"
 
 **Interfaces:**
 - Consumes: `canonical_sha256` from Task 1.
-- Produces: `MAPPING_VERSION`, `TEMPLATE_VERSION`, `FINANCIAL_REQUEST_VERSION`, `StatementDataset`, `StatementKind`, `DATASET_TO_STATEMENT`, `PeriodInfo`, `FieldRule`, `FinancialFact`, `classify_period()`, `field_rules()`, `TemplateDefinition`, and `resolve_template()`.
+- Produces: `MAPPING_VERSION`, `FINANCIAL_REQUEST_VERSION`, `StatementDataset`, `StatementKind`, `DATASET_TO_STATEMENT`, `PeriodInfo`, `FieldRule`, `FinancialFact`, `classify_period()`, `field_rules()`, `TEMPLATE_VERSION`, `TemplateDefinition`, and `resolve_template()`.
 
 - [ ] **Step 1: Write failing period, fact-ID, mapping, and registry tests**
 
@@ -370,7 +370,6 @@ Use these exact declarations:
 
 ```python
 MAPPING_VERSION = "eastmoney-financial-mapping-v1"
-TEMPLATE_VERSION = "template-registry-v1"
 FINANCIAL_REQUEST_VERSION = "eastmoney-financial-request-v1"
 StatementDataset = Literal["balance_sheet", "profit_sheet", "cash_flow_sheet"]
 StatementKind = Literal["balance", "income", "cash_flow"]
@@ -385,6 +384,8 @@ TARGET_PERIOD_ENDS = frozenset({
     "2025-12-31", "2025-06-30", "2026-06-30",
 })
 ```
+
+`financial_schema.py` owns `MAPPING_VERSION` and `FINANCIAL_REQUEST_VERSION`. Define `TEMPLATE_VERSION = "template-registry-v1"` exactly once in `industry_templates.py`, beside `TemplateDefinition` and the registry; all later consumers import it from there.
 
 `classify_period()` returns `FY` for December 31, `H1` for June 30, `Q1` for March 31, `Q3` for September 30, and `OTHER` for a valid unmatched report date. Duration periods start January 1 of the report year. `FinancialFact.create()` normalizes aware timestamps to UTC and hashes all fields except `id`/`created_at`.
 
@@ -471,6 +472,8 @@ def test_initialize_migrates_literal_v2_database_to_v3_without_changing_existing
 ```
 
 Add tests for two consecutive initializations, foreign-key rejection, invalid feature status/dimension, coverage -0.01 and 1.01, and preservation of final score-run immutability.
+
+The literal-v2 migration regression must not preserve only `run`. Seed representative, foreign-key-consistent rows in every existing v2 table (`run`, `snapshot`, `job`, `score_run`, `score_item`, `quality_issue`, and `export_artifact`), capture each table with a deterministic `SELECT * ... ORDER BY` before initialization, and compare every table row-for-row after migration. The v3 table/version assertions come only after those preservation assertions.
 
 - [ ] **Step 2: Run the migration test to verify RED**
 
@@ -1006,6 +1009,8 @@ def test_future_revision_is_not_selected_before_its_effective_time(self):
 
 Add tests for numeric zero vs null/nonfinite/bool, missing security/report date, security mismatch, FY/H1 vs quarter retention, deterministic shuffled duplicates, conflicting units, and the approved asset-balance tolerance: a CNY 500 difference on CNY 1,000,000 passes; a CNY 10,000 difference blocks.
 
+Also add a small test-local JSON fixture-structure validator in `tests/test_financial_features.py`. Its rejection tests must cover a missing statement batch, a missing required FY/H1 period, missing identity/date fields, and a trade-calendar fixture that does not span the mandated range. Keep this validator local to Task 7; do not import the Task 13 helper or Task 10 worker code.
+
 - [ ] **Step 2: Run fact-normalization tests to verify RED**
 
 Run:
@@ -1106,7 +1111,7 @@ def select_visible_facts(
 ) -> FactSelection:
 ```
 
-Filter `effective_at <= as_of` and group by `(security_id, metric_key, period_end)`. Within each group, compute the maximum version rank `(effective_at, source_updated_at or announced_at, snapshot_fetched_at[source_snapshot_id])` **without** the fact ID. Inspect every fact tied at that top rank: differing finite values, units, or natures add `conflicting_fact_versions`/`conflicting_fact_units` and select none. Only when the tied facts are semantically identical may ID be used as the final deterministic deduplication order. This keeps the conflict branch reachable.
+Use `effective_at_utc <= as_of_utc` only as the visibility gate and group visible facts by `(security_id, metric_key, period_end)`. Within each group, compute the maximum business version rank `(announced_at_utc, source_updated_at_utc with a deterministic missing sentinel, snapshot_fetched_at[source_snapshot_id])` **without** content hash or fact ID. Inspect every fact tied at that top business rank: differing finite values, units, or natures add `conflicting_fact_versions`/`conflicting_fact_units` and select none. Only when tied facts are semantically identical may raw/content hash and then ID be used for deterministic deduplication. This follows the binding announcement → source update → fetch ordering while keeping the conflict branch reachable. Effective time remains the first verified trading close strictly after `max(NOTICE_DATE, UPDATE_DATE)`.
 
 After selection, `validate_balance_equation()` checks `|assets - liabilities - equity| <= max(1000, 0.001 * |assets|)`. A material gap adds `balance_equation_mismatch`; mixed units for one logical fact add `conflicting_fact_units`. Both blockers flow unchanged into Task 8.
 
@@ -1258,7 +1263,7 @@ def feature_input_hash(
     })
 ```
 
-Omitting a statement key is not equivalent to explicit null: normalize all three keys before hashing. `candidate_set_hash` already commits to the prefilter inputs and each sorted performance-row hash, including the target-period disclosure state; therefore the pure bundle builder may consume `reported_target_period` without adding a second unapproved hash dependency.
+Always normalize exactly the three statement keys before hashing. An omitted caller key becomes the required explicit null marker and therefore hashes identically to an explicitly supplied null; changing that null to a real snapshot hash must change the input hash. `candidate_set_hash` already commits to the prefilter inputs and each sorted performance-row hash, including the target-period disclosure state; therefore the pure bundle builder may consume `reported_target_period` without adding a second unapproved hash dependency.
 
 - [ ] **Step 4: Implement deterministic feature construction**
 
@@ -2151,6 +2156,8 @@ Scope child jobs by current member, request version, and refresh date—not by t
 
 Derive `active_circuit_breakers` from current retryable jobs whose stored `source_blocked` retry window has not expired, so a later standalone `status` command preserves circuit state. Count expired current leases and any failure outside the allowed taxonomy explicitly. Scope feature sets to current candidate hash/contract. Require `len(incomplete_candidates) == denominator - numerator`; sort items and all nested lists. Do not aggregate all historical score items into current deep progress.
 
+Compute `denominator = len(context.members)` so hermetic contexts remain coherent. The operational acceptance script below separately requires the deployed candidate context denominator to be exactly 120 and coverage to be at least 114; a truncated production context must not pass acceptance.
+
 Expose the same bounded counts in `reporting.py` operational rows if present, but do not add individual financial values. Keep `seven_dimension_ready=false`, `formal_score_ready=false`, and pool counts zero.
 
 - [ ] **Step 7: Run orchestrator and reporting tests**
@@ -2181,7 +2188,7 @@ git commit -m "feat: expose bounded deep collection and progress"
 
 **Interfaces:**
 - Consumes: all prior tasks and the fixed industrial, bank, real-estate/missing fixtures.
-- Produces: a hermetic fake-source proof, a true offline frozen-job proof, and an updated execution ledger; no new production interface.
+- Produces: a hermetic fake-source proof, a true offline frozen-job proof, and an updated project-facing status document; no new production interface.
 
 - [ ] **Step 1: Write the failing hermetic and offline replay tests**
 
@@ -2536,6 +2543,8 @@ In `progress.md`, record:
 - explicit statement that this phase produces financial feature inputs only;
 - `formal_score_ready=false` and both official pools remain zero;
 - next project is market/capital-action/governance inputs plus formal scoring.
+
+This repository-root `progress.md` is the committed project-facing status document. It is distinct from the ignored private SDD recovery ledger under `.superpowers/sdd/2026-08-29-seven-dimension-feature-foundation/progress.md`; never stage the private ledger.
 
 - [ ] **Step 6: Commit end-to-end evidence**
 
