@@ -47,16 +47,23 @@ class SnapshotRepository:
 
     def persist(self, batch: FetchBatch) -> tuple[SnapshotRef, bool]:
         request_fingerprint = canonical_sha256(batch.request)
-        fetched_at = require_aware_utc(batch.fetched_at_utc, "snapshot fetched_at")
         target, digest, _ = self.snapshot_store.write(batch)
+        winner = self.snapshot_store.read_verified(target, digest)
+        winner_fingerprint = canonical_sha256(winner.request)
+        if (
+            winner.canonical_bytes() != batch.canonical_bytes()
+            or winner_fingerprint != request_fingerprint
+        ):
+            raise OSError("published snapshot does not match the requested content")
+        fetched_at = require_aware_utc(winner.fetched_at_utc, "snapshot fetched_at")
         relative_path = self._project_relative_data_path(target)
         snapshot_id, created = self.state_store.record_snapshot(
-            batch.source,
-            batch.dataset,
-            request_fingerprint,
+            winner.source,
+            winner.dataset,
+            winner_fingerprint,
             digest,
             relative_path,
-            len(batch.records),
+            len(winner.records),
             fetched_at,
         )
         snapshot = self.get(snapshot_id)

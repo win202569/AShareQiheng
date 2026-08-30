@@ -27,9 +27,9 @@ class SnapshotStoreTestCase(unittest.TestCase):
         self.assertEqual(path, self.root / "raw" / "baostock" / "daily" / "2026-08-25" / f"{digest}.json")
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["records"][0]["code"], "000001")
 
-    def test_failed_replace_removes_only_own_part_file(self):
+    def test_failed_no_clobber_publish_removes_only_own_part_file(self):
         store = SnapshotStore(self.root)
-        with patch("ashare_pipeline.snapshot_store.os.replace", side_effect=OSError("disk full")):
+        with patch("ashare_pipeline.snapshot_store.os.link", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 store.write(self.batch)
 

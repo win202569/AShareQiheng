@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 import os
@@ -130,6 +131,61 @@ class SnapshotRepositoryTestCase(unittest.TestCase):
         self.assertEqual(duplicate, first)
         with closing(sqlite3.connect(self.data_root / "state.sqlite3")) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0], 1)
+
+    def test_concurrent_same_target_persist_keeps_first_published_batch_and_db_ref(self):
+        first_batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+        second_batch = statement_batch("SH600001", 100.0, "2026-08-29T01:00:00+00:00")
+        publish_barrier = threading.Barrier(2)
+        first_persisted = threading.Event()
+        results: dict[str, tuple[object, bool]] = {}
+        errors: list[BaseException] = []
+        result_lock = threading.Lock()
+
+        def controlled_publish(real_publish):
+            def publish(source, target, *args, **kwargs):
+                publish_barrier.wait(timeout=5)
+                is_first = first_batch.fetched_at_utc in Path(source).read_text(encoding="utf-8")
+                if not is_first and not first_persisted.wait(timeout=5):
+                    raise RuntimeError("first writer did not persist before second publish")
+                return real_publish(source, target, *args, **kwargs)
+            return publish
+
+        def persist(name: str, batch: FetchBatch) -> None:
+            try:
+                result = self.repository.persist(batch)
+                with result_lock:
+                    results[name] = result
+                if name == "first":
+                    first_persisted.set()
+            except BaseException as error:
+                with result_lock:
+                    errors.append(error)
+
+        real_replace = os.replace
+        real_link = os.link
+        with patch("ashare_pipeline.snapshot_store.os.replace", new=controlled_publish(real_replace)), patch(
+            "ashare_pipeline.snapshot_store.os.link", new=controlled_publish(real_link)
+        ):
+            first = threading.Thread(target=persist, args=("first", first_batch))
+            second = threading.Thread(target=persist, args=("second", second_batch))
+            first.start()
+            second.start()
+            first.join(timeout=10)
+            second.join(timeout=10)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(set(results), {"first", "second"})
+        first_ref, first_created = results["first"]
+        second_ref, second_created = results["second"]
+        self.assertEqual(first_ref, second_ref)
+        self.assertTrue(first_created)
+        self.assertFalse(second_created)
+        self.assertEqual(first_ref.fetched_at, first_batch.fetched_at_utc)
+        winner = self.repository.read_verified(first_ref)
+        self.assertEqual(winner.batch.fetched_at_utc, first_batch.fetched_at_utc)
+        self.assertEqual(self.repository.read_verified(second_ref).batch, winner.batch)
 
     def test_read_verified_rejects_tampered_snapshot(self):
         snapshot, _ = self.repository.persist(

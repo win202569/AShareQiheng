@@ -45,14 +45,18 @@ class SnapshotStore:
                 part_path.unlink()
                 part_path = None
                 return existing, digest, False
-            os.replace(part_path, target)
-            part_path = None
             try:
+                os.link(part_path, target)
+            except FileExistsError:
+                existing = self._verify(target, digest)
+                part_path.unlink()
+                part_path = None
+                return target, digest, False
+            else:
+                part_path.unlink()
+                part_path = None
                 self._verify(target, digest)
-            except OSError:
-                target.unlink(missing_ok=True)
-                raise
-            return target, digest, True
+                return target, digest, True
         except BaseException:
             if part_path is not None:
                 part_path.unlink(missing_ok=True)
