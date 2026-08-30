@@ -65,3 +65,19 @@ class SnapshotStoreTestCase(unittest.TestCase):
         replace.assert_not_called()
         self.assertEqual(list(self.root.rglob("*.part")), [])
         self.assertEqual(list(self.root.rglob("*.json")), [])
+
+    def test_read_verified_returns_the_stored_batch_only_when_hash_matches(self):
+        store = SnapshotStore(self.root)
+        path, digest, _ = store.write(self.batch)
+
+        observed = store.read_verified(path, digest)
+
+        self.assertEqual(observed, self.batch)
+
+    def test_read_verified_fails_safely_for_missing_payload_fields(self):
+        store = SnapshotStore(self.root)
+        path = self.root / "malformed.json"
+        path.write_text('{"source":"baostock"}', encoding="utf-8")
+
+        with self.assertRaisesRegex(OSError, "invalid snapshot payload"):
+            store.read_verified(path, "0" * 64)
