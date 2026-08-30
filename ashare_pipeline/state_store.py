@@ -6,7 +6,7 @@ import json
 import sqlite3
 import uuid
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Iterable, Iterator, Mapping, Sequence
@@ -19,6 +19,7 @@ JOB_STATES = {"pending", "running", "succeeded", "retryable_failed", "terminal_f
 SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
 SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
 RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
+_OWNED_JOB_KINDS = frozenset({"deep_financial", "deep_statement", "feature_build"})
 SCHEMA_VERSION = 3
 
 FINANCIAL_FACT_COLUMNS = (
@@ -210,7 +211,21 @@ class FinalizationBlocked(RuntimeError):
 class JobSpec:
     kind: str
     idempotency_key: str
-    payload: dict[str, object]
+    _payload_json: str = field(init=False, repr=False)
+
+    def __init__(
+        self,
+        kind: str,
+        idempotency_key: str,
+        payload: dict[str, object],
+    ) -> None:
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "idempotency_key", idempotency_key)
+        object.__setattr__(self, "_payload_json", _json(payload))
+
+    @property
+    def payload(self) -> dict[str, object]:
+        return json.loads(self._payload_json)
 
 
 def _utc_now() -> str:
@@ -532,6 +547,7 @@ class StateStore:
             self._insert_followups(connection, followups, now)
             cursor = connection.execute(
                 """UPDATE job SET status = 'succeeded', result_json = ?,
+                last_error_json = NULL, next_retry_at = NULL,
                 lease_worker = NULL, lease_expires_at = NULL, updated_at = ?
                 WHERE id = ? AND status = 'running' AND lease_worker = ?
                 AND lease_expires_at > ?""",
@@ -591,7 +607,7 @@ class StateStore:
         now: str,
     ) -> None:
         for followup in followups:
-            payload_json = _json(followup.payload)
+            payload_json = followup._payload_json
             existing = connection.execute(
                 """SELECT kind, payload_json FROM job
                 WHERE idempotency_key = ?""",
@@ -621,10 +637,13 @@ class StateStore:
             )
 
     def complete_job(self, job_id: str, result: dict) -> None:
-        with self._transaction() as connection:
+        with self._transaction(immediate=True) as connection:
+            self._require_legacy_transition_allowed(connection, job_id, "completed")
             cursor = connection.execute(
-                """UPDATE job SET status = 'succeeded', result_json = ?, lease_worker = NULL,
-                lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running'""",
+                """UPDATE job SET status = 'succeeded', result_json = ?,
+                last_error_json = NULL, next_retry_at = NULL, lease_worker = NULL,
+                lease_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND status = 'running'""",
                 (_json(result), _utc_now(), job_id),
             )
             if cursor.rowcount != 1:
@@ -658,8 +677,9 @@ class StateStore:
         self, job_id: str, error: dict, retryable: bool, next_retry_at: str | None = None
     ) -> None:
         state = "retryable_failed" if retryable else "terminal_failed"
-        retry_at = _utc_iso(next_retry_at) if retryable and next_retry_at else None
-        with self._transaction() as connection:
+        with self._transaction(immediate=True) as connection:
+            self._require_legacy_transition_allowed(connection, job_id, "failed")
+            retry_at = _utc_iso(next_retry_at) if retryable and next_retry_at else None
             cursor = connection.execute(
                 """UPDATE job SET status = ?, last_error_json = ?, next_retry_at = ?,
                 lease_worker = NULL, lease_expires_at = NULL, updated_at = ?
@@ -668,6 +688,20 @@ class StateStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError("only running jobs can fail")
+
+    @staticmethod
+    def _require_legacy_transition_allowed(
+        connection: sqlite3.Connection,
+        job_id: str,
+        action: str,
+    ) -> None:
+        row = connection.execute(
+            "SELECT kind, status FROM job WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            raise ValueError(f"only running jobs can be {action}")
+        if row["kind"] in _OWNED_JOB_KINDS:
+            raise ValueError("owned jobs require an explicit lease owner")
 
     def recover_expired_leases(self, now_utc: str | None = None) -> int:
         now = _utc_iso(now_utc)

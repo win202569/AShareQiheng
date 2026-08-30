@@ -771,6 +771,48 @@ class StateStoreTestCase(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             spec.kind = "deep_statement"
 
+    def test_job_spec_payload_is_a_stable_construction_snapshot(self) -> None:
+        source_payload = {
+            "security_id": "SH600001",
+            "nested": {"version": 1},
+            "items": [{"dataset": "balance_sheet"}],
+        }
+        spec = JobSpec("feature_build", "feature:immutable", source_payload)
+
+        source_payload["nested"]["version"] = 2
+        source_payload["items"][0]["dataset"] = "profit_sheet"
+        source_payload["added"] = True
+        self.assertEqual(
+            spec.payload,
+            {
+                "security_id": "SH600001",
+                "nested": {"version": 1},
+                "items": [{"dataset": "balance_sheet"}],
+            },
+        )
+
+        exposed_payload = spec.payload
+        exposed_payload["nested"]["version"] = 3
+        exposed_payload["items"].append({"dataset": "cash_flow_sheet"})
+        exposed_payload["security_id"] = "SZ000001"
+
+        parent_id = self.store.enqueue_job("deep_statement", "statement:immutable", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60)
+        self.store.complete_job_with_followups(
+            parent_id, "worker-a", {"outcome": "expanded"}, (spec,)
+        )
+
+        stored = self.store.list_jobs(["feature_build"])[0]
+        self.assertEqual(
+            stored["payload"],
+            {
+                "security_id": "SH600001",
+                "nested": {"version": 1},
+                "items": [{"dataset": "balance_sheet"}],
+            },
+        )
+        self.assertEqual(spec.payload, stored["payload"])
+
     def test_renew_job_lease_requires_current_unexpired_owner(self) -> None:
         job_id = self.store.enqueue_job("deep_statement", "statement-a", {})
         self.store.lease_next_job(["deep_statement"], "worker-a", 60, utc_at(0))
@@ -799,8 +841,8 @@ class StateStoreTestCase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "lease owner"):
             self.store.renew_job_lease(expired_id, "worker-a", 60, utc_at(10))
 
-        completed_id = self.store.enqueue_job("deep_statement", "statement-complete", {})
-        self.store.lease_next_job(["deep_statement"], "worker-a", 60, utc_at(20))
+        completed_id = self.store.enqueue_job("fetch", "fetch-complete", {})
+        self.store.lease_next_job(["fetch"], "worker-a", 60, utc_at(20))
         self.store.complete_job(completed_id, {"rows": 1})
         with self.assertRaisesRegex(ValueError, "lease owner"):
             self.store.renew_job_lease(completed_id, "worker-a", 60, utc_at(21))
@@ -858,6 +900,72 @@ class StateStoreTestCase(unittest.TestCase):
                             (),
                         )
                 self.assertEqual(self.store.get_job(job_id)["status"], "running")
+
+    def test_owned_kinds_reject_ownerless_legacy_transitions_after_release(self) -> None:
+        for kind in ("deep_financial", "deep_statement", "feature_build"):
+            with self.subTest(kind=kind):
+                job_id = self.store.enqueue_job(kind, f"owned:legacy:{kind}", {})
+                self.store.lease_next_job([kind], "worker-a", 10, utc_at(0))
+                self.assertEqual(self.store.recover_expired_leases(utc_at(11)), 1)
+                leased = self.store.lease_next_job([kind], "worker-b", 60, utc_at(11))
+
+                with self.assertRaisesRegex(ValueError, "owner"):
+                    self.store.complete_job(job_id, {"outcome": "stale-complete"})
+                with self.assertRaisesRegex(ValueError, "owner"):
+                    self.store.fail_job(
+                        job_id, {"reason": "stale-failure"}, False
+                    )
+
+                current = self.store.get_job(job_id)
+                self.assertEqual(current["status"], "running")
+                self.assertEqual(current["lease_worker"], "worker-b")
+                self.assertEqual(current["lease_expires_at"], leased["lease_expires_at"])
+
+    def test_strict_success_clears_recovered_failure_fields(self) -> None:
+        now = datetime.now(UTC)
+        old_start = (now - timedelta(minutes=2)).isoformat()
+        recovery_time = (now - timedelta(minutes=1)).isoformat()
+        job_id = self.store.enqueue_job("deep_statement", "statement:recovered", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 10, old_start)
+        self.assertEqual(self.store.recover_expired_leases(recovery_time), 1)
+        self.store.lease_next_job(["deep_statement"], "worker-b", 3600)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE job SET next_retry_at = ? WHERE id = ?",
+                ((now + timedelta(hours=1)).isoformat(), job_id),
+            )
+            connection.commit()
+
+        self.store.complete_job_with_followups(
+            job_id, "worker-b", {"outcome": "recovered"}, ()
+        )
+
+        completed = self.store.get_job(job_id)
+        self.assertEqual(completed["status"], "succeeded")
+        self.assertIsNone(completed["error"])
+        self.assertIsNone(completed["next_retry_at"])
+
+    def test_legacy_success_clears_recovered_failure_fields(self) -> None:
+        now = datetime.now(UTC)
+        old_start = (now - timedelta(minutes=2)).isoformat()
+        recovery_time = (now - timedelta(minutes=1)).isoformat()
+        job_id = self.store.enqueue_job("fetch", "legacy:recovered", {})
+        self.store.lease_next_job(["fetch"], "worker-a", 10, old_start)
+        self.assertEqual(self.store.recover_expired_leases(recovery_time), 1)
+        self.store.lease_next_job(["fetch"], "worker-b", 3600)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE job SET next_retry_at = ? WHERE id = ?",
+                ((now + timedelta(hours=1)).isoformat(), job_id),
+            )
+            connection.commit()
+
+        self.store.complete_job(job_id, {"outcome": "recovered"})
+
+        completed = self.store.get_job(job_id)
+        self.assertEqual(completed["status"], "succeeded")
+        self.assertIsNone(completed["error"])
+        self.assertIsNone(completed["next_retry_at"])
 
     def test_statement_completion_and_feature_followup_are_one_transaction(self) -> None:
         job_id = self.store.enqueue_job("deep_statement", "statement-b", {})
