@@ -82,6 +82,24 @@ class FeatureContractTests(unittest.TestCase):
                 "v.x", 1.0, "CNY", "as_of", "observed", "v1", (evidence(),), None),))
             bundle(bad)
 
+    def test_missing_dimension_accepts_missing_slots_mixed_with_not_applicable(self):
+        missing = FeatureValue(
+            "m.required", None, "ratio", "FY2022", "missing", "derived-v1",
+            (), "financial_fact_missing:required",
+        )
+        not_applicable = FeatureValue(
+            "m.opening", None, "ratio", "FY2021", "not_applicable",
+            "derived-v1", (), "frozen_window_no_opening_period",
+        )
+
+        candidate = DimensionInput("missing", (missing, not_applicable))
+
+        self.assertEqual(candidate.status, "missing")
+        self.assertEqual(
+            {value.status for value in candidate.values},
+            {"missing", "not_applicable"},
+        )
+
     def test_json_round_trip(self):
         restored = FeatureBundle.from_dict(bundle().to_dict())
         self.assertEqual(restored.to_dict(), bundle().to_dict())

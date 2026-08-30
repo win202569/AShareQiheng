@@ -1069,9 +1069,19 @@ def build_feature_bundle(
         statement_snapshot_hashes.get(dataset) is None
         for dataset in ("balance_sheet", "profit_sheet", "cash_flow_sheet")
     )
+    target_statements = {
+        fact.statement
+        for fact in supplied_facts
+        if fact.security_id == security_id and fact.period_end == report_period
+    }
+    target_period_incomplete = target_statements != {"balance", "income", "cash_flow"}
     cutoff = datetime.fromisoformat("2026-08-31T23:59:59+08:00")
     as_of = datetime.fromisoformat(require_aware_utc(as_of_utc, "as_of_utc"))
-    if reported_target_period and missing_statement and as_of > cutoff:
+    if (
+        reported_target_period
+        and (missing_statement or target_period_incomplete)
+        and as_of > cutoff
+    ):
         financial_blockers.add("reported_but_statement_missing")
     input_hash = feature_input_hash(
         security_id=security_id,

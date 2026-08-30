@@ -139,7 +139,7 @@ class DimensionInput:
         if len(keys) != len(set(keys)):
             raise ValueError("duplicate feature key and period")
         states = {item.status for item in values}
-        if self.status == "missing" and states - {"missing"}:
+        if self.status == "missing" and states - {"missing", "not_applicable"}:
             raise ValueError("missing dimension cannot contain observed values")
         if self.status == "not_applicable" and states - {"not_applicable"}:
             raise ValueError("not_applicable dimension has inconsistent values")

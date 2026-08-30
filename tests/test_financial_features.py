@@ -848,6 +848,33 @@ class FeatureBundleBuildTests(unittest.TestCase):
         self.assertAlmostEqual(values["m.roic.FY2025"], 200.0 / 900.0)
         self.assertEqual(values["m.gross_margin.FY2025"], 0.4)
 
+    def test_general_bundle_with_no_facts_is_valid_partial_with_explicit_missing_slots(self):
+        bundle = build_bundle_with_overrides(facts=())
+        values = self.values(bundle)
+
+        self.assertEqual(bundle.financial_status, "partial")
+        self.assertEqual(bundle.financial_coverage, 0.0)
+        self.assertEqual(bundle.dimension_inputs["M"].status, "missing")
+        self.assertEqual(values["m.roic.FY2021"].status, "not_applicable")
+        self.assertEqual(
+            values["g.revenue.FY2022"].missing_reason,
+            "financial_fact_missing:revenue",
+        )
+
+    def test_general_bundle_with_only_balance_and_cash_facts_is_valid_partial(self):
+        partial_facts = tuple(
+            fact
+            for fact in complete_general_facts()
+            if fact.statement in {"balance", "cash_flow"}
+        )
+
+        bundle = build_bundle_with_overrides(facts=partial_facts)
+
+        self.assertEqual(bundle.financial_status, "partial")
+        self.assertGreater(bundle.financial_coverage, 0.0)
+        self.assertLess(bundle.financial_coverage, 1.0)
+        self.assertEqual(bundle.dimension_inputs["M"].status, "partial")
+
     def test_tax_rate_is_bounded_and_invalid_ratio_denominators_fail_closed(self):
         negative_tax = self.replace_fact(hand_checked_general_facts(), "income_tax", "2025-12-31", -10.0)
         excessive_tax = self.replace_fact(hand_checked_general_facts(), "income_tax", "2025-12-31", 200.0)
@@ -1055,6 +1082,21 @@ class FeatureBundleBuildTests(unittest.TestCase):
         self.assertNotIn("reported_but_statement_missing", before.blockers)
         self.assertIn("reported_but_statement_missing", after.blockers)
         self.assertNotIn("reported_but_statement_missing", not_reported.blockers)
+
+    def test_post_cutoff_target_facts_missing_blocks_even_when_all_snapshots_exist(self):
+        historical_only = tuple(
+            fact
+            for fact in complete_general_facts()
+            if fact.period_end != "2026-06-30"
+        )
+
+        bundle = build_bundle_with_overrides(
+            facts=historical_only,
+            as_of_utc="2026-08-31T16:00:00+00:00",
+        )
+
+        self.assertIn("reported_but_statement_missing", bundle.blockers)
+        self.assertEqual(bundle.financial_status, "blocked")
 
     def test_missing_calendar_blocks_and_fact_order_is_deterministic(self):
         facts = list(complete_general_facts())
