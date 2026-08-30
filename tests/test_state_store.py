@@ -4,7 +4,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import closing
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -19,7 +19,7 @@ from ashare_pipeline.feature_contract import (
     IndustryContext,
 )
 from ashare_pipeline.financial_schema import MAPPING_VERSION, FinancialFact
-from ashare_pipeline.state_store import FinalizationBlocked, StateStore
+from ashare_pipeline.state_store import FinalizationBlocked, JobSpec, StateStore
 
 
 UTC = timezone.utc
@@ -764,6 +764,279 @@ class StateStoreTestCase(unittest.TestCase):
         self.assertEqual(job["error"], {"reason": "temporary"})
         self.assertEqual(job["next_retry_at"], utc_at(60))
         self.assertIsNone(self.store.get_job("missing"))
+
+    def test_job_spec_is_frozen(self) -> None:
+        spec = JobSpec("feature_build", "feature:frozen", {"security_id": "SH600001"})
+
+        with self.assertRaises(FrozenInstanceError):
+            spec.kind = "deep_statement"
+
+    def test_renew_job_lease_requires_current_unexpired_owner(self) -> None:
+        job_id = self.store.enqueue_job("deep_statement", "statement-a", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60, utc_at(0))
+
+        expiry = self.store.renew_job_lease(job_id, "worker-a", 120, utc_at(30))
+
+        self.assertEqual(expiry, utc_at(150))
+        with self.assertRaisesRegex(ValueError, "lease owner"):
+            self.store.renew_job_lease(job_id, "worker-b", 120, utc_at(31))
+
+    def test_renew_job_lease_rejects_nonpositive_duration(self) -> None:
+        job_id = self.store.enqueue_job("deep_statement", "statement-duration", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60, utc_at(0))
+
+        for lease_seconds in (0, -1):
+            with self.subTest(lease_seconds=lease_seconds), self.assertRaisesRegex(
+                ValueError, "lease_seconds"
+            ):
+                self.store.renew_job_lease(
+                    job_id, "worker-a", lease_seconds, utc_at(1)
+                )
+
+    def test_expired_and_completed_jobs_cannot_renew(self) -> None:
+        expired_id = self.store.enqueue_job("deep_statement", "statement-expired", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 10, utc_at(0))
+        with self.assertRaisesRegex(ValueError, "lease owner"):
+            self.store.renew_job_lease(expired_id, "worker-a", 60, utc_at(10))
+
+        completed_id = self.store.enqueue_job("deep_statement", "statement-complete", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60, utc_at(20))
+        self.store.complete_job(completed_id, {"rows": 1})
+        with self.assertRaisesRegex(ValueError, "lease owner"):
+            self.store.renew_job_lease(completed_id, "worker-a", 60, utc_at(21))
+
+    def test_wrong_worker_cannot_complete_or_fail_owned_job(self) -> None:
+        followup = JobSpec("feature_build", "feature:wrong-owner", {"version": 1})
+        complete_id = self.store.enqueue_job("deep_statement", "complete:owned", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60)
+        with self.assertRaisesRegex(ValueError, "lease owner"):
+            self.store.complete_job_with_followups(
+                complete_id, "worker-b", {"snapshot": "a" * 64}, (followup,)
+            )
+
+        fail_id = self.store.enqueue_job("deep_statement", "fail:owned", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60)
+        with self.assertRaisesRegex(ValueError, "lease owner"):
+            self.store.fail_job_with_followups(
+                fail_id,
+                "worker-b",
+                {"reason": "temporary"},
+                True,
+                utc_at(120),
+                (followup,),
+            )
+
+        self.assertEqual(self.store.get_job(complete_id)["status"], "running")
+        self.assertEqual(self.store.get_job(fail_id)["status"], "running")
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_expired_worker_cannot_complete_or_fail_owned_job(self) -> None:
+        for action in ("complete", "fail"):
+            with self.subTest(action=action):
+                job_id = self.store.enqueue_job(
+                    "deep_statement", f"statement:stale:{action}", {}
+                )
+                self.store.lease_next_job(["deep_statement"], "worker-a", 60)
+                with closing(sqlite3.connect(self.db_path)) as connection:
+                    connection.execute(
+                        "UPDATE job SET lease_expires_at = ? WHERE id = ?",
+                        ("2000-01-01T00:00:00+00:00", job_id),
+                    )
+                    connection.commit()
+                with self.assertRaisesRegex(ValueError, "lease owner"):
+                    if action == "complete":
+                        self.store.complete_job_with_followups(
+                            job_id, "worker-a", {"rows": 1}, ()
+                        )
+                    else:
+                        self.store.fail_job_with_followups(
+                            job_id,
+                            "worker-a",
+                            {"reason": "late"},
+                            False,
+                            None,
+                            (),
+                        )
+                self.assertEqual(self.store.get_job(job_id)["status"], "running")
+
+    def test_statement_completion_and_feature_followup_are_one_transaction(self) -> None:
+        job_id = self.store.enqueue_job("deep_statement", "statement-b", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60)
+        followup = JobSpec(
+            "feature_build", "feature-b", {"security_id": "SH600001"}
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """CREATE TRIGGER reject_feature BEFORE INSERT ON job
+                WHEN NEW.kind='feature_build' BEGIN
+                  SELECT RAISE(ABORT,'reject feature');
+                END"""
+            )
+            connection.commit()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.complete_job_with_followups(
+                job_id, "worker-a", {"snapshot": "a" * 64}, (followup,)
+            )
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "running")
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_statement_failure_and_feature_followup_are_one_transaction(self) -> None:
+        job_id = self.store.enqueue_job("deep_statement", "statement-failure", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60)
+        followup = JobSpec(
+            "feature_build", "feature-after-failure", {"security_id": "SH600001"}
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """CREATE TRIGGER reject_failure_followup BEFORE INSERT ON job
+                WHEN NEW.kind='feature_build' BEGIN
+                  SELECT RAISE(ABORT,'reject failure followup');
+                END"""
+            )
+            connection.commit()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.fail_job_with_followups(
+                job_id,
+                "worker-a",
+                {"reason": "temporary"},
+                True,
+                utc_at(120),
+                (followup,),
+            )
+
+        job = self.store.get_job(job_id)
+        self.assertEqual(job["status"], "running")
+        self.assertIsNone(job["error"])
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_repeated_identical_followups_are_idempotent_and_canonical(self) -> None:
+        job_id = self.store.enqueue_job("deep_statement", "statement-idempotent", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60)
+        followup = JobSpec(
+            "feature_build",
+            "feature:idempotent",
+            {"z": 1, "security_id": "深证", "a": [2, 1]},
+        )
+
+        self.store.complete_job_with_followups(
+            job_id, "worker-a", {"outcome": "expanded"}, (followup, followup)
+        )
+
+        jobs = self.store.list_jobs(["feature_build"])
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["payload"], followup.payload)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            stored_json = connection.execute(
+                "SELECT payload_json FROM job WHERE idempotency_key = ?",
+                (followup.idempotency_key,),
+            ).fetchone()[0]
+        self.assertEqual(stored_json, '{"a":[2,1],"security_id":"深证","z":1}')
+
+    def test_conflicting_followup_idempotency_key_fails_closed_and_rolls_back(self) -> None:
+        self.store.enqueue_job(
+            "feature_build", "feature:conflict", {"security_id": "SH600001"}
+        )
+        parent_id = self.store.enqueue_job("deep_statement", "statement-conflict", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60)
+
+        with self.assertRaisesRegex(ValueError, "idempotency"):
+            self.store.complete_job_with_followups(
+                parent_id,
+                "worker-a",
+                {"outcome": "expanded"},
+                (
+                    JobSpec(
+                        "feature_build",
+                        "feature:conflict",
+                        {"security_id": "SZ000001"},
+                    ),
+                ),
+            )
+
+        self.assertEqual(self.store.get_job(parent_id)["status"], "running")
+        self.assertEqual(
+            self.store.list_jobs(["feature_build"])[0]["payload"],
+            {"security_id": "SH600001"},
+        )
+
+        kind_parent_id = self.store.enqueue_job(
+            "deep_statement", "statement-kind-conflict", {}
+        )
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60)
+        with self.assertRaisesRegex(ValueError, "idempotency"):
+            self.store.complete_job_with_followups(
+                kind_parent_id,
+                "worker-a",
+                {"outcome": "expanded"},
+                (
+                    JobSpec(
+                        "deep_statement",
+                        "feature:conflict",
+                        {"security_id": "SH600001"},
+                    ),
+                ),
+            )
+        self.assertEqual(self.store.get_job(kind_parent_id)["status"], "running")
+
+    def test_nonfinite_followup_payload_rolls_back_parent_transition(self) -> None:
+        job_id = self.store.enqueue_job("deep_statement", "statement-nonfinite", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 60)
+
+        with self.assertRaises(ValueError):
+            self.store.complete_job_with_followups(
+                job_id,
+                "worker-a",
+                {"outcome": "expanded"},
+                (JobSpec("feature_build", "feature:nan", {"value": math.nan}),),
+            )
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "running")
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_list_jobs_filters_by_parameter_and_orders_created_at_then_id(self) -> None:
+        first_id = self.store.enqueue_job("deep_statement", "list:first", {"order": 1})
+        ignored_id = self.store.enqueue_job("feature_build", "list:ignored", {})
+        second_id = self.store.enqueue_job("deep_statement", "list:second", {"order": 2})
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE job SET created_at = ? WHERE id IN (?, ?)",
+                (utc_at(0), first_id, ignored_id),
+            )
+            connection.execute(
+                "UPDATE job SET created_at = ? WHERE id = ?", (utc_at(1), second_id)
+            )
+            connection.commit()
+
+        jobs = self.store.list_jobs(["deep_statement", "x') OR 1=1 --"])
+
+        self.assertEqual([job["id"] for job in jobs], [first_id, second_id])
+        self.assertEqual(self.store.list_jobs([]), [])
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE job SET created_at = ? WHERE id IN (?, ?)",
+                (utc_at(2), first_id, second_id),
+            )
+            connection.commit()
+        self.assertEqual(
+            [job["id"] for job in self.store.list_jobs(["deep_statement"])],
+            sorted((first_id, second_id)),
+        )
+
+    def test_legacy_completion_and_failure_without_worker_remain_compatible(self) -> None:
+        completed_id = self.store.enqueue_job("fetch", "legacy:complete", {})
+        self.store.lease_next_job(["fetch"], "worker-a", 60)
+        self.store.complete_job(completed_id, {"rows": 1})
+
+        failed_id = self.store.enqueue_job("fetch", "legacy:fail", {})
+        self.store.lease_next_job(["fetch"], "worker-a", 60)
+        self.store.fail_job(failed_id, {"reason": "bad input"}, False)
+
+        self.assertEqual(self.store.get_job(completed_id)["status"], "succeeded")
+        self.assertEqual(self.store.get_job(failed_id)["status"], "terminal_failed")
 
     def test_snapshot_deduplicates_same_content_and_versions_new_hash(self) -> None:
         first_id, first_created = self.store.record_snapshot(

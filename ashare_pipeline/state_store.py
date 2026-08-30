@@ -6,6 +6,7 @@ import json
 import sqlite3
 import uuid
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Iterable, Iterator, Mapping, Sequence
@@ -203,6 +204,13 @@ _V3_INDEX_DDL = {
 
 class FinalizationBlocked(RuntimeError):
     """The final publication gate has not yet been satisfied."""
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    kind: str
+    idempotency_key: str
+    payload: dict[str, object]
 
 
 def _utc_now() -> str:
@@ -486,6 +494,132 @@ class StateStore:
             leased = connection.execute("SELECT * FROM job WHERE id = ?", (row["id"],)).fetchone()
         return self._job_public(leased)
 
+    def renew_job_lease(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_seconds: int,
+        now_utc: str | None = None,
+    ) -> str:
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        now = _utc_iso(now_utc)
+        expires = datetime.fromisoformat(now).timestamp() + lease_seconds
+        expiry = datetime.fromtimestamp(expires, timezone.utc).isoformat()
+        with self._transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                """UPDATE job SET lease_expires_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'running' AND lease_worker = ?
+                AND lease_expires_at > ?""",
+                (expiry, now, job_id, worker_id, now),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "job is not held by the current unexpired lease owner"
+                )
+        return expiry
+
+    def complete_job_with_followups(
+        self,
+        job_id: str,
+        worker_id: str,
+        result: dict,
+        followups: Iterable[JobSpec],
+    ) -> None:
+        now = _utc_now()
+        with self._transaction(immediate=True) as connection:
+            self._require_unexpired_job_owner(connection, job_id, worker_id, now)
+            self._insert_followups(connection, followups, now)
+            cursor = connection.execute(
+                """UPDATE job SET status = 'succeeded', result_json = ?,
+                lease_worker = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND status = 'running' AND lease_worker = ?
+                AND lease_expires_at > ?""",
+                (_json(result), now, job_id, worker_id, now),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "job is not held by the current unexpired lease owner"
+                )
+
+    def fail_job_with_followups(
+        self,
+        job_id: str,
+        worker_id: str,
+        error: dict,
+        retryable: bool,
+        next_retry_at: str | None,
+        followups: Iterable[JobSpec],
+    ) -> None:
+        state = "retryable_failed" if retryable else "terminal_failed"
+        retry_at = _utc_iso(next_retry_at) if retryable and next_retry_at else None
+        now = _utc_now()
+        with self._transaction(immediate=True) as connection:
+            self._require_unexpired_job_owner(connection, job_id, worker_id, now)
+            self._insert_followups(connection, followups, now)
+            cursor = connection.execute(
+                """UPDATE job SET status = ?, last_error_json = ?, next_retry_at = ?,
+                lease_worker = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND status = 'running' AND lease_worker = ?
+                AND lease_expires_at > ?""",
+                (state, _json(error), retry_at, now, job_id, worker_id, now),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "job is not held by the current unexpired lease owner"
+                )
+
+    @staticmethod
+    def _require_unexpired_job_owner(
+        connection: sqlite3.Connection,
+        job_id: str,
+        worker_id: str,
+        now: str,
+    ) -> None:
+        owned = connection.execute(
+            """SELECT 1 FROM job WHERE id = ? AND status = 'running'
+            AND lease_worker = ? AND lease_expires_at > ?""",
+            (job_id, worker_id, now),
+        ).fetchone()
+        if owned is None:
+            raise ValueError("job is not held by the current unexpired lease owner")
+
+    @staticmethod
+    def _insert_followups(
+        connection: sqlite3.Connection,
+        followups: Iterable[JobSpec],
+        now: str,
+    ) -> None:
+        for followup in followups:
+            payload_json = _json(followup.payload)
+            existing = connection.execute(
+                """SELECT kind, payload_json FROM job
+                WHERE idempotency_key = ?""",
+                (followup.idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["kind"] != followup.kind
+                    or existing["payload_json"] != payload_json
+                ):
+                    raise ValueError(
+                        "follow-up idempotency key conflicts with an existing job"
+                    )
+                continue
+            connection.execute(
+                """INSERT INTO job
+                (id, kind, idempotency_key, payload_json, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+                (
+                    str(uuid.uuid4()),
+                    followup.kind,
+                    followup.idempotency_key,
+                    payload_json,
+                    now,
+                    now,
+                ),
+            )
+
     def complete_job(self, job_id: str, result: dict) -> None:
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -503,6 +637,22 @@ class StateStore:
         finally:
             connection.close()
         return self._job_public(row) if row is not None else None
+
+    def list_jobs(self, kinds: Sequence[str] | None = None) -> list[dict]:
+        query = "SELECT * FROM job"
+        parameters: list[object] = []
+        if kinds is not None:
+            if not kinds:
+                return []
+            marks = ",".join("?" for _ in kinds)
+            query += f" WHERE kind IN ({marks})"
+            parameters.extend(kinds)
+        query += " ORDER BY created_at, id"
+        with closing(self._connect()) as connection:
+            return [
+                self._job_public(row)
+                for row in connection.execute(query, parameters)
+            ]
 
     def fail_job(
         self, job_id: str, error: dict, retryable: bool, next_retry_at: str | None = None
