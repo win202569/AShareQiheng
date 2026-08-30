@@ -6,9 +6,17 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from ashare_pipeline.deep_worker import (
+    CandidateContext,
+    STATEMENT_DATASETS,
+)
+from ashare_pipeline.feature_contract import canonical_sha256
+from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
+from ashare_pipeline.snapshot_repository import SnapshotRepository
 from ashare_pipeline.snapshot_store import SnapshotStore
 from ashare_pipeline.sources import FetchBatch, SourceBlocked
 from ashare_pipeline.state_store import StateStore
@@ -24,10 +32,75 @@ def records_hash(records):
     return hashlib.sha256(payload).hexdigest()
 
 
+def write_candidate_documents(root, candidates):
+    performance_records = [
+        {
+            "security_id": security_id,
+            "industry": industry,
+            "report_period": "2026-06-30",
+        }
+        for security_id, industry in sorted(candidates.items())
+    ]
+    prefilter_records = [
+        {"security_id": row["security_id"], "industry": row["industry"]}
+        for row in performance_records
+    ]
+    documents = {
+        "performance": {
+            "schema_version": 2,
+            "input_hashes": {"fixture": "performance"},
+            "records_hash": canonical_sha256(performance_records),
+            "records": performance_records,
+        },
+        "prefilter": {
+            "schema_version": 2,
+            "input_hashes": {"fixture": "prefilter"},
+            "records_hash": canonical_sha256(prefilter_records),
+            "records": prefilter_records,
+        },
+    }
+    for name, document in documents.items():
+        path = root / "curated" / f"{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(document, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+
+
+def exact_statement_batch(security_id, dataset, *, target=True):
+    return batch(
+        "akshare",
+        dataset,
+        [
+            {
+                "SECURITY_CODE": security_id[2:],
+                "REPORT_DATE": "2026-06-30" if target else "2025-12-31",
+                "NOTICE_DATE": "2026-08-20",
+            }
+        ],
+        {"symbol": security_id, "report_period": "2026-06-30"},
+    )
+
+
+def exact_calendar_batch(now="2026-08-29T12:00:00+00:00"):
+    return batch(
+        "baostock",
+        "trade_dates",
+        [
+            {"calendar_date": "2026-08-31", "is_trading_day": "1"},
+            {"calendar_date": "2026-09-07", "is_trading_day": "1"},
+        ],
+        {"start_date": "2021-01-01", "end_date": "2026-09-08"},
+        now,
+    )
+
+
 class FakeBaoSource:
     def __init__(self):
         self.round = 0
         self.calls = {"security_master": 0, "trade_dates": 0}
+        self.trade_date_requests = []
         self.master = [
             {"code": "sz.000001", "code_name": "平安银行", "ipoDate": "1991-04-03", "type": "1", "status": "1"},
             {"code": "sh.600000", "code_name": "浦发银行", "ipoDate": "1999-11-10", "type": "1", "status": "1"},
@@ -44,11 +117,23 @@ class FakeBaoSource:
 
     def fetch_trade_dates(self, start_date, end_date):
         self.calls["trade_dates"] += 1
+        self.trade_date_requests.append((start_date, end_date))
         self.round += 1
         return batch(
             "baostock",
             "trade_dates",
-            [{"calendar_date": end_date, "is_trading_day": "1"}],
+            [
+                {
+                    "calendar_date": (
+                        date.fromisoformat(start_date) + timedelta(days=offset)
+                    ).isoformat(),
+                    "is_trading_day": "1",
+                }
+                for offset in range(
+                    (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days
+                    + 1
+                )
+            ],
             {"start_date": start_date, "end_date": end_date},
             self._time(),
         )
@@ -59,6 +144,7 @@ class FakeAKSource:
         self.round = 0
         self.blocked = False
         self.calls = {"disclosure_schedule": 0, "performance_report": 0}
+        self.statement_calls = []
         self.performance = [
             {
                 "股票代码": "000001", "股票简称": "平安银行", "营业总收入同比增长": 5,
@@ -88,6 +174,19 @@ class FakeAKSource:
             raise AssertionError("circuit breaker should skip later AKShare calls")
         return batch("akshare", "performance_report", self.performance, {"date": "20260630"}, self._time())
 
+    def fetch_financial_statement(self, symbol, dataset, report_period="2026-06-30"):
+        self.statement_calls.append((symbol, dataset, report_period))
+        return exact_statement_batch(symbol, dataset)
+
+
+class FakeStatementSource:
+    def __init__(self):
+        self.calls = []
+
+    def fetch_financial_statement(self, symbol, dataset, report_period="2026-06-30"):
+        self.calls.append((symbol, dataset, report_period))
+        return exact_statement_batch(symbol, dataset)
+
 
 class OrchestratorTestCase(unittest.TestCase):
     def setUp(self):
@@ -98,6 +197,526 @@ class OrchestratorTestCase(unittest.TestCase):
 
     def tearDown(self):
         self.tempdir.cleanup()
+
+    def test_deep_parser_accepts_limit_bounds_and_rejects_outside(self):
+        self.assertEqual(
+            orchestrator._parser().parse_args(
+                ["--root", "data", "--db", "data/state.sqlite3", "deep"]
+            ).limit,
+            10,
+        )
+        for valid in (1, 360):
+            parsed = orchestrator._parser().parse_args(
+                [
+                    "--root",
+                    "data",
+                    "--db",
+                    "data/state.sqlite3",
+                    "deep",
+                    "--limit",
+                    str(valid),
+                ]
+            )
+            self.assertEqual(parsed.limit, valid)
+        for invalid in (0, 361):
+            with self.assertRaises(SystemExit):
+                orchestrator._parser().parse_args(
+                    [
+                        "--root",
+                        "data",
+                        "--db",
+                        "data/state.sqlite3",
+                        "deep",
+                        "--limit",
+                        str(invalid),
+                    ]
+                )
+
+    def test_enqueue_daily_statement_jobs_is_360_style_idempotent_without_source_calls(self):
+        members = {f"SH{index:06d}" for index in range(1, 121)}
+        context = CandidateContext(
+            candidate_set_hash="a" * 64,
+            members=frozenset(members),
+            performance_input_hashes={item: "b" * 64 for item in members},
+            industries={item: "包装印刷" for item in members},
+            reported_target_period={item: True for item in members},
+        )
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+
+        first = orchestrator.enqueue_daily_statement_jobs(
+            store, context, "2026-06-30", "2026-08-29"
+        )
+        second = orchestrator.enqueue_daily_statement_jobs(
+            store, context, "2026-06-30", "2026-08-29"
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 360)
+        self.assertEqual(len(store.list_jobs(["deep_statement"])), 360)
+
+    def test_incremental_enqueues_without_statement_calls(self):
+        bao, ak = FakeBaoSource(), FakeAKSource()
+        payload, code = orchestrator.run_command(
+            self.root,
+            self.root / "state.sqlite3",
+            "incremental",
+            online=True,
+            now_cn="2026-08-29T20:00:00+08:00",
+            sources=(bao, ak),
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(ak.statement_calls, [])
+        store = StateStore(self.root / "state.sqlite3")
+        self.assertEqual(len(store.list_jobs(["deep_statement"])), 6)
+        self.assertFalse(payload["formal_score_ready"])
+
+    def test_verified_calendar_cache_and_injected_deep_source_construct_no_defaults(self):
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        repository = SnapshotRepository(self.root, store)
+        expected, _ = repository.persist(exact_calendar_batch())
+        source = FakeStatementSource()
+
+        with patch(
+            "ashare_pipeline.orchestrator._default_calendar_source",
+            side_effect=AssertionError("calendar default constructed"),
+        ), patch(
+            "ashare_pipeline.orchestrator._default_deep_source",
+            side_effect=AssertionError("deep default constructed"),
+        ):
+            observed_repository, observed_source, calendar = orchestrator._deep_dependencies(
+                self.root,
+                store,
+                now=orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+                online=True,
+                sources=None,
+                snapshot_store=None,
+                deep_source=source,
+            )
+
+        self.assertEqual(observed_repository.data_root, self.root.resolve())
+        self.assertIs(observed_source, source)
+        self.assertEqual(calendar.id, expected.id)
+
+    def test_tampered_calendar_cache_fails_closed(self):
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        repository = SnapshotRepository(self.root, store)
+        calendar, _ = repository.persist(exact_calendar_batch())
+        (self.base / calendar.payload_path).write_text("{}", encoding="utf-8")
+        source = FakeStatementSource()
+        bao = FakeBaoSource()
+
+        with self.assertRaisesRegex(OSError, "hash|invalid snapshot payload"):
+            orchestrator._deep_dependencies(
+                self.root,
+                store,
+                now=orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+                online=True,
+                sources=(bao, source),
+                snapshot_store=None,
+                deep_source=source,
+            )
+        self.assertEqual(source.calls, [])
+        self.assertEqual(bao.trade_date_requests, [])
+
+    def test_changed_calendar_request_is_not_hidden_by_cached_short_job(self):
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        old_key = "fetch_source:baostock:trade_dates:2026-08-29"
+        old = store.enqueue_job(old_key, old_key, {"request": "short"})
+        store.lease_next_job([old_key], "seed", 3600, "2026-08-29T00:00:00+00:00")
+        store.complete_job(old, {"batches": [{"dataset": "trade_dates"}]})
+        bao, ak = FakeBaoSource(), FakeAKSource()
+
+        orchestrator.run_command(
+            self.root,
+            self.root / "state.sqlite3",
+            "bootstrap",
+            online=True,
+            now_cn="2026-08-29T20:00:00+08:00",
+            sources=(bao, ak),
+        )
+
+        self.assertEqual(bao.trade_date_requests, [("2021-01-01", "2026-09-08")])
+        current_key = orchestrator._feature_calendar_job_key(
+            orchestrator._now_cn("2026-08-29T20:00:00+08:00")
+        )
+        current = next(
+            item for item in store.list_jobs() if item["idempotency_key"] == current_key
+        )
+        self.assertEqual(current["status"], "succeeded")
+
+    def test_offline_deep_constructs_no_source(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        with patch(
+            "ashare_pipeline.orchestrator._default_calendar_source",
+            side_effect=AssertionError("calendar default constructed"),
+        ), patch(
+            "ashare_pipeline.orchestrator._default_deep_source",
+            side_effect=AssertionError("deep default constructed"),
+        ), patch(
+            "ashare_pipeline.orchestrator._default_sources",
+            side_effect=AssertionError("legacy defaults constructed"),
+        ):
+            payload, code = orchestrator.run_command(
+                self.root,
+                self.root / "state.sqlite3",
+                "deep",
+                online=False,
+                now_cn="2026-08-29T20:00:00+08:00",
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["deep_run"]["remote_attempts"], 0)
+        with closing(sqlite3.connect(self.root / "state.sqlite3")) as connection:
+            params = json.loads(
+                connection.execute(
+                    "SELECT params_json FROM run ORDER BY started_at DESC LIMIT 1"
+                ).fetchone()[0]
+            )
+        self.assertEqual(params, {"limit": 10, "online": False})
+
+    def test_online_limit_one_calls_at_most_one_statement(self):
+        bao, ak = FakeBaoSource(), FakeAKSource()
+        orchestrator.run_command(
+            self.root,
+            self.root / "state.sqlite3",
+            "bootstrap",
+            online=True,
+            now_cn="2026-08-29T20:00:00+08:00",
+            sources=(bao, ak),
+        )
+        source = FakeStatementSource()
+
+        payload, code = orchestrator.run_command(
+            self.root,
+            self.root / "state.sqlite3",
+            "deep",
+            online=True,
+            now_cn="2026-08-29T20:01:00+08:00",
+            deep_source=source,
+            limit=1,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(source.calls), 1)
+        self.assertEqual(payload["deep_run"]["remote_attempts"], 1)
+
+    def test_status_financial_coverage_requires_three_verified_target_snapshots(self):
+        write_candidate_documents(
+            self.root, {"SH600001": "包装印刷", "SH600002": "包装印刷"}
+        )
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        orchestrator.enqueue_daily_statement_jobs(
+            store, context, "2026-06-30", "2026-08-29"
+        )
+        repository = SnapshotRepository(self.root, store)
+        for security_id, datasets in {
+            "SH600001": STATEMENT_DATASETS,
+            "SH600002": ("balance_sheet", "profit_sheet"),
+        }.items():
+            for dataset in datasets:
+                repository.persist(exact_statement_batch(security_id, dataset))
+
+        status, code = orchestrator.run_command(
+            self.root,
+            self.root / "state.sqlite3",
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            status["deep"]["candidate_financial_coverage"],
+            {"numerator": 1, "denominator": 2, "rate": 0.5},
+        )
+        self.assertEqual(len(status["deep"]["incomplete_candidates"]), 1)
+        self.assertEqual(
+            status["deep"]["incomplete_candidates"][0]["missing_datasets"],
+            ["cash_flow_sheet"],
+        )
+        self.assertEqual(status["deep"]["expired_current_lease_count"], 0)
+        self.assertEqual(status["deep"]["unknown_failure_count"], 0)
+        self.assertFalse(status["formal_score_ready"])
+
+    def test_verified_snapshot_count_does_not_excuse_a_missing_target_period(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        orchestrator.enqueue_daily_statement_jobs(
+            store, context, "2026-06-30", "2026-08-29"
+        )
+        repository = SnapshotRepository(self.root, store)
+        for dataset in STATEMENT_DATASETS:
+            repository.persist(
+                exact_statement_batch(
+                    "SH600001", dataset, target=dataset != "cash_flow_sheet"
+                )
+            )
+
+        progress = orchestrator.build_deep_progress(
+            self.root,
+            store,
+            repository,
+            context,
+            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+        )
+
+        self.assertEqual(
+            progress["statement_snapshot_counts"],
+            {dataset: 1 for dataset in sorted(STATEMENT_DATASETS)},
+        )
+        self.assertEqual(progress["candidate_financial_coverage"]["numerator"], 0)
+        self.assertEqual(
+            progress["incomplete_candidates"][0]["error_classifications"],
+            ["target_period_missing"],
+        )
+
+    def test_progress_excludes_stale_request_versions(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        common = {
+            "security_id": "SH600001",
+            "report_period": "2026-06-30",
+            "candidate_set_hash": "f" * 64,
+            "performance_input_hash": context.performance_input_hashes["SH600001"],
+        }
+        store.enqueue_job(
+            "deep_statement",
+            "stale-version",
+            {
+                **common,
+                "dataset": "profit_sheet",
+                "request_version": "old-request-version",
+                "refresh_date": "2026-08-29",
+            },
+        )
+        store.enqueue_job(
+            "deep_statement",
+            "stale-date",
+            {
+                **common,
+                "dataset": "cash_flow_sheet",
+                "request_version": FINANCIAL_REQUEST_VERSION,
+                "refresh_date": "2026-08-28",
+            },
+        )
+        store.enqueue_job(
+            "deep_statement",
+            "current-first-enqueue-hash-is-irrelevant",
+            {
+                **common,
+                "dataset": "balance_sheet",
+                "request_version": FINANCIAL_REQUEST_VERSION,
+                "refresh_date": "2026-08-29",
+            },
+        )
+        store.enqueue_job(
+            "deep_statement",
+            "stale-report-period",
+            {
+                **common,
+                "dataset": "balance_sheet",
+                "report_period": "2025-12-31",
+                "request_version": FINANCIAL_REQUEST_VERSION,
+                "refresh_date": "2026-08-29",
+            },
+        )
+
+        progress = orchestrator.build_deep_progress(
+            self.root,
+            store,
+            SnapshotRepository(self.root, store),
+            context,
+            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+        )
+
+        self.assertEqual(progress["deep_statement_job_counts"]["balance_sheet"], {"pending": 1})
+        self.assertEqual(progress["deep_statement_job_counts"]["profit_sheet"], {})
+        self.assertEqual(progress["deep_statement_job_counts"]["cash_flow_sheet"], {})
+        self.assertEqual(len(progress["incomplete_candidates"]), 1)
+
+    def test_progress_classifies_current_circuits_expired_leases_and_unknown_failures(self):
+        write_candidate_documents(
+            self.root,
+            {
+                "SH600001": "包装印刷",
+                "SH600002": "包装印刷",
+                "SH600003": "包装印刷",
+            },
+        )
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        orchestrator.enqueue_daily_statement_jobs(
+            store, context, "2026-06-30", "2026-08-29"
+        )
+        jobs = store.list_jobs(["deep_statement"])
+        by_slot = {
+            (job["payload"]["security_id"], job["payload"]["dataset"]): job["id"]
+            for job in jobs
+        }
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            connection.execute(
+                """UPDATE job SET status='retryable_failed',last_error_json=?,
+                next_retry_at=? WHERE id=?""",
+                (
+                    json.dumps({"error_classification": "source_blocked"}),
+                    "2026-08-29T21:00:00+08:00",
+                    by_slot[("SH600001", "balance_sheet")],
+                ),
+            )
+            connection.execute(
+                """UPDATE job SET status='running',lease_worker='worker',
+                lease_expires_at=? WHERE id=?""",
+                (
+                    "2026-08-29T19:00:00+08:00",
+                    by_slot[("SH600002", "balance_sheet")],
+                ),
+            )
+            connection.execute(
+                "UPDATE job SET status='terminal_failed',last_error_json=? WHERE id=?",
+                (
+                    json.dumps({"error_classification": "worker_error"}),
+                    by_slot[("SH600003", "balance_sheet")],
+                ),
+            )
+            connection.commit()
+
+        progress = orchestrator.build_deep_progress(
+            self.root,
+            store,
+            SnapshotRepository(self.root, store),
+            context,
+            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+        )
+
+        self.assertEqual(progress["active_circuit_breakers"], ["akshare"])
+        self.assertEqual(progress["expired_current_lease_count"], 1)
+        self.assertEqual(progress["unknown_failure_count"], 1)
+        self.assertEqual(
+            [item["security_id"] for item in progress["incomplete_candidates"]],
+            ["SH600001", "SH600002", "SH600003"],
+        )
+        for item in progress["incomplete_candidates"]:
+            self.assertEqual(item["missing_datasets"], sorted(item["missing_datasets"]))
+            self.assertEqual(item["job_states"], sorted(item["job_states"]))
+            self.assertEqual(
+                item["error_classifications"],
+                sorted(item["error_classifications"]),
+            )
+            self.assertTrue(
+                set(item["error_classifications"])
+                <= orchestrator._PROGRESS_CLASSIFICATIONS
+            )
+
+    def test_progress_feature_counts_require_current_candidate_hash_and_contract(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        rows = [
+            ("current", context.candidate_set_hash, "feature-contract-v1", "2026-06-30", "partial"),
+            ("stale-hash", "f" * 64, "feature-contract-v1", "2026-06-30", "blocked"),
+            ("stale-contract", context.candidate_set_hash, "feature-contract-v0", "2026-06-30", "blocked"),
+            ("stale-period", context.candidate_set_hash, "feature-contract-v1", "2025-12-31", "blocked"),
+        ]
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            for index, (row_id, candidate_hash, contract, report_period, status) in enumerate(rows):
+                connection.execute(
+                    """INSERT INTO feature_set
+                    (id,security_id,report_period,as_of_utc,candidate_set_hash,
+                     template_id,template_version,contract_version,input_hash,status,
+                     financial_coverage,dimension_status_json,confidence_inputs_json,
+                     blockers_json,bundle_hash,bundle_path,missing_json,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        row_id,
+                        "SH600001",
+                        report_period,
+                        f"2026-08-29T0{index}:00:00+00:00",
+                        candidate_hash,
+                        "general_nonfinancial",
+                        "template-registry-v1",
+                        contract,
+                        str(index) * 64,
+                        status,
+                        0.5,
+                        "{}",
+                        "{}",
+                        "[]",
+                        canonical_sha256(row_id),
+                        f"data/curated/formal_features/{row_id}.json",
+                        json.dumps([{"missing_reason": "fact_missing"}]),
+                        f"2026-08-29T0{index}:00:00+00:00",
+                    ),
+                )
+            connection.commit()
+
+        progress = orchestrator.build_deep_progress(
+            self.root,
+            store,
+            SnapshotRepository(self.root, store),
+            context,
+            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+        )
+
+        self.assertEqual(
+            progress["feature_set_counts"],
+            {"partial": 1, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(progress["template_counts"], {"general_nonfinancial": 1})
+        self.assertEqual(progress["missing_reason_counts"], {"fact_missing": 1})
+
+    def test_status_fails_closed_when_curated_candidate_documents_are_tampered(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        path = self.root / "curated" / "prefilter.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["records"][0]["industry"] = "被篡改"
+        path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "records_hash"):
+            orchestrator.run_command(
+                self.root,
+                self.root / "state.sqlite3",
+                "status",
+                now_cn="2026-08-29T20:00:00+08:00",
+            )
+
+    def test_build_deep_progress_rejects_mismatched_repository_root_or_store(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        other_root = self.base / "other-data"
+        other_store = StateStore(other_root / "state.sqlite3")
+        other_store.initialize()
+        other_repository = SnapshotRepository(other_root, other_store)
+
+        with self.assertRaisesRegex(ValueError, "root"):
+            orchestrator.build_deep_progress(
+                self.root,
+                store,
+                other_repository,
+                context,
+                orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+            )
+        with self.assertRaisesRegex(ValueError, "state store"):
+            orchestrator.build_deep_progress(
+                self.root,
+                store,
+                SnapshotRepository(self.root, other_store),
+                context,
+                orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+            )
 
     def install_market_evidence(self, records, *, universe_hash=None, declared_snapshot_hashes=None):
         universe_document = json.loads(
@@ -229,7 +848,7 @@ class OrchestratorTestCase(unittest.TestCase):
             unchanged_snapshots = connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0]
             unchanged_deep_jobs = connection.execute("SELECT COUNT(*) FROM job WHERE kind = 'deep_financial'").fetchone()[0]
         self.assertEqual(second_code, 0)
-        self.assertEqual(unchanged_snapshots, initial_snapshots)
+        self.assertEqual(unchanged_snapshots, initial_snapshots + 1)
         self.assertEqual(unchanged_deep_jobs, initial_deep_jobs)
 
         ak.performance[0] = {**ak.performance[0], "净利润同比增长": 20, "最新公告日期": "2026-08-31"}
@@ -261,7 +880,9 @@ class OrchestratorTestCase(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as connection:
             paths = [row[0] for row in connection.execute("SELECT payload_path FROM source_snapshot")]
         self.assertTrue(paths)
-        self.assertTrue(all(Path(path).is_absolute() for path in paths))
+        self.assertTrue(
+            all(Path(path).is_absolute() or path.startswith("data/") for path in paths)
+        )
 
     def test_curated_documents_embed_ruleset_fingerprint_and_stale_artifact_is_rebuilt(self):
         bao, ak = FakeBaoSource(), FakeAKSource()
@@ -412,7 +1033,13 @@ class OrchestratorTestCase(unittest.TestCase):
         now_utc = "2026-08-29T14:00:00+00:00"
 
         def seed(source, dataset, terminal_state):
-            kind = f"fetch_source:{source}:{dataset}:2026-08-29"
+            kind = (
+                orchestrator._feature_calendar_job_key(
+                    orchestrator._now_cn("2026-08-29T22:00:00+08:00")
+                )
+                if dataset == "trade_dates"
+                else f"fetch_source:{source}:{dataset}:2026-08-29"
+            )
             job_id = store.enqueue_job(kind, kind, {"source": source, "dataset": dataset})
             store.lease_next_job([kind], "seed", 3600, now_utc)
             if terminal_state == "succeeded":

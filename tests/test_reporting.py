@@ -495,6 +495,53 @@ class ProgressArtifactTests(unittest.TestCase):
         self.assertIn("truncated=true", source_metadata)
         self.assertIn("发布阻断优先", meta["selection_rule"])
 
+    def test_deep_progress_counts_are_exposed_without_individual_financial_values(self):
+        artifact = build_fixture(
+            pipeline_status={
+                "deep": {
+                    "deep_candidate_count": 2,
+                    "candidate_financial_coverage": {
+                        "numerator": 1,
+                        "denominator": 2,
+                        "rate": 0.5,
+                    },
+                    "deep_statement_job_counts": {
+                        "balance_sheet": {"succeeded": 2},
+                        "profit_sheet": {"succeeded": 2},
+                        "cash_flow_sheet": {"pending": 1, "succeeded": 1},
+                    },
+                    "statement_snapshot_counts": {
+                        "balance_sheet": 2,
+                        "profit_sheet": 2,
+                        "cash_flow_sheet": 1,
+                    },
+                    "feature_set_counts": {
+                        "partial": 1,
+                        "financial_ready": 1,
+                        "blocked": 0,
+                    },
+                    "incomplete_candidates": [
+                        {
+                            "security_id": "SH600001",
+                            "missing_datasets": ["cash_flow_sheet"],
+                            "job_states": ["pending"],
+                            "error_classifications": ["pending"],
+                        }
+                    ],
+                    "expired_current_lease_count": 0,
+                    "unknown_failure_count": 0,
+                    "active_circuit_breakers": [],
+                    "latest_feature_contract_version": "feature-contract-v1",
+                }
+            }
+        )
+
+        operations = dataset(artifact, "operational_status")
+        deep_rows = [row for row in operations if row["category"] == "深抓进度"]
+        self.assertTrue(deep_rows)
+        self.assertIn("1/2", " ".join(row["detail"] for row in deep_rows))
+        self.assertNotIn("SH600001", json.dumps(deep_rows, ensure_ascii=False))
+
     def test_snapshot_datasets_are_bounded_and_do_not_copy_raw_input(self):
         many_rows = [
             {"dataset": f"dataset-{index:03d}", "source": "test", "status": "ready", "row_count": index}

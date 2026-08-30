@@ -10,14 +10,26 @@ import math
 import re
 import sqlite3
 import tempfile
+from collections import Counter
 from contextlib import closing
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .curation import CORE_FIELDS, CUTOFF_CN, curate_performance, curate_universe, quality_gate
+from .deep_worker import (
+    STATEMENT_DATASETS,
+    CandidateContext,
+    build_candidate_context,
+    deep_statement_key,
+    load_candidate_context,
+    run_deep,
+)
+from .feature_contract import CONTRACT_VERSION, canonical_sha256
+from .financial_schema import FINANCIAL_REQUEST_VERSION
 from .scoring import PREFILTER_REASON, build_prefilter
+from .snapshot_repository import SnapshotRef, SnapshotRepository
 from .state_store import StateStore
 
 
@@ -33,6 +45,28 @@ CURATION_RULESET_HASH = hashlib.sha256(
 ).hexdigest()
 FORMAL_FEATURES = ("G", "V", "M", "EQ", "FS", "CA", "T")
 MARKET_PRICE_TRANSFORMATION_VERSION = "market-effective-close-v1"
+FEATURE_CALENDAR_START = date(2021, 1, 1)
+FEATURE_CALENDAR_MIN_END = date(2026, 9, 7)
+FEATURE_CALENDAR_REQUEST_VERSION = "trade-calendar-feature-v1"
+
+
+def _feature_calendar_end(now: datetime) -> str:
+    return max(now.date() + timedelta(days=10), FEATURE_CALENDAR_MIN_END).isoformat()
+
+
+def _feature_calendar_request(now: datetime) -> dict[str, str]:
+    return {
+        "start_date": FEATURE_CALENDAR_START.isoformat(),
+        "end_date": _feature_calendar_end(now),
+    }
+
+
+def _feature_calendar_job_key(now: datetime) -> str:
+    request_hash = canonical_sha256(_feature_calendar_request(now))
+    return (
+        f"collect:baostock:trade_dates:{FEATURE_CALENDAR_REQUEST_VERSION}:"
+        f"{request_hash}"
+    )
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -86,6 +120,46 @@ def _default_snapshot_store(root: Path):
     from .snapshot_store import SnapshotStore
 
     return SnapshotStore(root)
+
+
+def _default_calendar_source():
+    from .sources import BaoStockSource
+
+    return BaoStockSource()
+
+
+def _default_deep_source():
+    from .sources import AKShareSource
+
+    return AKShareSource()
+
+
+def _deep_dependencies(
+    root: Path,
+    store: StateStore,
+    *,
+    now: datetime,
+    online: bool,
+    sources: tuple[Any, Any] | None,
+    snapshot_store: Any | None,
+    deep_source: Any | None = None,
+) -> tuple[SnapshotRepository, Any | None, SnapshotRef | None]:
+    repository = SnapshotRepository(root, store, snapshot_store)
+    request = _feature_calendar_request(now)
+    calendar = repository.find_exact("baostock", "trade_dates", request)
+    if calendar is not None:
+        repository.read_verified(calendar)
+    source = None
+    if online:
+        source = deep_source
+        if source is None:
+            source = sources[1] if sources is not None else _default_deep_source()
+        if calendar is None:
+            bao = sources[0] if sources is not None else _default_calendar_source()
+            calendar, _ = repository.persist(
+                bao.fetch_trade_dates(request["start_date"], request["end_date"])
+            )
+    return repository, source, calendar
 
 
 def _latest_completed_market_date(now: datetime) -> str:
@@ -206,12 +280,19 @@ def _collect_online(
     recovered_expired = store.recover_expired_leases(now_utc)
     bao, ak = sources if sources is not None else _default_sources()
     snapshots = snapshot_store if snapshot_store is not None else _default_snapshot_store(root)
-    market_date = _latest_completed_market_date(now)
-    tasks: list[tuple[str, str, Callable[[], Any]]] = [
-        ("baostock", "security_master", bao.fetch_security_master),
-        ("baostock", "trade_dates", lambda: bao.fetch_trade_dates("2026-08-24", market_date)),
-        ("akshare", "disclosure_schedule", ak.fetch_disclosure_schedule),
-        ("akshare", "performance_report", ak.fetch_performance_report),
+    calendar_request = _feature_calendar_request(now)
+    tasks: list[tuple[str, str, Callable[[], Any], str | None]] = [
+        ("baostock", "security_master", bao.fetch_security_master, None),
+        (
+            "baostock",
+            "trade_dates",
+            lambda: bao.fetch_trade_dates(
+                calendar_request["start_date"], calendar_request["end_date"]
+            ),
+            _feature_calendar_job_key(now),
+        ),
+        ("akshare", "disclosure_schedule", ak.fetch_disclosure_schedule, None),
+        ("akshare", "performance_report", ak.fetch_performance_report, None),
     ]
     batches: list[dict] = []
     errors: list[dict] = []
@@ -244,11 +325,12 @@ def _collect_online(
             result["lease_expires_at"] = job["lease_expires_at"]
         return [result]
 
-    for source, dataset, collect in tasks:
+    calendar_repository = SnapshotRepository(root, store, snapshots)
+    for source, dataset, collect, explicit_job_key in tasks:
         if source in circuit_breakers:
             batches.append({"source": source, "dataset": dataset, "status": "circuit_open"})
             continue
-        kind = f"fetch_source:{source}:{dataset}:{attempt_date}"
+        kind = explicit_job_key or f"fetch_source:{source}:{dataset}:{attempt_date}"
         job_id = store.enqueue_job(kind, kind, {"source": source, "dataset": dataset, "attempt_date": attempt_date})
         leased = store.lease_next_job([kind], "orchestrator", 900, now_utc)
         if leased is None:
@@ -271,7 +353,27 @@ def _collect_online(
         try:
             collected = collect()
             items = list(collected.values()) if isinstance(collected, dict) else [collected]
-            persisted = [_persist_batch(root, db, store, snapshots, item) for item in items]
+            if dataset == "trade_dates":
+                persisted = []
+                for item in items:
+                    ref, created = calendar_repository.persist(item)
+                    persisted.append(
+                        {
+                            "dataset": ref.dataset,
+                            "source": ref.source,
+                            "source_version": item.source_version,
+                            "request": item.request,
+                            "rows": ref.row_count,
+                            "hash": ref.payload_hash,
+                            "path": ref.payload_path,
+                            "semantic_hash": _hash(_semantic_batch_payload(item)),
+                            "created": created,
+                        }
+                    )
+            else:
+                persisted = [
+                    _persist_batch(root, db, store, snapshots, item) for item in items
+                ]
             store.complete_job(job_id, {"batches": persisted})
             batches.extend({"source": source, "status": "succeeded", **item} for item in persisted)
         except Exception as error:
@@ -518,6 +620,37 @@ def _performance_input_hash(row: dict) -> str:
     return _hash(row)
 
 
+def enqueue_daily_statement_jobs(
+    store: StateStore,
+    context: CandidateContext,
+    report_period: str,
+    as_of_cn_date: str,
+) -> tuple[str, ...]:
+    job_ids: list[str] = []
+    for security_id in sorted(context.members):
+        for dataset in STATEMENT_DATASETS:
+            job_ids.append(
+                store.enqueue_job(
+                    "deep_statement",
+                    deep_statement_key(
+                        security_id, dataset, report_period, as_of_cn_date
+                    ),
+                    {
+                        "security_id": security_id,
+                        "dataset": dataset,
+                        "report_period": report_period,
+                        "candidate_set_hash": context.candidate_set_hash,
+                        "performance_input_hash": context.performance_input_hashes[
+                            security_id
+                        ],
+                        "request_version": FINANCIAL_REQUEST_VERSION,
+                        "refresh_date": as_of_cn_date,
+                    },
+                )
+            )
+    return tuple(job_ids)
+
+
 def _formal_feature_coverage(candidate: dict) -> float:
     feature_map = candidate.get("formal_features")
     if not isinstance(feature_map, dict):
@@ -542,6 +675,14 @@ def _enqueue_deep_and_partial_scores(store: StateStore, curated: dict[str, dict]
             f"deep_financial:{security_id}:{input_hash}",
             {"security_id": security_id, "input_hash": input_hash, "report_period": "2026-06-30"},
         )
+
+    context = build_candidate_context(curated["prefilter"], curated["performance"])
+    enqueue_daily_statement_jobs(
+        store,
+        context,
+        "2026-06-30",
+        now.date().isoformat(),
+    )
 
     scoring_input_hash = _hash(curated["performance"].get("input_hashes", {}))
     with closing(sqlite3.connect(store.db_path)) as connection:
@@ -582,6 +723,263 @@ def _curated_metrics(root: Path) -> dict[str, dict]:
     return result
 
 
+_PROGRESS_CLASSIFICATIONS = frozenset(
+    {
+        "pending",
+        "retryable_network",
+        "source_blocked",
+        "terminal_source_missing",
+        "unverified_snapshot",
+        "target_period_missing",
+    }
+)
+
+
+def _counts(values: list[str]) -> dict[str, int]:
+    return dict(sorted(Counter(values).items()))
+
+
+def _progress_instant(value: str, field: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field} must include a timezone offset")
+    return parsed.astimezone(timezone.utc)
+
+
+def _job_error_value(job: dict[str, object]) -> str | None:
+    error = job.get("error")
+    if not isinstance(error, dict):
+        return None
+    value = error.get("error_classification", error.get("classification"))
+    return value if isinstance(value, str) else None
+
+
+def _progress_error_classification(job: dict[str, object] | None) -> str | None:
+    if job is None or job.get("status") in {"pending", "running"}:
+        return "pending"
+    raw = _job_error_value(job)
+    if raw in {"retryable_source", "retryable_network", "retryable"}:
+        return "retryable_network"
+    if raw in {"source_blocked", "blocked"}:
+        return "source_blocked"
+    if raw in {"terminal_source", "terminal_source_missing"}:
+        return "terminal_source_missing"
+    if raw == "target_period_missing":
+        return "target_period_missing"
+    if raw == "unverified_snapshot":
+        return "unverified_snapshot"
+    return None
+
+
+def _empty_deep_progress() -> dict[str, object]:
+    return {
+        "deep_candidate_count": 0,
+        "deep_parent_job_counts": {},
+        "deep_statement_job_counts": {dataset: {} for dataset in STATEMENT_DATASETS},
+        "statement_snapshot_counts": {},
+        "feature_set_counts": {
+            "partial": 0,
+            "financial_ready": 0,
+            "blocked": 0,
+        },
+        "candidate_financial_coverage": {
+            "numerator": 0,
+            "denominator": 0,
+            "rate": 0.0,
+        },
+        "incomplete_candidates": [],
+        "expired_current_lease_count": 0,
+        "unknown_failure_count": 0,
+        "active_circuit_breakers": [],
+        "template_counts": {},
+        "missing_reason_counts": {},
+        "latest_feature_contract_version": CONTRACT_VERSION,
+    }
+
+
+def build_deep_progress(
+    data_root: Path,
+    store: StateStore,
+    repository: SnapshotRepository,
+    context: CandidateContext,
+    now: datetime,
+) -> dict[str, object]:
+    resolved_root = Path(data_root).resolve()
+    if repository.data_root.resolve() != resolved_root:
+        raise ValueError("snapshot repository root must match deep progress root")
+    if Path(repository.state_store.db_path).resolve() != Path(store.db_path).resolve():
+        raise ValueError("snapshot repository state store must match progress state store")
+    refresh_date = now.date().isoformat()
+    report_period = "2026-06-30"
+    members = set(context.members)
+    jobs = store.list_jobs()
+    parent_jobs = [
+        job
+        for job in jobs
+        if job.get("kind") == "deep_financial"
+        and isinstance(job.get("payload"), dict)
+        and job["payload"].get("security_id") in members
+    ]
+    current_jobs = [
+        job
+        for job in jobs
+        if job.get("kind") == "deep_statement"
+        and isinstance(job.get("payload"), dict)
+        and job["payload"].get("security_id") in members
+        and job["payload"].get("dataset") in STATEMENT_DATASETS
+        and job["payload"].get("report_period") == report_period
+        and job["payload"].get("request_version") == FINANCIAL_REQUEST_VERSION
+        and job["payload"].get("refresh_date") == refresh_date
+    ]
+    jobs_by_slot = {
+        (job["payload"]["security_id"], job["payload"]["dataset"]): job
+        for job in current_jobs
+    }
+    statement_job_counts = {
+        dataset: _counts(
+            [
+                str(job["status"])
+                for job in current_jobs
+                if job["payload"]["dataset"] == dataset
+            ]
+        )
+        for dataset in STATEMENT_DATASETS
+    }
+    snapshot_counts = Counter()
+    incomplete: list[dict[str, object]] = []
+    complete_count = 0
+    for security_id in sorted(members):
+        missing: list[str] = []
+        states: list[str] = []
+        classifications: list[str] = []
+        for dataset in STATEMENT_DATASETS:
+            job = jobs_by_slot.get((security_id, dataset))
+            request = {"symbol": security_id, "report_period": report_period}
+            snapshot = repository.find_exact("akshare", dataset, request)
+            classification: str | None = None
+            if snapshot is None:
+                classification = _progress_error_classification(job)
+                missing.append(dataset)
+                states.append(str(job["status"]) if job is not None else "pending")
+            else:
+                try:
+                    verified = repository.read_verified(snapshot)
+                except (OSError, ValueError, UnicodeError):
+                    classification = "unverified_snapshot"
+                else:
+                    snapshot_counts[dataset] += 1
+                    target_present = any(
+                        str(record.get("REPORT_DATE", ""))[:10] == report_period
+                        for record in verified.batch.records
+                        if isinstance(record, dict)
+                    )
+                    if not target_present:
+                        classification = "target_period_missing"
+            if classification is not None:
+                classifications.append(classification)
+                if dataset not in missing:
+                    missing.append(dataset)
+                    states.append(
+                        str(job["status"]) if job is not None else "pending"
+                    )
+        if missing:
+            incomplete.append(
+                {
+                    "security_id": security_id,
+                    "missing_datasets": sorted(missing),
+                    "job_states": sorted(set(states)),
+                    "error_classifications": sorted(set(classifications)),
+                }
+            )
+        else:
+            complete_count += 1
+
+    now_utc = now.astimezone(timezone.utc)
+    expired_current = sum(
+        1
+        for job in current_jobs
+        if job.get("status") == "running"
+        and isinstance(job.get("lease_expires_at"), str)
+        and _progress_instant(job["lease_expires_at"], "lease_expires_at")
+        <= now_utc
+    )
+    known_raw = {
+        "retryable_source",
+        "retryable_network",
+        "retryable",
+        "source_blocked",
+        "blocked",
+        "terminal_source",
+        "terminal_source_missing",
+        "target_period_missing",
+        "unverified_snapshot",
+    }
+    unknown_failures = sum(
+        1
+        for job in current_jobs
+        if job.get("status") in {"retryable_failed", "terminal_failed"}
+        and _job_error_value(job) not in known_raw
+    )
+    active_circuits = sorted(
+        {
+            "akshare"
+            for job in current_jobs
+            if job.get("status") == "retryable_failed"
+            and _job_error_value(job) in {"source_blocked", "blocked"}
+            and isinstance(job.get("next_retry_at"), str)
+            and _progress_instant(job["next_retry_at"], "next_retry_at") > now_utc
+        }
+    )
+
+    feature_rows: dict[str, dict[str, object]] = {}
+    with closing(store._connect()) as connection:
+        rows = connection.execute(
+            """SELECT * FROM feature_set
+            WHERE candidate_set_hash=? AND contract_version=? AND report_period=?
+            ORDER BY security_id,as_of_utc DESC,created_at DESC,id DESC""",
+            (context.candidate_set_hash, CONTRACT_VERSION, report_period),
+        ).fetchall()
+    for row in rows:
+        public = store._feature_set_public(row)
+        security_id = str(public["security_id"])
+        if security_id in members and security_id not in feature_rows:
+            feature_rows[security_id] = public
+    feature_counts = {"partial": 0, "financial_ready": 0, "blocked": 0}
+    templates: list[str] = []
+    missing_reasons: list[str] = []
+    for row in feature_rows.values():
+        status = str(row["status"])
+        if status in feature_counts:
+            feature_counts[status] += 1
+        templates.append(str(row["template_id"]))
+        for item in row.get("missing", []):
+            if isinstance(item, dict) and isinstance(item.get("missing_reason"), str):
+                missing_reasons.append(item["missing_reason"])
+
+    denominator = len(members)
+    if len(incomplete) != denominator - complete_count:
+        raise AssertionError("incomplete candidate cardinality mismatch")
+    return {
+        "deep_candidate_count": denominator,
+        "deep_parent_job_counts": _counts([str(job["status"]) for job in parent_jobs]),
+        "deep_statement_job_counts": statement_job_counts,
+        "statement_snapshot_counts": dict(sorted(snapshot_counts.items())),
+        "feature_set_counts": feature_counts,
+        "candidate_financial_coverage": {
+            "numerator": complete_count,
+            "denominator": denominator,
+            "rate": complete_count / denominator if denominator else 0.0,
+        },
+        "incomplete_candidates": incomplete,
+        "expired_current_lease_count": expired_current,
+        "unknown_failure_count": unknown_failures,
+        "active_circuit_breakers": active_circuits,
+        "template_counts": _counts(templates),
+        "missing_reason_counts": _counts(missing_reasons),
+        "latest_feature_contract_version": CONTRACT_VERSION,
+    }
+
+
 def _status_payload(
     root: Path,
     store: StateStore,
@@ -599,6 +997,21 @@ def _status_payload(
     curated = _curated_metrics(root)
     if pipeline_state is None:
         pipeline_state = str(curated.get("quality", {}).get("status", "pending"))
+    candidate_paths = (
+        root / "curated" / "prefilter.json",
+        root / "curated" / "performance.json",
+    )
+    if not any(path.exists() for path in candidate_paths):
+        deep_progress = _empty_deep_progress()
+    else:
+        context = load_candidate_context(root)
+        deep_progress = build_deep_progress(
+            root,
+            store,
+            SnapshotRepository(root, store),
+            context,
+            now,
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "command": command,
@@ -612,6 +1025,10 @@ def _status_payload(
         "circuit_breakers": circuit_breakers or [],
         "blocked_reasons": blocked_reasons or [],
         "recovered_expired_leases": recovered_expired_leases,
+        "formal_score_ready": False,
+        "seven_dimension_ready": False,
+        "official_pool_counts": {"waiting_price": 0, "strong_attention": 0},
+        "deep": deep_progress,
         "next_actions": [
             "继续增量采集披露变化和候选完整三表",
             "2026-08-31收盘后补齐行情证据",
@@ -848,6 +1265,8 @@ def run_command(
     now_cn: str | None = None,
     sources: tuple[Any, Any] | None = None,
     snapshot_store: Any | None = None,
+    deep_source: Any | None = None,
+    limit: int = 10,
 ) -> tuple[dict, int]:
     root_path = Path(root).resolve()
     db_path = Path(db).resolve()
@@ -860,7 +1279,10 @@ def run_command(
         _atomic_write_json(root_path / "status" / "pipeline_status.json", payload)
         return payload, 0
 
-    run_id = store.start_run(command, now.isoformat(), {"online": online})
+    run_params = {"online": online}
+    if command == "deep":
+        run_params["limit"] = limit
+    run_id = store.start_run(command, now.isoformat(), run_params)
 
     def write_then_finish(payload: dict, terminal_status: str, error: str | None = None) -> None:
         recent = payload.get("state", {}).get("recent_run")
@@ -871,6 +1293,38 @@ def run_command(
         store.finish_run(run_id, terminal_status, error)
 
     try:
+        if command == "deep":
+            repository, source, calendar = _deep_dependencies(
+                root_path,
+                store,
+                now=now,
+                online=online,
+                sources=sources,
+                snapshot_store=snapshot_store,
+                deep_source=deep_source,
+            )
+            summary = run_deep(
+                root_path,
+                store,
+                source=source,
+                snapshots=repository,
+                trade_calendar_snapshot=calendar,
+                now_cn=now,
+                online=online,
+                limit=limit,
+            )
+            payload = _status_payload(
+                root_path,
+                store,
+                now,
+                command,
+                "online" if online else "offline",
+                circuit_breakers=list(summary.circuit_breakers),
+            )
+            payload["deep_run"] = summary.to_dict()
+            write_then_finish(payload, "succeeded")
+            return payload, 0
+
         if command == "finalize":
             reasons, _ = _finalize(root_path, store, now)
             payload = _status_payload(
@@ -934,10 +1388,30 @@ def _parser() -> argparse.ArgumentParser:
     for command in ("bootstrap", "incremental"):
         child = subparsers.add_parser(command)
         child.add_argument("--online", action="store_true")
+    deep = subparsers.add_parser("deep")
+    deep.add_argument("--online", action="store_true")
+    deep.add_argument(
+        "--limit",
+        type=lambda value: _bounded_int(value, 1, 360),
+        default=10,
+    )
     subparsers.add_parser("status")
     finalize = subparsers.add_parser("finalize")
     finalize.add_argument("--now-cn", required=True)
     return parser
+
+
+def _bounded_int(value: str, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be an integer") from error
+    if not minimum <= parsed <= maximum:
+        raise argparse.ArgumentTypeError(
+            f"value must be between {minimum} and {maximum}"
+        )
+
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -948,6 +1422,7 @@ def main(argv: list[str] | None = None) -> int:
         arguments.command,
         online=bool(getattr(arguments, "online", False)),
         now_cn=getattr(arguments, "now_cn", None),
+        limit=getattr(arguments, "limit", 10),
     )
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return exit_code

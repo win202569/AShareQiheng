@@ -8,6 +8,7 @@ pipeline payloads into the reader-facing snapshot.
 from __future__ import annotations
 
 import copy
+import json
 import math
 import re
 import sqlite3
@@ -391,6 +392,62 @@ def _operational_rows(
                 "status": "非正式评分",
                 "detail": f"候选数={count if count is not None else '待采集'}；{reason}",
                 "next_action": "仅用于安排完整三表和正文核验",
+            }
+        )
+    deep = _first(pipeline_status, "deep")
+    if isinstance(deep, Mapping) and deep:
+        coverage = _first(deep, "candidate_financial_coverage")
+        if isinstance(coverage, Mapping):
+            numerator = _number(_first(coverage, "numerator"))
+            denominator = _number(_first(coverage, "denominator"))
+            rate = _number(_first(coverage, "rate"))
+            rows.append(
+                {
+                    "priority": 3,
+                    "category": "深抓进度",
+                    "subject": "候选财报覆盖",
+                    "status": "financial-inputs-only",
+                    "detail": (
+                        f"{numerator if numerator is not None else '待确认'}/"
+                        f"{denominator if denominator is not None else '待确认'}；"
+                        f"rate={rate if rate is not None else '待确认'}"
+                    ),
+                    "next_action": "补齐三张验签且含目标期的财报快照",
+                }
+            )
+        statement_counts = _first(deep, "deep_statement_job_counts")
+        snapshot_counts = _first(deep, "statement_snapshot_counts")
+        feature_counts = _first(deep, "feature_set_counts")
+        incomplete = _first(deep, "incomplete_candidates")
+        rows.append(
+            {
+                "priority": 3,
+                "category": "深抓进度",
+                "subject": "报表作业与快照",
+                "status": "bounded",
+                "detail": (
+                    "jobs="
+                    + json.dumps(statement_counts or {}, ensure_ascii=False, sort_keys=True)
+                    + "；snapshots="
+                    + json.dumps(snapshot_counts or {}, ensure_ascii=False, sort_keys=True)
+                ),
+                "next_action": "按请求版本和刷新日继续有界执行",
+            }
+        )
+        rows.append(
+            {
+                "priority": 3,
+                "category": "深抓进度",
+                "subject": "特征包状态",
+                "status": "nonformal",
+                "detail": (
+                    "feature_sets="
+                    + json.dumps(feature_counts or {}, ensure_ascii=False, sort_keys=True)
+                    + f"；incomplete_count={len(incomplete) if isinstance(incomplete, list) else 0}"
+                    + f"；expired_leases={_first(deep, 'expired_current_lease_count') or 0}"
+                    + f"；unknown_failures={_first(deep, 'unknown_failure_count') or 0}"
+                ),
+                "next_action": "保持正式评分闸门关闭并解决缺失分类",
             }
         )
     for fallback, item in _candidate_pairs(_first(pipeline_status, "next_actions")):
