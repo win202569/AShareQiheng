@@ -215,6 +215,135 @@ class DeepWorkerTestCase(unittest.TestCase):
         )
         return self.store.enqueue_job(spec.kind, spec.idempotency_key, spec.payload)
 
+    def _enqueue_direct_feature_payload(self, payload: dict[str, object]) -> str:
+        statements = payload["statement_snapshots"]
+        calendar = payload["trade_calendar_snapshot"]
+        input_hash = feature_input_hash(
+            security_id=payload["security_id"],
+            report_period=payload["report_period"],
+            as_of_utc=payload["as_of_utc"],
+            candidate_set_hash=payload["candidate_set_hash"],
+            statement_snapshot_hashes={
+                dataset: (
+                    statements[dataset]["payload_hash"]
+                    if statements[dataset] is not None
+                    else None
+                )
+                for dataset in STATEMENT_DATASETS
+            },
+            trade_calendar_snapshot_hash=(
+                calendar["payload_hash"] if calendar is not None else None
+            ),
+        )
+        return self.store.enqueue_job(
+            "feature_build",
+            feature_build_key(
+                payload["security_id"], payload["report_period"], input_hash
+            ),
+            payload,
+        )
+
+    def _assert_no_feature_artifacts(self) -> None:
+        self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
+        feature_root = self.data_root / "curated" / "formal_features"
+        self.assertEqual(list(feature_root.rglob("*.json")), [])
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM financial_fact").fetchone()[0],
+                0,
+            )
+
+    def _assert_candidate_payload_tamper_is_terminal(
+        self, field: str, value: object
+    ) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        payload = deep_worker_module.feature_build_payload(
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            context=context,
+            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+            trade_calendar_snapshot=None,
+        )
+        payload[field] = value
+        job_id = self._enqueue_direct_feature_payload(payload)
+
+        self._run(source=None, online=False)
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self._assert_no_feature_artifacts()
+
+    def _assert_periodic_heartbeat_loss_wins_over_source_error(
+        self,
+        error: BaseException,
+        *,
+        transfer_owner: bool,
+    ) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        job_id = self._enqueue_statement()
+        calendar = self._calendar_ref()
+        entered = threading.Event()
+        release = threading.Event()
+        source = FakeStatementSource(
+            failures={"balance_sheet": error},
+            entered=entered,
+            release=release,
+        )
+        real_renew = self.store.renew_job_lease
+        renewal_count = 0
+
+        def renew(*args, **kwargs):
+            nonlocal renewal_count
+            renewal_count += 1
+            if renewal_count == 1:
+                return real_renew(*args, **kwargs)
+            if transfer_owner:
+                with closing(sqlite3.connect(self.store.db_path)) as connection:
+                    connection.execute(
+                        """UPDATE job SET lease_worker = ?, lease_expires_at = ?
+                           WHERE id = ?""",
+                        ("worker-b", "2099-01-01T00:00:00+00:00", job_id),
+                    )
+                    connection.commit()
+            release.set()
+            raise ValueError("periodic renewal failed")
+
+        with patch.object(self.store, "renew_job_lease", side_effect=renew):
+            summary = self._run(
+                source=source,
+                trade_calendar_snapshot=calendar,
+                limit=1,
+                heartbeat_seconds=0.01,
+            )
+
+        job = self.store.get_job(job_id)
+        self.assertTrue(entered.is_set())
+        self.assertGreaterEqual(renewal_count, 2)
+        self.assertEqual(summary.remote_attempts, 1)
+        self.assertEqual(summary.circuit_breakers, ())
+        self.assertEqual(
+            [item["outcome"] for item in summary.items if "dataset" in item],
+            ["lease_lost"],
+        )
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(
+            job["lease_worker"], "worker-b" if transfer_owner else "worker-a"
+        )
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+        self.assertIsNone(
+            self.repository.find_exact(
+                "akshare",
+                "balance_sheet",
+                {"symbol": "SH600001", "report_period": REPORT_PERIOD},
+            )
+        )
+        self._assert_no_feature_artifacts()
+
     def _run(
         self,
         *,
@@ -424,6 +553,146 @@ class DeepWorkerTestCase(unittest.TestCase):
         self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
         self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
 
+    def test_feature_executor_rejects_wrong_key_before_fact_insertion(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        balance = self.repository.persist(fixture_statement_batch("balance_sheet"))[0]
+        payload = deep_worker_module.feature_build_payload(
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            context=context,
+            statement_snapshots={
+                "balance_sheet": balance,
+                "profit_sheet": None,
+                "cash_flow_sheet": None,
+            },
+            trade_calendar_snapshot=self._calendar_ref(),
+        )
+        job_id = self.store.enqueue_job(
+            "feature_build",
+            feature_build_key("SH600001", REPORT_PERIOD, "0" * 64),
+            payload,
+        )
+
+        self._run(source=None, online=False)
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self._assert_no_feature_artifacts()
+
+    def test_enqueue_feature_build_rejects_snapshot_in_wrong_statement_slot(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        profit = self.repository.persist(fixture_statement_batch("profit_sheet"))[0]
+
+        with self.assertRaisesRegex(ValueError, "statement snapshot"):
+            deep_worker_module.enqueue_feature_build(
+                self.store,
+                security_id="SH600001",
+                report_period=REPORT_PERIOD,
+                as_of_utc="2026-08-29T12:00:00+00:00",
+                candidate_context=context,
+                statement_snapshots={
+                    "balance_sheet": profit,
+                    "profit_sheet": None,
+                    "cash_flow_sheet": None,
+                },
+                trade_calendar_snapshot=None,
+            )
+
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_feature_executor_rejects_snapshot_in_wrong_statement_slot(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        profit = self.repository.persist(fixture_statement_batch("profit_sheet"))[0]
+        payload = deep_worker_module.feature_build_payload(
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            context=context,
+            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+            trade_calendar_snapshot=None,
+        )
+        payload["statement_snapshots"]["balance_sheet"] = (
+            deep_worker_module.frozen_snapshot_payload(profit)
+        )
+        job_id = self._enqueue_direct_feature_payload(payload)
+
+        self._run(source=None, online=False)
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self._assert_no_feature_artifacts()
+
+    def test_feature_executor_rejects_snapshot_for_wrong_security_request(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        other_security = self.repository.persist(
+            fixture_statement_batch("balance_sheet", security_id="SH600002")
+        )[0]
+        payload = deep_worker_module.feature_build_payload(
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            context=context,
+            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+            trade_calendar_snapshot=None,
+        )
+        payload["statement_snapshots"]["balance_sheet"] = (
+            deep_worker_module.frozen_snapshot_payload(other_security)
+        )
+        job_id = self._enqueue_direct_feature_payload(payload)
+
+        self._run(source=None, online=False)
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self._assert_no_feature_artifacts()
+
+    def test_feature_executor_rejects_duplicate_snapshot_across_statement_slots(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        balance = self.repository.persist(fixture_statement_batch("balance_sheet"))[0]
+        frozen = deep_worker_module.frozen_snapshot_payload(balance)
+        payload = deep_worker_module.feature_build_payload(
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            context=context,
+            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+            trade_calendar_snapshot=None,
+        )
+        payload["statement_snapshots"]["balance_sheet"] = frozen
+        payload["statement_snapshots"]["profit_sheet"] = dict(frozen)
+        job_id = self._enqueue_direct_feature_payload(payload)
+
+        self._run(source=None, online=False)
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self._assert_no_feature_artifacts()
+
+    def test_feature_executor_rejects_security_outside_candidate_context(self) -> None:
+        self._assert_candidate_payload_tamper_is_terminal(
+            "security_id", "SH600002"
+        )
+
+    def test_feature_executor_rejects_candidate_set_hash_context_mismatch(self) -> None:
+        self._assert_candidate_payload_tamper_is_terminal(
+            "candidate_set_hash", "9" * 64
+        )
+
+    def test_feature_executor_rejects_performance_hash_context_mismatch(self) -> None:
+        self._assert_candidate_payload_tamper_is_terminal(
+            "performance_input_hash", "9" * 64
+        )
+
+    def test_feature_executor_rejects_industry_context_mismatch(self) -> None:
+        self._assert_candidate_payload_tamper_is_terminal("industry", "银行")
+
+    def test_feature_executor_rejects_reported_flag_context_mismatch(self) -> None:
+        self._assert_candidate_payload_tamper_is_terminal(
+            "reported_target_period", False
+        )
+
     def test_remote_job_renews_lease_while_source_call_is_blocked(self) -> None:
         self._write_candidates({"SH600001": "包装印刷"})
         self._enqueue_statement()
@@ -476,6 +745,36 @@ class DeepWorkerTestCase(unittest.TestCase):
         self.assertEqual(source.calls, [])
         self.assertNotEqual(self.store.get_job(job_id)["status"], "succeeded")
         self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_periodic_lease_transfer_wins_over_source_blocked(self) -> None:
+        self._assert_periodic_heartbeat_loss_wins_over_source_error(
+            SourceBlocked("blocked"), transfer_owner=True
+        )
+
+    def test_periodic_lease_transfer_wins_over_retryable_source_error(self) -> None:
+        self._assert_periodic_heartbeat_loss_wins_over_source_error(
+            RetryableSourceError("retry"), transfer_owner=True
+        )
+
+    def test_periodic_lease_transfer_wins_over_terminal_source_error(self) -> None:
+        self._assert_periodic_heartbeat_loss_wins_over_source_error(
+            deep_worker_module.TerminalSourceError("terminal"), transfer_owner=True
+        )
+
+    def test_transient_periodic_renewal_failure_wins_over_source_blocked(self) -> None:
+        self._assert_periodic_heartbeat_loss_wins_over_source_error(
+            SourceBlocked("blocked"), transfer_owner=False
+        )
+
+    def test_transient_periodic_renewal_failure_wins_over_retryable_source_error(self) -> None:
+        self._assert_periodic_heartbeat_loss_wins_over_source_error(
+            RetryableSourceError("retry"), transfer_owner=False
+        )
+
+    def test_transient_periodic_renewal_failure_wins_over_terminal_source_error(self) -> None:
+        self._assert_periodic_heartbeat_loss_wins_over_source_error(
+            deep_worker_module.TerminalSourceError("terminal"), transfer_owner=False
+        )
 
     def test_run_recovers_expired_statement_lease_before_processing(self) -> None:
         self._write_candidates({"SH600001": "包装印刷"})

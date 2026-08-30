@@ -488,6 +488,24 @@ def frozen_snapshot_payload(snapshot: SnapshotRef | None) -> dict[str, str] | No
     }
 
 
+def _validate_statement_snapshot_ref(
+    snapshot: SnapshotRef,
+    *,
+    dataset: str,
+    security_id: str,
+    report_period: str,
+) -> None:
+    expected_fingerprint = canonical_sha256(
+        _statement_request(security_id, report_period)
+    )
+    if (
+        snapshot.source != "akshare"
+        or snapshot.dataset != dataset
+        or snapshot.request_fingerprint != expected_fingerprint
+    ):
+        raise ValueError("statement snapshot does not match its frozen slot")
+
+
 def feature_build_payload(
     *,
     security_id: str,
@@ -506,6 +524,22 @@ def feature_build_payload(
     as_of = require_aware_utc(as_of_utc, "as_of_utc")
     if not isinstance(statement_snapshots, Mapping):
         raise TypeError("statement_snapshots must be a mapping")
+    seen_snapshot_ids: set[str] = set()
+    for dataset in STATEMENT_DATASETS:
+        snapshot = statement_snapshots.get(dataset)
+        if snapshot is None:
+            continue
+        if not isinstance(snapshot, SnapshotRef):
+            raise TypeError("statement snapshots must contain SnapshotRef or None")
+        _validate_statement_snapshot_ref(
+            snapshot,
+            dataset=dataset,
+            security_id=security,
+            report_period=period,
+        )
+        if snapshot.id in seen_snapshot_ids:
+            raise ValueError("statement snapshot cannot occupy multiple slots")
+        seen_snapshot_ids.add(snapshot.id)
     return {
         "security_id": security,
         "report_period": period,
@@ -899,6 +933,34 @@ def _resolve_frozen_snapshot(
     return snapshot
 
 
+def _resolve_frozen_statement_snapshot(
+    snapshots: SnapshotRepository,
+    value: object,
+    *,
+    dataset: str,
+    security_id: str,
+    report_period: str,
+) -> SnapshotRef | None:
+    snapshot = _resolve_frozen_snapshot(snapshots, value)
+    if snapshot is None:
+        return None
+    _validate_statement_snapshot_ref(
+        snapshot,
+        dataset=dataset,
+        security_id=security_id,
+        report_period=report_period,
+    )
+    verified = snapshots.read_verified(snapshot)
+    expected_request = _statement_request(security_id, report_period)
+    if (
+        verified.batch.source != "akshare"
+        or verified.batch.dataset != dataset
+        or verified.batch.request != expected_request
+    ):
+        raise ValueError("verified statement snapshot does not match its frozen slot")
+    return snapshot
+
+
 def _lease_next_at_logical_time(
     store: StateStore,
     kinds: list[str],
@@ -1046,6 +1108,7 @@ def _execute_feature_job(
     root: Path,
     store: StateStore,
     snapshots: SnapshotRepository,
+    context: CandidateContext,
     job: Mapping[str, object],
     worker_id: str,
 ) -> tuple[bool, Mapping[str, object]]:
@@ -1054,50 +1117,37 @@ def _execute_feature_job(
     report_period = payload["report_period"]
     if not isinstance(security_id, str) or not isinstance(report_period, str):
         raise ValueError("feature identity must contain string values")
+    if security_id not in context.members:
+        raise ValueError("feature security is not in the candidate context")
+    if (
+        payload["candidate_set_hash"] != context.candidate_set_hash
+        or payload["performance_input_hash"]
+        != context.performance_input_hashes[security_id]
+        or payload["industry"] != context.industries[security_id]
+        or payload["reported_target_period"]
+        != context.reported_target_period[security_id]
+    ):
+        raise ValueError("feature payload does not match candidate context")
     frozen_statement_payloads = payload["statement_snapshots"]
     if not isinstance(frozen_statement_payloads, Mapping):
         raise ValueError("statement_snapshots must be a mapping")
     statement_refs = {
-        dataset: _resolve_frozen_snapshot(
-            snapshots, frozen_statement_payloads[dataset]
+        dataset: _resolve_frozen_statement_snapshot(
+            snapshots,
+            frozen_statement_payloads[dataset],
+            dataset=dataset,
+            security_id=security_id,
+            report_period=report_period,
         )
         for dataset in STATEMENT_DATASETS
     }
-    calendar_ref = _resolve_frozen_snapshot(
-        snapshots, payload["trade_calendar_snapshot"]
-    )
-    trading_days = _verified_calendar_days(snapshots, calendar_ref)
-
-    issue_codes: set[str] = set()
-    for dataset in STATEMENT_DATASETS:
-        snapshot = statement_refs[dataset]
-        if snapshot is None:
-            continue
-        _facts, issues = _normalize_statement_snapshot(
-            store=store,
-            snapshots=snapshots,
-            snapshot=snapshot,
-            security_id=security_id,
-            trading_days=trading_days,
-            record_issues=False,
-        )
-        issue_codes.update(issue.code for issue in issues)
-
     statement_ids = [
         snapshot.id for snapshot in statement_refs.values() if snapshot is not None
     ]
-    facts = store.list_financial_facts(
-        security_id,
-        source_snapshot_ids=statement_ids,
-    )
-    selection = select_visible_facts(
-        facts,
-        as_of_utc=payload["as_of_utc"],
-        snapshot_fetched_at={
-            snapshot.id: snapshot.fetched_at
-            for snapshot in statement_refs.values()
-            if snapshot is not None
-        },
+    if len(statement_ids) != len(set(statement_ids)):
+        raise ValueError("statement snapshot cannot occupy multiple slots")
+    calendar_ref = _resolve_frozen_snapshot(
+        snapshots, payload["trade_calendar_snapshot"]
     )
     statement_hashes = {
         dataset: (
@@ -1122,6 +1172,36 @@ def _execute_feature_job(
     )
     if job.get("idempotency_key") != expected_key:
         raise ValueError("feature-build key does not match frozen payload")
+    trading_days = _verified_calendar_days(snapshots, calendar_ref)
+
+    issue_codes: set[str] = set()
+    for dataset in STATEMENT_DATASETS:
+        snapshot = statement_refs[dataset]
+        if snapshot is None:
+            continue
+        _facts, issues = _normalize_statement_snapshot(
+            store=store,
+            snapshots=snapshots,
+            snapshot=snapshot,
+            security_id=security_id,
+            trading_days=trading_days,
+            record_issues=False,
+        )
+        issue_codes.update(issue.code for issue in issues)
+
+    facts = store.list_financial_facts(
+        security_id,
+        source_snapshot_ids=statement_ids,
+    )
+    selection = select_visible_facts(
+        facts,
+        as_of_utc=payload["as_of_utc"],
+        snapshot_fetched_at={
+            snapshot.id: snapshot.fetched_at
+            for snapshot in statement_refs.values()
+            if snapshot is not None
+        },
+    )
     bundle = build_feature_bundle(
         security_id=security_id,
         report_period=report_period,
@@ -1166,6 +1246,7 @@ def _process_feature_jobs(
     root: Path,
     store: StateStore,
     snapshots: SnapshotRepository,
+    context: CandidateContext,
     logical_now_utc: str,
     worker_id: str,
     lease_seconds: int,
@@ -1187,6 +1268,7 @@ def _process_feature_jobs(
                 root=root,
                 store=store,
                 snapshots=snapshots,
+                context=context,
                 job=job,
                 worker_id=worker_id,
             )
@@ -1317,6 +1399,7 @@ def execute_queued_deep_work(
         root=data_root,
         store=store,
         snapshots=snapshots,
+        context=context,
         logical_now_utc=logical_now_utc,
         worker_id=worker,
         lease_seconds=lease_seconds,
@@ -1406,122 +1489,22 @@ def execute_queued_deep_work(
                     heartbeat_seconds,
                 )
                 batch = None
-                try:
-                    with heartbeat:
-                        if not heartbeat.lost.is_set():
-                            counters["remote_attempts"] += 1
+                source_error: (
+                    SourceBlocked | RetryableSourceError | TerminalSourceError | None
+                ) = None
+                with heartbeat:
+                    if not heartbeat.lost.is_set():
+                        counters["remote_attempts"] += 1
+                        try:
                             batch = source.fetch_financial_statement(
                                 security_id, dataset, report_period
                             )
-                except SourceBlocked:
-                    followup = _statement_followup(
-                        context=context,
-                        snapshots=snapshots,
-                        security_id=security_id,
-                        report_period=report_period,
-                        as_of_utc=logical_now_utc,
-                        trade_calendar_snapshot=trade_calendar_snapshot,
-                    )
-                    store.fail_job_with_followups(
-                        job["id"],
-                        worker,
-                        {"error_classification": "source_blocked"},
-                        True,
-                        (normalized_now.astimezone(timezone.utc) + timedelta(hours=6)).isoformat(),
-                        (followup,),
-                    )
-                    counters["retryable_failed"] += 1
-                    items.append(
-                        _statement_item(
-                            security_id=security_id,
-                            dataset=dataset,
-                            outcome="retryable_failed",
-                            error_classification="source_blocked",
-                        )
-                    )
-                    circuits.append("akshare")
-                    feature_sets_written += _process_feature_jobs(
-                        root=data_root,
-                        store=store,
-                        snapshots=snapshots,
-                        logical_now_utc=logical_now_utc,
-                        worker_id=worker,
-                        lease_seconds=lease_seconds,
-                        items=items,
-                    )
-                    break
-                except RetryableSourceError:
-                    followup = _statement_followup(
-                        context=context,
-                        snapshots=snapshots,
-                        security_id=security_id,
-                        report_period=report_period,
-                        as_of_utc=logical_now_utc,
-                        trade_calendar_snapshot=trade_calendar_snapshot,
-                    )
-                    store.fail_job_with_followups(
-                        job["id"],
-                        worker,
-                        {"error_classification": "retryable_source"},
-                        True,
-                        (normalized_now.astimezone(timezone.utc) + timedelta(hours=6)).isoformat(),
-                        (followup,),
-                    )
-                    counters["retryable_failed"] += 1
-                    items.append(
-                        _statement_item(
-                            security_id=security_id,
-                            dataset=dataset,
-                            outcome="retryable_failed",
-                            error_classification="retryable_source",
-                        )
-                    )
-                    feature_sets_written += _process_feature_jobs(
-                        root=data_root,
-                        store=store,
-                        snapshots=snapshots,
-                        logical_now_utc=logical_now_utc,
-                        worker_id=worker,
-                        lease_seconds=lease_seconds,
-                        items=items,
-                    )
-                    continue
-                except TerminalSourceError:
-                    followup = _statement_followup(
-                        context=context,
-                        snapshots=snapshots,
-                        security_id=security_id,
-                        report_period=report_period,
-                        as_of_utc=logical_now_utc,
-                        trade_calendar_snapshot=trade_calendar_snapshot,
-                    )
-                    store.fail_job_with_followups(
-                        job["id"],
-                        worker,
-                        {"error_classification": "terminal_source"},
-                        False,
-                        None,
-                        (followup,),
-                    )
-                    counters["terminal_failed"] += 1
-                    items.append(
-                        _statement_item(
-                            security_id=security_id,
-                            dataset=dataset,
-                            outcome="terminal_failed",
-                            error_classification="terminal_source",
-                        )
-                    )
-                    feature_sets_written += _process_feature_jobs(
-                        root=data_root,
-                        store=store,
-                        snapshots=snapshots,
-                        logical_now_utc=logical_now_utc,
-                        worker_id=worker,
-                        lease_seconds=lease_seconds,
-                        items=items,
-                    )
-                    continue
+                        except (
+                            SourceBlocked,
+                            RetryableSourceError,
+                            TerminalSourceError,
+                        ) as error:
+                            source_error = error
                 if heartbeat.lost.is_set():
                     items.append(
                         _statement_item(
@@ -1532,6 +1515,64 @@ def execute_queued_deep_work(
                         )
                     )
                     break
+                if source_error is not None:
+                    blocked = isinstance(source_error, SourceBlocked)
+                    retryable = blocked or isinstance(
+                        source_error, RetryableSourceError
+                    )
+                    classification = (
+                        "source_blocked"
+                        if blocked
+                        else "retryable_source"
+                        if retryable
+                        else "terminal_source"
+                    )
+                    followup = _statement_followup(
+                        context=context,
+                        snapshots=snapshots,
+                        security_id=security_id,
+                        report_period=report_period,
+                        as_of_utc=logical_now_utc,
+                        trade_calendar_snapshot=trade_calendar_snapshot,
+                    )
+                    store.fail_job_with_followups(
+                        job["id"],
+                        worker,
+                        {"error_classification": classification},
+                        retryable,
+                        (
+                            normalized_now.astimezone(timezone.utc)
+                            + timedelta(hours=6)
+                        ).isoformat()
+                        if retryable
+                        else None,
+                        (followup,),
+                    )
+                    counter = "retryable_failed" if retryable else "terminal_failed"
+                    counters[counter] += 1
+                    items.append(
+                        _statement_item(
+                            security_id=security_id,
+                            dataset=dataset,
+                            outcome=counter,
+                            error_classification=classification,
+                        )
+                    )
+                    if blocked:
+                        circuits.append("akshare")
+                    feature_sets_written += _process_feature_jobs(
+                        root=data_root,
+                        store=store,
+                        snapshots=snapshots,
+                        context=context,
+                        logical_now_utc=logical_now_utc,
+                        worker_id=worker,
+                        lease_seconds=lease_seconds,
+                        items=items,
+                    )
+                    if blocked:
+                        break
+                    continue
                 if batch is None:
                     raise RuntimeError("remote statement request produced no batch")
                 if (
@@ -1568,6 +1609,7 @@ def execute_queued_deep_work(
                         root=data_root,
                         store=store,
                         snapshots=snapshots,
+                        context=context,
                         logical_now_utc=logical_now_utc,
                         worker_id=worker,
                         lease_seconds=lease_seconds,
@@ -1670,6 +1712,7 @@ def execute_queued_deep_work(
                 root=data_root,
                 store=store,
                 snapshots=snapshots,
+                context=context,
                 logical_now_utc=logical_now_utc,
                 worker_id=worker,
                 lease_seconds=lease_seconds,
