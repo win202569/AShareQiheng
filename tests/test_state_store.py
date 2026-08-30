@@ -3,9 +3,21 @@ import tempfile
 import threading
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from ashare_pipeline.feature_contract import (
+    CONTRACT_VERSION,
+    DIMENSIONS,
+    ConfidenceInputs,
+    DimensionInput,
+    EvidenceRef,
+    FeatureBundle,
+    FeatureValue,
+    IndustryContext,
+)
+from ashare_pipeline.financial_schema import MAPPING_VERSION, FinancialFact
 from ashare_pipeline.state_store import FinalizationBlocked, StateStore
 
 
@@ -14,6 +26,87 @@ UTC = timezone.utc
 
 def utc_at(seconds: int) -> str:
     return (datetime(2026, 8, 31, tzinfo=UTC) + timedelta(seconds=seconds)).isoformat()
+
+
+def financial_fact(
+    *, snapshot_id: str, raw_row_hash: str = "1" * 64, value: float = 100.0,
+    effective_at_utc: str = "2026-08-21T07:00:00+00:00",
+) -> FinancialFact:
+    return FinancialFact.create(
+        security_id="SH600001",
+        statement="income",
+        metric_key="revenue",
+        period_start="2026-01-01",
+        period_end="2026-06-30",
+        period_kind="H1",
+        value=value,
+        unit="CNY",
+        nature="duration",
+        announced_at_utc="2026-08-20T15:59:59+00:00",
+        effective_at_utc=effective_at_utc,
+        source_updated_at_utc=None,
+        source_snapshot_id=snapshot_id,
+        source_field="TOTAL_OPERATE_INCOME",
+        raw_row_hash=raw_row_hash,
+        mapping_version=MAPPING_VERSION,
+        created_at="2026-08-29T00:00:00+00:00",
+    )
+
+
+def valid_feature_bundle(
+    *, input_hash: str = "b" * 64,
+    as_of_utc: str = "2026-08-29T16:00:00+00:00",
+    blockers: tuple[str, ...] = ("formal_industry_mapping_missing",),
+) -> FeatureBundle:
+    evidence = EvidenceRef(
+        "fact-a",
+        "snapshot-a",
+        "TOTAL_ASSETS",
+        "a" * 64,
+        "2026-08-20T15:59:59+00:00",
+        "2026-08-21T07:00:00+00:00",
+    )
+    dimensions = {
+        dimension: DimensionInput(
+            "partial",
+            (
+                FeatureValue(
+                    f"{dimension.lower()}.sample",
+                    0.0,
+                    "ratio",
+                    "2026H1",
+                    "observed",
+                    "observed-v1",
+                    (evidence,),
+                    None,
+                ),
+            ),
+        )
+        for dimension in DIMENSIONS
+    }
+    return FeatureBundle(
+        1,
+        CONTRACT_VERSION,
+        "SH600001",
+        "2026-06-30",
+        as_of_utc,
+        "c" * 64,
+        IndustryContext(
+            "eastmoney-provisional",
+            None,
+            "包装印刷",
+            "general_nonfinancial",
+            "template-registry-v1",
+            False,
+        ),
+        input_hash,
+        "partial",
+        0.5,
+        ConfidenceInputs(0.5, {"timestamp": 0, "date_only": 1}, 3, True, None),
+        dimensions,
+        blockers,
+        False,
+    )
 
 
 class StateStoreTestCase(unittest.TestCase):
@@ -334,6 +427,220 @@ class StateStoreTestCase(unittest.TestCase):
                             feature_set_id=f"coverage-{index}",
                             coverage=coverage,
                         )
+
+    def test_insert_financial_facts_is_idempotent_and_preserves_revision(self) -> None:
+        snapshot_id, _ = self.store.record_snapshot(
+            "akshare", "balance_sheet", "request-a", "a" * 64,
+            "data/raw/a.json", 1, utc_at(0),
+        )
+        first = financial_fact(snapshot_id=snapshot_id, raw_row_hash="1" * 64, value=100.0)
+        revised = financial_fact(snapshot_id=snapshot_id, raw_row_hash="2" * 64, value=101.0)
+
+        self.assertEqual(self.store.insert_financial_facts([first, first]), (1, 1))
+        self.assertEqual(self.store.insert_financial_facts([revised]), (1, 0))
+        stored = self.store.list_financial_facts("SH600001")
+        self.assertEqual(len(stored), 2)
+        self.assertEqual({fact.raw_row_hash for fact in stored}, {"1" * 64, "2" * 64})
+
+    def test_list_financial_facts_applies_exact_snapshot_and_effective_filters(self) -> None:
+        first_snapshot, _ = self.store.record_snapshot(
+            "akshare", "profit_sheet", "request-a", "a" * 64,
+            "data/raw/a.json", 1, utc_at(0),
+        )
+        second_snapshot, _ = self.store.record_snapshot(
+            "akshare", "profit_sheet", "request-b", "b" * 64,
+            "data/raw/b.json", 1, utc_at(1),
+        )
+        first = financial_fact(snapshot_id=first_snapshot, raw_row_hash="1" * 64)
+        second = financial_fact(
+            snapshot_id=second_snapshot,
+            raw_row_hash="2" * 64,
+            effective_at_utc="2026-08-22T07:00:00+00:00",
+        )
+        self.store.insert_financial_facts([first, second])
+
+        self.assertEqual(
+            self.store.list_financial_facts(
+                "SH600001", source_snapshot_ids=[first_snapshot]
+            ),
+            [first],
+        )
+        self.assertEqual(
+            self.store.list_financial_facts(
+                "SH600001", effective_at_or_before="2026-08-21T07:00:00Z"
+            ),
+            [first],
+        )
+        self.assertEqual(
+            self.store.list_financial_facts("SH600001", source_snapshot_ids=[]), []
+        )
+
+    def test_put_feature_bundle_is_atomic_and_rejects_nondeterministic_conflict(self) -> None:
+        bundle = valid_feature_bundle(input_hash="b" * 64)
+        feature_id, created = self.store.put_feature_bundle(
+            bundle,
+            bundle_path="data/curated/formal_features/2026-06-30/SH600001/b.json",
+            bundle_hash=bundle.bundle_hash(),
+        )
+        self.assertTrue(created)
+        self.assertEqual(feature_id, bundle.bundle_hash())
+        self.assertEqual(
+            self.store.put_feature_bundle(
+                bundle,
+                bundle_path="data/curated/formal_features/2026-06-30/SH600001/b.json",
+                bundle_hash=bundle.bundle_hash(),
+            ),
+            (feature_id, False),
+        )
+        conflicting = replace(bundle, blockers=("changed-without-input-hash",))
+        with self.assertRaisesRegex(ValueError, "non-deterministic feature conflict"):
+            self.store.put_feature_bundle(
+                conflicting,
+                bundle_path="data/curated/formal_features/2026-06-30/SH600001/c.json",
+                bundle_hash=conflicting.bundle_hash(),
+            )
+        stored = self.store.get_feature_bundle_row("SH600001", "2026-06-30", "b" * 64)
+        self.assertEqual(stored["bundle_hash"], bundle.bundle_hash())
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0], 7
+            )
+
+    def test_put_feature_bundle_rolls_back_header_and_values_when_one_value_aborts(self) -> None:
+        bundle = valid_feature_bundle()
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.executescript(
+                """CREATE TRIGGER abort_fs_feature_value
+                BEFORE INSERT ON feature_value WHEN NEW.dimension = 'FS'
+                BEGIN SELECT RAISE(ABORT, 'forced feature value failure'); END;"""
+            )
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "forced feature value failure"):
+            self.store.put_feature_bundle(
+                bundle,
+                bundle_path="data/curated/formal_features/2026-06-30/SH600001/b.json",
+                bundle_hash=bundle.bundle_hash(),
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0], 0)
+
+    def test_put_feature_bundle_rejects_hash_mismatch_and_unsafe_paths(self) -> None:
+        bundle = valid_feature_bundle()
+        invalid_paths = (
+            "/data/curated/formal_features/b.json",
+            "C:/data/curated/formal_features/b.json",
+            "data\\curated\\formal_features\\b.json",
+            "data/curated/formal_features/../outside.json",
+            "data/curated/formal_features",
+            "data/curated/other/b.json",
+        )
+        for invalid_path in invalid_paths:
+            with self.subTest(path=invalid_path), self.assertRaisesRegex(
+                ValueError, "bundle_path"
+            ):
+                self.store.put_feature_bundle(
+                    bundle, bundle_path=invalid_path, bundle_hash=bundle.bundle_hash()
+                )
+        with self.assertRaisesRegex(ValueError, "bundle_hash"):
+            self.store.put_feature_bundle(
+                bundle,
+                bundle_path="data/curated/formal_features/b.json",
+                bundle_hash="0" * 64,
+            )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0], 0)
+
+    def test_latest_feature_set_filters_exactly_orders_and_parses_json(self) -> None:
+        older = valid_feature_bundle(
+            input_hash="1" * 64, as_of_utc="2026-08-28T16:00:00+00:00"
+        )
+        newer = valid_feature_bundle(
+            input_hash="2" * 64,
+            as_of_utc="2026-08-29T16:00:00+00:00",
+            blockers=("z-blocker", "a-blocker"),
+        )
+        for label, bundle in (("older", older), ("newer", newer)):
+            self.store.put_feature_bundle(
+                bundle,
+                bundle_path=f"data/curated/formal_features/{label}.json",
+                bundle_hash=bundle.bundle_hash(),
+            )
+
+        latest = self.store.latest_feature_set("SH600001", "2026-06-30")
+        self.assertEqual(latest["id"], newer.bundle_hash())
+        self.assertEqual(latest["dimension_status"], {key: "partial" for key in DIMENSIONS})
+        self.assertEqual(latest["confidence_inputs"]["history_years_present"], 3)
+        self.assertEqual(latest["blockers"], ["a-blocker", "z-blocker"])
+        self.assertEqual(latest["missing"], [])
+        self.assertNotIn("dimension_status_json", latest)
+        self.assertNotIn("value", latest)
+        self.assertEqual(
+            self.store.latest_feature_set(
+                "SH600001", "2026-06-30", as_of_utc=older.as_of_utc
+            )["id"],
+            older.bundle_hash(),
+        )
+        self.assertIsNone(
+            self.store.latest_feature_set(
+                "SH600001", "2026-06-30", contract_version="other-contract"
+            )
+        )
+        self.assertIsNone(
+            self.store.latest_feature_set(
+                "SH600001", "2026-06-30", as_of_utc="2026-08-28T16:00:01+00:00"
+            )
+        )
+
+    def test_latest_feature_set_breaks_as_of_ties_by_created_at_then_id(self) -> None:
+        bundles = (
+            valid_feature_bundle(input_hash="3" * 64),
+            valid_feature_bundle(input_hash="4" * 64),
+        )
+        for index, bundle in enumerate(bundles):
+            self.store.put_feature_bundle(
+                bundle,
+                bundle_path=f"data/curated/formal_features/tie-{index}.json",
+                bundle_hash=bundle.bundle_hash(),
+            )
+        low_id, high_id = sorted(bundle.bundle_hash() for bundle in bundles)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE feature_set SET created_at = ? WHERE id = ?", (utc_at(1), high_id)
+            )
+            connection.execute(
+                "UPDATE feature_set SET created_at = ? WHERE id = ?", (utc_at(2), low_id)
+            )
+            connection.commit()
+        self.assertEqual(
+            self.store.latest_feature_set("SH600001", "2026-06-30")["id"], low_id
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("UPDATE feature_set SET created_at = ?", (utc_at(3),))
+            connection.commit()
+        self.assertEqual(
+            self.store.latest_feature_set("SH600001", "2026-06-30")["id"], high_id
+        )
+
+    def test_record_quality_issue_stores_canonical_details_json(self) -> None:
+        issue_id = self.store.record_quality_issue(
+            run_id=None,
+            score_run_id=None,
+            severity="warning",
+            code="mapping_gap",
+            details={"z": 1, "message": "缺失", "a": [2, 1]},
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            row = connection.execute(
+                "SELECT id, run_id, score_run_id, severity, code, details_json FROM quality_issue"
+            ).fetchone()
+        self.assertEqual(
+            row,
+            (issue_id, None, None, "warning", "mapping_gap", '{"a":[2,1],"message":"缺失","z":1}'),
+        )
 
     def test_duplicate_enqueue_returns_original_job_without_second_row(self) -> None:
         job_id = self.store.enqueue_job("fetch", "source:000001", {"request": "first"})

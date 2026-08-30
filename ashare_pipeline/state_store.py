@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Iterator
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Iterable, Iterator, Mapping, Sequence
+
+from ashare_pipeline.feature_contract import DIMENSIONS, FeatureBundle
+from ashare_pipeline.financial_schema import FinancialFact
 
 
 JOB_STATES = {"pending", "running", "succeeded", "retryable_failed", "terminal_failed"}
@@ -16,6 +19,57 @@ SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
 SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
 RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
 SCHEMA_VERSION = 3
+
+FINANCIAL_FACT_COLUMNS = (
+    "id",
+    "security_id",
+    "statement",
+    "metric_key",
+    "period_start",
+    "period_end",
+    "period_kind",
+    "value",
+    "unit",
+    "nature",
+    "announced_at_utc",
+    "effective_at_utc",
+    "source_updated_at_utc",
+    "source_snapshot_id",
+    "source_field",
+    "raw_row_hash",
+    "mapping_version",
+    "created_at",
+)
+
+_FEATURE_SET_CONTENT_COLUMNS = (
+    "security_id",
+    "report_period",
+    "as_of_utc",
+    "candidate_set_hash",
+    "template_id",
+    "template_version",
+    "contract_version",
+    "input_hash",
+    "status",
+    "financial_coverage",
+    "dimension_status_json",
+    "confidence_inputs_json",
+    "blockers_json",
+    "bundle_hash",
+    "missing_json",
+)
+
+_FEATURE_VALUE_CONTENT_COLUMNS = (
+    "dimension",
+    "feature_key",
+    "period_key",
+    "value",
+    "unit",
+    "status",
+    "formula_version",
+    "evidence_json",
+    "missing_reason",
+)
 
 _V2_TABLE_DDL = {
     "run": """CREATE TABLE IF NOT EXISTS run (
@@ -495,6 +549,174 @@ class StateStore:
             )
         return snapshot_id, True
 
+    def insert_financial_facts(
+        self,
+        facts: Iterable[FinancialFact],
+    ) -> tuple[int, int]:
+        records = tuple(facts)
+        inserted = 0
+        with self._transaction(immediate=True) as connection:
+            for fact in records:
+                record = fact.to_record()
+                cursor = connection.execute(
+                    """INSERT OR IGNORE INTO financial_fact
+                    (id,security_id,statement,metric_key,period_start,period_end,period_kind,
+                     value,unit,nature,announced_at_utc,effective_at_utc,source_updated_at_utc,
+                     source_snapshot_id,source_field,raw_row_hash,mapping_version,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    tuple(record[key] for key in FINANCIAL_FACT_COLUMNS),
+                )
+                inserted += cursor.rowcount
+        return inserted, len(records) - inserted
+
+    def list_financial_facts(
+        self,
+        security_id: str,
+        *,
+        effective_at_or_before: str | None = None,
+        source_snapshot_ids: Sequence[str] | None = None,
+    ) -> list[FinancialFact]:
+        query = "SELECT * FROM financial_fact WHERE security_id = ?"
+        parameters: list[object] = [security_id]
+        if effective_at_or_before is not None:
+            query += " AND effective_at_utc <= ?"
+            parameters.append(_utc_iso(effective_at_or_before))
+        if source_snapshot_ids is not None:
+            if not source_snapshot_ids:
+                return []
+            marks = ",".join("?" for _ in source_snapshot_ids)
+            query += f" AND source_snapshot_id IN ({marks})"
+            parameters.extend(source_snapshot_ids)
+        query += " ORDER BY metric_key,period_end,effective_at_utc,id"
+        with closing(self._connect()) as connection:
+            return [
+                FinancialFact.from_record(dict(row))
+                for row in connection.execute(query, parameters)
+            ]
+
+    def put_feature_bundle(
+        self,
+        bundle: FeatureBundle,
+        *,
+        bundle_path: str,
+        bundle_hash: str,
+    ) -> tuple[str, bool]:
+        bundle.validate()
+        if bundle_hash != bundle.bundle_hash():
+            raise ValueError("bundle_hash does not match canonical bundle hash")
+        self._validate_feature_bundle_path(bundle_path)
+        header, values = self._feature_bundle_content(bundle, bundle_hash)
+
+        with self._transaction(immediate=True) as connection:
+            existing = connection.execute(
+                """SELECT * FROM feature_set
+                WHERE security_id = ? AND report_period = ? AND as_of_utc = ? AND input_hash = ?""",
+                (
+                    header["security_id"],
+                    header["report_period"],
+                    header["as_of_utc"],
+                    header["input_hash"],
+                ),
+            ).fetchone()
+            if existing is not None:
+                if not self._stored_feature_content_matches(
+                    connection, existing, header, values
+                ):
+                    raise ValueError("non-deterministic feature conflict")
+                return str(existing["id"]), False
+
+            feature_set_id = bundle_hash
+            connection.execute(
+                """INSERT INTO feature_set
+                (id,security_id,report_period,as_of_utc,candidate_set_hash,
+                 template_id,template_version,contract_version,input_hash,status,
+                 financial_coverage,dimension_status_json,confidence_inputs_json,
+                 blockers_json,bundle_hash,bundle_path,missing_json,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    feature_set_id,
+                    *(header[column] for column in _FEATURE_SET_CONTENT_COLUMNS[:-2]),
+                    header["bundle_hash"],
+                    bundle_path,
+                    header["missing_json"],
+                    _utc_now(),
+                ),
+            )
+            for value in values:
+                connection.execute(
+                    """INSERT INTO feature_value
+                    (feature_set_id,dimension,feature_key,period_key,value,unit,status,
+                     formula_version,evidence_json,missing_reason)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        feature_set_id,
+                        *(value[column] for column in _FEATURE_VALUE_CONTENT_COLUMNS),
+                    ),
+                )
+        return feature_set_id, True
+
+    def get_feature_bundle_row(
+        self,
+        security_id: str,
+        report_period: str,
+        input_hash: str,
+    ) -> dict | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT * FROM feature_set
+                WHERE security_id = ? AND report_period = ? AND input_hash = ?
+                ORDER BY as_of_utc DESC, created_at DESC, id DESC LIMIT 1""",
+                (security_id, report_period, input_hash),
+            ).fetchone()
+        return self._feature_set_public(row) if row is not None else None
+
+    def latest_feature_set(
+        self,
+        security_id: str,
+        report_period: str,
+        contract_version: str | None = None,
+        as_of_utc: str | None = None,
+    ) -> dict | None:
+        query = "SELECT * FROM feature_set WHERE security_id = ? AND report_period = ?"
+        parameters: list[object] = [security_id, report_period]
+        if contract_version is not None:
+            query += " AND contract_version = ?"
+            parameters.append(contract_version)
+        if as_of_utc is not None:
+            query += " AND as_of_utc = ?"
+            parameters.append(_utc_iso(as_of_utc))
+        query += " ORDER BY as_of_utc DESC, created_at DESC, id DESC LIMIT 1"
+        with closing(self._connect()) as connection:
+            row = connection.execute(query, parameters).fetchone()
+        return self._feature_set_public(row) if row is not None else None
+
+    def record_quality_issue(
+        self,
+        *,
+        run_id: str | None,
+        score_run_id: str | None,
+        severity: str,
+        code: str,
+        details: Mapping[str, object],
+    ) -> str:
+        issue_id = str(uuid.uuid4())
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO quality_issue
+                (id,run_id,score_run_id,severity,code,details_json,created_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                (
+                    issue_id,
+                    run_id,
+                    score_run_id,
+                    severity,
+                    code,
+                    _json(dict(details)),
+                    _utc_now(),
+                ),
+            )
+        return issue_id
+
     def create_score_run(
         self, report_period: str, as_of_cn: str, ruleset_hash: str, universe_hash: str, mode: str
     ) -> str:
@@ -594,6 +816,115 @@ class StateStore:
             "recent_run": dict(recent) if recent else None,
             "updated_at": max(update_values, default=_utc_now()),
         }
+
+    @staticmethod
+    def _validate_feature_bundle_path(bundle_path: str) -> None:
+        prefix_parts = ("data", "curated", "formal_features")
+        if not isinstance(bundle_path, str) or not bundle_path or "\\" in bundle_path:
+            raise ValueError("bundle_path must be a forward-slash project-relative path")
+        raw_parts = bundle_path.split("/")
+        path = PurePosixPath(bundle_path)
+        if (
+            path.is_absolute()
+            or PureWindowsPath(bundle_path).is_absolute()
+            or tuple(raw_parts[:3]) != prefix_parts
+            or len(raw_parts) == len(prefix_parts)
+            or any(part in {"", ".", ".."} for part in raw_parts)
+        ):
+            raise ValueError(
+                "bundle_path must begin with data/curated/formal_features/ and stay within it"
+            )
+
+    @staticmethod
+    def _feature_bundle_content(
+        bundle: FeatureBundle,
+        bundle_hash: str,
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        payload = bundle.to_dict()
+        dimension_status = {
+            dimension: payload["dimension_inputs"][dimension]["status"]
+            for dimension in DIMENSIONS
+        }
+        values: list[dict[str, object]] = []
+        missing: list[dict[str, object]] = []
+        for dimension in DIMENSIONS:
+            for value in payload["dimension_inputs"][dimension]["values"]:
+                values.append(
+                    {
+                        "dimension": dimension,
+                        "feature_key": value["key"],
+                        "period_key": value["period_key"],
+                        "value": value["value"],
+                        "unit": value["unit"],
+                        "status": value["status"],
+                        "formula_version": value["formula_version"],
+                        "evidence_json": _json(value["evidence"]),
+                        "missing_reason": value["missing_reason"],
+                    }
+                )
+                if value["status"] in {"missing", "not_applicable", "blocked"}:
+                    missing.append(
+                        {
+                            "dimension": dimension,
+                            "feature_key": value["key"],
+                            "period_key": value["period_key"],
+                            "reason": value["missing_reason"],
+                        }
+                    )
+        header: dict[str, object] = {
+            "security_id": payload["security_id"],
+            "report_period": payload["report_period"],
+            "as_of_utc": payload["as_of_utc"],
+            "candidate_set_hash": payload["candidate_set_hash"],
+            "template_id": payload["industry"]["template_id"],
+            "template_version": payload["industry"]["template_version"],
+            "contract_version": payload["contract_version"],
+            "input_hash": payload["input_hash"],
+            "status": payload["financial_status"],
+            "financial_coverage": payload["financial_coverage"],
+            "dimension_status_json": _json(dimension_status),
+            "confidence_inputs_json": _json(payload["confidence_inputs"]),
+            "blockers_json": _json(payload["blockers"]),
+            "bundle_hash": bundle_hash,
+            "missing_json": _json(missing),
+        }
+        return header, values
+
+    @staticmethod
+    def _stored_feature_content_matches(
+        connection: sqlite3.Connection,
+        existing: sqlite3.Row,
+        header: Mapping[str, object],
+        values: Sequence[Mapping[str, object]],
+    ) -> bool:
+        if any(existing[column] != header[column] for column in _FEATURE_SET_CONTENT_COLUMNS):
+            return False
+        stored_values = connection.execute(
+            """SELECT dimension,feature_key,period_key,value,unit,status,
+            formula_version,evidence_json,missing_reason FROM feature_value
+            WHERE feature_set_id = ? ORDER BY dimension,feature_key,period_key""",
+            (existing["id"],),
+        ).fetchall()
+        expected = sorted(
+            (
+                tuple(value[column] for column in _FEATURE_VALUE_CONTENT_COLUMNS)
+                for value in values
+            ),
+            key=lambda value: (value[0], value[1], value[2]),
+        )
+        return [tuple(row) for row in stored_values] == expected
+
+    @staticmethod
+    def _feature_set_public(row: sqlite3.Row) -> dict:
+        result = dict(row)
+        for stored_name, public_name in (
+            ("dimension_status_json", "dimension_status"),
+            ("confidence_inputs_json", "confidence_inputs"),
+            ("blockers_json", "blockers"),
+            ("missing_json", "missing"),
+        ):
+            result[public_name] = json.loads(result.pop(stored_name))
+        return result
 
     @staticmethod
     def _job_public(row: sqlite3.Row) -> dict:
