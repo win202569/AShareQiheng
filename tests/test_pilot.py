@@ -252,6 +252,7 @@ class PilotTestCase(unittest.TestCase):
             class AK:
                 def fetch_disclosure_schedule(self): return FetchBatch("fake", "disclosure_schedule", {}, [], "2026-08-28T00:00:00+00:00", "v", {})
                 def fetch_performance_report(self): return FetchBatch("fake", "performance_report", {}, [], "2026-08-28T00:00:00+00:00", "v", {})
+                def fetch_financial_statement(self, *_): raise AssertionError("pilot must keep using the compatibility wrapper")
                 def fetch_financial_statements(self, _): calls["financial"] += 1; return {}
                 def fetch_spot_snapshot(self): return FetchBatch("fake", "spot_snapshot", {}, [], "2026-08-28T00:00:00+00:00", "v", {})
             store = StateStore(db); store.initialize()

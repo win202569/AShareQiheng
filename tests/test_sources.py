@@ -156,10 +156,84 @@ class SourcesTestCase(unittest.TestCase):
         batches = AKShareSource(module=module, clock=lambda: "2026-08-25T00:00:00+00:00").fetch_financial_statements("SH600000")
 
         self.assertEqual(set(batches), {"balance_sheet", "profit_sheet", "cash_flow_sheet"})
+        self.assertEqual([name for name, _ in module.calls], ["balance", "profit", "cash"])
         self.assertEqual(batches["balance_sheet"].metadata["report_period_match_count"], 1)
         self.assertEqual(batches["balance_sheet"].metadata["column_count"], 4)
         self.assertIsNone(batches["balance_sheet"].records[0]["VALUE"])
         self.assertEqual(batches["balance_sheet"].records[0]["NOTICE_DATE"], "2026-08-20")
+
+    def test_fetch_financial_statement_calls_exactly_one_requested_method(self):
+        for dataset, expected_call in (
+            ("balance_sheet", "balance"),
+            ("profit_sheet", "profit"),
+            ("cash_flow_sheet", "cash"),
+        ):
+            with self.subTest(dataset=dataset):
+                module = FakeAKShare()
+                batch = AKShareSource(module=module).fetch_financial_statement(
+                    "SH600000", dataset, "2026-06-30"
+                )
+
+                self.assertEqual([name for name, _ in module.calls], [expected_call])
+                self.assertEqual(batch.dataset, dataset)
+                self.assertEqual(batch.request, {
+                    "symbol": "SH600000",
+                    "report_period": "2026-06-30",
+                })
+                self.assertEqual(batch.metadata["report_period_match_count"], 1)
+
+    def test_fetch_financial_statement_rejects_unknown_dataset_before_module_access(self):
+        module = FakeAKShare()
+
+        class GuardedAKShareSource(AKShareSource):
+            def _module(self):
+                raise AssertionError("module access")
+
+        with self.assertRaisesRegex(ValueError, "unsupported financial dataset"):
+            GuardedAKShareSource(module=module).fetch_financial_statement(
+                "SH600000", "unknown_sheet", "2026-06-30"
+            )
+
+        self.assertEqual(module.calls, [])
+
+    def test_fetch_financial_statement_retries_empty_result(self):
+        module = FakeAKShare()
+        module.statement = FakeFrame([], [])
+
+        with self.assertRaises(RetryableSourceError):
+            AKShareSource(module=module).fetch_financial_statement(
+                "SH600000", "balance_sheet", "2026-06-30"
+            )
+
+        self.assertEqual([name for name, _ in module.calls], ["balance"])
+
+    def test_financial_statements_wrapper_reuses_single_statement_method_in_fixed_order(self):
+        class RecordingSource(AKShareSource):
+            def __init__(self):
+                super().__init__(module=FakeAKShare())
+                self.statement_requests = []
+
+            def fetch_financial_statement(self, symbol, dataset, report_period="2026-06-30"):
+                self.statement_requests.append((symbol, dataset, report_period))
+                return FetchBatch(
+                    "akshare",
+                    dataset,
+                    {"symbol": symbol, "report_period": report_period},
+                    [{"REPORT_DATE": report_period}],
+                    "2026-08-25T00:00:00+00:00",
+                    "test",
+                    {"report_period_match_count": 1},
+                )
+
+        source = RecordingSource()
+        batches = source.fetch_financial_statements("SH600000", "2026-06-30")
+
+        self.assertEqual(list(batches), ["balance_sheet", "profit_sheet", "cash_flow_sheet"])
+        self.assertEqual(source.statement_requests, [
+            ("SH600000", "balance_sheet", "2026-06-30"),
+            ("SH600000", "profit_sheet", "2026-06-30"),
+            ("SH600000", "cash_flow_sheet", "2026-06-30"),
+        ])
 
     def test_akshare_spot_blocks_access_control_and_retries_empty_structure(self):
         module = FakeAKShare()

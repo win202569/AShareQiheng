@@ -10,7 +10,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 
 class SourceError(RuntimeError):
@@ -85,6 +85,16 @@ class FetchBatch:
 
     def sha256(self) -> str:
         return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+
+class FinancialStatementSource(Protocol):
+    def fetch_financial_statement(
+        self,
+        symbol: str,
+        dataset: str,
+        report_period: str = "2026-06-30",
+    ) -> FetchBatch:
+        raise NotImplementedError
 
 
 _HTTP_STATUS = re.compile(r"(?<!\d)(?:http\s*)?(?:403|429)(?!\d)", re.IGNORECASE)
@@ -245,24 +255,49 @@ class AKShareSource:
         metadata["source_column_mapping"] = source_mapping
         return FetchBatch(batch.source, batch.dataset, batch.request, records, batch.fetched_at_utc, batch.source_version, metadata)
 
-    def fetch_financial_statements(self, symbol: str, report_period: str = "2026-06-30") -> dict[str, FetchBatch]:
-        specifications = {
+    def fetch_financial_statement(
+        self,
+        symbol: str,
+        dataset: str,
+        report_period: str = "2026-06-30",
+    ) -> FetchBatch:
+        methods = {
             "balance_sheet": "stock_balance_sheet_by_report_em",
             "profit_sheet": "stock_profit_sheet_by_report_em",
             "cash_flow_sheet": "stock_cash_flow_sheet_by_report_em",
         }
-        batches: dict[str, FetchBatch] = {}
-        for dataset, method_name in specifications.items():
-            request = {"symbol": symbol, "report_period": report_period}
-            def collect(module: Any, name: str = method_name) -> Any:
-                return getattr(module, name)(symbol=symbol)
-            batch = self._batch(dataset, request, collect)
-            matches = sum(str(row.get("REPORT_DATE", ""))[:10] == report_period for row in batch.records)
-            metadata = {"report_period_match_count": matches, "column_count": len(batch.records[0]) if batch.records else 0,
-                        "NOTICE_DATE": [row.get("NOTICE_DATE") for row in batch.records if row.get("NOTICE_DATE") is not None],
-                        "UPDATE_DATE": [row.get("UPDATE_DATE") for row in batch.records if row.get("UPDATE_DATE") is not None]}
-            batches[dataset] = FetchBatch(batch.source, batch.dataset, batch.request, batch.records, batch.fetched_at_utc, batch.source_version, metadata)
-        return batches
+        if dataset not in methods:
+            raise ValueError(f"unsupported financial dataset: {dataset}")
+        request = {"symbol": symbol, "report_period": report_period}
+        method_name = methods[dataset]
+        batch = self._batch(
+            dataset,
+            request,
+            lambda module: getattr(module, method_name)(symbol=symbol),
+            require_rows=True,
+        )
+        matches = sum(str(row.get("REPORT_DATE", ""))[:10] == report_period for row in batch.records)
+        metadata = {
+            "report_period_match_count": matches,
+            "column_count": len(batch.records[0]) if batch.records else 0,
+            "NOTICE_DATE": [row.get("NOTICE_DATE") for row in batch.records if row.get("NOTICE_DATE") is not None],
+            "UPDATE_DATE": [row.get("UPDATE_DATE") for row in batch.records if row.get("UPDATE_DATE") is not None],
+        }
+        return FetchBatch(
+            batch.source,
+            batch.dataset,
+            batch.request,
+            batch.records,
+            batch.fetched_at_utc,
+            batch.source_version,
+            metadata,
+        )
+
+    def fetch_financial_statements(self, symbol: str, report_period: str = "2026-06-30") -> dict[str, FetchBatch]:
+        return {
+            dataset: self.fetch_financial_statement(symbol, dataset, report_period)
+            for dataset in ("balance_sheet", "profit_sheet", "cash_flow_sheet")
+        }
 
     def fetch_cninfo_halfyear_disclosures(self, symbol: str, start_date: str = "20260701", end_date: str = "20260831") -> FetchBatch:
         request = {"symbol": symbol, "market": "沪深京", "category": "半年报", "start_date": start_date, "end_date": end_date}
