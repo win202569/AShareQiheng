@@ -357,6 +357,11 @@ class OrchestratorTestCase(unittest.TestCase):
             "missing_ref",
             "missing_result",
             "wrong_result",
+            "wrong_rows",
+            "wrong_source_version",
+            "wrong_semantic_hash",
+            "extra_field",
+            "nonboolean_created",
         ):
             with self.subTest(failure_mode=failure_mode):
                 data_root = self.base / failure_mode / "data"
@@ -394,19 +399,29 @@ class OrchestratorTestCase(unittest.TestCase):
                     current_key = orchestrator._feature_calendar_job_key(
                         orchestrator._now_cn("2026-08-29T20:00:00+08:00")
                     )
-                    cached_result = {"batches": []}
-                    if failure_mode == "wrong_result":
-                        cached_result["batches"] = [
-                            {
-                                "source": "baostock",
-                                "dataset": "trade_dates",
-                                "request": {
-                                    "start_date": "2026-08-24",
-                                    "end_date": "2026-09-08",
-                                },
-                            }
-                        ]
                     with closing(sqlite3.connect(database)) as connection:
+                        stored = connection.execute(
+                            "SELECT result_json FROM job WHERE idempotency_key=?",
+                            (current_key,),
+                        ).fetchone()
+                        cached_result = json.loads(stored[0])
+                        if failure_mode == "missing_result":
+                            cached_result = {"batches": []}
+                        elif failure_mode == "wrong_result":
+                            cached_result["batches"][0]["request"] = {
+                                "start_date": "2026-08-24",
+                                "end_date": "2026-09-08",
+                            }
+                        elif failure_mode == "wrong_rows":
+                            cached_result["batches"][0]["rows"] = 1
+                        elif failure_mode == "wrong_source_version":
+                            cached_result["batches"][0]["source_version"] = "tampered"
+                        elif failure_mode == "wrong_semantic_hash":
+                            cached_result["batches"][0]["semantic_hash"] = "0" * 64
+                        elif failure_mode == "extra_field":
+                            cached_result["batches"][0]["secret"] = "must-not-leak"
+                        else:
+                            cached_result["batches"][0]["created"] = 1
                         connection.execute(
                             "UPDATE job SET result_json=? WHERE idempotency_key=?",
                             (json.dumps(cached_result), current_key),
@@ -423,6 +438,78 @@ class OrchestratorTestCase(unittest.TestCase):
                         sources=(bao, ak),
                     )
                 self.assertEqual(bao.calls["trade_dates"], 1)
+
+    def test_cached_long_calendar_public_result_is_derived_from_verified_snapshot(self):
+        bao, ak = FakeBaoSource(), FakeAKSource()
+        _, first_code = orchestrator.run_command(
+            self.root,
+            self.root / "state.sqlite3",
+            "bootstrap",
+            online=True,
+            now_cn="2026-08-29T20:00:00+08:00",
+            sources=(bao, ak),
+        )
+        payload, second_code = orchestrator.run_command(
+            self.root,
+            self.root / "state.sqlite3",
+            "incremental",
+            online=True,
+            now_cn="2026-08-29T20:01:00+08:00",
+            sources=(bao, ak),
+        )
+
+        self.assertEqual((first_code, second_code), (0, 0))
+        self.assertEqual(bao.calls["trade_dates"], 1)
+        store = StateStore(self.root / "state.sqlite3")
+        repository = SnapshotRepository(self.root, store)
+        calendar = repository.find_exact(
+            "baostock",
+            "trade_dates",
+            {"start_date": "2021-01-01", "end_date": "2026-09-08"},
+        )
+        verified = repository.read_verified(calendar)
+        semantic_payload = {
+            "source": verified.batch.source,
+            "dataset": verified.batch.dataset,
+            "request": dict(verified.batch.request),
+            "records": list(verified.batch.records),
+            "source_version": verified.batch.source_version,
+            "metadata": dict(verified.batch.metadata),
+        }
+        semantic_hash = hashlib.sha256(
+            json.dumps(
+                semantic_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        cached = next(
+            item
+            for item in payload["source_batches"]
+            if item.get("dataset") == "trade_dates"
+        )
+
+        self.assertEqual(
+            cached,
+            {
+                "source": "baostock",
+                "dataset": "trade_dates",
+                "status": "succeeded",
+                "cached": True,
+                "source_version": verified.batch.source_version,
+                "request": {
+                    "start_date": "2021-01-01",
+                    "end_date": "2026-09-08",
+                },
+                "rows": calendar.row_count,
+                "hash": calendar.payload_hash,
+                "path": calendar.payload_path,
+                "semantic_hash": semantic_hash,
+                "created": False,
+            },
+        )
 
     def test_versioned_calendar_job_rejects_nonexact_or_multiple_batches(self):
         exact = exact_calendar_batch()

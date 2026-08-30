@@ -326,16 +326,39 @@ def _collect_online(
                 ):
                     raise OSError("cached feature calendar result is missing")
                 prior = prior_batches[0]
-                if (
-                    prior.get("source") != "baostock"
-                    or prior.get("dataset") != "trade_dates"
-                    or prior.get("request") != calendar_request
-                    or prior.get("hash") != calendar.payload_hash
-                    or prior.get("path") != calendar.payload_path
-                ):
+                derived = {
+                    "source": calendar.source,
+                    "dataset": calendar.dataset,
+                    "source_version": verified.batch.source_version,
+                    "request": dict(verified.batch.request),
+                    "rows": calendar.row_count,
+                    "hash": calendar.payload_hash,
+                    "path": calendar.payload_path,
+                    "semantic_hash": _hash(
+                        _semantic_batch_payload(verified.batch)
+                    ),
+                    "created": False,
+                }
+                if set(prior) != set(derived) or type(prior.get("created")) is not bool:
                     raise OSError(
                         "cached feature calendar result does not match its snapshot"
                     )
+                for field, expected in derived.items():
+                    if field == "created":
+                        continue
+                    if type(prior.get(field)) is not type(expected) or prior.get(
+                        field
+                    ) != expected:
+                        raise OSError(
+                            "cached feature calendar result does not match its snapshot"
+                        )
+                return [
+                    {
+                        **derived,
+                        "status": "succeeded",
+                        "cached": True,
+                    }
+                ]
             if prior_batches:
                 return [
                     {"source": source, "status": "succeeded", "cached": True, **item}
