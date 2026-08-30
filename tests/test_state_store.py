@@ -1,3 +1,4 @@
+import math
 import sqlite3
 import tempfile
 import threading
@@ -641,6 +642,22 @@ class StateStoreTestCase(unittest.TestCase):
             row,
             (issue_id, None, None, "warning", "mapping_gap", '{"a":[2,1],"message":"缺失","z":1}'),
         )
+
+    def test_record_quality_issue_rejects_nonfinite_details_without_rows(self) -> None:
+        for invalid in (math.nan, math.inf, -math.inf):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.store.record_quality_issue(
+                    run_id=None,
+                    score_run_id=None,
+                    severity="warning",
+                    code="nonfinite_observation",
+                    details={"observed": invalid},
+                )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM quality_issue").fetchone()[0], 0
+            )
 
     def test_duplicate_enqueue_returns_original_job_without_second_row(self) -> None:
         job_id = self.store.enqueue_job("fetch", "source:000001", {"request": "first"})
