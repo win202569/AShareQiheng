@@ -15,7 +15,136 @@ JOB_STATES = {"pending", "running", "succeeded", "retryable_failed", "terminal_f
 SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
 SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
 RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+_V2_TABLE_DDL = {
+    "run": """CREATE TABLE IF NOT EXISTS run (
+        id TEXT PRIMARY KEY, mode TEXT NOT NULL, as_of_cn TEXT NOT NULL,
+        params_json TEXT NOT NULL, status TEXT NOT NULL,
+        error TEXT, started_at TEXT NOT NULL, finished_at TEXT
+    )""",
+    "job": """CREATE TABLE IF NOT EXISTS job (
+        id TEXT PRIMARY KEY, kind TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+        payload_json TEXT NOT NULL, status TEXT NOT NULL,
+        lease_worker TEXT, lease_expires_at TEXT, next_retry_at TEXT,
+        result_json TEXT, last_error_json TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        CHECK (status IN ('pending','running','succeeded','retryable_failed','terminal_failed'))
+    )""",
+    "artifact": """CREATE TABLE IF NOT EXISTS artifact (
+        id TEXT PRIMARY KEY, run_id TEXT REFERENCES run(id), kind TEXT NOT NULL,
+        payload_hash TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(run_id, kind, payload_hash)
+    )""",
+    "source_snapshot": """CREATE TABLE IF NOT EXISTS source_snapshot (
+        id TEXT PRIMARY KEY, source TEXT NOT NULL, dataset TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL, payload_hash TEXT NOT NULL,
+        payload_path TEXT NOT NULL, row_count INTEGER NOT NULL, fetched_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(source, dataset, request_fingerprint, payload_hash)
+    )""",
+    "score_run": """CREATE TABLE IF NOT EXISTS score_run (
+        id TEXT PRIMARY KEY, report_period TEXT NOT NULL, as_of_cn TEXT NOT NULL,
+        ruleset_hash TEXT NOT NULL, universe_hash TEXT NOT NULL, mode TEXT NOT NULL,
+        status TEXT NOT NULL, created_at TEXT NOT NULL, finalized_at TEXT,
+        cutoff_utc TEXT, market_ready INTEGER, quality_passed INTEGER,
+        market_evidence_json TEXT, quality_evidence_json TEXT,
+        CHECK (status IN ('provisional','final','invalidated'))
+    )""",
+    "score_item": """CREATE TABLE IF NOT EXISTS score_item (
+        score_run_id TEXT NOT NULL REFERENCES score_run(id), security_id TEXT NOT NULL,
+        state TEXT NOT NULL, coverage REAL NOT NULL, input_hash TEXT NOT NULL,
+        scores_json TEXT, reasons_json TEXT NOT NULL, updated_at TEXT NOT NULL,
+        PRIMARY KEY(score_run_id, security_id),
+        CHECK (state IN ('pending','partial','ready','blocked','final')),
+        CHECK (coverage >= 0 AND coverage <= 1)
+    )""",
+    "quality_issue": """CREATE TABLE IF NOT EXISTS quality_issue (
+        id TEXT PRIMARY KEY, run_id TEXT REFERENCES run(id), score_run_id TEXT REFERENCES score_run(id),
+        severity TEXT NOT NULL, code TEXT NOT NULL, details_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""",
+}
+
+_V2_INDEX_DDL = {
+    "job_lease_idx": "CREATE INDEX IF NOT EXISTS job_lease_idx ON job(kind, status, next_retry_at)",
+}
+
+_MIGRATION_TABLE_DDL = """CREATE TABLE IF NOT EXISTS schema_migration(
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+)"""
+
+_V3_TABLE_DDL = {
+    "financial_fact": """CREATE TABLE IF NOT EXISTS financial_fact(
+        id TEXT PRIMARY KEY,
+        security_id TEXT NOT NULL,
+        statement TEXT NOT NULL CHECK(statement IN('income','balance','cash_flow')),
+        metric_key TEXT NOT NULL,
+        period_start TEXT,
+        period_end TEXT NOT NULL,
+        period_kind TEXT NOT NULL CHECK(period_kind IN('FY','H1','Q1','Q3','OTHER')),
+        value REAL NOT NULL CHECK(value BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308),
+        unit TEXT NOT NULL CHECK(unit IN('CNY','shares','ratio','CNY_per_share')),
+        nature TEXT NOT NULL CHECK(nature IN('instant','duration')),
+        announced_at_utc TEXT NOT NULL,
+        effective_at_utc TEXT NOT NULL,
+        source_updated_at_utc TEXT,
+        source_snapshot_id TEXT NOT NULL REFERENCES source_snapshot(id),
+        source_field TEXT NOT NULL,
+        raw_row_hash TEXT NOT NULL,
+        mapping_version TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK((nature='instant' AND period_start IS NULL) OR
+              (nature='duration' AND period_start IS NOT NULL))
+    )""",
+    "feature_set": """CREATE TABLE IF NOT EXISTS feature_set(
+        id TEXT PRIMARY KEY,
+        security_id TEXT NOT NULL,
+        report_period TEXT NOT NULL,
+        as_of_utc TEXT NOT NULL,
+        candidate_set_hash TEXT NOT NULL,
+        template_id TEXT NOT NULL,
+        template_version TEXT NOT NULL,
+        contract_version TEXT NOT NULL,
+        input_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN('partial','financial_ready','blocked')),
+        financial_coverage REAL NOT NULL CHECK(financial_coverage>=0 AND financial_coverage<=1),
+        dimension_status_json TEXT NOT NULL,
+        confidence_inputs_json TEXT NOT NULL,
+        blockers_json TEXT NOT NULL,
+        bundle_hash TEXT NOT NULL UNIQUE,
+        bundle_path TEXT NOT NULL,
+        missing_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(security_id,report_period,as_of_utc,input_hash)
+    )""",
+    "feature_value": """CREATE TABLE IF NOT EXISTS feature_value(
+        feature_set_id TEXT NOT NULL REFERENCES feature_set(id) ON DELETE CASCADE,
+        dimension TEXT NOT NULL CHECK(dimension IN('G','V','M','EQ','FS','CA','T')),
+        feature_key TEXT NOT NULL,
+        period_key TEXT NOT NULL,
+        value REAL,
+        unit TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN('observed','derived','missing','not_applicable','blocked')),
+        formula_version TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        missing_reason TEXT,
+        PRIMARY KEY(feature_set_id,dimension,feature_key,period_key),
+        CHECK(value IS NULL OR value BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308),
+        CHECK((status IN('observed','derived') AND value IS NOT NULL AND missing_reason IS NULL)
+           OR (status IN('missing','not_applicable','blocked') AND value IS NULL AND missing_reason IS NOT NULL))
+    )""",
+}
+
+_V3_INDEX_DDL = {
+    "financial_fact_lookup_idx": """CREATE INDEX IF NOT EXISTS financial_fact_lookup_idx
+        ON financial_fact(security_id,metric_key,period_end,effective_at_utc)""",
+    "financial_fact_snapshot_idx": """CREATE INDEX IF NOT EXISTS financial_fact_snapshot_idx
+        ON financial_fact(source_snapshot_id)""",
+    "feature_set_latest_idx": """CREATE INDEX IF NOT EXISTS feature_set_latest_idx
+        ON feature_set(security_id,report_period,contract_version,as_of_utc DESC,created_at DESC)""",
+}
 
 
 class FinalizationBlocked(RuntimeError):
@@ -69,69 +198,114 @@ class StateStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._connect()
         try:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS run (
-                    id TEXT PRIMARY KEY, mode TEXT NOT NULL, as_of_cn TEXT NOT NULL,
-                    params_json TEXT NOT NULL, status TEXT NOT NULL,
-                    error TEXT, started_at TEXT NOT NULL, finished_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS job (
-                    id TEXT PRIMARY KEY, kind TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
-                    payload_json TEXT NOT NULL, status TEXT NOT NULL,
-                    lease_worker TEXT, lease_expires_at TEXT, next_retry_at TEXT,
-                    result_json TEXT, last_error_json TEXT,
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    CHECK (status IN ('pending','running','succeeded','retryable_failed','terminal_failed'))
-                );
-                CREATE INDEX IF NOT EXISTS job_lease_idx ON job(kind, status, next_retry_at);
-                CREATE TABLE IF NOT EXISTS artifact (
-                    id TEXT PRIMARY KEY, run_id TEXT REFERENCES run(id), kind TEXT NOT NULL,
-                    payload_hash TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL,
-                    UNIQUE(run_id, kind, payload_hash)
-                );
-                CREATE TABLE IF NOT EXISTS source_snapshot (
-                    id TEXT PRIMARY KEY, source TEXT NOT NULL, dataset TEXT NOT NULL,
-                    request_fingerprint TEXT NOT NULL, payload_hash TEXT NOT NULL,
-                    payload_path TEXT NOT NULL, row_count INTEGER NOT NULL, fetched_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(source, dataset, request_fingerprint, payload_hash)
-                );
-                CREATE TABLE IF NOT EXISTS score_run (
-                    id TEXT PRIMARY KEY, report_period TEXT NOT NULL, as_of_cn TEXT NOT NULL,
-                    ruleset_hash TEXT NOT NULL, universe_hash TEXT NOT NULL, mode TEXT NOT NULL,
-                    status TEXT NOT NULL, created_at TEXT NOT NULL, finalized_at TEXT,
-                    cutoff_utc TEXT, market_ready INTEGER, quality_passed INTEGER,
-                    market_evidence_json TEXT, quality_evidence_json TEXT,
-                    CHECK (status IN ('provisional','final','invalidated'))
-                );
-                CREATE TABLE IF NOT EXISTS score_item (
-                    score_run_id TEXT NOT NULL REFERENCES score_run(id), security_id TEXT NOT NULL,
-                    state TEXT NOT NULL, coverage REAL NOT NULL, input_hash TEXT NOT NULL,
-                    scores_json TEXT, reasons_json TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    PRIMARY KEY(score_run_id, security_id),
-                    CHECK (state IN ('pending','partial','ready','blocked','final')),
-                    CHECK (coverage >= 0 AND coverage <= 1)
-                );
-                CREATE TABLE IF NOT EXISTS quality_issue (
-                    id TEXT PRIMARY KEY, run_id TEXT REFERENCES run(id), score_run_id TEXT REFERENCES score_run(id),
-                    severity TEXT NOT NULL, code TEXT NOT NULL, details_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                """
-            )
-            existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(score_run)")}
-            for name, definition in (
-                ("cutoff_utc", "TEXT"),
-                ("market_ready", "INTEGER"),
-                ("quality_passed", "INTEGER"),
-                ("market_evidence_json", "TEXT"),
-                ("quality_evidence_json", "TEXT"),
-            ):
-                if name not in existing_columns:
-                    connection.execute(f"ALTER TABLE score_run ADD COLUMN {name} {definition}")
+            connection.execute("BEGIN IMMEDIATE")
+            tables = self._user_tables(connection)
+            if not tables:
+                self._create_v2_schema(connection)
+                connection.execute(_MIGRATION_TABLE_DDL)
+                connection.execute(
+                    "INSERT INTO schema_migration(version, applied_at) VALUES (2, ?)",
+                    (_utc_now(),),
+                )
+                self._apply_v3_migration(connection)
+            elif "schema_migration" not in tables:
+                if tables != set(_V2_TABLE_DDL):
+                    raise RuntimeError("database does not match the complete v2 schema")
+                self._assert_v2_schema(connection)
+                connection.execute(_MIGRATION_TABLE_DDL)
+                connection.execute(
+                    "INSERT INTO schema_migration(version, applied_at) VALUES (2, ?)",
+                    (_utc_now(),),
+                )
+                self._apply_v3_migration(connection)
+            else:
+                self._assert_schema_ddl(
+                    connection,
+                    {"schema_migration": _MIGRATION_TABLE_DDL},
+                    {},
+                    "migration ledger",
+                )
+                versions = {
+                    int(row[0])
+                    for row in connection.execute("SELECT version FROM schema_migration")
+                }
+                if versions not in ({2}, {2, 3}):
+                    raise RuntimeError(f"unsupported migration versions: {sorted(versions)}")
+                self._assert_v2_schema(connection)
+                if versions == {2}:
+                    partial_v3_tables = tables & set(_V3_TABLE_DDL)
+                    if partial_v3_tables:
+                        raise RuntimeError(
+                            f"version-2 ledger has unexpected v3 tables: {sorted(partial_v3_tables)}"
+                        )
+                    self._apply_v3_migration(connection)
+                else:
+                    self._assert_schema_ddl(
+                        connection,
+                        _V3_TABLE_DDL,
+                        _V3_INDEX_DDL,
+                        "v3 schema",
+                    )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _user_tables(connection: sqlite3.Connection) -> set[str]:
+        return {
+            str(row[0])
+            for row in connection.execute(
+                """SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"""
+            )
+        }
+
+    @staticmethod
+    def _normalized_ddl(sql: str) -> str:
+        normalized = "".join(sql.lower().split()).rstrip(";")
+        return normalized.replace("createtableifnotexists", "createtable").replace(
+            "createindexifnotexists", "createindex"
+        )
+
+    @classmethod
+    def _assert_schema_ddl(
+        cls,
+        connection: sqlite3.Connection,
+        table_ddl: dict[str, str],
+        index_ddl: dict[str, str],
+        label: str,
+    ) -> None:
+        for object_type, definitions in (("table", table_ddl), ("index", index_ddl)):
+            for name, expected_sql in definitions.items():
+                row = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = ? AND name = ?",
+                    (object_type, name),
+                ).fetchone()
+                if row is None or row[0] is None:
+                    raise RuntimeError(f"{label} is missing {object_type} {name}")
+                if cls._normalized_ddl(str(row[0])) != cls._normalized_ddl(expected_sql):
+                    raise RuntimeError(f"{label} does not exactly match {object_type} {name}")
+
+    @classmethod
+    def _create_v2_schema(cls, connection: sqlite3.Connection) -> None:
+        for statement in (*_V2_TABLE_DDL.values(), *_V2_INDEX_DDL.values()):
+            connection.execute(statement)
+
+    @classmethod
+    def _assert_v2_schema(cls, connection: sqlite3.Connection) -> None:
+        cls._assert_schema_ddl(connection, _V2_TABLE_DDL, _V2_INDEX_DDL, "v2 schema")
+
+    @classmethod
+    def _apply_v3_migration(cls, connection: sqlite3.Connection) -> None:
+        for statement in (*_V3_TABLE_DDL.values(), *_V3_INDEX_DDL.values()):
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO schema_migration(version, applied_at) VALUES (3, ?)",
+            (_utc_now(),),
+        )
 
     def start_run(self, mode: str, as_of_cn: str, params: dict) -> str:
         run_id = str(uuid.uuid4())

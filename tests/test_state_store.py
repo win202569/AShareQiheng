@@ -33,6 +33,242 @@ class StateStoreTestCase(unittest.TestCase):
             "2026-06-30", "2026-08-31T08:00:00+08:00", "rules-v1", "universe-v1", "incremental"
         )
 
+    @staticmethod
+    def insert_feature_set(
+        connection: sqlite3.Connection,
+        *,
+        feature_set_id: str = "feature-set-1",
+        status: str = "partial",
+        coverage: float = 0.5,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO feature_set (
+            id, security_id, report_period, as_of_utc, candidate_set_hash,
+            template_id, template_version, contract_version, input_hash,
+            status, financial_coverage, dimension_status_json,
+            confidence_inputs_json, blockers_json, bundle_hash, bundle_path,
+            missing_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                feature_set_id,
+                "SH600001",
+                "2026-06-30",
+                utc_at(0),
+                "candidate-hash-1",
+                "general",
+                "template-v1",
+                "contract-v1",
+                f"input-{feature_set_id}",
+                status,
+                coverage,
+                "{}",
+                "{}",
+                "[]",
+                f"bundle-{feature_set_id}",
+                f"data/curated/formal_features/{feature_set_id}.json",
+                "[]",
+                utc_at(1),
+            ),
+        )
+
+    def test_initialize_migrates_literal_v2_database_to_v3_without_changing_existing_rows(self) -> None:
+        legacy_path = Path(self.tempdir.name) / "legacy.sqlite3"
+        schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
+        ordered_tables = {
+            "run": "id",
+            "source_snapshot": "id",
+            "job": "id",
+            "score_run": "id",
+            "score_item": "score_run_id, security_id",
+            "quality_issue": "id",
+            "artifact": "id",
+        }
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.executescript(schema_sql)
+            connection.execute(
+                "INSERT INTO run VALUES (?,?,?,?,?,?,?,?)",
+                ("run-1", "incremental", utc_at(0), "{}", "succeeded", None, utc_at(0), utc_at(1)),
+            )
+            connection.execute(
+                "INSERT INTO source_snapshot VALUES (?,?,?,?,?,?,?,?,?)",
+                ("snapshot-1", "provider", "daily", "request-1", "payload-1", "raw/1.json", 1, utc_at(0), utc_at(1)),
+            )
+            connection.execute(
+                "INSERT INTO job VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("job-1", "fetch", "fetch:1", "{}", "succeeded", None, None, None, "{}", None, utc_at(0), utc_at(1)),
+            )
+            connection.execute(
+                "INSERT INTO score_run VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("score-1", "2026-06-30", utc_at(0), "rules-1", "universe-1", "incremental", "final", utc_at(0), utc_at(1), utc_at(0), 1, 1, "{}", "{}"),
+            )
+            connection.execute(
+                "INSERT INTO score_item VALUES (?,?,?,?,?,?,?,?)",
+                ("score-1", "SH600001", "final", 1.0, "input-1", '{"total":90}', "[]", utc_at(1)),
+            )
+            connection.execute(
+                "INSERT INTO quality_issue VALUES (?,?,?,?,?,?,?)",
+                ("issue-1", "run-1", "score-1", "warning", "fixture", "{}", utc_at(1)),
+            )
+            connection.execute(
+                "INSERT INTO artifact VALUES (?,?,?,?,?,?)",
+                ("artifact-1", "run-1", "export", "artifact-hash-1", "exports/1.json", utc_at(1)),
+            )
+            connection.commit()
+            before = {
+                table: connection.execute(f"SELECT * FROM {table} ORDER BY {order_by}").fetchall()
+                for table, order_by in ordered_tables.items()
+            }
+
+        StateStore(legacy_path).initialize()
+
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            for table, order_by in ordered_tables.items():
+                self.assertEqual(
+                    connection.execute(f"SELECT * FROM {table} ORDER BY {order_by}").fetchall(),
+                    before[table],
+                    table,
+                )
+            self.assertEqual(
+                connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
+                [(2,), (3,)],
+            )
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+        self.assertTrue({"financial_fact", "feature_set", "feature_value"} <= tables)
+
+        with self.assertRaises(ValueError):
+            StateStore(legacy_path).upsert_score_item(
+                "score-1", "SH600001", "ready", 1.0, "changed", {"total": 91}, []
+            )
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT * FROM score_item ORDER BY score_run_id, security_id"
+                ).fetchall(),
+                before["score_item"],
+            )
+
+    def test_initialize_twice_keeps_one_complete_v3_schema_and_ledger(self) -> None:
+        self.store.initialize()
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
+                [(2,), (3,)],
+            )
+            counts = dict(
+                connection.execute(
+                    """SELECT name, COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name IN ('financial_fact','feature_set','feature_value')
+                    GROUP BY name"""
+                )
+            )
+        self.assertEqual(counts, {"financial_fact": 1, "feature_set": 1, "feature_value": 1})
+
+    def test_initialize_rejects_partial_v2_database_without_creating_ledger(self) -> None:
+        corrupt_path = Path(self.tempdir.name) / "partial.sqlite3"
+        with closing(sqlite3.connect(corrupt_path)) as connection:
+            connection.execute("CREATE TABLE run (id TEXT PRIMARY KEY)")
+            connection.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "v2 schema"):
+            StateStore(corrupt_path).initialize()
+
+        with closing(sqlite3.connect(corrupt_path)) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+        self.assertEqual(tables, {"run"})
+
+    def test_initialize_rejects_migration_ledgers_other_than_two_or_two_three(self) -> None:
+        schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
+        for index, versions in enumerate(((3,), (2, 4), (2, 3, 4))):
+            with self.subTest(versions=versions):
+                legacy_path = Path(self.tempdir.name) / f"invalid-ledger-{index}.sqlite3"
+                with closing(sqlite3.connect(legacy_path)) as connection:
+                    connection.executescript(schema_sql)
+                    connection.execute(
+                        "CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+                    )
+                    connection.executemany(
+                        "INSERT INTO schema_migration VALUES (?, ?)",
+                        ((version, utc_at(version)) for version in versions),
+                    )
+                    connection.commit()
+
+                with self.assertRaisesRegex(RuntimeError, "migration versions"):
+                    StateStore(legacy_path).initialize()
+
+    def test_initialize_applies_v3_when_migration_ledger_contains_only_v2(self) -> None:
+        legacy_path = Path(self.tempdir.name) / "ledger-v2.sqlite3"
+        schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.executescript(schema_sql)
+            connection.execute(
+                "CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO schema_migration VALUES (2, ?)", (utc_at(2),))
+            connection.commit()
+
+        StateStore(legacy_path).initialize()
+
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
+                [(2,), (3,)],
+            )
+
+    def test_v3_foreign_keys_reject_missing_snapshot_and_feature_set(self) -> None:
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """INSERT INTO financial_fact VALUES
+                    (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        "fact-1", "SH600001", "income", "revenue", utc_at(0),
+                        "2026-06-30", "H1", 100.0, "CNY", "duration", utc_at(0),
+                        utc_at(0), None, "missing-snapshot", "revenue", "raw-hash-1",
+                        "mapping-v1", utc_at(1),
+                    ),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO feature_value VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    ("missing-set", "G", "revenue_growth", "FY0", 0.1, "ratio", "observed", "v1", "[]", None),
+                )
+
+    def test_v3_rejects_invalid_feature_status_and_dimension(self) -> None:
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.insert_feature_set(connection, feature_set_id="bad-header", status="ready")
+            self.insert_feature_set(connection)
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO feature_value VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    ("feature-set-1", "X", "growth", "FY0", 0.1, "ratio", "observed", "v1", "[]", None),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO feature_value VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    ("feature-set-1", "G", "growth", "FY0", None, "ratio", "unknown", "v1", "[]", "invalid"),
+                )
+
+    def test_v3_rejects_feature_coverage_outside_closed_unit_interval(self) -> None:
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            for index, coverage in enumerate((-0.01, 1.01)):
+                with self.subTest(coverage=coverage):
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        self.insert_feature_set(
+                            connection,
+                            feature_set_id=f"coverage-{index}",
+                            coverage=coverage,
+                        )
+
     def test_duplicate_enqueue_returns_original_job_without_second_row(self) -> None:
         job_id = self.store.enqueue_job("fetch", "source:000001", {"request": "first"})
         repeated_id = self.store.enqueue_job("fetch", "source:000001", {"request": "changed"})
