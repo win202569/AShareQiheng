@@ -245,6 +245,50 @@ class DimensionInput:
         )
 
 
+def financial_projection_values(
+    dimension_inputs: Mapping[str, DimensionInput],
+) -> tuple[tuple[str, FeatureValue], ...]:
+    """Return the globally recognized financial namespace across all dimensions."""
+    from .financial_formulas import (
+        DERIVED_FORMULA_SPECS,
+        DERIVED_FORMULA_VERSION,
+    )
+    from .financial_schema import raw_financial_slot_descriptor
+    from .industry_templates import TEMPLATES
+
+    raw_metrics = frozenset(
+        slot
+        for template in TEMPLATES.values()
+        for slot in template.financial_slots
+    )
+    raw_versions = frozenset(
+        raw_financial_slot_descriptor(metric).formula_version
+        for metric in raw_metrics
+    )
+    formula_slots = frozenset(
+        (spec.metric_key, spec.period_key) for spec in DERIVED_FORMULA_SPECS
+    )
+    financial_versions = raw_versions | {DERIVED_FORMULA_VERSION}
+    recognized: list[tuple[str, FeatureValue]] = []
+    for dimension_name in DIMENSIONS:
+        for value in dimension_inputs[dimension_name].values:
+            parts = value.key.split(".")
+            metric_key = parts[1] if len(parts) == 3 else None
+            registered_alias = (
+                metric_key in raw_metrics
+                and value.period_key in FINANCIAL_PERIOD_KEYS
+            )
+            formula_alias = (metric_key, value.period_key) in formula_slots
+            if (
+                dimension_name in FINANCIAL_DIMENSIONS
+                or value.formula_version in financial_versions
+                or registered_alias
+                or formula_alias
+            ):
+                recognized.append((dimension_name, value))
+    return tuple(recognized)
+
+
 @dataclass(frozen=True)
 class IndustryContext:
     source: str
@@ -485,15 +529,12 @@ class FeatureBundle:
                 identity = (spec.dimension, spec.canonical_key, spec.period_key)
                 expected_projection[identity] = ("formula", spec)
 
+        supplied_entries = financial_projection_values(self.dimension_inputs)
         supplied_projection = {
             (dimension_name, value.key, value.period_key): value
-            for dimension_name in FINANCIAL_DIMENSIONS
-            for value in self.dimension_inputs[dimension_name].values
+            for dimension_name, value in supplied_entries
         }
-        supplied_count = sum(
-            len(self.dimension_inputs[dimension_name].values)
-            for dimension_name in FINANCIAL_DIMENSIONS
-        )
+        supplied_count = len(supplied_entries)
         if (
             supplied_count != len(expected_projection)
             or set(supplied_projection) != set(expected_projection)

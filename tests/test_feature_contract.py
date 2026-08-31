@@ -61,6 +61,46 @@ def real_unclassified_bundle():
     return build_bundle_with_overrides(source_industry_name="不存在行业")
 
 
+def copy_financial_value_into_dimension_payload(
+    payload,
+    target_dimension,
+    *,
+    source_payload=None,
+    source_dimension="M",
+    feature_key="m.gross_profit.FY2021",
+):
+    source = source_payload or payload
+    copied = copy.deepcopy(next(
+        value
+        for value in source["dimension_inputs"][source_dimension]["values"]
+        if value["key"] == feature_key
+    ))
+    payload["dimension_inputs"][target_dimension] = {
+        "status": "input_ready",
+        "values": [copied],
+    }
+    return payload
+
+
+def bundle_with_copied_financial_value(
+    candidate,
+    target_dimension,
+    *,
+    source_dimension="M",
+    feature_key="m.gross_profit.FY2021",
+):
+    copied = next(
+        value
+        for value in candidate.dimension_inputs[source_dimension].values
+        if value.key == feature_key
+    )
+    forged = copy.copy(candidate)
+    forged_dimensions = dict(candidate.dimension_inputs)
+    forged_dimensions[target_dimension] = DimensionInput("input_ready", (copied,))
+    object.__setattr__(forged, "dimension_inputs", forged_dimensions)
+    return forged
+
+
 def retag_missing_revenue_slot(payload, attack):
     dimensions = payload["dimension_inputs"]
     target = next(
@@ -379,6 +419,29 @@ class FeatureContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "financial projection"):
                     FeatureBundle.from_dict(payload)
 
+    def test_public_parse_rejects_financial_projection_copies_in_v_and_t(self):
+        sources = (
+            ("formula", "M", "m.gross_profit.FY2021"),
+            ("raw", "G", "g.revenue.FY2021"),
+        )
+        for case, source_dimension, feature_key in sources:
+            for target_dimension in ("V", "T"):
+                with self.subTest(
+                    case=case, target_dimension=target_dimension
+                ):
+                    payload = copy_financial_value_into_dimension_payload(
+                        real_general_ready_bundle().to_dict(),
+                        target_dimension,
+                        source_dimension=source_dimension,
+                        feature_key=feature_key,
+                    )
+                    with self.assertRaisesRegex(ValueError, "financial projection"):
+                        FeatureBundle.from_dict(payload)
+
+        restored = FeatureBundle.from_dict(bundle().to_dict())
+        self.assertEqual(restored.dimension_inputs["V"].values[0].key, "v.market_cap")
+        self.assertEqual(restored.dimension_inputs["T"].values[0].key, "t.sample")
+
     def test_exact_formula_set_applies_to_partial_and_blocked_common_templates(self):
         from tests.test_financial_features import build_bundle_with_overrides
 
@@ -435,6 +498,21 @@ class FeatureContractTests(unittest.TestCase):
                 }
                 with self.assertRaisesRegex(ValueError, "financial projection"):
                     FeatureBundle.from_dict(payload)
+
+    def test_no_output_templates_reject_financial_formula_values_in_v_and_t(self):
+        financial_source = real_general_ready_bundle().to_dict()
+        for industry_name in ("银行", "不存在行业"):
+            for target_dimension in ("V", "T"):
+                with self.subTest(
+                    industry=industry_name, target_dimension=target_dimension
+                ):
+                    payload = copy_financial_value_into_dimension_payload(
+                        real_specialized_bundle(industry_name).to_dict(),
+                        target_dimension,
+                        source_payload=financial_source,
+                    )
+                    with self.assertRaisesRegex(ValueError, "financial projection"):
+                        FeatureBundle.from_dict(payload)
 
     def test_public_parse_rejects_registered_raw_slot_retag_substitutions(self):
         attacks = (

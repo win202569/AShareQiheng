@@ -36,7 +36,10 @@ from ashare_pipeline.snapshot_store import SnapshotStore
 from ashare_pipeline.sources import FetchBatch, SourceBlocked
 from ashare_pipeline.state_store import StateStore
 from ashare_pipeline import orchestrator
-from tests.test_feature_contract import retag_missing_revenue_slot
+from tests.test_feature_contract import (
+    bundle_with_copied_financial_value,
+    retag_missing_revenue_slot,
+)
 from tests.test_financial_features import build_bundle_with_overrides, rebuild_fact
 from tests.test_state_store import installed_ready_bundle
 
@@ -1357,6 +1360,70 @@ class OrchestratorTestCase(unittest.TestCase):
             status["deep"]["feature_set_counts"],
             {"partial": 0, "financial_ready": 0, "blocked": 0},
         )
+        self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
+
+    def test_progress_rejects_newest_financial_formula_copy_in_t_without_fallback(self):
+        store, newer, newer_path, _newer_hash, newer_id = self.install_ready_history(
+            "formula-copy-t"
+        )
+        forged = bundle_with_copied_financial_value(newer, "T")
+        forged_bytes = forged.canonical_bytes()
+        forged_hash = forged.bundle_hash()
+        copied = forged.dimension_inputs["T"].values[0]
+        (self.base / newer_path).write_bytes(forged_bytes)
+        dimension_status_json = canonical_json_bytes({
+            dimension: forged.dimension_inputs[dimension].status
+            for dimension in DIMENSIONS
+        }).decode("utf-8")
+        evidence_json = canonical_json_bytes(
+            [evidence.to_dict() for evidence in copied.evidence]
+        ).decode("utf-8")
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            connection.execute(
+                "UPDATE feature_set SET bundle_hash=?,dimension_status_json=? WHERE id=?",
+                (forged_hash, dimension_status_json, newer_id),
+            )
+            cursor = connection.execute(
+                """INSERT INTO feature_value
+                (feature_set_id,dimension,feature_key,period_key,value,unit,status,
+                 formula_version,evidence_json,missing_reason)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    newer_id,
+                    "T",
+                    copied.key,
+                    copied.period_key,
+                    copied.value,
+                    copied.unit,
+                    copied.status,
+                    copied.formula_version,
+                    evidence_json,
+                    copied.missing_reason,
+                ),
+            )
+            self.assertEqual(cursor.rowcount, 1)
+            connection.commit()
+        self.assertEqual((self.base / newer_path).read_bytes(), forged_bytes)
+
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(status["deep"]["template_counts"], {})
+        self.assertEqual(status["deep"]["missing_reason_counts"], {})
         self.assertEqual(status["deep"]["unknown_failure_count"], 1)
         self.assertFalse(status["formal_score_ready"])
         self.assertFalse(status["seven_dimension_ready"])

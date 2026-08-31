@@ -27,6 +27,7 @@ from tests.test_financial_features import (
     complete_general_facts,
     rebuild_fact,
 )
+from tests.test_feature_contract import bundle_with_copied_financial_value
 
 
 UTC = timezone.utc
@@ -914,6 +915,55 @@ class StateStoreTestCase(unittest.TestCase):
                         connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
                         0,
                     )
+
+    def test_first_persistence_rejects_financial_formula_copy_in_t(self) -> None:
+        honest, _facts, _snapshots = self.installed_ready_bundle(
+            self.store, snapshot_tag="formula-copy-first"
+        )
+        forged = bundle_with_copied_financial_value(honest, "T")
+
+        with self.assertRaisesRegex(ValueError, "financial projection"):
+            self.store.put_feature_bundle(
+                forged,
+                bundle_path=(
+                    "data/curated/formal_features/2026-06-30/SH600001/"
+                    "formula-copy-first.json"
+                ),
+                bundle_hash=forged.bundle_hash(),
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                0,
+            )
+
+    def test_evidence_authority_rejects_financial_formula_aliases_in_v_and_t(self) -> None:
+        honest, _facts, _snapshots = self.installed_ready_bundle(
+            self.store, snapshot_tag="formula-copy-evidence"
+        )
+        sources = (
+            ("formula", "M", "m.gross_profit.FY2021"),
+            ("raw", "G", "g.revenue.FY2021"),
+        )
+        for case, source_dimension, feature_key in sources:
+            for target_dimension in ("V", "T"):
+                with self.subTest(
+                    case=case, target_dimension=target_dimension
+                ):
+                    forged = bundle_with_copied_financial_value(
+                        honest,
+                        target_dimension,
+                        source_dimension=source_dimension,
+                        feature_key=feature_key,
+                    )
+                    with self.store._transaction() as connection:
+                        with self.assertRaisesRegex(
+                            ValueError, "financial projection"
+                        ):
+                            self.store._validate_feature_bundle_evidence(
+                                connection, forged
+                            )
 
     def test_idempotent_put_reauthenticates_derived_numeric_projection(self) -> None:
         honest, _facts, _snapshots = self.installed_ready_bundle(

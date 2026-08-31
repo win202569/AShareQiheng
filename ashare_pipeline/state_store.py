@@ -13,9 +13,11 @@ from typing import Iterable, Iterator, Mapping, Sequence
 
 from ashare_pipeline.feature_contract import (
     DIMENSIONS,
+    FINANCIAL_DIMENSIONS,
     FINANCIAL_PERIODS,
     EvidenceRef,
     FeatureBundle,
+    financial_projection_values,
 )
 from ashare_pipeline.financial_formulas import (
     DERIVED_FORMULA_SPECS,
@@ -809,6 +811,19 @@ class StateStore:
         connection: sqlite3.Connection,
         bundle: FeatureBundle,
     ) -> None:
+        from ashare_pipeline.industry_templates import TEMPLATES
+
+        projection_entries = financial_projection_values(bundle.dimension_inputs)
+        template = TEMPLATES[bundle.industry.template_id]
+        if (
+            (not template.financial_slots and projection_entries)
+            or any(
+                dimension_name not in FINANCIAL_DIMENSIONS
+                for dimension_name, _value in projection_entries
+            )
+        ):
+            raise ValueError("financial projection has a noncanonical container")
+
         evidence_by_id: dict[str, EvidenceRef] = {}
         for dimension in bundle.dimension_inputs.values():
             for value in dimension.values:
@@ -924,8 +939,7 @@ class StateStore:
         }
         formula_values = {
             (dimension_name, value.key, value.period_key): value
-            for dimension_name, dimension in bundle.dimension_inputs.items()
-            for value in dimension.values
+            for dimension_name, value in projection_entries
             if (dimension_name, value.key, value.period_key) in formula_identities
         }
         if formula_values:
