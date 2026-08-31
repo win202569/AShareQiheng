@@ -387,6 +387,7 @@ class FeatureBundle:
         self.validate()
 
     def validate(self) -> None:
+        from .financial_schema import raw_financial_slot_descriptor
         from .industry_templates import TEMPLATES
 
         if (
@@ -469,28 +470,47 @@ class FeatureBundle:
                 raise ValueError(
                     "financial_ready requires complete applicable financial dimensions"
                 )
-            registered_slot_periods = {
-                (slot, period_key)
+            descriptors = {
+                slot: raw_financial_slot_descriptor(slot)
                 for slot in template.financial_slots
+            }
+            registered_slot_periods = {
+                (descriptor.metric_key, period_key)
+                for descriptor in descriptors.values()
                 for period_key in FINANCIAL_PERIOD_KEYS
             }
             supplied_slot_periods: list[tuple[str, str]] = []
+            supplied_fact_ids: list[str] = []
             for dimension_name, dimension in financial_inputs.items():
                 for value in dimension.values:
                     parts = value.key.split(".")
-                    if (
+                    if not (
                         len(parts) == 3
-                        and parts[0] == dimension_name.lower()
-                        and parts[1] in template.financial_slots
+                        and parts[1] in descriptors
                         and parts[2] == value.period_key
                         and value.period_key in FINANCIAL_PERIOD_KEYS
-                        and value.status in {"observed", "derived"}
                     ):
-                        supplied_slot_periods.append((parts[1], value.period_key))
+                        continue
+                    descriptor = descriptors[parts[1]]
+                    if (
+                        dimension_name != descriptor.dimension
+                        or value.key != descriptor.canonical_key(value.period_key)
+                        or value.status not in descriptor.allowed_statuses
+                        or value.formula_version != descriptor.formula_version
+                        or value.unit != descriptor.unit
+                        or len(value.evidence) != 1
+                        or value.evidence[0].source_field not in descriptor.source_fields
+                    ):
+                        raise ValueError(
+                            "registered raw financial slot has noncanonical metadata"
+                        )
+                    supplied_slot_periods.append((parts[1], value.period_key))
+                    supplied_fact_ids.append(value.evidence[0].financial_fact_id)
             if (
                 not registered_slot_periods
                 or len(supplied_slot_periods) != len(registered_slot_periods)
                 or set(supplied_slot_periods) != registered_slot_periods
+                or len(supplied_fact_ids) != len(set(supplied_fact_ids))
             ):
                 raise ValueError(
                     "financial_ready requires every registered slot for every financial period"

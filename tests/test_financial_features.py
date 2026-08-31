@@ -24,7 +24,11 @@ from ashare_pipeline.financial_features import (
     symmetric_growth,
     trading_days_from_batch,
 )
-from ashare_pipeline.financial_schema import FinancialFact, MAPPING_VERSION
+from ashare_pipeline.financial_schema import (
+    FinancialFact,
+    MAPPING_VERSION,
+    raw_financial_slot_descriptor,
+)
 from ashare_pipeline.industry_templates import TEMPLATE_VERSION, resolve_template
 from ashare_pipeline.sources import FetchBatch
 
@@ -67,6 +71,7 @@ CASH_FLOW_METRICS = {
 
 
 def bundle_fact(metric_key: str, period_end: str, value: float, *, serial: int = 0) -> FinancialFact:
+    descriptor = raw_financial_slot_descriptor(metric_key)
     nature = "instant" if metric_key in INSTANT_METRICS else "duration"
     statement = (
         "balance" if metric_key in BALANCE_METRICS
@@ -88,7 +93,7 @@ def bundle_fact(metric_key: str, period_end: str, value: float, *, serial: int =
         effective_at_utc="2026-04-01T07:00:00+00:00",
         source_updated_at_utc=None,
         source_snapshot_id=f"snapshot-{period_end}-{metric_key}-{serial}",
-        source_field=metric_key.upper(),
+        source_field=descriptor.source_fields[0],
         raw_row_hash=canonical_sha256({"metric": metric_key, "period": period_end, "value": value, "serial": serial}),
         mapping_version=MAPPING_VERSION,
         created_at="2026-08-29T00:00:00+00:00",

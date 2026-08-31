@@ -34,6 +34,7 @@ from ashare_pipeline.snapshot_store import SnapshotStore
 from ashare_pipeline.sources import FetchBatch, SourceBlocked
 from ashare_pipeline.state_store import StateStore
 from ashare_pipeline import orchestrator
+from tests.test_feature_contract import retag_missing_revenue_slot
 from tests.test_financial_features import build_bundle_with_overrides
 
 
@@ -1136,6 +1137,62 @@ class OrchestratorTestCase(unittest.TestCase):
             status["deep"]["feature_set_counts"],
             {"partial": 0, "financial_ready": 0, "blocked": 0},
         )
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
+
+    def test_derived_retag_cannot_cross_verified_storage_or_count_ready(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        built = build_bundle_with_overrides(
+            candidate_set_hash=context.candidate_set_hash
+        )
+        forged_payload = retag_missing_revenue_slot(
+            built.to_dict(), "derived_wrong_dimension"
+        )
+        try:
+            parsed = FeatureBundle.from_dict(forged_payload)
+        except ValueError:
+            parsed = None
+        verified = None
+        if parsed is not None:
+            relative_path, bundle_hash, _created = write_feature_bundle(
+                self.base, parsed
+            )
+            store.put_feature_bundle(
+                parsed,
+                bundle_path=relative_path,
+                bundle_hash=bundle_hash,
+            )
+            verified = read_verified_feature_bundle(
+                self.base, relative_path, bundle_hash
+            )
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+
+        if verified is not None:
+            self.assertEqual(verified.financial_status, "financial_ready")
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                0,
+            )
+        feature_root = self.root / "curated" / "formal_features"
+        self.assertEqual(list(feature_root.rglob("*.json")), [])
         self.assertFalse(status["formal_score_ready"])
         self.assertFalse(status["seven_dimension_ready"])
         self.assertEqual(

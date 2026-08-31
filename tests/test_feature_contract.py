@@ -49,6 +49,51 @@ def real_specialized_bundle(industry_name):
     return build_bundle_with_overrides(source_industry_name=industry_name)
 
 
+def retag_missing_revenue_slot(payload, attack):
+    dimensions = payload["dimension_inputs"]
+    target = next(
+        value
+        for value in dimensions["G"]["values"]
+        if value["key"] == "g.revenue.FY2021"
+    )
+    dimensions["G"]["values"].remove(target)
+    if attack == "derived_wrong_dimension":
+        replacement = copy.deepcopy(next(
+            value
+            for value in dimensions["M"]["values"]
+            if value["key"] == "m.gross_profit.FY2021"
+        ))
+        replacement["key"] = "m.revenue.FY2021"
+        dimensions["M"]["values"].append(replacement)
+    elif attack == "derived_correct_dimension":
+        replacement = copy.deepcopy(next(
+            value
+            for value in dimensions["M"]["values"]
+            if value["key"] == "m.gross_profit.FY2021"
+        ))
+        replacement["key"] = "g.revenue.FY2021"
+        dimensions["G"]["values"].append(replacement)
+    elif attack == "observed_wrong_dimension":
+        target["key"] = "m.revenue.FY2021"
+        dimensions["M"]["values"].append(target)
+    elif attack == "observed_wrong_formula":
+        target["formula_version"] = "financial-derived-v1"
+        dimensions["G"]["values"].append(target)
+    elif attack == "other_observed_raw_slot":
+        replacement = copy.deepcopy(next(
+            value
+            for value in dimensions["M"]["values"]
+            if value["key"] == "m.operating_cost.FY2021"
+        ))
+        replacement["key"] = "g.revenue.FY2021"
+        dimensions["G"]["values"].append(replacement)
+    else:
+        raise AssertionError(f"unknown retag attack: {attack}")
+    for dimension in dimensions.values():
+        dimension["values"].sort(key=lambda value: (value["key"], value["period_key"]))
+    return payload
+
+
 class FeatureContractTests(unittest.TestCase):
     def test_bundle_requires_exactly_seven_dimensions_and_is_never_formal(self):
         self.assertEqual(DIMENSIONS, ("G", "V", "M", "EQ", "FS", "CA", "T"))
@@ -271,6 +316,22 @@ class FeatureContractTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             FeatureBundle.from_dict(payload)
+
+    def test_public_parse_rejects_registered_raw_slot_retag_substitutions(self):
+        attacks = (
+            "derived_wrong_dimension",
+            "derived_correct_dimension",
+            "observed_wrong_dimension",
+            "observed_wrong_formula",
+            "other_observed_raw_slot",
+        )
+        for attack in attacks:
+            with self.subTest(attack=attack):
+                payload = retag_missing_revenue_slot(
+                    real_general_ready_bundle().to_dict(), attack
+                )
+                with self.assertRaises(ValueError):
+                    FeatureBundle.from_dict(payload)
 
     def test_public_parse_enforces_specialized_template_blocker(self):
         for industry_name in ("房地产开发", "工业金属", "银行"):

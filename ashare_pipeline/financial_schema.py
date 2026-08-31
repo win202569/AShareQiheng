@@ -8,7 +8,11 @@ import math
 import re
 from typing import Any, Literal, Mapping
 
-from ashare_pipeline.feature_contract import canonical_sha256, require_aware_utc
+from ashare_pipeline.feature_contract import (
+    FINANCIAL_DIMENSIONS,
+    canonical_sha256,
+    require_aware_utc,
+)
 
 
 MAPPING_VERSION = "eastmoney-financial-mapping-v1"
@@ -131,6 +135,75 @@ _FIELD_RULES: tuple[FieldRule, ...] = (
 UNMAPPED_COMMON_FACTS: dict[str, str] = {
     "share_repurchase_cash": "source_field_unavailable",
 }
+
+
+@dataclass(frozen=True)
+class RawFinancialSlotDescriptor:
+    metric_key: str
+    dimension: str
+    kind: str
+    allowed_statuses: tuple[str, ...]
+    formula_version: str
+    unit: str
+    source_fields: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.metric_key or self.dimension not in FINANCIAL_DIMENSIONS:
+            raise ValueError("raw financial slot requires a canonical dimension")
+        if self.kind != "raw_fact" or self.allowed_statuses != ("observed",):
+            raise ValueError("raw financial slot must require observed raw facts")
+        if self.formula_version != MAPPING_VERSION:
+            raise ValueError("raw financial slot must use the active mapping version")
+        if self.unit not in FACT_UNITS or not self.source_fields:
+            raise ValueError("raw financial slot requires unit and source-field metadata")
+
+    def canonical_key(self, period_key: str) -> str:
+        return f"{self.dimension.lower()}.{self.metric_key}.{period_key}"
+
+
+def _raw_dimension(rule: FieldRule) -> str:
+    if rule.metric_key == "revenue":
+        return "G"
+    if rule.statement == "income":
+        return "M"
+    if rule.metric_key == "operating_cash_flow":
+        return "EQ"
+    if rule.statement == "cash_flow":
+        return "CA"
+    return "FS"
+
+
+_RAW_FINANCIAL_SLOT_DESCRIPTORS = {
+    rule.metric_key: RawFinancialSlotDescriptor(
+        metric_key=rule.metric_key,
+        dimension=_raw_dimension(rule),
+        kind="raw_fact",
+        allowed_statuses=("observed",),
+        formula_version=MAPPING_VERSION,
+        unit=rule.unit,
+        source_fields=rule.source_fields,
+    )
+    for rule in _FIELD_RULES
+}
+_RAW_FINANCIAL_SLOT_DESCRIPTORS["share_repurchase_cash"] = (
+    RawFinancialSlotDescriptor(
+        metric_key="share_repurchase_cash",
+        dimension="CA",
+        kind="raw_fact",
+        allowed_statuses=("observed",),
+        formula_version=MAPPING_VERSION,
+        unit="CNY",
+        source_fields=("SHARE_REPURCHASE_CASH",),
+    )
+)
+
+
+def raw_financial_slot_descriptor(metric_key: str) -> RawFinancialSlotDescriptor:
+    """Return the canonical metadata for one registered raw fact slot."""
+    try:
+        return _RAW_FINANCIAL_SLOT_DESCRIPTORS[metric_key]
+    except KeyError as error:
+        raise ValueError(f"unknown raw financial slot: {metric_key!r}") from error
 
 
 def field_rules(statement: StatementKind | str) -> tuple[FieldRule, ...]:

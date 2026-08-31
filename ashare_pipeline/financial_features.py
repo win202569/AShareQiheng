@@ -29,6 +29,7 @@ from ashare_pipeline.financial_schema import (
     FinancialFact,
     classify_period,
     field_rules,
+    raw_financial_slot_descriptor,
 )
 from ashare_pipeline.industry_templates import (
     TEMPLATE_VERSION,
@@ -61,36 +62,6 @@ _OPENING_PERIOD = {
     "2025-06-30": "2024-12-31",
     "2026-06-30": "2025-12-31",
 }
-
-_RAW_DIMENSION = {
-    "revenue": "G",
-    "operating_cost": "M",
-    "operating_profit": "M",
-    "total_profit": "M",
-    "income_tax": "M",
-    "net_profit": "M",
-    "parent_net_profit": "M",
-    "deduct_parent_net_profit": "M",
-    "interest_expense": "M",
-    "rd_expense": "M",
-    "operating_cash_flow": "EQ",
-    "capital_expenditure": "CA",
-    "cash_dividends": "CA",
-    "interest_paid": "CA",
-    "acquisition_cash_paid": "CA",
-    "disposal_long_asset_cash": "CA",
-    "equity_financing_cash": "CA",
-    "debt_financing_cash": "CA",
-    "debt_repayment_cash": "CA",
-    "share_repurchase_cash": "CA",
-}
-_EXPECTED_UNITS = {
-    rule.metric_key: rule.unit
-    for statement in ("income", "balance", "cash_flow")
-    for rule in field_rules(statement)
-}
-_EXPECTED_UNITS["share_repurchase_cash"] = "CNY"
-
 
 def _deep_freeze(value: object) -> object:
     if isinstance(value, Mapping):
@@ -605,14 +576,21 @@ def _evidence_tuple(facts: Iterable[FinancialFact]) -> tuple[EvidenceRef, ...]:
 
 
 def _observed_value(metric_key: str, period_key: str, fact: FinancialFact) -> FeatureValue:
-    dimension = _RAW_DIMENSION.get(metric_key, "FS")
+    descriptor = raw_financial_slot_descriptor(metric_key)
+    if (
+        fact.metric_key != descriptor.metric_key
+        or fact.mapping_version != descriptor.formula_version
+        or fact.unit != descriptor.unit
+        or fact.source_field not in descriptor.source_fields
+    ):
+        raise ValueError("financial fact does not match its canonical raw slot")
     return FeatureValue(
-        key=f"{dimension.lower()}.{metric_key}.{period_key}",
+        key=descriptor.canonical_key(period_key),
         value=fact.value,
         unit=fact.unit,
         period_key=period_key,
-        status="observed",
-        formula_version=MAPPING_VERSION,
+        status=descriptor.allowed_statuses[0],
+        formula_version=descriptor.formula_version,
         evidence=(_evidence(fact),),
         missing_reason=None,
     )
@@ -953,13 +931,14 @@ def assemble_bundle_from_registered_slots(
     dimensions: dict[str, list[FeatureValue]] = {key: [] for key in DIMENSIONS}
     if template.financial_slots:
         for metric_key in template.financial_slots:
-            dimension = _RAW_DIMENSION.get(metric_key, "FS")
+            descriptor = raw_financial_slot_descriptor(metric_key)
+            dimension = descriptor.dimension
             for period_end, period_key in _REQUIRED_PERIODS:
                 fact = facts_by_key.get((metric_key, period_end))
                 if fact is None:
                     dimensions[dimension].append(_missing_value(
                         dimension, metric_key, period_key,
-                        _EXPECTED_UNITS.get(metric_key, "CNY"),
+                        descriptor.unit,
                         f"financial_fact_missing:{metric_key}",
                     ))
                 else:
