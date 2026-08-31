@@ -11,8 +11,16 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Iterable, Iterator, Mapping, Sequence
 
-from ashare_pipeline.feature_contract import DIMENSIONS, FeatureBundle
-from ashare_pipeline.financial_schema import FinancialFact
+from ashare_pipeline.feature_contract import (
+    DIMENSIONS,
+    FINANCIAL_PERIODS,
+    EvidenceRef,
+    FeatureBundle,
+)
+from ashare_pipeline.financial_schema import (
+    FinancialFact,
+    raw_financial_slot_descriptor,
+)
 
 
 JOB_STATES = {"pending", "running", "succeeded", "retryable_failed", "terminal_failed"}
@@ -21,6 +29,7 @@ SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
 RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
 _OWNED_JOB_KINDS = frozenset({"deep_financial", "deep_statement", "feature_build"})
 SCHEMA_VERSION = 3
+_EVIDENCE_QUERY_BATCH_SIZE = 256
 
 FINANCIAL_FACT_COLUMNS = (
     "id",
@@ -784,6 +793,111 @@ class StateStore:
                 for row in connection.execute(query, parameters)
             ]
 
+    def validate_feature_bundle_evidence(self, bundle: FeatureBundle) -> None:
+        """Revalidate one bundle against the canonical facts in this store."""
+        bundle.validate()
+        with self._transaction() as connection:
+            self._validate_feature_bundle_evidence(connection, bundle)
+
+    @staticmethod
+    def _validate_feature_bundle_evidence(
+        connection: sqlite3.Connection,
+        bundle: FeatureBundle,
+    ) -> None:
+        evidence_by_id: dict[str, EvidenceRef] = {}
+        for dimension in bundle.dimension_inputs.values():
+            for value in dimension.values:
+                for evidence in value.evidence:
+                    existing = evidence_by_id.get(evidence.financial_fact_id)
+                    if existing is not None and existing != evidence:
+                        raise ValueError("feature evidence metadata conflicts for one fact")
+                    evidence_by_id[evidence.financial_fact_id] = evidence
+        if not evidence_by_id:
+            return
+
+        facts_by_id: dict[str, FinancialFact] = {}
+        fact_ids = sorted(evidence_by_id)
+        try:
+            for offset in range(0, len(fact_ids), _EVIDENCE_QUERY_BATCH_SIZE):
+                batch = fact_ids[offset : offset + _EVIDENCE_QUERY_BATCH_SIZE]
+                marks = ",".join("?" for _item in batch)
+                rows = connection.execute(
+                    f"SELECT * FROM financial_fact WHERE id IN ({marks})", batch
+                ).fetchall()
+                for row in rows:
+                    fact = FinancialFact.from_record(dict(row))
+                    if fact.id in facts_by_id:
+                        raise ValueError("duplicate canonical financial fact evidence")
+                    facts_by_id[fact.id] = fact
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("feature evidence contains a malformed financial fact") from error
+        if set(facts_by_id) != set(fact_ids):
+            raise ValueError("feature evidence financial fact is missing")
+
+        snapshot_ids = sorted({fact.source_snapshot_id for fact in facts_by_id.values()})
+        observed_snapshot_ids: set[str] = set()
+        for offset in range(0, len(snapshot_ids), _EVIDENCE_QUERY_BATCH_SIZE):
+            batch = snapshot_ids[offset : offset + _EVIDENCE_QUERY_BATCH_SIZE]
+            marks = ",".join("?" for _item in batch)
+            rows = connection.execute(
+                f"SELECT id FROM source_snapshot WHERE id IN ({marks})", batch
+            ).fetchall()
+            for row in rows:
+                snapshot_id = row["id"]
+                if not isinstance(snapshot_id, str) or snapshot_id in observed_snapshot_ids:
+                    raise ValueError("feature evidence snapshot row is malformed or duplicated")
+                observed_snapshot_ids.add(snapshot_id)
+        if observed_snapshot_ids != set(snapshot_ids):
+            raise ValueError("feature evidence source snapshot is missing")
+
+        for fact_id, evidence in evidence_by_id.items():
+            fact = facts_by_id[fact_id]
+            if (
+                fact.security_id != bundle.security_id
+                or evidence.source_snapshot_id != fact.source_snapshot_id
+                or evidence.source_field != fact.source_field
+                or evidence.raw_row_hash != fact.raw_row_hash
+                or evidence.announced_at_utc != fact.announced_at_utc
+                or evidence.effective_at_utc != fact.effective_at_utc
+            ):
+                raise ValueError("feature evidence does not match canonical financial fact")
+
+        period_end_by_key = {
+            period_key: period_end for period_end, period_key in FINANCIAL_PERIODS
+        }
+        for dimension_name, dimension in bundle.dimension_inputs.items():
+            for value in dimension.values:
+                if value.status != "observed":
+                    continue
+                parts = value.key.split(".")
+                if len(parts) != 3:
+                    continue
+                try:
+                    descriptor = raw_financial_slot_descriptor(parts[1])
+                except ValueError:
+                    continue
+                period_end = period_end_by_key.get(value.period_key)
+                if (
+                    period_end is None
+                    or dimension_name != descriptor.dimension
+                    or value.key != descriptor.canonical_key(value.period_key)
+                    or value.status not in descriptor.allowed_statuses
+                    or value.formula_version != descriptor.formula_version
+                    or value.unit != descriptor.unit
+                    or len(value.evidence) != 1
+                ):
+                    raise ValueError("raw observed feature evidence is noncanonical")
+                fact = facts_by_id[value.evidence[0].financial_fact_id]
+                if (
+                    fact.metric_key != descriptor.metric_key
+                    or fact.period_end != period_end
+                    or fact.value != value.value
+                    or fact.unit != descriptor.unit
+                    or fact.mapping_version != descriptor.formula_version
+                    or fact.source_field not in descriptor.source_fields
+                ):
+                    raise ValueError("raw observed feature evidence does not match its fact")
+
     def put_feature_bundle(
         self,
         bundle: FeatureBundle,
@@ -798,6 +912,7 @@ class StateStore:
         header, values = self._feature_bundle_content(bundle, bundle_hash)
 
         with self._transaction(immediate=True) as connection:
+            self._validate_feature_bundle_evidence(connection, bundle)
             existing = connection.execute(
                 """SELECT * FROM feature_set
                 WHERE security_id = ? AND report_period = ? AND as_of_utc = ? AND input_hash = ?""",

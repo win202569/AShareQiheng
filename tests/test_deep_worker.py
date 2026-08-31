@@ -39,6 +39,7 @@ from ashare_pipeline.sources import (
     SourceBlocked,
 )
 from ashare_pipeline.state_store import StateStore
+from tests.test_financial_features import build_bundle_with_overrides
 
 
 REPORT_PERIOD = "2026-06-30"
@@ -1481,6 +1482,42 @@ class DeepWorkerTestCase(unittest.TestCase):
         )
         self.assertEqual(list(feature_root.glob("*.json")), [])
         self.assertFalse((self.data_root / "data").exists())
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                0,
+            )
+
+    def test_evidence_rejection_removes_only_new_feature_file(self) -> None:
+        bundle = build_bundle_with_overrides()
+        target = self.project_root / (
+            f"data/curated/formal_features/{REPORT_PERIOD}/SH600001/"
+            f"{bundle.input_hash}.json"
+        )
+
+        with self.assertRaisesRegex(ValueError, "evidence"):
+            deep_worker_module._write_and_store_feature_bundle(
+                project_root=self.project_root,
+                store=self.store,
+                bundle=bundle,
+            )
+        self.assertFalse(target.exists())
+
+        relative_path, digest, created = deep_worker_module.write_feature_bundle(
+            self.project_root, bundle
+        )
+        original = target.read_bytes()
+        with self.assertRaisesRegex(ValueError, "evidence"):
+            deep_worker_module._write_and_store_feature_bundle(
+                project_root=self.project_root,
+                store=self.store,
+                bundle=bundle,
+            )
+
+        self.assertTrue(created)
+        self.assertEqual(relative_path, target.relative_to(self.project_root).as_posix())
+        self.assertEqual(digest, bundle.bundle_hash())
+        self.assertEqual(target.read_bytes(), original)
         with closing(sqlite3.connect(self.store.db_path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],

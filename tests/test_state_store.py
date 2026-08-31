@@ -17,9 +17,15 @@ from ashare_pipeline.feature_contract import (
     FeatureBundle,
     FeatureValue,
     IndustryContext,
+    canonical_sha256,
 )
 from ashare_pipeline.financial_schema import MAPPING_VERSION, FinancialFact
 from ashare_pipeline.state_store import FinalizationBlocked, JobSpec, StateStore
+from tests.test_financial_features import (
+    build_bundle_with_overrides,
+    complete_general_facts,
+    rebuild_fact,
+)
 
 
 UTC = timezone.utc
@@ -58,14 +64,11 @@ def valid_feature_bundle(
     *, input_hash: str = "b" * 64,
     as_of_utc: str = "2026-08-29T16:00:00+00:00",
     blockers: tuple[str, ...] = ("formal_industry_mapping_missing",),
+    evidence: EvidenceRef | None = None,
 ) -> FeatureBundle:
-    evidence = EvidenceRef(
-        "fact-a",
-        "snapshot-a",
-        "TOTAL_ASSETS",
-        "a" * 64,
-        "2026-08-20T15:59:59+00:00",
-        "2026-08-21T07:00:00+00:00",
+    evidence = evidence or EvidenceRef(
+        "fact-a", "snapshot-a", "TOTAL_ASSETS", "a" * 64,
+        "2026-08-20T15:59:59+00:00", "2026-08-21T07:00:00+00:00",
     )
     dimensions = {
         dimension: DimensionInput(
@@ -110,6 +113,13 @@ def valid_feature_bundle(
     )
 
 
+def installed_ready_bundle(
+    store: StateStore, **overrides: object
+) -> tuple[FeatureBundle, tuple[FinancialFact, ...], dict[str, str]]:
+    """Share the real evidence prerequisite without exporting a TestCase class."""
+    return StateStoreTestCase.installed_ready_bundle(store, **overrides)
+
+
 class StateStoreTestCase(unittest.TestCase):
     """Each test guards a durable public state-transition contract."""
 
@@ -126,6 +136,100 @@ class StateStoreTestCase(unittest.TestCase):
         return self.store.create_score_run(
             "2026-06-30", "2026-08-31T08:00:00+08:00", "rules-v1", "universe-v1", "incremental"
         )
+
+    @staticmethod
+    def evidence_for_fact(fact: FinancialFact) -> EvidenceRef:
+        return EvidenceRef(
+            fact.id,
+            fact.source_snapshot_id,
+            fact.source_field,
+            fact.raw_row_hash,
+            fact.announced_at_utc,
+            fact.effective_at_utc,
+        )
+
+    def stored_evidence_bundle(self, **overrides: object) -> FeatureBundle:
+        snapshot_id, _created = self.store.record_snapshot(
+            "akshare", "profit_sheet", canonical_sha256({"fixture": "sample"}),
+            "a" * 64, "data/raw/sample.json", 1, utc_at(0),
+        )
+        fact = financial_fact(snapshot_id=snapshot_id)
+        self.store.insert_financial_facts((fact,))
+        return valid_feature_bundle(
+            evidence=self.evidence_for_fact(fact), **overrides
+        )
+
+    @staticmethod
+    def installed_ready_bundle(
+        store: StateStore,
+        *,
+        security_id: str = "SH600001",
+        snapshot_tag: str = "current",
+        **overrides: object,
+    ) -> tuple[FeatureBundle, tuple[FinancialFact, ...], dict[str, str]]:
+        dataset_by_statement = {
+            "income": "profit_sheet",
+            "balance": "balance_sheet",
+            "cash_flow": "cash_flow_sheet",
+        }
+        snapshot_ids: dict[str, str] = {}
+        snapshot_hashes: dict[str, str] = {}
+        for index, (statement, dataset) in enumerate(
+            dataset_by_statement.items(), start=1
+        ):
+            payload_hash = canonical_sha256(
+                {"fixture": snapshot_tag, "dataset": dataset}
+            )
+            snapshot_id, _created = store.record_snapshot(
+                "akshare",
+                dataset,
+                canonical_sha256(
+                    {"symbol": security_id, "tag": snapshot_tag, "dataset": dataset}
+                ),
+                payload_hash,
+                f"data/raw/{snapshot_tag}-{dataset}.json",
+                1,
+                utc_at(index),
+            )
+            snapshot_ids[statement] = snapshot_id
+            snapshot_hashes[dataset] = payload_hash
+        facts = tuple(
+            rebuild_fact(
+                fact,
+                security_id=security_id,
+                source_snapshot_id=snapshot_ids[fact.statement],
+            )
+            for fact in complete_general_facts()
+        )
+        self_inserted, ignored = store.insert_financial_facts(facts)
+        if self_inserted != len(facts) or ignored:
+            raise AssertionError("ready evidence fixture must insert canonical facts once")
+        arguments: dict[str, object] = {
+            "security_id": security_id,
+            "facts": facts,
+            "statement_snapshot_hashes": snapshot_hashes,
+        }
+        arguments.update(overrides)
+        bundle = build_bundle_with_overrides(**arguments)
+        return bundle, facts, snapshot_ids
+
+    @classmethod
+    def bundle_with_replaced_evidence(
+        cls,
+        bundle: FeatureBundle,
+        *,
+        feature_key: str,
+        evidence: EvidenceRef,
+    ) -> FeatureBundle:
+        payload = bundle.to_dict()
+        target = next(
+            value
+            for dimension in payload["dimension_inputs"].values()
+            for value in dimension["values"]
+            if value["key"] == feature_key
+        )
+        target["evidence"] = [evidence.to_dict()]
+        return FeatureBundle.from_dict(payload)
 
     @staticmethod
     def insert_feature_set(
@@ -477,7 +581,7 @@ class StateStoreTestCase(unittest.TestCase):
         )
 
     def test_put_feature_bundle_is_atomic_and_rejects_nondeterministic_conflict(self) -> None:
-        bundle = valid_feature_bundle(input_hash="b" * 64)
+        bundle = self.stored_evidence_bundle(input_hash="b" * 64)
         feature_id, created = self.store.put_feature_bundle(
             bundle,
             bundle_path="data/curated/formal_features/2026-06-30/SH600001/b.json",
@@ -508,7 +612,7 @@ class StateStoreTestCase(unittest.TestCase):
             )
 
     def test_put_feature_bundle_rolls_back_header_and_values_when_one_value_aborts(self) -> None:
-        bundle = valid_feature_bundle()
+        bundle = self.stored_evidence_bundle()
         with closing(sqlite3.connect(self.db_path)) as connection:
             connection.executescript(
                 """CREATE TRIGGER abort_fs_feature_value
@@ -553,11 +657,229 @@ class StateStoreTestCase(unittest.TestCase):
         with closing(sqlite3.connect(self.db_path)) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0], 0)
 
+    def test_put_feature_bundle_rejects_ready_bundle_when_evidence_database_is_empty(self) -> None:
+        bundle = build_bundle_with_overrides()
+
+        with self.assertRaisesRegex(ValueError, "evidence"):
+            self.store.put_feature_bundle(
+                bundle,
+                bundle_path="data/curated/formal_features/2026-06-30/SH600001/empty.json",
+                bundle_hash=bundle.bundle_hash(),
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0],
+                0,
+            )
+
+    def test_put_feature_bundle_revalidates_evidence_before_idempotent_success(self) -> None:
+        bundle, facts, _snapshot_ids = self.installed_ready_bundle(
+            self.store, snapshot_tag="idempotent"
+        )
+        path = "data/curated/formal_features/2026-06-30/SH600001/idempotent.json"
+        feature_id, created = self.store.put_feature_bundle(
+            bundle, bundle_path=path, bundle_hash=bundle.bundle_hash()
+        )
+        self.assertTrue(created)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM financial_fact WHERE id=?", (facts[0].id,)
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "evidence"):
+            self.store.put_feature_bundle(
+                bundle, bundle_path=path, bundle_hash=bundle.bundle_hash()
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0],
+                363,
+            )
+        self.assertEqual(feature_id, bundle.bundle_hash())
+
+    def test_put_feature_bundle_rejects_missing_or_mismatched_evidence_rows(self) -> None:
+        cases = (
+            "missing_fact",
+            "missing_snapshot",
+            "source_snapshot_id",
+            "source_field",
+            "raw_row_hash",
+            "announced_at_utc",
+            "effective_at_utc",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                case_store = StateStore(Path(self.tempdir.name) / f"{case}.sqlite3")
+                case_store.initialize()
+                bundle, facts, snapshot_ids = self.installed_ready_bundle(
+                    case_store, snapshot_tag=case
+                )
+                target_fact = next(
+                    fact
+                    for fact in facts
+                    if fact.metric_key == "revenue" and fact.period_end == "2021-12-31"
+                )
+                if case == "missing_fact":
+                    with closing(sqlite3.connect(case_store.db_path)) as connection:
+                        connection.execute(
+                            "DELETE FROM financial_fact WHERE id=?", (target_fact.id,)
+                        )
+                        connection.commit()
+                    attacked = bundle
+                elif case == "missing_snapshot":
+                    with closing(sqlite3.connect(case_store.db_path)) as connection:
+                        connection.execute(
+                            "DELETE FROM source_snapshot WHERE id=?",
+                            (target_fact.source_snapshot_id,),
+                        )
+                        connection.commit()
+                    attacked = bundle
+                else:
+                    derived = next(
+                        value
+                        for value in bundle.dimension_inputs["M"].values
+                        if value.key == "m.gross_profit.FY2021"
+                    )
+                    original = derived.evidence[0]
+                    replacements = {
+                        "source_snapshot_id": EvidenceRef(
+                            original.financial_fact_id,
+                            snapshot_ids["balance"],
+                            original.source_field,
+                            original.raw_row_hash,
+                            original.announced_at_utc,
+                            original.effective_at_utc,
+                        ),
+                        "source_field": EvidenceRef(
+                            original.financial_fact_id,
+                            original.source_snapshot_id,
+                            "WRONG_SOURCE_FIELD",
+                            original.raw_row_hash,
+                            original.announced_at_utc,
+                            original.effective_at_utc,
+                        ),
+                        "raw_row_hash": EvidenceRef(
+                            original.financial_fact_id,
+                            original.source_snapshot_id,
+                            original.source_field,
+                            "f" * 64,
+                            original.announced_at_utc,
+                            original.effective_at_utc,
+                        ),
+                        "announced_at_utc": EvidenceRef(
+                            original.financial_fact_id,
+                            original.source_snapshot_id,
+                            original.source_field,
+                            original.raw_row_hash,
+                            "2026-03-30T15:59:59+00:00",
+                            original.effective_at_utc,
+                        ),
+                        "effective_at_utc": EvidenceRef(
+                            original.financial_fact_id,
+                            original.source_snapshot_id,
+                            original.source_field,
+                            original.raw_row_hash,
+                            original.announced_at_utc,
+                            "2026-04-02T07:00:00+00:00",
+                        ),
+                    }
+                    attacked = self.bundle_with_replaced_evidence(
+                        bundle,
+                        feature_key=derived.key,
+                        evidence=replacements[case],
+                    )
+
+                with self.assertRaisesRegex(ValueError, "evidence"):
+                    case_store.put_feature_bundle(
+                        attacked,
+                        bundle_path=(
+                            "data/curated/formal_features/2026-06-30/SH600001/"
+                            f"{case}.json"
+                        ),
+                        bundle_hash=attacked.bundle_hash(),
+                    )
+                with closing(sqlite3.connect(case_store.db_path)) as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0],
+                        0,
+                    )
+
+    def test_put_feature_bundle_rejects_raw_observed_fact_mismatches(self) -> None:
+        cases = ("wrong_security", "metric", "period", "value", "unit", "mapping")
+        for case in cases:
+            with self.subTest(case=case):
+                case_store = StateStore(Path(self.tempdir.name) / f"raw-{case}.sqlite3")
+                case_store.initialize()
+                bundle, facts, _snapshot_ids = self.installed_ready_bundle(
+                    case_store, snapshot_tag=f"raw-{case}"
+                )
+                original = next(
+                    fact
+                    for fact in facts
+                    if fact.metric_key == "revenue" and fact.period_end == "2021-12-31"
+                )
+                if case == "mapping":
+                    with closing(sqlite3.connect(case_store.db_path)) as connection:
+                        connection.execute(
+                            "UPDATE financial_fact SET mapping_version=? WHERE id=?",
+                            ("wrong-mapping-v1", original.id),
+                        )
+                        connection.commit()
+                    attacked = bundle
+                else:
+                    overrides: dict[str, object] = {}
+                    if case == "wrong_security":
+                        overrides["security_id"] = "SH600002"
+                    elif case == "metric":
+                        overrides["metric_key"] = "operating_cost"
+                    elif case == "period":
+                        overrides.update(
+                            period_start="2020-01-01",
+                            period_end="2020-12-31",
+                            period_kind="FY",
+                        )
+                    elif case == "value":
+                        overrides["value"] = original.value + 1.0
+                    elif case == "unit":
+                        overrides["unit"] = "shares"
+                    substitute = rebuild_fact(original, **overrides)
+                    case_store.insert_financial_facts((substitute,))
+                    attacked = self.bundle_with_replaced_evidence(
+                        bundle,
+                        feature_key="g.revenue.FY2021",
+                        evidence=self.evidence_for_fact(substitute),
+                    )
+
+                with self.assertRaisesRegex(ValueError, "evidence"):
+                    case_store.put_feature_bundle(
+                        attacked,
+                        bundle_path=(
+                            "data/curated/formal_features/2026-06-30/SH600001/"
+                            f"raw-{case}.json"
+                        ),
+                        bundle_hash=attacked.bundle_hash(),
+                    )
+
     def test_latest_feature_set_filters_exactly_orders_and_parses_json(self) -> None:
-        older = valid_feature_bundle(
+        older = self.stored_evidence_bundle(
             input_hash="1" * 64, as_of_utc="2026-08-28T16:00:00+00:00"
         )
-        newer = valid_feature_bundle(
+        newer = self.stored_evidence_bundle(
             input_hash="2" * 64,
             as_of_utc="2026-08-29T16:00:00+00:00",
             blockers=("z-blocker", "a-blocker"),
@@ -596,8 +918,8 @@ class StateStoreTestCase(unittest.TestCase):
 
     def test_latest_feature_set_breaks_as_of_ties_by_created_at_then_id(self) -> None:
         bundles = (
-            valid_feature_bundle(input_hash="3" * 64),
-            valid_feature_bundle(input_hash="4" * 64),
+            self.stored_evidence_bundle(input_hash="3" * 64),
+            self.stored_evidence_bundle(input_hash="4" * 64),
         )
         for index, bundle in enumerate(bundles):
             self.store.put_feature_bundle(

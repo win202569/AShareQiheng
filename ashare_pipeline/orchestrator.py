@@ -1075,6 +1075,7 @@ def build_deep_progress(
             )
             if any(row[key] != value for key, value in expected_header.items()):
                 raise ValueError("feature bundle database header mismatch")
+            store.validate_feature_bundle_evidence(bundle)
         except (KeyError, OSError, TypeError, UnicodeError, ValueError):
             unknown_failures += 1
             continue

@@ -36,6 +36,7 @@ from ashare_pipeline.state_store import StateStore
 from ashare_pipeline import orchestrator
 from tests.test_feature_contract import retag_missing_revenue_slot
 from tests.test_financial_features import build_bundle_with_overrides
+from tests.test_state_store import installed_ready_bundle
 
 
 def batch(source, dataset, records, request=None, fetched_at="2026-08-29T12:00:00+00:00"):
@@ -1205,8 +1206,10 @@ class OrchestratorTestCase(unittest.TestCase):
         store = StateStore(self.root / "state.sqlite3")
         store.initialize()
         context = orchestrator.load_candidate_context(self.root)
-        built = build_bundle_with_overrides(
-            candidate_set_hash=context.candidate_set_hash
+        built, _facts, _snapshot_ids = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="positive-progress",
         )
         parsed = FeatureBundle.from_dict(built.to_dict())
 
@@ -1235,6 +1238,59 @@ class OrchestratorTestCase(unittest.TestCase):
             status["deep"]["feature_set_counts"],
             {"partial": 0, "financial_ready": 1, "blocked": 0},
         )
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
+
+    def test_progress_excludes_newest_bundle_after_evidence_snapshot_loss_without_fallback(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        older, _older_facts, _older_snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="progress-older",
+            as_of_utc="2026-08-28T16:00:00+00:00",
+        )
+        newer, _newer_facts, newer_snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="progress-newer",
+            as_of_utc="2026-08-29T16:00:00+00:00",
+        )
+        for bundle in (older, newer):
+            relative_path, bundle_hash, _created = write_feature_bundle(
+                self.base, bundle
+            )
+            store.put_feature_bundle(
+                bundle,
+                bundle_path=relative_path,
+                bundle_hash=bundle_hash,
+            )
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM source_snapshot WHERE id=?",
+                (newer_snapshots["income"],),
+            )
+            connection.commit()
+
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(status["deep"]["unknown_failure_count"], 1)
         self.assertFalse(status["formal_score_ready"])
         self.assertFalse(status["seven_dimension_ready"])
         self.assertEqual(
