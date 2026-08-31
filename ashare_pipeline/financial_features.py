@@ -158,19 +158,34 @@ def _parse_date(value: object, field: str) -> date:
         raise ValueError(f"{field} must be an ISO date") from exc
 
 
-def trading_days_from_batch(batch: FetchBatch) -> tuple[date, ...]:
-    """Extract explicit sessions from a verified trade-date batch, failing closed."""
-    if not isinstance(batch, FetchBatch) or batch.dataset != "trade_dates":
-        raise ValueError("verified trade calendar must use the trade_dates dataset")
-    request = batch.request
-    if not isinstance(request, Mapping):
-        raise ValueError("trade calendar request must be a mapping")
+def validate_feature_calendar_request(
+    request: object,
+) -> dict[str, str]:
+    """Validate the exact long-calendar semantic request and normalize its keys."""
+    if not isinstance(request, Mapping) or set(request) != {"start_date", "end_date"}:
+        raise ValueError("trade calendar request must contain exact start_date/end_date keys")
     start = _parse_date(request.get("start_date"), "trade calendar start_date")
     end = _parse_date(request.get("end_date"), "trade calendar end_date")
+    if start != _CALENDAR_START or end < _CALENDAR_END:
+        raise ValueError("trade calendar does not cover the required range")
     if start > end:
         raise ValueError("trade calendar range is reversed")
-    if start > _CALENDAR_START or end < _CALENDAR_END:
-        raise ValueError("trade calendar does not cover the required range")
+    return {"start_date": start.isoformat(), "end_date": end.isoformat()}
+
+
+def trading_days_from_batch(batch: FetchBatch) -> tuple[date, ...]:
+    """Extract explicit sessions from a verified trade-date batch, failing closed."""
+    if (
+        not isinstance(batch, FetchBatch)
+        or batch.source != "baostock"
+        or batch.dataset != "trade_dates"
+    ):
+        raise ValueError(
+            "verified trade calendar must use baostock/trade_dates"
+        )
+    request = validate_feature_calendar_request(batch.request)
+    start = date.fromisoformat(request["start_date"])
+    end = date.fromisoformat(request["end_date"])
     if not isinstance(batch.records, list) or not batch.records:
         raise ValueError("trade calendar records must be a non-empty list")
 
@@ -807,7 +822,13 @@ def _add_period_formulas(
     revenue_evidence = (revenue,) if revenue is not None and revenue.unit == "CNY" else ()
     gross_margin = (
         gross_profit / revenue.value
-        if gross_profit is not None and revenue_evidence and revenue.value > 0 else None
+        if (
+            gross_profit is not None
+            and revenue_evidence
+            and math.isfinite(revenue.value)
+            and revenue.value != 0
+        )
+        else None
     )
     dimensions["M"].append(_derived_value(
         "M", "gross_margin", period_key, gross_margin, "ratio",
@@ -831,7 +852,7 @@ def _add_period_formulas(
     if assets is not None and opening_assets is not None and opening_assets.unit == "CNY":
         average_assets = (opening_assets.value + assets[2].value) / 2.0
         accrual_evidence = _evidence_facts(assets, (opening_assets,))
-        if average_assets > 0:
+        if math.isfinite(average_assets) and average_assets != 0:
             accruals = (assets[0].value - assets[1].value) / average_assets
     dimensions["EQ"].append(_derived_value(
         "EQ", "total_accruals", period_key, accruals, "ratio", accrual_evidence,
@@ -848,7 +869,7 @@ def _add_period_formulas(
         roic_evidence = _evidence_facts(
             nopat_operands, invested_evidence, opening_invested_evidence
         )
-        if average_invested > 0:
+        if math.isfinite(average_invested) and average_invested != 0:
             roic = nopat / average_invested
     dimensions["M"].append(_derived_value(
         "M", "roic", period_key, roic, "ratio", roic_evidence,
@@ -1063,6 +1084,11 @@ def build_feature_bundle(
     ))
     if template.template_id == "unclassified":
         financial_blockers.add("industry_template_unclassified")
+    if (
+        template.specialized_inputs_required
+        and template.template_id != "unclassified"
+    ):
+        financial_blockers.add("specialized_financial_inputs_missing")
     if trade_calendar_snapshot_hash is None:
         financial_blockers.add("trade_calendar_missing")
     missing_statement = any(

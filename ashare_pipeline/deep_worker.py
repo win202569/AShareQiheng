@@ -28,6 +28,7 @@ from ashare_pipeline.financial_features import (
     feature_input_hash,
     select_visible_facts,
     trading_days_from_batch,
+    validate_feature_calendar_request,
 )
 from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
 from ashare_pipeline.snapshot_repository import SnapshotRef, SnapshotRepository
@@ -462,6 +463,16 @@ _FEATURE_PAYLOAD_KEYS = frozenset(
     }
 )
 _FROZEN_SNAPSHOT_KEYS = frozenset({"source_snapshot_id", "payload_hash"})
+_FROZEN_CALENDAR_KEYS = frozenset(
+    {
+        "source_snapshot_id",
+        "payload_hash",
+        "source",
+        "dataset",
+        "request",
+        "request_fingerprint",
+    }
+)
 _SUMMARY_ITEM_KEYS = frozenset(
     {
         "security_id",
@@ -504,6 +515,36 @@ def _validate_statement_snapshot_ref(
         or snapshot.request_fingerprint != expected_fingerprint
     ):
         raise ValueError("statement snapshot does not match its frozen slot")
+
+
+def _validate_calendar_snapshot_ref(snapshot: SnapshotRef) -> dict[str, str]:
+    if not isinstance(snapshot, SnapshotRef):
+        raise TypeError("trade calendar snapshot must be SnapshotRef")
+    request = validate_feature_calendar_request(snapshot.request)
+    expected_fingerprint = canonical_sha256(request)
+    if (
+        snapshot.source != "baostock"
+        or snapshot.dataset != "trade_dates"
+        or snapshot.request_fingerprint != expected_fingerprint
+    ):
+        raise ValueError("trade calendar snapshot does not match exact request")
+    return request
+
+
+def frozen_calendar_payload(snapshot: SnapshotRef | None) -> dict[str, object] | None:
+    if snapshot is None:
+        return None
+    request = _validate_calendar_snapshot_ref(snapshot)
+    return {
+        "source_snapshot_id": _require_nonempty_text(
+            snapshot.id, "source_snapshot_id"
+        ),
+        "payload_hash": _require_sha256(snapshot.payload_hash, "payload_hash"),
+        "source": "baostock",
+        "dataset": "trade_dates",
+        "request": request,
+        "request_fingerprint": canonical_sha256(request),
+    }
 
 
 def feature_build_payload(
@@ -552,9 +593,7 @@ def feature_build_payload(
             dataset: frozen_snapshot_payload(statement_snapshots.get(dataset))
             for dataset in STATEMENT_DATASETS
         },
-        "trade_calendar_snapshot": frozen_snapshot_payload(
-            trade_calendar_snapshot
-        ),
+        "trade_calendar_snapshot": frozen_calendar_payload(trade_calendar_snapshot),
     }
 
 
@@ -903,7 +942,7 @@ def _validate_feature_payload(payload: object) -> dict[str, object]:
         raise ValueError("statement_snapshots must contain exactly three datasets")
     for dataset in STATEMENT_DATASETS:
         _validate_frozen_snapshot(statements[dataset])
-    _validate_frozen_snapshot(normalized["trade_calendar_snapshot"])
+    _validate_frozen_calendar_snapshot(normalized["trade_calendar_snapshot"])
     return normalized
 
 
@@ -914,6 +953,23 @@ def _validate_frozen_snapshot(value: object) -> None:
         raise ValueError("frozen snapshot payload has invalid keys")
     _require_nonempty_text(value["source_snapshot_id"], "source_snapshot_id")
     _require_sha256(value["payload_hash"], "payload_hash")
+
+
+def _validate_frozen_calendar_snapshot(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping) or set(value) != _FROZEN_CALENDAR_KEYS:
+        raise ValueError("frozen trade calendar payload has invalid keys")
+    _require_nonempty_text(value["source_snapshot_id"], "source_snapshot_id")
+    _require_sha256(value["payload_hash"], "payload_hash")
+    if value["source"] != "baostock" or value["dataset"] != "trade_dates":
+        raise ValueError("frozen trade calendar has invalid source or dataset")
+    request = validate_feature_calendar_request(value["request"])
+    fingerprint = _require_sha256(
+        value["request_fingerprint"], "request_fingerprint"
+    )
+    if fingerprint != canonical_sha256(request):
+        raise ValueError("frozen trade calendar request fingerprint mismatch")
 
 
 def _resolve_frozen_snapshot(
@@ -930,6 +986,36 @@ def _resolve_frozen_snapshot(
     if snapshot.payload_hash != value["payload_hash"]:
         raise ValueError("frozen snapshot payload hash does not match repository")
     snapshots.read_verified(snapshot)
+    return snapshot
+
+
+def _resolve_frozen_calendar_snapshot(
+    snapshots: SnapshotRepository, value: object
+) -> SnapshotRef | None:
+    _validate_frozen_calendar_snapshot(value)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("frozen trade calendar payload must be a mapping")
+    snapshot = snapshots.get(value["source_snapshot_id"])
+    if snapshot is None:
+        raise ValueError("frozen trade calendar snapshot id does not exist")
+    if (
+        snapshot.payload_hash != value["payload_hash"]
+        or snapshot.source != value["source"]
+        or snapshot.dataset != value["dataset"]
+        or snapshot.request_fingerprint != value["request_fingerprint"]
+    ):
+        raise ValueError("frozen trade calendar identity does not match repository")
+    verified = snapshots.read_verified(snapshot)
+    expected_request = validate_feature_calendar_request(value["request"])
+    if (
+        verified.batch.source != "baostock"
+        or verified.batch.dataset != "trade_dates"
+        or verified.batch.request != expected_request
+        or canonical_sha256(verified.batch.request) != value["request_fingerprint"]
+    ):
+        raise ValueError("verified trade calendar does not match frozen identity")
     return snapshot
 
 
@@ -1022,9 +1108,18 @@ def _verified_calendar_days(
     if calendar_ref is None:
         return None
     stored = snapshots.get(calendar_ref.id)
-    if stored is None or stored.payload_hash != calendar_ref.payload_hash:
+    if (
+        stored is None
+        or stored.payload_hash != calendar_ref.payload_hash
+        or stored.source != "baostock"
+        or stored.dataset != "trade_dates"
+    ):
         raise ValueError("trade calendar snapshot does not match repository")
-    return trading_days_from_batch(snapshots.read_verified(stored).batch)
+    verified = snapshots.read_verified(stored)
+    request = validate_feature_calendar_request(verified.batch.request)
+    if stored.request_fingerprint != canonical_sha256(request):
+        raise ValueError("trade calendar request fingerprint mismatch")
+    return trading_days_from_batch(verified.batch)
 
 
 def _normalize_statement_snapshot(
@@ -1146,7 +1241,7 @@ def _execute_feature_job(
     ]
     if len(statement_ids) != len(set(statement_ids)):
         raise ValueError("statement snapshot cannot occupy multiple slots")
-    calendar_ref = _resolve_frozen_snapshot(
+    calendar_ref = _resolve_frozen_calendar_snapshot(
         snapshots, payload["trade_calendar_snapshot"]
     )
     statement_hashes = {
@@ -1175,11 +1270,12 @@ def _execute_feature_job(
     trading_days = _verified_calendar_days(snapshots, calendar_ref)
 
     issue_codes: set[str] = set()
+    normalized_facts: list[object] = []
     for dataset in STATEMENT_DATASETS:
         snapshot = statement_refs[dataset]
         if snapshot is None:
             continue
-        _facts, issues = _normalize_statement_snapshot(
+        facts, issues = _normalize_statement_snapshot(
             store=store,
             snapshots=snapshots,
             snapshot=snapshot,
@@ -1187,14 +1283,11 @@ def _execute_feature_job(
             trading_days=trading_days,
             record_issues=False,
         )
+        normalized_facts.extend(facts)
         issue_codes.update(issue.code for issue in issues)
 
-    facts = store.list_financial_facts(
-        security_id,
-        source_snapshot_ids=statement_ids,
-    )
     selection = select_visible_facts(
-        facts,
+        normalized_facts,
         as_of_utc=payload["as_of_utc"],
         snapshot_fetched_at={
             snapshot.id: snapshot.fetched_at

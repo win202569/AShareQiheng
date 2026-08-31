@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import MappingProxyType
+from typing import Mapping
 
 from .feature_contract import canonical_sha256, require_aware_utc
 from .snapshot_store import SnapshotStore
@@ -23,6 +25,9 @@ class SnapshotRef:
     row_count: int
     fetched_at: str
     created_at: str
+    request: Mapping[str, object] | None = field(
+        default=None, compare=False, repr=False
+    )
 
 
 @dataclass(frozen=True)
@@ -69,7 +74,10 @@ class SnapshotRepository:
         snapshot = self.get(snapshot_id)
         if snapshot is None:
             raise RuntimeError("recorded snapshot could not be retrieved")
-        return snapshot, created
+        return replace(
+            snapshot,
+            request=MappingProxyType(dict(winner.request)),
+        ), created
 
     def find_exact(
         self, source: str, dataset: str, request: dict
@@ -85,7 +93,12 @@ class SnapshotRepository:
                    LIMIT 1""",
                 (source, dataset, fingerprint),
             ).fetchone()
-        return self._ref_from_row(row) if row is not None else None
+        if row is None:
+            return None
+        return replace(
+            self._ref_from_row(row),
+            request=MappingProxyType(dict(request)),
+        )
 
     def get(self, snapshot_id: str) -> SnapshotRef | None:
         with closing(self.state_store._connect()) as connection:

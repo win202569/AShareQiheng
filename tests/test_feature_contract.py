@@ -1,3 +1,4 @@
+import copy
 import math
 import unittest
 
@@ -167,6 +168,47 @@ class FeatureContractTests(unittest.TestCase):
         for values in ((), (not_applicable,)):
             with self.subTest(values=values), self.assertRaisesRegex(ValueError, "input_ready"):
                 DimensionInput("input_ready", values)
+
+    def test_public_parse_rejects_canonical_but_semantically_invalid_bundles(self):
+        cases = {
+            "schema_type": lambda value: value.__setitem__("schema_version", True),
+            "security_id": lambda value: value.__setitem__("security_id", "600001"),
+            "report_date": lambda value: value.__setitem__("report_period", "2026-6-30"),
+            "as_of_type": lambda value: value.__setitem__("as_of_utc", 7),
+            "candidate_hash": lambda value: value.__setitem__("candidate_set_hash", "c" * 63),
+            "input_hash": lambda value: value.__setitem__("input_hash", "not-a-hash"),
+            "template_version": lambda value: value["industry"].__setitem__(
+                "template_version", "template-registry-v0"
+            ),
+            "template_binding": lambda value: value["industry"].__setitem__(
+                "template_id", "bank"
+            ),
+            "count_keys": lambda value: value["confidence_inputs"].__setitem__(
+                "date_precision_counts", {"timestamp": 0}
+            ),
+            "negative_history_count": lambda value: value["confidence_inputs"].__setitem__(
+                "history_years_present", -1
+            ),
+            "mapping_boolean": lambda value: value["confidence_inputs"].__setitem__(
+                "mapping_consistent", 1
+            ),
+            "ready_coverage": lambda value: value.__setitem__(
+                "financial_status", "financial_ready"
+            ),
+            "coverage_mismatch": lambda value: value["confidence_inputs"].__setitem__(
+                "data_completeness_ratio", 0.4
+            ),
+            "blocker_type": lambda value: value.__setitem__(
+                "blockers", ["formal_industry_mapping_missing", 7]
+            ),
+        }
+        baseline = bundle().to_dict()
+        for field, mutate in cases.items():
+            with self.subTest(field=field):
+                payload = copy.deepcopy(baseline)
+                mutate(payload)
+                with self.assertRaises(ValueError):
+                    FeatureBundle.from_dict(payload)
 
 
 if __name__ == "__main__":

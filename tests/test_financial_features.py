@@ -590,9 +590,16 @@ class TradeCalendarTests(unittest.TestCase):
             records[(session - start).days]["is_trading_day"] = "1"
         return records
 
-    def calendar_batch(self, *, records=None, request=None, dataset="trade_dates"):
+    def calendar_batch(
+        self,
+        *,
+        records=None,
+        request=None,
+        source="baostock",
+        dataset="trade_dates",
+    ):
         return FetchBatch(
-            "baostock", dataset,
+            source, dataset,
             request or {"start_date": "2021-01-01", "end_date": "2026-09-07"},
             self.complete_records() if records is None else records,
             "2026-08-30T00:00:00+00:00", "test", {"verified_snapshot_id": "calendar-a"},
@@ -627,6 +634,7 @@ class TradeCalendarTests(unittest.TestCase):
 
     def test_calendar_rejects_wrong_dataset_malformed_rows_flags_and_range(self):
         invalid_batches = (
+            self.calendar_batch(source="not-baostock"),
             self.calendar_batch(dataset="daily"),
             self.calendar_batch(records=[{"calendar_date": "bad", "is_trading_day": "1"}]),
             self.calendar_batch(records=[{"calendar_date": "2026-08-28", "is_trading_day": "yes"}]),
@@ -893,13 +901,51 @@ class FeatureBundleBuildTests(unittest.TestCase):
             "missing",
         )
 
-    def test_zero_average_assets_and_negative_average_invested_capital_fail_closed(self):
+    def test_zero_average_assets_and_invested_capital_fail_closed(self):
         facts = self.replace_fact(hand_checked_general_facts(), "total_assets", "2024-12-31", -1_000.0)
         values = self.values(build_bundle_with_overrides(facts=facts))
         self.assertEqual(values["eq.total_accruals.FY2025"].status, "missing")
-        facts = self.replace_fact(hand_checked_general_facts(), "total_equity", "2024-12-31", -2_000.0)
+        facts = self.replace_fact(hand_checked_general_facts(), "total_equity", "2024-12-31", -1_400.0)
         values = self.values(build_bundle_with_overrides(facts=facts))
         self.assertEqual(values["m.roic.FY2025"].status, "missing")
+
+    def test_negative_nonzero_ratio_denominators_are_hand_calculated(self):
+        negative_revenue = hand_checked_general_facts(fy2025_revenue=-1_000.0)
+        revenue_values = self.values(
+            build_bundle_with_overrides(facts=negative_revenue)
+        )
+        self.assertEqual(revenue_values["m.gross_margin.FY2025"].status, "derived")
+        self.assertEqual(revenue_values["m.gross_margin.FY2025"].value, 1.6)
+
+        negative_average_assets = self.replace_fact(
+            hand_checked_general_facts(),
+            "total_assets",
+            "2024-12-31",
+            -1_200.0,
+        )
+        accrual_values = self.values(
+            build_bundle_with_overrides(facts=negative_average_assets)
+        )
+        self.assertEqual(
+            accrual_values["eq.total_accruals.FY2025"].status, "derived"
+        )
+        self.assertEqual(
+            accrual_values["eq.total_accruals.FY2025"].value, 0.2
+        )
+
+        negative_average_invested = self.replace_fact(
+            hand_checked_general_facts(),
+            "total_equity",
+            "2024-12-31",
+            -2_000.0,
+        )
+        roic_values = self.values(
+            build_bundle_with_overrides(facts=negative_average_invested)
+        )
+        self.assertEqual(roic_values["m.roic.FY2025"].status, "derived")
+        self.assertAlmostEqual(
+            roic_values["m.roic.FY2025"].value, -2.0 / 3.0
+        )
 
     def test_fact_blockers_survive_verbatim_and_keep_bundle_blocked(self):
         bundle = build_bundle_with_overrides(
@@ -1026,12 +1072,27 @@ class FeatureBundleBuildTests(unittest.TestCase):
         self.assertEqual(bundle.financial_coverage, 0.0)
         self.assertFalse(any("interest_bearing_debt" in key or ".roic." in key for key in keys))
 
-    def test_real_estate_uses_registered_high_leverage_financial_inputs(self):
-        bundle = build_bundle_with_overrides(source_industry_name="房地产开发")
-        values = self.values(bundle)
-        self.assertEqual(bundle.industry.template_id, "real_estate_high_leverage")
-        self.assertIn("fs.interest_bearing_debt.FY2025", values)
-        self.assertIn("m.roic.FY2025", values)
+    def test_specialized_real_estate_and_resource_templates_never_ready_on_common_inputs(self):
+        cases = (
+            ("房地产开发", "real_estate_high_leverage"),
+            ("工业金属", "resource_cycle"),
+        )
+        for industry, template_id in cases:
+            with self.subTest(industry=industry):
+                template = resolve_template(industry)
+                bundle = build_bundle_with_overrides(
+                    source_industry_name=industry
+                )
+                values = self.values(bundle)
+                self.assertEqual(bundle.industry.template_id, template_id)
+                self.assertTrue(template.specialized_inputs_required)
+                self.assertIn("fs.interest_bearing_debt.FY2025", values)
+                self.assertIn("m.roic.FY2025", values)
+                self.assertEqual(bundle.financial_coverage, 1.0)
+                self.assertEqual(bundle.financial_status, "blocked")
+                self.assertIn(
+                    "specialized_financial_inputs_missing", bundle.blockers
+                )
 
     def test_unclassified_template_blocks_instead_of_falling_back(self):
         bundle = build_bundle_with_overrides(source_industry_name="不存在行业")

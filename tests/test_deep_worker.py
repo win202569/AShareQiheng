@@ -24,7 +24,13 @@ from ashare_pipeline.deep_worker import (
     statement_job_specs,
 )
 from ashare_pipeline.feature_contract import FeatureBundle, canonical_json_bytes, canonical_sha256
-from ashare_pipeline.financial_features import SHANGHAI, build_feature_bundle, feature_input_hash
+from ashare_pipeline.financial_features import (
+    SHANGHAI,
+    build_feature_bundle,
+    build_financial_facts,
+    feature_input_hash,
+    trading_days_from_batch,
+)
 from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
 from ashare_pipeline.snapshot_repository import SnapshotRepository
 from ashare_pipeline.sources import (
@@ -171,6 +177,27 @@ def fixture_calendar_batch() -> FetchBatch:
     )
 
 
+def fixture_calendar_with_session(calendar_date: str) -> FetchBatch:
+    batch = fixture_calendar_batch()
+    records = [dict(row) for row in batch.records]
+    matched = False
+    for row in records:
+        if row["calendar_date"] == calendar_date:
+            row["is_trading_day"] = "1"
+            matched = True
+    if not matched:
+        raise AssertionError(f"fixture calendar does not contain {calendar_date}")
+    return FetchBatch(
+        batch.source,
+        batch.dataset,
+        dict(batch.request),
+        records,
+        batch.fetched_at_utc,
+        batch.source_version,
+        dict(batch.metadata),
+    )
+
+
 class DeepWorkerTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -194,6 +221,27 @@ class DeepWorkerTestCase(unittest.TestCase):
 
     def _calendar_ref(self):
         return self.repository.persist(fixture_calendar_batch())[0]
+
+    def _persist_statements_and_seed_old_calendar_facts(self):
+        statements = {
+            dataset: self.repository.persist(fixture_statement_batch(dataset))[0]
+            for dataset in STATEMENT_DATASETS
+        }
+        old_trading_days = trading_days_from_batch(
+            fixture_calendar_with_session("2026-08-29")
+        )
+        for snapshot in statements.values():
+            verified = self.repository.read_verified(snapshot)
+            result = build_financial_facts(
+                verified.batch,
+                source_snapshot_id=snapshot.id,
+                expected_security_id="SH600001",
+                trading_days=old_trading_days,
+                created_at_utc=snapshot.fetched_at,
+            )
+            self.assertEqual(result.issues, ())
+            self.store.insert_financial_facts(result.facts)
+        return statements
 
     def _enqueue_statement(
         self,
@@ -492,6 +540,69 @@ class DeepWorkerTestCase(unittest.TestCase):
         )
         self.assertNotIn("999.0", bundle_text)
 
+    def test_feature_build_selects_only_facts_normalized_with_its_frozen_calendar(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        statements = self._persist_statements_and_seed_old_calendar_facts()
+        current_calendar = self._calendar_ref()
+        job_id = deep_worker_module.enqueue_feature_build(
+            self.store,
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            candidate_context=context,
+            statement_snapshots=statements,
+            trade_calendar_snapshot=current_calendar,
+        )
+
+        self._run(
+            source=None,
+            online=False,
+            limit=1,
+            trade_calendar_snapshot=current_calendar,
+        )
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "succeeded")
+        row = self.store.latest_feature_set("SH600001", REPORT_PERIOD)
+        bundle = deep_worker_module.read_verified_feature_bundle(
+            self.project_root, row["bundle_path"], row["bundle_hash"]
+        )
+        values = {
+            value.key: value
+            for dimension in bundle.dimension_inputs.values()
+            for value in dimension.values
+        }
+        self.assertEqual(values["g.revenue.2026H1"].status, "missing")
+
+    def test_feature_build_with_null_calendar_does_not_reuse_old_calendar_facts(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        statements = self._persist_statements_and_seed_old_calendar_facts()
+        job_id = deep_worker_module.enqueue_feature_build(
+            self.store,
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            candidate_context=context,
+            statement_snapshots=statements,
+            trade_calendar_snapshot=None,
+        )
+
+        self._run(source=None, online=False, limit=1, trade_calendar_snapshot=None)
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "succeeded")
+        row = self.store.latest_feature_set("SH600001", REPORT_PERIOD)
+        bundle = deep_worker_module.read_verified_feature_bundle(
+            self.project_root, row["bundle_path"], row["bundle_hash"]
+        )
+        values = {
+            value.key: value
+            for dimension in bundle.dimension_inputs.values()
+            for value in dimension.values
+        }
+        self.assertEqual(values["g.revenue.2026H1"].status, "missing")
+        self.assertIn("trade_calendar_missing", bundle.blockers)
+
     def test_feature_build_key_rejects_conflicting_frozen_payload(self) -> None:
         self._write_candidates({"SH600001": "包装印刷"})
         context = load_candidate_context(self.data_root)
@@ -529,6 +640,131 @@ class DeepWorkerTestCase(unittest.TestCase):
             self.store.get_job(first_id)["payload"]["performance_input_hash"],
             context.performance_input_hashes["SH600001"],
         )
+
+    def test_feature_payload_freezes_exact_calendar_identity(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        calendar = self._calendar_ref()
+
+        payload = deep_worker_module.feature_build_payload(
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            context=context,
+            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+            trade_calendar_snapshot=calendar,
+        )
+
+        self.assertEqual(
+            payload["trade_calendar_snapshot"],
+            {
+                "source_snapshot_id": calendar.id,
+                "payload_hash": calendar.payload_hash,
+                "source": "baostock",
+                "dataset": "trade_dates",
+                "request": {
+                    "start_date": "2021-01-01",
+                    "end_date": "2026-09-07",
+                },
+                "request_fingerprint": canonical_sha256(
+                    {
+                        "start_date": "2021-01-01",
+                        "end_date": "2026-09-07",
+                    }
+                ),
+            },
+        )
+
+    def test_enqueue_feature_build_rejects_wrong_calendar_identity(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        calendar = self._calendar_ref()
+        cases = {
+            "source": replace(calendar, source="not-baostock"),
+            "dataset": replace(calendar, dataset="daily"),
+            "request": replace(
+                calendar,
+                request_fingerprint=canonical_sha256(
+                    {"start_date": "2021-01-01", "end_date": "2026-09-08"}
+                ),
+            ),
+        }
+
+        for field, wrong_calendar in cases.items():
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, "trade calendar"
+            ):
+                deep_worker_module.enqueue_feature_build(
+                    self.store,
+                    security_id="SH600001",
+                    report_period=REPORT_PERIOD,
+                    as_of_utc="2026-08-29T12:00:00+00:00",
+                    candidate_context=context,
+                    statement_snapshots={
+                        dataset: None for dataset in STATEMENT_DATASETS
+                    },
+                    trade_calendar_snapshot=wrong_calendar,
+                )
+
+    def test_feature_executor_rejects_calendar_identity_swapped_after_enqueue(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        valid_calendar = self._calendar_ref()
+        valid_payload = deep_worker_module.feature_build_payload(
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            context=context,
+            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+            trade_calendar_snapshot=valid_calendar,
+        )
+        base_batch = fixture_calendar_batch()
+        extended_records = [dict(row) for row in base_batch.records]
+        extended_records.append(
+            {"calendar_date": "2026-09-08", "is_trading_day": "1"}
+        )
+        wrong_batches = {
+            "source": FetchBatch(
+                "not-baostock",
+                "trade_dates",
+                dict(base_batch.request),
+                [dict(row) for row in base_batch.records],
+                base_batch.fetched_at_utc,
+                base_batch.source_version,
+                dict(base_batch.metadata),
+            ),
+            "dataset": FetchBatch(
+                "baostock",
+                "daily",
+                dict(base_batch.request),
+                [dict(row) for row in base_batch.records],
+                base_batch.fetched_at_utc,
+                base_batch.source_version,
+                dict(base_batch.metadata),
+            ),
+            "request": FetchBatch(
+                "baostock",
+                "trade_dates",
+                {"start_date": "2021-01-01", "end_date": "2026-09-08"},
+                extended_records,
+                base_batch.fetched_at_utc,
+                base_batch.source_version,
+                dict(base_batch.metadata),
+            ),
+        }
+        job_ids = {}
+        for field, batch in wrong_batches.items():
+            wrong_ref = self.repository.persist(batch)[0]
+            payload = json.loads(json.dumps(valid_payload))
+            payload["trade_calendar_snapshot"]["source_snapshot_id"] = wrong_ref.id
+            payload["trade_calendar_snapshot"]["payload_hash"] = wrong_ref.payload_hash
+            job_ids[field] = self._enqueue_direct_feature_payload(payload)
+
+        self._run(source=None, online=False, trade_calendar_snapshot=valid_calendar)
+
+        for field, job_id in job_ids.items():
+            with self.subTest(field=field):
+                self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
 
     def test_feature_executor_rejects_key_not_bound_to_frozen_payload(self) -> None:
         self._write_candidates({"SH600001": "包装印刷"})
@@ -1267,6 +1503,26 @@ class DeepWorkerTestCase(unittest.TestCase):
         )
         self.assertTrue((self.project_root / relative_path).is_file())
         self.assertFalse((self.data_root / "data").exists())
+
+    def test_verified_feature_read_rejects_canonical_but_invalid_bundle(self) -> None:
+        bundle = self._empty_feature_bundle()
+        payload = bundle.to_dict()
+        payload["financial_status"] = "financial_ready"
+        canonical = canonical_json_bytes(payload)
+        relative_path = (
+            f"data/curated/formal_features/{REPORT_PERIOD}/SH600001/"
+            f"{bundle.input_hash}.json"
+        )
+        target = self.project_root / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(canonical)
+
+        with self.assertRaisesRegex(OSError, "malformed"):
+            deep_worker_module.read_verified_feature_bundle(
+                self.project_root,
+                relative_path,
+                canonical_sha256(payload),
+            )
 
     def test_old_parent_expands_to_three_dated_unique_statement_jobs(self) -> None:
         context = candidate_context({"SH600001"})

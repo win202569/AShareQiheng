@@ -24,6 +24,7 @@ from .deep_worker import (
     build_candidate_context,
     deep_statement_key,
     load_candidate_context,
+    read_verified_feature_bundle,
     run_deep,
 )
 from .feature_contract import CONTRACT_VERSION, canonical_sha256
@@ -156,9 +157,24 @@ def _deep_dependencies(
             source = sources[1] if sources is not None else _default_deep_source()
         if calendar is None:
             bao = sources[0] if sources is not None else _default_calendar_source()
-            calendar, _ = repository.persist(
-                bao.fetch_trade_dates(request["start_date"], request["end_date"])
+            calendar_batch = bao.fetch_trade_dates(
+                request["start_date"], request["end_date"]
             )
+            from .sources import FetchBatch
+
+            if (
+                not isinstance(calendar_batch, FetchBatch)
+                or calendar_batch.source != "baostock"
+                or calendar_batch.dataset != "trade_dates"
+                or calendar_batch.request != request
+            ):
+                raise ValueError(
+                    "trade calendar fetch did not match baostock/trade_dates exact request"
+                )
+            calendar, _ = repository.persist(calendar_batch)
+            persisted = repository.read_verified(calendar)
+            if persisted.batch.request != request:
+                raise ValueError("trade calendar persisted request mismatch")
     return repository, source, calendar
 
 
@@ -1041,11 +1057,28 @@ def build_deep_progress(
             ORDER BY security_id,as_of_utc DESC,created_at DESC,id DESC""",
             (context.candidate_set_hash, CONTRACT_VERSION, report_period),
         ).fetchall()
+    seen_feature_securities: set[str] = set()
     for row in rows:
-        public = store._feature_set_public(row)
-        security_id = str(public["security_id"])
-        if security_id in members and security_id not in feature_rows:
-            feature_rows[security_id] = public
+        security_id = str(row["security_id"])
+        if security_id not in members or security_id in seen_feature_securities:
+            continue
+        seen_feature_securities.add(security_id)
+        try:
+            public = store._feature_set_public(row)
+            bundle = read_verified_feature_bundle(
+                resolved_root.parent,
+                public["bundle_path"],
+                public["bundle_hash"],
+            )
+            expected_header, _values = store._feature_bundle_content(
+                bundle, bundle.bundle_hash()
+            )
+            if any(row[key] != value for key, value in expected_header.items()):
+                raise ValueError("feature bundle database header mismatch")
+        except (KeyError, OSError, TypeError, UnicodeError, ValueError):
+            unknown_failures += 1
+            continue
+        feature_rows[security_id] = public
     feature_counts = {"partial": 0, "financial_ready": 0, "blocked": 0}
     templates: list[str] = []
     missing_reasons: list[str] = []
@@ -1055,8 +1088,8 @@ def build_deep_progress(
             feature_counts[status] += 1
         templates.append(str(row["template_id"]))
         for item in row.get("missing", []):
-            if isinstance(item, dict) and isinstance(item.get("missing_reason"), str):
-                missing_reasons.append(item["missing_reason"])
+            if isinstance(item, dict) and isinstance(item.get("reason"), str):
+                missing_reasons.append(item["reason"])
 
     denominator = len(members)
     if len(incomplete) != denominator - complete_count:

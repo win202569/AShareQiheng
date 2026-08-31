@@ -14,8 +14,18 @@ from ashare_pipeline.deep_worker import (
     CandidateContext,
     STATEMENT_DATASETS,
     deep_statement_key,
+    write_feature_bundle,
 )
-from ashare_pipeline.feature_contract import canonical_sha256
+from ashare_pipeline.feature_contract import (
+    CONTRACT_VERSION,
+    DIMENSIONS,
+    ConfidenceInputs,
+    DimensionInput,
+    FeatureBundle,
+    FeatureValue,
+    IndustryContext,
+    canonical_sha256,
+)
 from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
 from ashare_pipeline.snapshot_repository import SnapshotRepository
 from ashare_pipeline.snapshot_store import SnapshotStore
@@ -94,6 +104,65 @@ def exact_calendar_batch(now="2026-08-29T12:00:00+00:00"):
         ],
         {"start_date": "2021-01-01", "end_date": "2026-09-08"},
         now,
+    )
+
+
+def progress_bundle(
+    candidate_set_hash,
+    *,
+    security_id="SH600001",
+    input_hash="1" * 64,
+    missing_reason="financial_fact_missing:revenue",
+):
+    dimension_inputs = {
+        dimension: DimensionInput("not_applicable", ())
+        for dimension in DIMENSIONS
+    }
+    dimension_inputs["G"] = DimensionInput(
+        "missing",
+        (
+            FeatureValue(
+                "g.revenue.FY2025",
+                None,
+                "CNY",
+                "FY2025",
+                "missing",
+                "financial-derived-v1",
+                (),
+                missing_reason,
+            ),
+        ),
+    )
+    dimension_inputs["V"] = DimensionInput("missing", ())
+    dimension_inputs["T"] = DimensionInput("missing", ())
+    return FeatureBundle(
+        1,
+        CONTRACT_VERSION,
+        security_id,
+        "2026-06-30",
+        "2026-08-29T12:00:00+00:00",
+        candidate_set_hash,
+        IndustryContext(
+            "eastmoney-provisional",
+            None,
+            "包装印刷",
+            "general_nonfinancial",
+            "template-registry-v1",
+            False,
+        ),
+        input_hash,
+        "partial",
+        0.0,
+        ConfidenceInputs(
+            0.0,
+            {"timestamp": 0, "date_only": 0},
+            0,
+            True,
+            None,
+        ),
+        dimension_inputs,
+        ("formal_industry_mapping_missing",),
+        False,
     )
 
 
@@ -322,6 +391,58 @@ class OrchestratorTestCase(unittest.TestCase):
             )
         self.assertEqual(source.calls, [])
         self.assertEqual(bao.trade_date_requests, [])
+
+    def test_calendar_fetch_rejects_wrong_source_dataset_and_exact_request(self):
+        now = orchestrator._now_cn("2026-08-29T20:00:00+08:00")
+        expected_request = orchestrator._feature_calendar_request(now)
+        wrong_batches = {
+            "source": batch(
+                "not-baostock", "trade_dates", [], expected_request
+            ),
+            "dataset": batch("baostock", "daily", [], expected_request),
+            "request": batch(
+                "baostock",
+                "trade_dates",
+                [],
+                {
+                    "start_date": expected_request["start_date"],
+                    "end_date": (
+                        date.fromisoformat(expected_request["end_date"])
+                        + timedelta(days=1)
+                    ).isoformat(),
+                },
+            ),
+        }
+
+        class CalendarSource:
+            def __init__(self, value):
+                self.value = value
+
+            def fetch_trade_dates(self, _start_date, _end_date):
+                return self.value
+
+        for field, wrong_batch in wrong_batches.items():
+            with self.subTest(field=field):
+                data_root = self.base / f"wrong-calendar-{field}" / "data"
+                store = StateStore(data_root / "state.sqlite3")
+                store.initialize()
+                with self.assertRaisesRegex(ValueError, "trade calendar"):
+                    orchestrator._deep_dependencies(
+                        data_root,
+                        store,
+                        now=now,
+                        online=True,
+                        sources=(CalendarSource(wrong_batch), object()),
+                        snapshot_store=None,
+                        deep_source=object(),
+                    )
+                with closing(sqlite3.connect(store.db_path)) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM source_snapshot"
+                        ).fetchone()[0],
+                        0,
+                    )
 
     def test_changed_calendar_request_is_not_hidden_by_cached_short_job(self):
         store = StateStore(self.root / "state.sqlite3")
@@ -929,48 +1050,18 @@ class OrchestratorTestCase(unittest.TestCase):
                 <= orchestrator._PROGRESS_CLASSIFICATIONS
             )
 
-    def test_progress_feature_counts_require_current_candidate_hash_and_contract(self):
+    def test_progress_aggregates_missing_reason_from_real_persisted_bundle(self):
         write_candidate_documents(self.root, {"SH600001": "包装印刷"})
         store = StateStore(self.root / "state.sqlite3")
         store.initialize()
         context = orchestrator.load_candidate_context(self.root)
-        rows = [
-            ("current", context.candidate_set_hash, "feature-contract-v1", "2026-06-30", "partial"),
-            ("stale-hash", "f" * 64, "feature-contract-v1", "2026-06-30", "blocked"),
-            ("stale-contract", context.candidate_set_hash, "feature-contract-v0", "2026-06-30", "blocked"),
-            ("stale-period", context.candidate_set_hash, "feature-contract-v1", "2025-12-31", "blocked"),
-        ]
-        with closing(sqlite3.connect(store.db_path)) as connection:
-            for index, (row_id, candidate_hash, contract, report_period, status) in enumerate(rows):
-                connection.execute(
-                    """INSERT INTO feature_set
-                    (id,security_id,report_period,as_of_utc,candidate_set_hash,
-                     template_id,template_version,contract_version,input_hash,status,
-                     financial_coverage,dimension_status_json,confidence_inputs_json,
-                     blockers_json,bundle_hash,bundle_path,missing_json,created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        row_id,
-                        "SH600001",
-                        report_period,
-                        f"2026-08-29T0{index}:00:00+00:00",
-                        candidate_hash,
-                        "general_nonfinancial",
-                        "template-registry-v1",
-                        contract,
-                        str(index) * 64,
-                        status,
-                        0.5,
-                        "{}",
-                        "{}",
-                        "[]",
-                        canonical_sha256(row_id),
-                        f"data/curated/formal_features/{row_id}.json",
-                        json.dumps([{"missing_reason": "fact_missing"}]),
-                        f"2026-08-29T0{index}:00:00+00:00",
-                    ),
-                )
-            connection.commit()
+        bundle = progress_bundle(context.candidate_set_hash)
+        relative_path, bundle_hash, _ = write_feature_bundle(self.base, bundle)
+        store.put_feature_bundle(
+            bundle,
+            bundle_path=relative_path,
+            bundle_hash=bundle_hash,
+        )
 
         progress = orchestrator.build_deep_progress(
             self.root,
@@ -985,7 +1076,123 @@ class OrchestratorTestCase(unittest.TestCase):
             {"partial": 1, "financial_ready": 0, "blocked": 0},
         )
         self.assertEqual(progress["template_counts"], {"general_nonfinancial": 1})
-        self.assertEqual(progress["missing_reason_counts"], {"fact_missing": 1})
+        self.assertEqual(
+            progress["missing_reason_counts"],
+            {"financial_fact_missing:revenue": 1},
+        )
+        self.assertNotIn("g.revenue.FY2025", json.dumps(progress))
+
+    def test_progress_excludes_deleted_and_tampered_bundle_files(self):
+        write_candidate_documents(
+            self.root,
+            {"SH600001": "包装印刷", "SH600002": "包装印刷"},
+        )
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        targets = []
+        for security_id, input_hash in (
+            ("SH600001", "1" * 64),
+            ("SH600002", "2" * 64),
+        ):
+            bundle = progress_bundle(
+                context.candidate_set_hash,
+                security_id=security_id,
+                input_hash=input_hash,
+            )
+            relative_path, bundle_hash, _ = write_feature_bundle(
+                self.base, bundle
+            )
+            store.put_feature_bundle(
+                bundle,
+                bundle_path=relative_path,
+                bundle_hash=bundle_hash,
+            )
+            targets.append(self.base / relative_path)
+        targets[0].unlink()
+        targets[1].write_bytes(b'{"tampered":true}')
+
+        progress = orchestrator.build_deep_progress(
+            self.root,
+            store,
+            SnapshotRepository(self.root, store),
+            context,
+            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+        )
+
+        self.assertEqual(
+            progress["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(progress["template_counts"], {})
+        self.assertEqual(progress["missing_reason_counts"], {})
+        self.assertEqual(progress["unknown_failure_count"], 2)
+
+    def test_progress_excludes_bundle_when_database_header_mismatches_file(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        bundle = progress_bundle(context.candidate_set_hash)
+        relative_path, bundle_hash, _ = write_feature_bundle(self.base, bundle)
+        store.put_feature_bundle(
+            bundle,
+            bundle_path=relative_path,
+            bundle_hash=bundle_hash,
+        )
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            connection.execute(
+                "UPDATE feature_set SET status='financial_ready' WHERE input_hash=?",
+                (bundle.input_hash,),
+            )
+            connection.commit()
+
+        progress = orchestrator.build_deep_progress(
+            self.root,
+            store,
+            SnapshotRepository(self.root, store),
+            context,
+            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+        )
+
+        self.assertEqual(
+            progress["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(progress["unknown_failure_count"], 1)
+
+    def test_progress_reports_corrupt_database_summary_as_unknown(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        bundle = progress_bundle(context.candidate_set_hash)
+        relative_path, bundle_hash, _ = write_feature_bundle(self.base, bundle)
+        store.put_feature_bundle(
+            bundle,
+            bundle_path=relative_path,
+            bundle_hash=bundle_hash,
+        )
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            connection.execute(
+                "UPDATE feature_set SET missing_json='{' WHERE input_hash=?",
+                (bundle.input_hash,),
+            )
+            connection.commit()
+
+        progress = orchestrator.build_deep_progress(
+            self.root,
+            store,
+            SnapshotRepository(self.root, store),
+            context,
+            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+        )
+
+        self.assertEqual(
+            progress["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(progress["unknown_failure_count"], 1)
 
     def test_status_fails_closed_when_curated_candidate_documents_are_tampered(self):
         write_candidate_documents(self.root, {"SH600001": "包装印刷"})
