@@ -65,52 +65,12 @@ def valid_feature_bundle(
     *, input_hash: str = "b" * 64,
     as_of_utc: str = "2026-08-29T16:00:00+00:00",
     blockers: tuple[str, ...] = ("formal_industry_mapping_missing",),
-    evidence: EvidenceRef | None = None,
 ) -> FeatureBundle:
-    evidence = evidence or EvidenceRef(
-        "fact-a", "snapshot-a", "TOTAL_ASSETS", "a" * 64,
-        "2026-08-20T15:59:59+00:00", "2026-08-21T07:00:00+00:00",
-    )
-    dimensions = {
-        dimension: DimensionInput(
-            "partial",
-            (
-                FeatureValue(
-                    f"{dimension.lower()}.sample",
-                    0.0,
-                    "ratio",
-                    "2026H1",
-                    "observed",
-                    "observed-v1",
-                    (evidence,),
-                    None,
-                ),
-            ),
-        )
-        for dimension in DIMENSIONS
-    }
-    return FeatureBundle(
-        1,
-        CONTRACT_VERSION,
-        "SH600001",
-        "2026-06-30",
-        as_of_utc,
-        "c" * 64,
-        IndustryContext(
-            "eastmoney-provisional",
-            None,
-            "包装印刷",
-            "general_nonfinancial",
-            "template-registry-v1",
-            False,
-        ),
-        input_hash,
-        "partial",
-        0.5,
-        ConfidenceInputs(0.5, {"timestamp": 0, "date_only": 1}, 3, True, None),
-        dimensions,
-        blockers,
-        False,
+    return replace(
+        build_bundle_with_overrides(facts=()),
+        input_hash=input_hash,
+        as_of_utc=as_of_utc,
+        blockers=blockers,
     )
 
 
@@ -156,9 +116,7 @@ class StateStoreTestCase(unittest.TestCase):
         )
         fact = financial_fact(snapshot_id=snapshot_id)
         self.store.insert_financial_facts((fact,))
-        return valid_feature_bundle(
-            evidence=self.evidence_for_fact(fact), **overrides
-        )
+        return replace(build_bundle_with_overrides(facts=(fact,)), **overrides)
 
     @staticmethod
     def installed_ready_bundle(
@@ -599,7 +557,7 @@ class StateStoreTestCase(unittest.TestCase):
             (feature_id, False),
         )
         conflicting = replace(bundle, blockers=("changed-without-input-hash",))
-        with self.assertRaisesRegex(ValueError, "non-deterministic feature conflict"):
+        with self.assertRaisesRegex(ValueError, "stored feature bundle content mismatch"):
             self.store.put_feature_bundle(
                 conflicting,
                 bundle_path="data/curated/formal_features/2026-06-30/SH600001/c.json",
@@ -609,7 +567,7 @@ class StateStoreTestCase(unittest.TestCase):
         self.assertEqual(stored["bundle_hash"], bundle.bundle_hash())
         with closing(sqlite3.connect(self.db_path)) as connection:
             self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0], 7
+                connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0], 363
             )
 
     def test_put_feature_bundle_rolls_back_header_and_values_when_one_value_aborts(self) -> None:
@@ -631,6 +589,46 @@ class StateStoreTestCase(unittest.TestCase):
         with closing(sqlite3.connect(self.db_path)) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0], 0)
+
+    def test_first_insert_mirror_validation_rolls_back_materialization_drift(self) -> None:
+        bundle, _facts, _snapshots = self.installed_ready_bundle(
+            self.store, snapshot_tag="first-insert-mirror"
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.executescript(
+                """CREATE TRIGGER corrupt_inserted_feature_value
+                AFTER INSERT ON feature_value
+                WHEN NEW.dimension = 'G' AND NEW.feature_key = 'g.revenue.FY2021'
+                BEGIN
+                    UPDATE feature_value SET value = value + 1.0
+                    WHERE feature_set_id = NEW.feature_set_id
+                    AND dimension = NEW.dimension
+                    AND feature_key = NEW.feature_key
+                    AND period_key = NEW.period_key;
+                END;"""
+            )
+
+        with self.assertRaisesRegex(
+            ValueError, "stored feature bundle content mismatch"
+        ):
+            self.store.put_feature_bundle(
+                bundle,
+                bundle_path=(
+                    "data/curated/formal_features/2026-06-30/SH600001/"
+                    "first-insert-mirror.json"
+                ),
+                bundle_hash=bundle.bundle_hash(),
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0],
+                0,
+            )
 
     def test_put_feature_bundle_rejects_hash_mismatch_and_unsafe_paths(self) -> None:
         bundle = valid_feature_bundle()
@@ -857,6 +855,168 @@ class StateStoreTestCase(unittest.TestCase):
                         0,
                     )
 
+    def test_put_feature_bundle_authenticates_derived_values_and_operands(self) -> None:
+        def raw_value(payload, key):
+            return next(
+                value
+                for dimension in payload["dimension_inputs"].values()
+                for value in dimension["values"]
+                if value["key"] == key
+            )
+
+        def mutate_numeric(payload):
+            raw_value(payload, "m.gross_profit.FY2021")["value"] += 1.0
+
+        def substitute_gross_profit_operand(payload):
+            target = raw_value(payload, "m.gross_profit.FY2021")
+            cost = raw_value(payload, "m.operating_cost.FY2021")["evidence"][0]
+            substitute = raw_value(payload, "m.total_profit.FY2021")["evidence"][0]
+            target["evidence"] = [
+                copy.deepcopy(substitute if item["financial_fact_id"] == cost["financial_fact_id"] else item)
+                for item in target["evidence"]
+            ]
+
+        def substitute_growth_period(payload):
+            target = raw_value(payload, "g.revenue_symmetric_growth.FY2022")
+            previous = raw_value(payload, "g.revenue.FY2021")["evidence"][0]
+            substitute = raw_value(payload, "g.revenue.FY2023")["evidence"][0]
+            target["evidence"] = [
+                copy.deepcopy(substitute if item["financial_fact_id"] == previous["financial_fact_id"] else item)
+                for item in target["evidence"]
+            ]
+
+        for case, mutate in (
+            ("numeric", mutate_numeric),
+            ("gross_profit_operand", substitute_gross_profit_operand),
+            ("growth_period_operand", substitute_growth_period),
+        ):
+            with self.subTest(case=case):
+                case_store = StateStore(Path(self.tempdir.name) / f"derived-{case}.sqlite3")
+                case_store.initialize()
+                honest, _facts, _snapshots = self.installed_ready_bundle(
+                    case_store, snapshot_tag=f"derived-{case}"
+                )
+                payload = honest.to_dict()
+                mutate(payload)
+                forged = FeatureBundle.from_dict(payload)
+
+                with self.assertRaisesRegex(ValueError, "derived financial projection"):
+                    case_store.put_feature_bundle(
+                        forged,
+                        bundle_path=(
+                            "data/curated/formal_features/2026-06-30/SH600001/"
+                            f"derived-{case}.json"
+                        ),
+                        bundle_hash=forged.bundle_hash(),
+                    )
+                with closing(sqlite3.connect(case_store.db_path)) as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                        0,
+                    )
+
+    def test_idempotent_put_reauthenticates_derived_numeric_projection(self) -> None:
+        honest, _facts, _snapshots = self.installed_ready_bundle(
+            self.store, snapshot_tag="derived-idempotent"
+        )
+        path = "data/curated/formal_features/2026-06-30/SH600001/derived-idempotent.json"
+        feature_id, created = self.store.put_feature_bundle(
+            honest, bundle_path=path, bundle_hash=honest.bundle_hash()
+        )
+        self.assertTrue(created)
+        payload = honest.to_dict()
+        gross = next(
+            value
+            for value in payload["dimension_inputs"]["M"]["values"]
+            if value["key"] == "m.gross_profit.FY2021"
+        )
+        gross["value"] += 1.0
+        forged = FeatureBundle.from_dict(payload)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE feature_set SET bundle_hash=? WHERE id=?",
+                (forged.bundle_hash(), feature_id),
+            )
+            connection.execute(
+                """UPDATE feature_value SET value=?
+                WHERE feature_set_id=? AND dimension='M'
+                AND feature_key='m.gross_profit.FY2021' AND period_key='FY2021'""",
+                (gross["value"], feature_id),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "derived financial projection"):
+            self.store.put_feature_bundle(
+                forged, bundle_path=path, bundle_hash=forged.bundle_hash()
+            )
+
+    def test_idempotent_put_rejects_exact_child_mirror_corruption_without_repair(self) -> None:
+        for case in ("deleted", "updated", "extra"):
+            with self.subTest(case=case):
+                case_store = StateStore(Path(self.tempdir.name) / f"mirror-{case}.sqlite3")
+                case_store.initialize()
+                bundle, _facts, _snapshots = self.installed_ready_bundle(
+                    case_store, snapshot_tag=f"mirror-{case}"
+                )
+                path = (
+                    "data/curated/formal_features/2026-06-30/SH600001/"
+                    f"mirror-{case}.json"
+                )
+                feature_id, created = case_store.put_feature_bundle(
+                    bundle, bundle_path=path, bundle_hash=bundle.bundle_hash()
+                )
+                self.assertTrue(created)
+                with closing(sqlite3.connect(case_store.db_path)) as connection:
+                    before = connection.execute(
+                        "SELECT COUNT(*) FROM feature_value WHERE feature_set_id=?",
+                        (feature_id,),
+                    ).fetchone()[0]
+                    if case == "deleted":
+                        cursor = connection.execute(
+                            """DELETE FROM feature_value WHERE feature_set_id=?
+                            AND dimension='G' AND feature_key='g.revenue.FY2021'
+                            AND period_key='FY2021'""",
+                            (feature_id,),
+                        )
+                        expected_count = before - 1
+                    elif case == "updated":
+                        cursor = connection.execute(
+                            """UPDATE feature_value SET value=value+1.0
+                            WHERE feature_set_id=? AND dimension='G'
+                            AND feature_key='g.revenue.FY2021' AND period_key='FY2021'""",
+                            (feature_id,),
+                        )
+                        expected_count = before
+                    else:
+                        cursor = connection.execute(
+                            """INSERT INTO feature_value
+                            (feature_set_id,dimension,feature_key,period_key,value,unit,status,
+                             formula_version,evidence_json,missing_reason)
+                            SELECT feature_set_id,dimension,'g.unregistered_extra.FY2021',period_key,
+                                   value,unit,status,formula_version,evidence_json,missing_reason
+                            FROM feature_value WHERE feature_set_id=? AND dimension='G'
+                            AND feature_key='g.revenue.FY2021' AND period_key='FY2021'""",
+                            (feature_id,),
+                        )
+                        expected_count = before + 1
+                    self.assertEqual(cursor.rowcount, 1)
+                    connection.commit()
+
+                with self.assertRaisesRegex(
+                    ValueError, "stored feature bundle content mismatch"
+                ):
+                    case_store.put_feature_bundle(
+                        bundle, bundle_path=path, bundle_hash=bundle.bundle_hash()
+                    )
+                with closing(sqlite3.connect(case_store.db_path)) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM feature_value WHERE feature_set_id=?",
+                            (feature_id,),
+                        ).fetchone()[0],
+                        expected_count,
+                    )
+
     def test_put_feature_bundle_rejects_raw_observed_fact_mismatches(self) -> None:
         cases = ("wrong_security", "metric", "period", "value", "unit", "mapping")
         for case in cases:
@@ -931,10 +1091,27 @@ class StateStoreTestCase(unittest.TestCase):
 
         latest = self.store.latest_feature_set("SH600001", "2026-06-30")
         self.assertEqual(latest["id"], newer.bundle_hash())
-        self.assertEqual(latest["dimension_status"], {key: "partial" for key in DIMENSIONS})
-        self.assertEqual(latest["confidence_inputs"]["history_years_present"], 3)
+        self.assertEqual(
+            latest["dimension_status"],
+            {
+                "G": "partial",
+                "V": "missing",
+                "M": "missing",
+                "EQ": "missing",
+                "FS": "missing",
+                "CA": "missing",
+                "T": "missing",
+            },
+        )
+        self.assertEqual(latest["confidence_inputs"]["history_years_present"], 0)
         self.assertEqual(latest["blockers"], ["a-blocker", "z-blocker"])
-        self.assertEqual(latest["missing"], [])
+        self.assertEqual(len(latest["missing"]), 362)
+        self.assertTrue(
+            all(
+                set(item) == {"dimension", "feature_key", "period_key", "reason"}
+                for item in latest["missing"]
+            )
+        )
         self.assertNotIn("dimension_status_json", latest)
         self.assertNotIn("value", latest)
         self.assertEqual(

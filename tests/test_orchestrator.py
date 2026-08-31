@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -120,55 +121,15 @@ def progress_bundle(
     input_hash="1" * 64,
     missing_reason="financial_fact_missing:revenue",
 ):
-    dimension_inputs = {
-        dimension: DimensionInput("not_applicable", ())
-        for dimension in DIMENSIONS
-    }
-    dimension_inputs["G"] = DimensionInput(
-        "missing",
-        (
-            FeatureValue(
-                "g.revenue.FY2025",
-                None,
-                "CNY",
-                "FY2025",
-                "missing",
-                "financial-derived-v1",
-                (),
-                missing_reason,
-            ),
+    if missing_reason != "financial_fact_missing:revenue":
+        raise AssertionError("progress fixture uses the registered revenue missing reason")
+    return replace(
+        build_bundle_with_overrides(
+            security_id=security_id,
+            candidate_set_hash=candidate_set_hash,
+            facts=(),
         ),
-    )
-    dimension_inputs["V"] = DimensionInput("missing", ())
-    dimension_inputs["T"] = DimensionInput("missing", ())
-    return FeatureBundle(
-        1,
-        CONTRACT_VERSION,
-        security_id,
-        "2026-06-30",
-        "2026-08-29T12:00:00+00:00",
-        candidate_set_hash,
-        IndustryContext(
-            "eastmoney-provisional",
-            None,
-            "包装印刷",
-            "general_nonfinancial",
-            "template-registry-v1",
-            False,
-        ),
-        input_hash,
-        "partial",
-        0.0,
-        ConfidenceInputs(
-            0.0,
-            {"timestamp": 0, "date_only": 0},
-            0,
-            True,
-            None,
-        ),
-        dimension_inputs,
-        ("formal_industry_mapping_missing",),
-        False,
+        input_hash=input_hash,
     )
 
 
@@ -273,6 +234,112 @@ class OrchestratorTestCase(unittest.TestCase):
 
     def tearDown(self):
         self.tempdir.cleanup()
+
+    def install_ready_history(self, snapshot_prefix):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        older, _older_facts, _older_snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag=f"{snapshot_prefix}-older",
+            as_of_utc="2026-08-28T16:00:00+00:00",
+        )
+        newer, _newer_facts, _newer_snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag=f"{snapshot_prefix}-newer",
+            as_of_utc="2026-08-29T16:00:00+00:00",
+        )
+        locations = []
+        for candidate in (older, newer):
+            relative_path, bundle_hash, _created = write_feature_bundle(
+                self.base, candidate
+            )
+            feature_id, stored = store.put_feature_bundle(
+                candidate, bundle_path=relative_path, bundle_hash=bundle_hash
+            )
+            self.assertTrue(stored)
+            locations.append((relative_path, bundle_hash, feature_id))
+        newer_path, newer_hash, newer_id = locations[-1]
+        verified = read_verified_feature_bundle(self.base, newer_path, newer_hash)
+        self.assertEqual(verified.canonical_bytes(), newer.canonical_bytes())
+        return store, newer, newer_path, newer_hash, newer_id
+
+    def assert_newest_child_corruption_is_bounded_unknown(self, mutation):
+        store, newer, newer_path, newer_hash, newer_id = self.install_ready_history(
+            mutation
+        )
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            before = connection.execute(
+                "SELECT COUNT(*) FROM feature_value WHERE feature_set_id=?",
+                (newer_id,),
+            ).fetchone()[0]
+            if mutation == "deleted":
+                cursor = connection.execute(
+                    """DELETE FROM feature_value WHERE feature_set_id=?
+                    AND dimension='G' AND feature_key='g.revenue.FY2021'
+                    AND period_key='FY2021'""",
+                    (newer_id,),
+                )
+                self.assertEqual(cursor.rowcount, 1)
+                expected_count = before - 1
+            elif mutation == "updated":
+                cursor = connection.execute(
+                    """UPDATE feature_value SET value=value+1.0
+                    WHERE feature_set_id=? AND dimension='G'
+                    AND feature_key='g.revenue.FY2021' AND period_key='FY2021'""",
+                    (newer_id,),
+                )
+                self.assertEqual(cursor.rowcount, 1)
+                expected_count = before
+            elif mutation == "extra":
+                cursor = connection.execute(
+                    """INSERT INTO feature_value
+                    (feature_set_id,dimension,feature_key,period_key,value,unit,status,
+                     formula_version,evidence_json,missing_reason)
+                    SELECT feature_set_id,dimension,'g.unregistered_extra.FY2021',period_key,
+                           value,unit,status,formula_version,evidence_json,missing_reason
+                    FROM feature_value WHERE feature_set_id=? AND dimension='G'
+                    AND feature_key='g.revenue.FY2021' AND period_key='FY2021'""",
+                    (newer_id,),
+                )
+                self.assertEqual(cursor.rowcount, 1)
+                expected_count = before + 1
+            else:
+                raise AssertionError(f"unknown child mutation: {mutation}")
+            connection.commit()
+            after = connection.execute(
+                "SELECT COUNT(*) FROM feature_value WHERE feature_set_id=?",
+                (newer_id,),
+            ).fetchone()[0]
+        self.assertEqual(after, expected_count)
+        self.assertEqual(
+            read_verified_feature_bundle(self.base, newer_path, newer_hash).canonical_bytes(),
+            newer.canonical_bytes(),
+        )
+
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(status["deep"]["template_counts"], {})
+        self.assertEqual(status["deep"]["missing_reason_counts"], {})
+        self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
 
     def test_deep_parser_accepts_limit_bounds_and_rejects_outside(self):
         self.assertEqual(
@@ -1083,8 +1150,8 @@ class OrchestratorTestCase(unittest.TestCase):
         )
         self.assertEqual(progress["template_counts"], {"general_nonfinancial": 1})
         self.assertEqual(
-            progress["missing_reason_counts"],
-            {"financial_fact_missing:revenue": 1},
+            progress["missing_reason_counts"]["financial_fact_missing:revenue"],
+            7,
         )
         self.assertNotIn("g.revenue.FY2025", json.dumps(progress))
 
@@ -1245,6 +1312,67 @@ class OrchestratorTestCase(unittest.TestCase):
             status["official_pool_counts"],
             {"waiting_price": 0, "strong_attention": 0},
         )
+
+    def test_progress_rejects_newest_derived_numeric_mutation_without_fallback(self):
+        store, newer, newer_path, _newer_hash, newer_id = self.install_ready_history(
+            "derived-numeric"
+        )
+        payload = newer.to_dict()
+        gross = next(
+            value
+            for value in payload["dimension_inputs"]["M"]["values"]
+            if value["key"] == "m.gross_profit.FY2021"
+        )
+        gross["value"] += 1.0
+        forged = FeatureBundle.from_dict(payload)
+        forged_bytes = forged.canonical_bytes()
+        forged_hash = forged.bundle_hash()
+        (self.base / newer_path).write_bytes(forged_bytes)
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            connection.execute(
+                "UPDATE feature_set SET bundle_hash=? WHERE id=?",
+                (forged_hash, newer_id),
+            )
+            cursor = connection.execute(
+                """UPDATE feature_value SET value=? WHERE feature_set_id=?
+                AND dimension='M' AND feature_key='m.gross_profit.FY2021'
+                AND period_key='FY2021'""",
+                (gross["value"], newer_id),
+            )
+            self.assertEqual(cursor.rowcount, 1)
+            connection.commit()
+        self.assertEqual(
+            read_verified_feature_bundle(self.base, newer_path, forged_hash).canonical_bytes(),
+            forged_bytes,
+        )
+
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
+
+    def test_progress_rejects_deleted_newest_feature_child_without_fallback(self):
+        self.assert_newest_child_corruption_is_bounded_unknown("deleted")
+
+    def test_progress_rejects_updated_newest_feature_child_without_fallback(self):
+        self.assert_newest_child_corruption_is_bounded_unknown("updated")
+
+    def test_progress_rejects_extra_newest_feature_child_without_fallback(self):
+        self.assert_newest_child_corruption_is_bounded_unknown("extra")
 
     def test_equal_effective_instant_persists_reads_and_counts_ready(self):
         write_candidate_documents(self.root, {"SH600001": "包装印刷"})

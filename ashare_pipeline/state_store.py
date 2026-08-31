@@ -17,6 +17,11 @@ from ashare_pipeline.feature_contract import (
     EvidenceRef,
     FeatureBundle,
 )
+from ashare_pipeline.financial_formulas import (
+    DERIVED_FORMULA_SPECS,
+    FormulaFact,
+    evaluate_derived_financial,
+)
 from ashare_pipeline.financial_schema import (
     FinancialFact,
     raw_financial_slot_descriptor,
@@ -865,6 +870,8 @@ class StateStore:
         period_end_by_key = {
             period_key: period_end for period_end, period_key in FINANCIAL_PERIODS
         }
+        formula_inputs: dict[tuple[str, str], FormulaFact] = {}
+        observed_raw_fact_ids: set[str] = set()
         for dimension_name, dimension in bundle.dimension_inputs.items():
             for value in dimension.values:
                 if value.status != "observed":
@@ -897,6 +904,59 @@ class StateStore:
                     or fact.source_field not in descriptor.source_fields
                 ):
                     raise ValueError("raw observed feature evidence does not match its fact")
+                if fact.id in observed_raw_fact_ids:
+                    raise ValueError("raw observed financial fact is reused across slots")
+                observed_raw_fact_ids.add(fact.id)
+                slot = (descriptor.metric_key, period_end)
+                if slot in formula_inputs:
+                    raise ValueError("raw observed financial slot is duplicated")
+                formula_inputs[slot] = FormulaFact(
+                    fact.metric_key,
+                    fact.period_end,
+                    fact.value,
+                    fact.unit,
+                    fact.id,
+                )
+
+        formula_identities = {
+            (spec.dimension, spec.canonical_key, spec.period_key)
+            for spec in DERIVED_FORMULA_SPECS
+        }
+        formula_values = {
+            (dimension_name, value.key, value.period_key): value
+            for dimension_name, dimension in bundle.dimension_inputs.items()
+            for value in dimension.values
+            if (dimension_name, value.key, value.period_key) in formula_identities
+        }
+        if formula_values:
+            expected_results = evaluate_derived_financial(formula_inputs)
+            if len(formula_values) != len(expected_results):
+                raise ValueError("derived financial projection does not match canonical facts")
+            for result in expected_results:
+                identity = (
+                    result.spec.dimension,
+                    result.spec.canonical_key,
+                    result.spec.period_key,
+                )
+                value = formula_values.get(identity)
+                if value is None:
+                    raise ValueError(
+                        "derived financial projection does not match canonical facts"
+                    )
+                advertised_ids = tuple(
+                    sorted(evidence.financial_fact_id for evidence in value.evidence)
+                )
+                if (
+                    value.status != result.status
+                    or value.unit != result.spec.unit
+                    or value.formula_version != result.spec.formula_version
+                    or _json(value.value) != _json(result.value)
+                    or value.missing_reason != result.missing_reason
+                    or advertised_ids != result.operand_ids
+                ):
+                    raise ValueError(
+                        "derived financial projection does not match canonical facts"
+                    )
 
     def put_feature_bundle(
         self,
@@ -924,10 +984,9 @@ class StateStore:
                 ),
             ).fetchone()
             if existing is not None:
-                if not self._stored_feature_content_matches(
-                    connection, existing, header, values
-                ):
-                    raise ValueError("non-deterministic feature conflict")
+                self._validate_stored_feature_bundle_content(
+                    connection, existing, bundle
+                )
                 return str(existing["id"]), False
 
             feature_set_id = bundle_hash
@@ -958,6 +1017,14 @@ class StateStore:
                         *(value[column] for column in _FEATURE_VALUE_CONTENT_COLUMNS),
                     ),
                 )
+            inserted = connection.execute(
+                "SELECT * FROM feature_set WHERE id=?", (feature_set_id,)
+            ).fetchone()
+            if inserted is None:
+                raise ValueError("stored feature bundle content mismatch")
+            self._validate_stored_feature_bundle_content(
+                connection, inserted, bundle
+            )
         return feature_set_id, True
 
     def get_feature_bundle_row(
@@ -1196,19 +1263,25 @@ class StateStore:
         return header, values
 
     @staticmethod
-    def _stored_feature_content_matches(
+    def _validate_stored_feature_bundle_content(
         connection: sqlite3.Connection,
-        existing: sqlite3.Row,
-        header: Mapping[str, object],
-        values: Sequence[Mapping[str, object]],
-    ) -> bool:
-        if any(existing[column] != header[column] for column in _FEATURE_SET_CONTENT_COLUMNS):
-            return False
+        feature_set_row: sqlite3.Row,
+        bundle: FeatureBundle,
+    ) -> None:
+        header, values = StateStore._feature_bundle_content(
+            bundle, bundle.bundle_hash()
+        )
+        if any(
+            feature_set_row[column] != header[column]
+            for column in _FEATURE_SET_CONTENT_COLUMNS
+        ):
+            raise ValueError("stored feature bundle content mismatch")
         stored_values = connection.execute(
             """SELECT dimension,feature_key,period_key,value,unit,status,
             formula_version,evidence_json,missing_reason FROM feature_value
-            WHERE feature_set_id = ? ORDER BY dimension,feature_key,period_key""",
-            (existing["id"],),
+            WHERE feature_set_id = ? ORDER BY dimension,feature_key,period_key
+            LIMIT ?""",
+            (feature_set_row["id"], len(values) + 1),
         ).fetchall()
         expected = sorted(
             (
@@ -1217,7 +1290,8 @@ class StateStore:
             ),
             key=lambda value: (value[0], value[1], value[2]),
         )
-        return [tuple(row) for row in stored_values] == expected
+        if [tuple(row) for row in stored_values] != expected:
+            raise ValueError("stored feature bundle content mismatch")
 
     @staticmethod
     def _feature_set_public(row: sqlite3.Row) -> dict:

@@ -71,3 +71,11 @@
 - 后续独立 scoped review 与 fresh whole-branch review 仍是必须完成的门闸；本记录不预判其结论。
 - 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
 - `formal_score_ready=false`，未发布 formal scores；正式等待价格池与正式强烈关注池均保持关闭且为空。
+
+## 七维派生公式与 DB 镜像认证（2026-08-31）
+
+- `financial-derived-v1` 的 90 个派生逻辑输出现由单一中立公式目录与 evaluator 生成并按 canonical raw facts 重算认证；公共合约同时强制 common template 的完整 raw + formula 闭集、元数据与覆盖率，无输出模板仍保持空财务命名空间。
+- verified artifact 与 SQLite `feature_set` header 及完整 `feature_value` child set 现按 canonical 标量/JSON 精确比较；首写、幂等复用和 progress 共用同一 validator，progress 在一个 read transaction 内保持 newest-only、no-fallback 与每候选至多一个 bounded unknown。
+- 本轮 fresh full `unittest` 回归为 386/386 通过；后续独立 scoped review 与 fresh whole-branch review 仍是必须门闸，本记录不预判结论。
+- 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
+- `formal_score_ready=false`，未发布 formal scores；正式等待价格池与正式强烈关注池继续关闭且为空。

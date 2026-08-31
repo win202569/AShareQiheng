@@ -387,6 +387,10 @@ class FeatureBundle:
         self.validate()
 
     def validate(self) -> None:
+        from .financial_formulas import (
+            DERIVED_FORMULA_SPECS,
+            DERIVED_FORMULA_VERSION,
+        )
         from .financial_schema import raw_financial_slot_descriptor
         from .industry_templates import TEMPLATES
 
@@ -462,6 +466,120 @@ class FeatureBundle:
             raise ValueError(
                 "specialized financial template requires blocked status and missing-input blocker"
             )
+
+        descriptors = {
+            slot: raw_financial_slot_descriptor(slot)
+            for slot in template.financial_slots
+        }
+        expected_projection: dict[tuple[str, str, str], tuple[str, object]] = {}
+        for descriptor in descriptors.values():
+            for period_key in FINANCIAL_PERIOD_KEYS:
+                identity = (
+                    descriptor.dimension,
+                    descriptor.canonical_key(period_key),
+                    period_key,
+                )
+                expected_projection[identity] = ("raw", descriptor)
+        if descriptors:
+            for spec in DERIVED_FORMULA_SPECS:
+                identity = (spec.dimension, spec.canonical_key, spec.period_key)
+                expected_projection[identity] = ("formula", spec)
+
+        supplied_projection = {
+            (dimension_name, value.key, value.period_key): value
+            for dimension_name in FINANCIAL_DIMENSIONS
+            for value in self.dimension_inputs[dimension_name].values
+        }
+        supplied_count = sum(
+            len(self.dimension_inputs[dimension_name].values)
+            for dimension_name in FINANCIAL_DIMENSIONS
+        )
+        if (
+            supplied_count != len(expected_projection)
+            or set(supplied_projection) != set(expected_projection)
+        ):
+            raise ValueError("financial projection must contain the exact registered slots")
+
+        for identity, (kind, authority) in expected_projection.items():
+            value = supplied_projection[identity]
+            if kind == "raw":
+                descriptor = authority
+                if value.unit != descriptor.unit:
+                    raise ValueError("financial projection raw slot has noncanonical unit")
+                if value.status == "observed":
+                    if (
+                        value.formula_version != descriptor.formula_version
+                        or len(value.evidence) != 1
+                        or value.missing_reason is not None
+                        or value.evidence[0].source_field not in descriptor.source_fields
+                    ):
+                        raise ValueError(
+                            "financial projection raw observed slot is noncanonical"
+                        )
+                elif value.status == "missing":
+                    if (
+                        value.value is not None
+                        or value.formula_version != DERIVED_FORMULA_VERSION
+                        or value.evidence
+                        or value.missing_reason
+                        != f"financial_fact_missing:{descriptor.metric_key}"
+                    ):
+                        raise ValueError(
+                            "financial projection raw missing slot is noncanonical"
+                        )
+                else:
+                    raise ValueError("financial projection raw slot has invalid status")
+            else:
+                spec = authority
+                if (
+                    value.unit != spec.unit
+                    or value.formula_version != spec.formula_version
+                ):
+                    raise ValueError("financial projection formula metadata is noncanonical")
+                if spec.result_state == "not_applicable":
+                    if (
+                        value.status != "not_applicable"
+                        or value.value is not None
+                        or value.evidence
+                        or value.missing_reason != spec.missing_reason
+                    ):
+                        raise ValueError(
+                            "financial projection frozen-window slot is noncanonical"
+                        )
+                elif value.status == "derived":
+                    if value.value is None or not value.evidence or value.missing_reason is not None:
+                        raise ValueError(
+                            "financial projection derived slot is noncanonical"
+                        )
+                elif value.status == "missing":
+                    if (
+                        value.value is not None
+                        or value.evidence
+                        or value.missing_reason != spec.missing_reason
+                    ):
+                        raise ValueError(
+                            "financial projection missing formula slot is noncanonical"
+                        )
+                else:
+                    raise ValueError("financial projection formula slot has invalid status")
+
+        applicable_projection = [
+            value
+            for value in supplied_projection.values()
+            if value.status != "not_applicable"
+        ]
+        authenticated_coverage = (
+            sum(
+                value.status in {"observed", "derived"}
+                for value in applicable_projection
+            )
+            / len(applicable_projection)
+            if applicable_projection
+            else 0.0
+        )
+        if coverage != authenticated_coverage:
+            raise ValueError("financial projection coverage is noncanonical")
+
         if self.financial_status == "financial_ready":
             if (
                 coverage != 1.0
@@ -485,51 +603,6 @@ class FeatureBundle:
             ):
                 raise ValueError(
                     "financial_ready requires complete applicable financial dimensions"
-                )
-            descriptors = {
-                slot: raw_financial_slot_descriptor(slot)
-                for slot in template.financial_slots
-            }
-            registered_slot_periods = {
-                (descriptor.metric_key, period_key)
-                for descriptor in descriptors.values()
-                for period_key in FINANCIAL_PERIOD_KEYS
-            }
-            supplied_slot_periods: list[tuple[str, str]] = []
-            supplied_fact_ids: list[str] = []
-            for dimension_name, dimension in financial_inputs.items():
-                for value in dimension.values:
-                    parts = value.key.split(".")
-                    if not (
-                        len(parts) == 3
-                        and parts[1] in descriptors
-                        and parts[2] == value.period_key
-                        and value.period_key in FINANCIAL_PERIOD_KEYS
-                    ):
-                        continue
-                    descriptor = descriptors[parts[1]]
-                    if (
-                        dimension_name != descriptor.dimension
-                        or value.key != descriptor.canonical_key(value.period_key)
-                        or value.status not in descriptor.allowed_statuses
-                        or value.formula_version != descriptor.formula_version
-                        or value.unit != descriptor.unit
-                        or len(value.evidence) != 1
-                        or value.evidence[0].source_field not in descriptor.source_fields
-                    ):
-                        raise ValueError(
-                            "registered raw financial slot has noncanonical metadata"
-                        )
-                    supplied_slot_periods.append((parts[1], value.period_key))
-                    supplied_fact_ids.append(value.evidence[0].financial_fact_id)
-            if (
-                not registered_slot_periods
-                or len(supplied_slot_periods) != len(registered_slot_periods)
-                or set(supplied_slot_periods) != registered_slot_periods
-                or len(supplied_fact_ids) != len(set(supplied_fact_ids))
-            ):
-                raise ValueError(
-                    "financial_ready requires every registered slot for every financial period"
                 )
 
     def to_dict(self) -> dict[str, Any]:

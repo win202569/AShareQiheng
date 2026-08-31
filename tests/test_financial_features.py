@@ -12,7 +12,7 @@ from unittest.mock import patch
 import ashare_pipeline.financial_features as financial_features_module
 import ashare_pipeline.financial_schema as financial_schema_module
 
-from ashare_pipeline.feature_contract import DIMENSIONS, canonical_sha256
+from ashare_pipeline.feature_contract import DIMENSIONS, FeatureBundle, canonical_sha256
 from ashare_pipeline.financial_features import (
     FORMULA_VERSION,
     QualityIssue,
@@ -978,6 +978,29 @@ class FeatureBundleBuildTests(unittest.TestCase):
         serialized = json.dumps(bundle.to_dict(), ensure_ascii=False)
         for forbidden in ('"S0"', '"Sc"', '"pool"', '"buy"', '"sell"'):
             self.assertNotIn(forbidden, serialized)
+
+    def test_all_nonspecialized_common_templates_keep_the_exact_ready_projection(self):
+        cases = (
+            ("包装印刷", "general_nonfinancial"),
+            ("电力", "utility"),
+            ("半导体", "rd_growth"),
+        )
+        for industry_name, template_id in cases:
+            with self.subTest(template=template_id):
+                bundle = build_bundle_with_overrides(
+                    source_industry_name=industry_name
+                )
+                restored = FeatureBundle.from_dict(bundle.to_dict())
+                financial_values = tuple(
+                    value
+                    for dimension in ("G", "M", "EQ", "FS", "CA")
+                    for value in restored.dimension_inputs[dimension].values
+                )
+                self.assertEqual(restored.industry.template_id, template_id)
+                self.assertEqual(restored.financial_status, "financial_ready")
+                self.assertEqual(restored.financial_coverage, 1.0)
+                self.assertEqual(len(financial_values), 363)
+                self.assertEqual(restored.to_dict(), bundle.to_dict())
 
     def test_fy2021_average_formula_slots_are_explicitly_not_applicable(self):
         bundle = build_bundle_with_overrides()

@@ -15,26 +15,31 @@ def evidence(snapshot_id="snapshot-a"):
 
 
 def dimensions():
-    result = {key: DimensionInput("partial", (FeatureValue(
-        f"{key.lower()}.sample", 0.0, "ratio", "2026H1", "observed",
-        "observed-v1", (evidence(),), None),)) for key in DIMENSIONS}
+    from tests.test_financial_features import build_bundle_with_overrides
+
+    result = dict(build_bundle_with_overrides(facts=()).dimension_inputs)
     result["V"] = DimensionInput("missing", (FeatureValue(
         "v.market_cap", None, "CNY", "as_of", "missing", "observed-v1",
         (), "market_data_missing"),))
+    result["T"] = DimensionInput("partial", (FeatureValue(
+        "t.sample", 0.0, "ratio", "2026H1", "observed",
+        "observed-v1", (evidence(),), None),))
     return result
 
 
-def bundle(dimension_inputs=None, *, is_formal_score_ready=False, coverage=0.5,
+def bundle(dimension_inputs=None, *, is_formal_score_ready=False, coverage=0.0,
            formal_confidence=None):
+    from tests.test_financial_features import build_bundle_with_overrides
+
+    baseline = build_bundle_with_overrides(facts=())
     return FeatureBundle(
-        1, CONTRACT_VERSION, "SH600001", "2026-06-30",
-        "2026-08-29T16:00:00+00:00", "c" * 64,
-        IndustryContext("eastmoney-provisional", None, "包装印刷",
-                        "general_nonfinancial", "template-registry-v1", False),
-        "1" * 64, "partial", coverage,
+        baseline.schema_version, baseline.contract_version, baseline.security_id,
+        baseline.report_period, baseline.as_of_utc, baseline.candidate_set_hash,
+        baseline.industry, baseline.input_hash, baseline.financial_status, coverage,
         ConfidenceInputs(coverage, {"timestamp": 0, "date_only": 1}, 3,
                           True, formal_confidence),
-        dimension_inputs or dimensions(), ("formal_industry_mapping_missing",),
+        dimensions() if dimension_inputs is None else dimension_inputs,
+        baseline.blockers,
         is_formal_score_ready)
 
 
@@ -110,7 +115,7 @@ class FeatureContractTests(unittest.TestCase):
             bundle(dimensions(), is_formal_score_ready=True)
 
     def test_zero_missing_and_nonfinite_values_have_distinct_contracts(self):
-        self.assertEqual(dimensions()["G"].values[0].value, 0.0)
+        self.assertEqual(dimensions()["T"].values[0].value, 0.0)
         self.assertIsNone(dimensions()["V"].values[0].value)
         for invalid in (True, math.nan, math.inf, -math.inf):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
@@ -120,8 +125,8 @@ class FeatureContractTests(unittest.TestCase):
     def test_canonical_hash_is_order_independent_and_evidence_sensitive(self):
         first = bundle()
         second = bundle(dict(reversed(tuple(dimensions().items()))))
-        changed = bundle({**dimensions(), "G": DimensionInput("partial", (FeatureValue(
-            "g.sample", 0.0, "ratio", "2026H1", "observed", "observed-v1",
+        changed = bundle({**dimensions(), "T": DimensionInput("partial", (FeatureValue(
+            "t.sample", 0.0, "ratio", "2026H1", "observed", "observed-v1",
             (evidence("snapshot-b"),), None),))})
         self.assertEqual(first.canonical_bytes(), second.canonical_bytes())
         self.assertEqual(first.bundle_hash(), second.bundle_hash())
@@ -177,8 +182,8 @@ class FeatureContractTests(unittest.TestCase):
             1, CONTRACT_VERSION, "SH600001", "2026-06-30",
             "2026-08-29T16:00:00+00:00", "c" * 64,
             IndustryContext("eastmoney-provisional", None, "包装印刷", "general_nonfinancial", "template-registry-v1", False),
-            "1" * 64, "partial", 0.5,
-            ConfidenceInputs(0.5, raw_counts, 3, True, None), raw_dimensions,
+            "1" * 64, "partial", 0.0,
+            ConfidenceInputs(0.0, raw_counts, 3, True, None), raw_dimensions,
             raw_blockers, False)
         before = (candidate.to_dict(), candidate.bundle_hash())
         raw_dimensions["G"] = raw_dimensions["V"]
@@ -323,6 +328,113 @@ class FeatureContractTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             FeatureBundle.from_dict(payload)
+
+    def test_public_parse_authenticates_closed_derived_projection(self):
+        baseline = real_general_ready_bundle().to_dict()
+
+        def target(value):
+            return next(
+                item
+                for item in value["dimension_inputs"]["M"]["values"]
+                if item["key"] == "m.gross_profit.FY2021"
+            )
+
+        def omit(value):
+            value["dimension_inputs"]["M"]["values"].remove(target(value))
+
+        def add_unknown(value):
+            extra = copy.deepcopy(target(value))
+            extra["key"] = "m.unknown_formula.FY2021"
+            value["dimension_inputs"]["M"]["values"].append(extra)
+
+        def move_wrong_dimension(value):
+            moved = target(value)
+            value["dimension_inputs"]["M"]["values"].remove(moved)
+            value["dimension_inputs"]["G"]["values"].append(moved)
+
+        def copy_cross_dimension(value):
+            value["dimension_inputs"]["G"]["values"].append(
+                copy.deepcopy(target(value))
+            )
+
+        attacks = {
+            "formula_version": lambda value: target(value).__setitem__(
+                "formula_version", "financial-derived-v2"
+            ),
+            "omission": omit,
+            "unknown": add_unknown,
+            "wrong_key": lambda value: target(value).__setitem__(
+                "key", "m.gross_profit.FY2099"
+            ),
+            "wrong_period": lambda value: target(value).__setitem__(
+                "period_key", "FY2022"
+            ),
+            "wrong_dimension": move_wrong_dimension,
+            "cross_dimension_copy": copy_cross_dimension,
+        }
+        for case, attack in attacks.items():
+            with self.subTest(case=case):
+                payload = copy.deepcopy(baseline)
+                attack(payload)
+                with self.assertRaisesRegex(ValueError, "financial projection"):
+                    FeatureBundle.from_dict(payload)
+
+    def test_exact_formula_set_applies_to_partial_and_blocked_common_templates(self):
+        from tests.test_financial_features import build_bundle_with_overrides
+
+        candidates = (
+            build_bundle_with_overrides(facts=()),
+            real_specialized_bundle("房地产开发"),
+        )
+        self.assertEqual(
+            tuple(candidate.financial_status for candidate in candidates),
+            ("partial", "blocked"),
+        )
+        for candidate in candidates:
+            with self.subTest(status=candidate.financial_status):
+                payload = candidate.to_dict()
+                values = payload["dimension_inputs"]["M"]["values"]
+                values.remove(
+                    next(
+                        value
+                        for value in values
+                        if value["key"] == "m.gross_profit.FY2021"
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "financial projection"):
+                    FeatureBundle.from_dict(payload)
+
+    def test_no_output_templates_keep_an_empty_financial_namespace(self):
+        for industry_name in ("银行", "保险", "证券", "不存在行业"):
+            with self.subTest(industry=industry_name):
+                candidate = real_specialized_bundle(industry_name)
+                restored = FeatureBundle.from_dict(candidate.to_dict())
+                self.assertEqual(restored.financial_coverage, 0.0)
+                self.assertEqual(
+                    sum(
+                        len(restored.dimension_inputs[dimension].values)
+                        for dimension in FINANCIAL_DIMENSIONS
+                    ),
+                    0,
+                )
+                payload = candidate.to_dict()
+                payload["dimension_inputs"]["M"] = {
+                    "status": "missing",
+                    "values": [
+                        {
+                            "key": "m.unknown_formula.FY2021",
+                            "value": None,
+                            "unit": "CNY",
+                            "period_key": "FY2021",
+                            "status": "missing",
+                            "formula_version": "financial-derived-v1",
+                            "evidence": [],
+                            "missing_reason": "missing_operand:unknown_formula",
+                        }
+                    ],
+                }
+                with self.assertRaisesRegex(ValueError, "financial projection"):
+                    FeatureBundle.from_dict(payload)
 
     def test_public_parse_rejects_registered_raw_slot_retag_substitutions(self):
         attacks = (

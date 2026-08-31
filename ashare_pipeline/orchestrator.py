@@ -1050,36 +1050,34 @@ def build_deep_progress(
     )
 
     feature_rows: dict[str, dict[str, object]] = {}
-    with closing(store._connect()) as connection:
+    seen_feature_securities: set[str] = set()
+    with store._transaction() as connection:
         rows = connection.execute(
             """SELECT * FROM feature_set
             WHERE candidate_set_hash=? AND contract_version=? AND report_period=?
             ORDER BY security_id,as_of_utc DESC,created_at DESC,id DESC""",
             (context.candidate_set_hash, CONTRACT_VERSION, report_period),
         ).fetchall()
-    seen_feature_securities: set[str] = set()
-    for row in rows:
-        security_id = str(row["security_id"])
-        if security_id not in members or security_id in seen_feature_securities:
-            continue
-        seen_feature_securities.add(security_id)
-        try:
-            public = store._feature_set_public(row)
-            bundle = read_verified_feature_bundle(
-                resolved_root.parent,
-                public["bundle_path"],
-                public["bundle_hash"],
-            )
-            expected_header, _values = store._feature_bundle_content(
-                bundle, bundle.bundle_hash()
-            )
-            if any(row[key] != value for key, value in expected_header.items()):
-                raise ValueError("feature bundle database header mismatch")
-            store.validate_feature_bundle_evidence(bundle)
-        except (KeyError, OSError, TypeError, UnicodeError, ValueError):
-            unknown_failures += 1
-            continue
-        feature_rows[security_id] = public
+        for row in rows:
+            security_id = str(row["security_id"])
+            if security_id not in members or security_id in seen_feature_securities:
+                continue
+            seen_feature_securities.add(security_id)
+            try:
+                public = store._feature_set_public(row)
+                bundle = read_verified_feature_bundle(
+                    resolved_root.parent,
+                    public["bundle_path"],
+                    public["bundle_hash"],
+                )
+                store._validate_stored_feature_bundle_content(
+                    connection, row, bundle
+                )
+                store._validate_feature_bundle_evidence(connection, bundle)
+            except (KeyError, OSError, TypeError, UnicodeError, ValueError):
+                unknown_failures += 1
+                continue
+            feature_rows[security_id] = public
     feature_counts = {"partial": 0, "financial_ready": 0, "blocked": 0}
     templates: list[str] = []
     missing_reasons: list[str] = []

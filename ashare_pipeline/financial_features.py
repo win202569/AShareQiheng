@@ -23,6 +23,14 @@ from ashare_pipeline.feature_contract import (
     canonical_sha256,
     require_aware_utc,
 )
+from ashare_pipeline.financial_formulas import (
+    DERIVED_FORMULA_VERSION,
+    DerivedFormulaResult,
+    FormulaFact,
+    evaluate_derived_financial,
+    positive_cagr,
+    symmetric_growth,
+)
 from ashare_pipeline.financial_schema import (
     DATASET_TO_STATEMENT,
     MAPPING_VERSION,
@@ -40,7 +48,7 @@ from ashare_pipeline.sources import FetchBatch
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-FORMULA_VERSION = "financial-derived-v1"
+FORMULA_VERSION = DERIVED_FORMULA_VERSION
 _CALENDAR_START = date(2021, 1, 1)
 _CALENDAR_END = date(2026, 9, 7)
 _MISSING_UPDATED_AT = datetime.min.replace(tzinfo=timezone.utc)
@@ -54,15 +62,6 @@ _SECUCODE = re.compile(r"^(\d{6})\.(SH|SZ)$")
 
 _REQUIRED_PERIODS = FINANCIAL_PERIODS
 _PERIOD_KEY = dict(_REQUIRED_PERIODS)
-_OPENING_PERIOD = {
-    "2022-12-31": "2021-12-31",
-    "2023-12-31": "2022-12-31",
-    "2024-12-31": "2023-12-31",
-    "2025-12-31": "2024-12-31",
-    "2025-06-30": "2024-12-31",
-    "2026-06-30": "2025-12-31",
-}
-
 def _deep_freeze(value: object) -> object:
     if isinstance(value, Mapping):
         frozen = {
@@ -487,40 +486,6 @@ def select_visible_facts(
     )
 
 
-def symmetric_growth(current: float, previous: float) -> float | None:
-    """Return percent symmetric growth, preserving meaningful negative bases."""
-    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in (current, previous)):
-        return None
-    current_value = float(current)
-    previous_value = float(previous)
-    if not math.isfinite(current_value) or not math.isfinite(previous_value):
-        return None
-    denominator = abs(current_value) + abs(previous_value)
-    if denominator == 0:
-        return None
-    return 200.0 * (current_value - previous_value) / denominator
-
-
-def positive_cagr(start: float, end: float, years: int) -> float | None:
-    """Return percent CAGR only for finite positive endpoints and horizon."""
-    if (
-        isinstance(start, bool)
-        or isinstance(end, bool)
-        or isinstance(years, bool)
-        or not isinstance(start, (int, float))
-        or not isinstance(end, (int, float))
-        or not isinstance(years, int)
-    ):
-        return None
-    start_value = float(start)
-    end_value = float(end)
-    if not math.isfinite(start_value) or not math.isfinite(end_value):
-        return None
-    if start_value <= 0 or end_value <= 0 or years <= 0:
-        return None
-    return 100.0 * ((end_value / start_value) ** (1.0 / years) - 1.0)
-
-
 def feature_input_hash(
     *,
     security_id: str,
@@ -634,52 +599,38 @@ def _not_applicable_value(
     )
 
 
-def _derived_value(
-    dimension: str,
-    metric_key: str,
-    period_key: str,
-    value: float | None,
-    unit: str,
-    evidence_facts: Iterable[FinancialFact],
-    reason: str,
+def _formula_value(
+    result: DerivedFormulaResult,
+    facts_by_id: Mapping[str, FinancialFact],
 ) -> FeatureValue:
-    evidence = _evidence_tuple(evidence_facts)
-    if value is None or not math.isfinite(float(value)) or not evidence:
-        return _missing_value(dimension, metric_key, period_key, unit, reason)
+    spec = result.spec
+    if result.status == "not_applicable":
+        return _not_applicable_value(
+            spec.dimension,
+            spec.metric_key,
+            spec.period_key,
+            spec.unit,
+            result.missing_reason or spec.missing_reason,
+        )
+    if result.status == "missing":
+        return _missing_value(
+            spec.dimension,
+            spec.metric_key,
+            spec.period_key,
+            spec.unit,
+            result.missing_reason or spec.missing_reason,
+        )
+    evidence_facts = tuple(facts_by_id[identity] for identity in result.operand_ids)
     return FeatureValue(
-        key=f"{dimension.lower()}.{metric_key}.{period_key}",
-        value=float(value),
-        unit=unit,
-        period_key=period_key,
+        key=spec.canonical_key,
+        value=result.value,
+        unit=spec.unit,
+        period_key=spec.period_key,
         status="derived",
-        formula_version=FORMULA_VERSION,
-        evidence=evidence,
+        formula_version=spec.formula_version,
+        evidence=_evidence_tuple(evidence_facts),
         missing_reason=None,
     )
-
-
-def _period_facts(
-    facts_by_key: Mapping[tuple[str, str], FinancialFact],
-    period_end: str,
-    metric_keys: Sequence[str],
-) -> tuple[FinancialFact, ...] | None:
-    result = tuple(facts_by_key.get((metric_key, period_end)) for metric_key in metric_keys)
-    if any(item is None or item.unit != "CNY" for item in result):
-        return None
-    return result  # type: ignore[return-value]
-
-
-def _sum_formula(
-    facts_by_key: Mapping[tuple[str, str], FinancialFact],
-    period_end: str,
-    metric_keys: Sequence[str],
-    signs: Sequence[float] | None = None,
-) -> tuple[float | None, tuple[FinancialFact, ...]]:
-    operands = _period_facts(facts_by_key, period_end, metric_keys)
-    if operands is None:
-        return None, ()
-    coefficients = signs or (1.0,) * len(metric_keys)
-    return sum(coefficient * fact.value for coefficient, fact in zip(coefficients, operands)), operands
 
 
 def _dimension_status(values: Sequence[FeatureValue], *, blocked: bool) -> str:
@@ -696,218 +647,6 @@ def _dimension_status(values: Sequence[FeatureValue], *, blocked: bool) -> str:
     if applicable_states == {"missing"}:
         return "missing"
     return "partial"
-
-
-def _add_period_formulas(
-    dimensions: dict[str, list[FeatureValue]],
-    facts_by_key: Mapping[tuple[str, str], FinancialFact],
-    period_end: str,
-    period_key: str,
-) -> None:
-    gross_profit, gross_evidence = _sum_formula(
-        facts_by_key, period_end, ("revenue", "operating_cost"), (1.0, -1.0)
-    )
-    dimensions["M"].append(_derived_value(
-        "M", "gross_profit", period_key, gross_profit, "CNY", gross_evidence,
-        "missing_operand:gross_profit",
-    ))
-
-    ebit, ebit_evidence = _sum_formula(
-        facts_by_key, period_end, ("total_profit", "interest_expense")
-    )
-    dimensions["M"].append(_derived_value(
-        "M", "ebit", period_key, ebit, "CNY", ebit_evidence, "missing_operand:ebit"
-    ))
-
-    tax_operands = _period_facts(facts_by_key, period_end, ("income_tax", "total_profit"))
-    tax_rate = None
-    if tax_operands is not None and tax_operands[1].value > 0:
-        tax_rate = min(0.5, max(0.0, tax_operands[0].value / tax_operands[1].value))
-    dimensions["M"].append(_derived_value(
-        "M", "effective_tax_rate", period_key, tax_rate, "ratio", tax_operands or (),
-        "invalid_denominator:total_profit",
-    ))
-
-    nopat_operands: tuple[FinancialFact, ...] = ()
-    nopat = None
-    if ebit is not None and tax_rate is not None:
-        nopat_operands = _evidence_facts(ebit_evidence, tax_operands or ())
-        nopat = ebit * (1.0 - tax_rate)
-    dimensions["M"].append(_derived_value(
-        "M", "nopat", period_key, nopat, "CNY", nopat_operands,
-        "missing_operand:nopat",
-    ))
-
-    fcf, fcf_evidence = _sum_formula(
-        facts_by_key, period_end, ("operating_cash_flow", "capital_expenditure"), (1.0, -1.0)
-    )
-    dimensions["CA"].append(_derived_value(
-        "CA", "fcf", period_key, fcf, "CNY", fcf_evidence, "missing_operand:fcf"
-    ))
-
-    debt_metrics = (
-        "short_term_debt", "current_portion_long_term_debt", "long_term_debt",
-        "bonds_payable", "lease_liabilities",
-    )
-    debt, debt_evidence = _sum_formula(facts_by_key, period_end, debt_metrics)
-    dimensions["FS"].append(_derived_value(
-        "FS", "interest_bearing_debt", period_key, debt, "CNY", debt_evidence,
-        "missing_operand:interest_bearing_debt",
-    ))
-
-    cash = facts_by_key.get(("cash", period_end))
-    cash_evidence = (cash,) if cash is not None and cash.unit == "CNY" else ()
-    net_debt = debt - cash.value if debt is not None and cash_evidence else None
-    dimensions["FS"].append(_derived_value(
-        "FS", "net_debt", period_key, net_debt, "CNY",
-        _evidence_facts(debt_evidence, cash_evidence), "missing_operand:net_debt",
-    ))
-
-    equity = facts_by_key.get(("total_equity", period_end))
-    equity_evidence = (equity,) if equity is not None and equity.unit == "CNY" else ()
-    invested_capital = (
-        equity.value + debt - cash.value
-        if equity_evidence and debt is not None and cash_evidence else None
-    )
-    invested_evidence = _evidence_facts(equity_evidence, debt_evidence, cash_evidence)
-    dimensions["M"].append(_derived_value(
-        "M", "invested_capital", period_key, invested_capital, "CNY", invested_evidence,
-        "missing_operand:invested_capital",
-    ))
-
-    working_capital, working_evidence = _sum_formula(
-        facts_by_key,
-        period_end,
-        (
-            "notes_receivable", "accounts_receivable", "contract_assets", "inventory",
-            "notes_payable", "accounts_payable", "contract_liabilities",
-        ),
-        (1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0),
-    )
-    dimensions["M"].append(_derived_value(
-        "M", "operating_working_capital", period_key, working_capital, "CNY",
-        working_evidence, "missing_operand:operating_working_capital",
-    ))
-
-    revenue = facts_by_key.get(("revenue", period_end))
-    revenue_evidence = (revenue,) if revenue is not None and revenue.unit == "CNY" else ()
-    gross_margin = (
-        gross_profit / revenue.value
-        if (
-            gross_profit is not None
-            and revenue_evidence
-            and math.isfinite(revenue.value)
-            and revenue.value != 0
-        )
-        else None
-    )
-    dimensions["M"].append(_derived_value(
-        "M", "gross_margin", period_key, gross_margin, "ratio",
-        _evidence_facts(gross_evidence, revenue_evidence), "invalid_denominator:revenue",
-    ))
-
-    opening_period = _OPENING_PERIOD.get(period_end)
-    if opening_period is None:
-        reason = "frozen_window_no_opening_period"
-        dimensions["EQ"].append(_not_applicable_value(
-            "EQ", "total_accruals", period_key, "ratio", reason
-        ))
-        dimensions["M"].append(_not_applicable_value(
-            "M", "roic", period_key, "ratio", reason
-        ))
-        return
-    assets = _period_facts(facts_by_key, period_end, ("net_profit", "operating_cash_flow", "total_assets"))
-    opening_assets = facts_by_key.get(("total_assets", opening_period))
-    accruals = None
-    accrual_evidence: tuple[FinancialFact, ...] = ()
-    if assets is not None and opening_assets is not None and opening_assets.unit == "CNY":
-        average_assets = (opening_assets.value + assets[2].value) / 2.0
-        accrual_evidence = _evidence_facts(assets, (opening_assets,))
-        if math.isfinite(average_assets) and average_assets != 0:
-            accruals = (assets[0].value - assets[1].value) / average_assets
-    dimensions["EQ"].append(_derived_value(
-        "EQ", "total_accruals", period_key, accruals, "ratio", accrual_evidence,
-        "invalid_denominator:average_total_assets",
-    ))
-
-    opening_invested, opening_invested_evidence = _invested_capital(
-        facts_by_key, opening_period
-    )
-    roic = None
-    roic_evidence: tuple[FinancialFact, ...] = ()
-    if nopat is not None and invested_capital is not None and opening_invested is not None:
-        average_invested = (opening_invested + invested_capital) / 2.0
-        roic_evidence = _evidence_facts(
-            nopat_operands, invested_evidence, opening_invested_evidence
-        )
-        if math.isfinite(average_invested) and average_invested != 0:
-            roic = nopat / average_invested
-    dimensions["M"].append(_derived_value(
-        "M", "roic", period_key, roic, "ratio", roic_evidence,
-        "invalid_denominator:average_invested_capital",
-    ))
-
-
-def _evidence_facts(*groups: Iterable[FinancialFact]) -> tuple[FinancialFact, ...]:
-    by_id = {fact.id: fact for group in groups for fact in group}
-    return tuple(by_id[key] for key in sorted(by_id))
-
-
-def _invested_capital(
-    facts_by_key: Mapping[tuple[str, str], FinancialFact],
-    period_end: str,
-) -> tuple[float | None, tuple[FinancialFact, ...]]:
-    metrics = (
-        "total_equity", "short_term_debt", "current_portion_long_term_debt",
-        "long_term_debt", "bonds_payable", "lease_liabilities", "cash",
-    )
-    operands = _period_facts(facts_by_key, period_end, metrics)
-    if operands is None:
-        return None, ()
-    return (
-        operands[0].value + sum(item.value for item in operands[1:6]) - operands[6].value,
-        operands,
-    )
-
-
-def _add_growth_formulas(
-    dimensions: dict[str, list[FeatureValue]],
-    facts_by_key: Mapping[tuple[str, str], FinancialFact],
-) -> None:
-    growth_pairs = (
-        ("2022-12-31", "2021-12-31"),
-        ("2023-12-31", "2022-12-31"),
-        ("2024-12-31", "2023-12-31"),
-        ("2025-12-31", "2024-12-31"),
-        ("2026-06-30", "2025-06-30"),
-    )
-    for current_period, previous_period in growth_pairs:
-        operands = _period_facts(
-            facts_by_key, current_period, ("revenue",)
-        )
-        previous = facts_by_key.get(("revenue", previous_period))
-        evidence: tuple[FinancialFact, ...] = ()
-        value = None
-        if operands is not None and previous is not None and previous.unit == "CNY":
-            evidence = _evidence_facts(operands, (previous,))
-            value = symmetric_growth(operands[0].value, previous.value)
-        period_key = _PERIOD_KEY[current_period]
-        dimensions["G"].append(_derived_value(
-            "G", "revenue_symmetric_growth", period_key, value, "ratio", evidence,
-            "invalid_denominator:symmetric_growth",
-        ))
-
-    start = facts_by_key.get(("revenue", "2022-12-31"))
-    end = facts_by_key.get(("revenue", "2025-12-31"))
-    evidence = ()
-    value = None
-    if start is not None and end is not None and start.unit == end.unit == "CNY":
-        evidence = _evidence_facts((start,), (end,))
-        value = positive_cagr(start.value, end.value, 3)
-    dimensions["G"].append(_derived_value(
-        "G", "revenue_cagr", "FY2025", value, "ratio", evidence,
-        "invalid_endpoint:revenue_cagr",
-    ))
 
 
 def assemble_bundle_from_registered_slots(
@@ -943,9 +682,21 @@ def assemble_bundle_from_registered_slots(
                     ))
                 else:
                     dimensions[dimension].append(_observed_value(metric_key, period_key, fact))
-        for period_end, period_key in _REQUIRED_PERIODS:
-            _add_period_formulas(dimensions, facts_by_key, period_end, period_key)
-        _add_growth_formulas(dimensions, facts_by_key)
+        formula_inputs = {
+            slot: FormulaFact(
+                fact.metric_key,
+                fact.period_end,
+                fact.value,
+                fact.unit,
+                fact.id,
+            )
+            for slot, fact in facts_by_key.items()
+        }
+        facts_by_id = {fact.id: fact for fact in facts_by_key.values()}
+        for result in evaluate_derived_financial(formula_inputs):
+            dimensions[result.spec.dimension].append(
+                _formula_value(result, facts_by_id)
+            )
 
     applicable_values = [
         value
