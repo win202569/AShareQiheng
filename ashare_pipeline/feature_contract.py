@@ -424,6 +424,14 @@ class FeatureBundle:
             raise ValueError("formal score must not be ready in the feature contract")
         if any(not isinstance(v, DimensionInput) for v in self.dimension_inputs.values()):
             raise ValueError("dimension inputs must be DimensionInput values")
+        as_of_instant = datetime.fromisoformat(self.as_of_utc)
+        if any(
+            datetime.fromisoformat(evidence.effective_at_utc) > as_of_instant
+            for dimension in self.dimension_inputs.values()
+            for value in dimension.values
+            for evidence in value.evidence
+        ):
+            raise ValueError("evidence effective instant must not exceed bundle as_of")
         if any(
             not isinstance(blocker, str) or not blocker
             for blocker in self.blockers
@@ -435,6 +443,14 @@ class FeatureBundle:
             "formal_industry_mapping_missing"
         }
         template = TEMPLATES[self.industry.template_id]
+        if template.template_id == "unclassified" and (
+            self.financial_status != "blocked"
+            or coverage != 0.0
+            or "industry_template_unclassified" not in self.blockers
+        ):
+            raise ValueError(
+                "unclassified template requires blocked status, zero coverage, and blocker"
+            )
         specialized_inputs_pending = (
             template.template_id != "unclassified"
             and template.specialized_inputs_required

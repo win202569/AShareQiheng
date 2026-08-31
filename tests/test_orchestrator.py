@@ -26,6 +26,7 @@ from ashare_pipeline.feature_contract import (
     FeatureBundle,
     FeatureValue,
     IndustryContext,
+    canonical_json_bytes,
     canonical_sha256,
 )
 from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
@@ -35,7 +36,7 @@ from ashare_pipeline.sources import FetchBatch, SourceBlocked
 from ashare_pipeline.state_store import StateStore
 from ashare_pipeline import orchestrator
 from tests.test_feature_contract import retag_missing_revenue_slot
-from tests.test_financial_features import build_bundle_with_overrides
+from tests.test_financial_features import build_bundle_with_overrides, rebuild_fact
 from tests.test_state_store import installed_ready_bundle
 
 
@@ -1238,6 +1239,217 @@ class OrchestratorTestCase(unittest.TestCase):
             status["deep"]["feature_set_counts"],
             {"partial": 0, "financial_ready": 1, "blocked": 0},
         )
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
+
+    def test_equal_effective_instant_persists_reads_and_counts_ready(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        built, facts, _snapshot_ids = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="pit-equality",
+            as_of_utc="2026-04-01T07:00:00+00:00",
+        )
+        self.assertTrue(all(fact.effective_at_utc == built.as_of_utc for fact in facts))
+
+        relative_path, bundle_hash, _created = write_feature_bundle(self.base, built)
+        _feature_id, stored = store.put_feature_bundle(
+            built, bundle_path=relative_path, bundle_hash=bundle_hash
+        )
+        verified = read_verified_feature_bundle(
+            self.base, relative_path, bundle_hash
+        )
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+
+        self.assertTrue(stored)
+        self.assertEqual(verified.canonical_bytes(), built.canonical_bytes())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 1, "blocked": 0},
+        )
+        self.assertEqual(status["deep"]["unknown_failure_count"], 0)
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
+
+    def test_progress_rejects_newest_future_evidence_artifact_without_fallback(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        older, _older_facts, _older_snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="pit-older",
+            as_of_utc="2026-08-28T16:00:00+00:00",
+        )
+        seed, seed_facts, _newer_snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="pit-newer",
+        )
+        future_facts = tuple(
+            rebuild_fact(
+                fact, effective_at_utc="2026-08-30T00:00:00+00:00"
+            )
+            for fact in seed_facts
+        )
+        inserted, ignored = store.insert_financial_facts(future_facts)
+        self.assertEqual((inserted, ignored), (len(future_facts), 0))
+        newer = build_bundle_with_overrides(
+            candidate_set_hash=context.candidate_set_hash,
+            facts=future_facts,
+            statement_snapshot_hashes={
+                "balance_sheet": seed.input_hash,
+                "profit_sheet": seed.input_hash,
+                "cash_flow_sheet": seed.input_hash,
+            },
+            as_of_utc="2026-08-30T00:00:00+00:00",
+        )
+        locations = []
+        for candidate in (older, newer):
+            relative_path, bundle_hash, _created = write_feature_bundle(
+                self.base, candidate
+            )
+            store.put_feature_bundle(
+                candidate, bundle_path=relative_path, bundle_hash=bundle_hash
+            )
+            locations.append((relative_path, bundle_hash))
+
+        newer_path, newer_hash = locations[-1]
+        forged_payload = newer.to_dict()
+        forged_payload["as_of_utc"] = "2026-08-29T16:00:00+00:00"
+        forged_bytes = canonical_json_bytes(forged_payload)
+        forged_hash = hashlib.sha256(forged_bytes).hexdigest()
+        (self.base / newer_path).write_bytes(forged_bytes)
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            connection.execute(
+                "UPDATE feature_set SET as_of_utc=?, bundle_hash=? WHERE bundle_hash=?",
+                (forged_payload["as_of_utc"], forged_hash, newer_hash),
+            )
+            connection.commit()
+
+        with self.assertRaises(OSError):
+            read_verified_feature_bundle(self.base, newer_path, forged_hash)
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
+
+    def test_forged_unclassified_partial_cannot_cross_real_boundaries(self):
+        write_candidate_documents(self.root, {"SH600001": "不存在行业"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        forged = build_bundle_with_overrides(
+            candidate_set_hash=context.candidate_set_hash,
+            source_industry_name="不存在行业",
+        )
+        object.__setattr__(forged, "financial_status", "partial")
+        object.__setattr__(
+            forged,
+            "blockers",
+            tuple(
+                blocker
+                for blocker in forged.blockers
+                if blocker != "industry_template_unclassified"
+            ),
+        )
+        crossed = False
+        try:
+            relative_path, bundle_hash, _created = write_feature_bundle(
+                self.base, forged
+            )
+            store.put_feature_bundle(
+                forged, bundle_path=relative_path, bundle_hash=bundle_hash
+            )
+            read_verified_feature_bundle(self.base, relative_path, bundle_hash)
+            crossed = True
+        except (OSError, ValueError):
+            pass
+
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+        self.assertFalse(crossed)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
+
+    def test_builder_unclassified_persists_reads_and_counts_blocked(self):
+        write_candidate_documents(self.root, {"SH600001": "不存在行业"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        built = build_bundle_with_overrides(
+            candidate_set_hash=context.candidate_set_hash,
+            source_industry_name="不存在行业",
+        )
+        relative_path, bundle_hash, _created = write_feature_bundle(self.base, built)
+        _feature_id, stored = store.put_feature_bundle(
+            built, bundle_path=relative_path, bundle_hash=bundle_hash
+        )
+        verified = read_verified_feature_bundle(
+            self.base, relative_path, bundle_hash
+        )
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+
+        self.assertTrue(stored)
+        self.assertEqual(verified.financial_status, "blocked")
+        self.assertEqual(verified.financial_coverage, 0.0)
+        self.assertIn("industry_template_unclassified", verified.blockers)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 1},
+        )
+        self.assertEqual(status["deep"]["unknown_failure_count"], 0)
         self.assertFalse(status["formal_score_ready"])
         self.assertFalse(status["seven_dimension_ready"])
         self.assertEqual(

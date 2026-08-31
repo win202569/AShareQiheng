@@ -63,3 +63,11 @@
 - 本阶段仅产出七维模型所需的财务特征输入，不代表七维正式评分已就绪；`formal_score_ready=false`。
 - 正式等待价格池为 0，正式强烈关注池为 0，两个正式池的发布门闸仍关闭。
 - 下一步：补齐市场、资本配置和治理输入，完成正式评分与发布验收。
+
+## 七维财务特征信任边界修复（2026-08-31）
+
+- 后续修复波次已收紧公共合约与真实持久化边界：所有证据的生效时点不得晚于 bundle `as_of_utc`；`unclassified` 模板只能保持 `blocked`、零财务覆盖率并携带 `industry_template_unclassified`。上述 PIT cutoff 与 unclassified blocked 不变量均由隔离测试覆盖。
+- DB-backed 财务证据存在性、字段一致性以及 canonical source snapshot 参照核验仍在 StateStore 事务与 verified progress 读取路径中强制执行；本轮完整 `unittest` 回归为 370/370 通过。
+- 后续独立 scoped review 与 fresh whole-branch review 仍是必须完成的门闸；本记录不预判其结论。
+- 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
+- `formal_score_ready=false`，未发布 formal scores；正式等待价格池与正式强烈关注池均保持关闭且为空。

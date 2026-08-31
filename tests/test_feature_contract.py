@@ -1,6 +1,7 @@
 import copy
 import math
 import unittest
+from datetime import datetime
 
 from ashare_pipeline.feature_contract import (
     CONTRACT_VERSION, DIMENSIONS, FINANCIAL_DIMENSIONS, ConfidenceInputs, DimensionInput,
@@ -47,6 +48,12 @@ def real_specialized_bundle(industry_name):
     from tests.test_financial_features import build_bundle_with_overrides
 
     return build_bundle_with_overrides(source_industry_name=industry_name)
+
+
+def real_unclassified_bundle():
+    from tests.test_financial_features import build_bundle_with_overrides
+
+    return build_bundle_with_overrides(source_industry_name="不存在行业")
 
 
 def retag_missing_revenue_slot(payload, attack):
@@ -344,6 +351,82 @@ class FeatureContractTests(unittest.TestCase):
                     payload["blockers"].remove("specialized_financial_inputs_missing")
                     with self.assertRaises(ValueError):
                         FeatureBundle.from_dict(payload)
+
+    def test_public_parse_enforces_point_in_time_cutoff_for_all_evidence(self):
+        attacks = (
+            (bundle().to_dict(), "T", "t.sample", "observed_nonfinancial_partial"),
+            (
+                real_general_ready_bundle().to_dict(),
+                "M",
+                "m.gross_profit.FY2021",
+                "derived_financial_ready",
+            ),
+        )
+        for payload, dimension, feature_key, case in attacks:
+            with self.subTest(case=case):
+                target = next(
+                    value
+                    for value in payload["dimension_inputs"][dimension]["values"]
+                    if value["key"] == feature_key
+                )
+                target["evidence"][0]["effective_at_utc"] = (
+                    "2026-08-29T12:30:00-04:00"
+                )
+                with self.assertRaisesRegex(ValueError, "effective.*as_of"):
+                    FeatureBundle.from_dict(payload)
+
+        accepted = (
+            ("exact_equal", "2026-08-30T00:00:00+08:00"),
+            ("earlier_despite_later_wall_clock", "2026-08-29T17:00:00+02:00"),
+        )
+        for case, effective_at in accepted:
+            with self.subTest(case=case):
+                payload = bundle().to_dict()
+                target = payload["dimension_inputs"]["T"]["values"][0]
+                target["evidence"][0]["effective_at_utc"] = effective_at
+                restored = FeatureBundle.from_dict(payload)
+                self.assertLessEqual(
+                    datetime.fromisoformat(
+                        restored.dimension_inputs["T"]
+                        .values[0]
+                        .evidence[0]
+                        .effective_at_utc
+                    ),
+                    datetime.fromisoformat(restored.as_of_utc),
+                )
+
+    def test_public_parse_keeps_unclassified_blocked_with_zero_coverage(self):
+        baseline = real_unclassified_bundle().to_dict()
+        attacks = {
+            "partial_with_blocker": lambda value: value.__setitem__(
+                "financial_status", "partial"
+            ),
+            "partial_without_blocker": lambda value: (
+                value.__setitem__("financial_status", "partial"),
+                value["blockers"].remove("industry_template_unclassified"),
+            ),
+            "blocked_without_blocker": lambda value: value["blockers"].remove(
+                "industry_template_unclassified"
+            ),
+            "nonzero_coverage": lambda value: (
+                value.__setitem__("financial_coverage", 0.25),
+                value["confidence_inputs"].__setitem__(
+                    "data_completeness_ratio", 0.25
+                ),
+            ),
+        }
+        for case, attack in attacks.items():
+            with self.subTest(case=case):
+                payload = copy.deepcopy(baseline)
+                attack(payload)
+                with self.assertRaisesRegex(ValueError, "unclassified"):
+                    FeatureBundle.from_dict(payload)
+
+        restored = FeatureBundle.from_dict(copy.deepcopy(baseline))
+        self.assertEqual(restored.industry.template_id, "unclassified")
+        self.assertEqual(restored.financial_status, "blocked")
+        self.assertEqual(restored.financial_coverage, 0.0)
+        self.assertIn("industry_template_unclassified", restored.blockers)
 
     def test_general_ready_bundle_still_has_canonical_public_round_trip(self):
         candidate = real_general_ready_bundle()

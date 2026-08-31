@@ -1,3 +1,4 @@
+import copy
 import math
 import sqlite3
 import tempfile
@@ -707,6 +708,43 @@ class StateStoreTestCase(unittest.TestCase):
                 363,
             )
         self.assertEqual(feature_id, bundle.bundle_hash())
+
+    def test_put_feature_bundle_rejects_future_fact_on_idempotent_success_path(self) -> None:
+        bundle, _facts, _snapshot_ids = self.installed_ready_bundle(
+            self.store,
+            snapshot_tag="pit-idempotent",
+            as_of_utc="2026-04-01T07:00:00+00:00",
+        )
+        path = "data/curated/formal_features/2026-06-30/SH600001/pit.json"
+        feature_id, created = self.store.put_feature_bundle(
+            bundle, bundle_path=path, bundle_hash=bundle.bundle_hash()
+        )
+        self.assertTrue(created)
+
+        forged = copy.copy(bundle)
+        object.__setattr__(forged, "as_of_utc", "2026-04-01T06:59:59+00:00")
+        forged_hash = forged.bundle_hash()
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE feature_set SET as_of_utc=?, bundle_hash=? WHERE id=?",
+                (forged.as_of_utc, forged_hash, feature_id),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "effective.*as_of"):
+            self.store.put_feature_bundle(
+                forged, bundle_path=path, bundle_hash=forged_hash
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0],
+                363,
+            )
 
     def test_put_feature_bundle_rejects_missing_or_mismatched_evidence_rows(self) -> None:
         cases = (
