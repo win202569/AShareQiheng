@@ -3,7 +3,7 @@ import math
 import unittest
 
 from ashare_pipeline.feature_contract import (
-    CONTRACT_VERSION, DIMENSIONS, ConfidenceInputs, DimensionInput,
+    CONTRACT_VERSION, DIMENSIONS, FINANCIAL_DIMENSIONS, ConfidenceInputs, DimensionInput,
     EvidenceRef, FeatureBundle, FeatureValue, IndustryContext,
 )
 
@@ -35,6 +35,18 @@ def bundle(dimension_inputs=None, *, is_formal_score_ready=False, coverage=0.5,
                           True, formal_confidence),
         dimension_inputs or dimensions(), ("formal_industry_mapping_missing",),
         is_formal_score_ready)
+
+
+def real_general_ready_bundle():
+    from tests.test_financial_features import build_bundle_with_overrides
+
+    return build_bundle_with_overrides()
+
+
+def real_specialized_bundle(industry_name):
+    from tests.test_financial_features import build_bundle_with_overrides
+
+    return build_bundle_with_overrides(source_industry_name=industry_name)
 
 
 class FeatureContractTests(unittest.TestCase):
@@ -209,6 +221,77 @@ class FeatureContractTests(unittest.TestCase):
                 mutate(payload)
                 with self.assertRaises(ValueError):
                     FeatureBundle.from_dict(payload)
+
+    def test_public_parse_rejects_ready_missing_or_blocked_financial_inputs(self):
+        baseline = real_general_ready_bundle().to_dict()
+
+        def replace_first_applicable_value(value, dimension, status):
+            target = next(
+                item
+                for item in value["dimension_inputs"][dimension]["values"]
+                if item["status"] in {"observed", "derived"}
+            )
+            target.update({
+                "value": None,
+                "status": status,
+                "evidence": [],
+                "missing_reason": f"forged_{status}",
+            })
+            value["dimension_inputs"][dimension]["status"] = "partial"
+
+        for dimension in FINANCIAL_DIMENSIONS:
+            cases = {
+                "missing_dimension": lambda value, dimension=dimension: value[
+                    "dimension_inputs"
+                ].__setitem__(dimension, {"status": "missing", "values": []}),
+                "blocked_dimension": lambda value, dimension=dimension: value[
+                    "dimension_inputs"
+                ][dimension].__setitem__("status", "blocked"),
+                "missing_value": lambda value, dimension=dimension: replace_first_applicable_value(
+                    value, dimension, "missing"
+                ),
+                "blocked_value": lambda value, dimension=dimension: replace_first_applicable_value(
+                    value, dimension, "blocked"
+                ),
+            }
+            for attack, mutate in cases.items():
+                with self.subTest(dimension=dimension, attack=attack):
+                    payload = copy.deepcopy(baseline)
+                    mutate(payload)
+                    with self.assertRaises(ValueError):
+                        FeatureBundle.from_dict(payload)
+
+    def test_public_parse_rejects_ready_with_registered_slot_period_omitted(self):
+        payload = real_general_ready_bundle().to_dict()
+        payload["dimension_inputs"]["G"]["values"] = [
+            value
+            for value in payload["dimension_inputs"]["G"]["values"]
+            if value["key"] != "g.revenue.FY2021"
+        ]
+
+        with self.assertRaises(ValueError):
+            FeatureBundle.from_dict(payload)
+
+    def test_public_parse_enforces_specialized_template_blocker(self):
+        for industry_name in ("房地产开发", "工业金属", "银行"):
+            baseline = real_specialized_bundle(industry_name).to_dict()
+            self.assertIn("specialized_financial_inputs_missing", baseline["blockers"])
+            for status in ("financial_ready", "blocked"):
+                with self.subTest(industry=industry_name, status=status):
+                    payload = copy.deepcopy(baseline)
+                    payload["financial_status"] = status
+                    payload["blockers"].remove("specialized_financial_inputs_missing")
+                    with self.assertRaises(ValueError):
+                        FeatureBundle.from_dict(payload)
+
+    def test_general_ready_bundle_still_has_canonical_public_round_trip(self):
+        candidate = real_general_ready_bundle()
+
+        restored = FeatureBundle.from_dict(candidate.to_dict())
+
+        self.assertEqual(restored.financial_status, "financial_ready")
+        self.assertEqual(restored.financial_coverage, 1.0)
+        self.assertEqual(restored.canonical_bytes(), candidate.canonical_bytes())
 
 
 if __name__ == "__main__":

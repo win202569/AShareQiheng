@@ -1,3 +1,4 @@
+import copy
 import io
 import hashlib
 import json
@@ -14,6 +15,7 @@ from ashare_pipeline.deep_worker import (
     CandidateContext,
     STATEMENT_DATASETS,
     deep_statement_key,
+    read_verified_feature_bundle,
     write_feature_bundle,
 )
 from ashare_pipeline.feature_contract import (
@@ -32,6 +34,7 @@ from ashare_pipeline.snapshot_store import SnapshotStore
 from ashare_pipeline.sources import FetchBatch, SourceBlocked
 from ashare_pipeline.state_store import StateStore
 from ashare_pipeline import orchestrator
+from tests.test_financial_features import build_bundle_with_overrides
 
 
 def batch(source, dataset, records, request=None, fetched_at="2026-08-29T12:00:00+00:00"):
@@ -1081,6 +1084,106 @@ class OrchestratorTestCase(unittest.TestCase):
             {"financial_fact_missing:revenue": 1},
         )
         self.assertNotIn("g.revenue.FY2025", json.dumps(progress))
+
+    def test_forged_ready_cannot_cross_write_or_persistence_boundary_or_count_ready(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        valid = build_bundle_with_overrides(
+            candidate_set_hash=context.candidate_set_hash
+        )
+        forged = copy.copy(valid)
+        forged_dimensions = dict(valid.dimension_inputs)
+        forged_dimensions["G"] = DimensionInput(
+            "input_ready",
+            tuple(
+                value
+                for value in valid.dimension_inputs["G"].values
+                if value.key != "g.revenue.FY2021"
+            ),
+        )
+        object.__setattr__(forged, "dimension_inputs", forged_dimensions)
+        forged_path = (
+            "data/curated/formal_features/2026-06-30/SH600001/"
+            f"{forged.input_hash}.json"
+        )
+
+        with self.assertRaises(ValueError):
+            store.put_feature_bundle(
+                forged,
+                bundle_path=forged_path,
+                bundle_hash=forged.bundle_hash(),
+            )
+        with self.assertRaisesRegex(OSError, "malformed"):
+            write_feature_bundle(self.base, forged)
+
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                0,
+            )
+        feature_root = self.root / "curated" / "formal_features"
+        self.assertEqual(list(feature_root.rglob("*.json")), [])
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
+
+    def test_general_ready_round_trips_through_verified_storage_and_progress(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        built = build_bundle_with_overrides(
+            candidate_set_hash=context.candidate_set_hash
+        )
+        parsed = FeatureBundle.from_dict(built.to_dict())
+
+        relative_path, bundle_hash, created = write_feature_bundle(self.base, parsed)
+        feature_id, stored = store.put_feature_bundle(
+            parsed,
+            bundle_path=relative_path,
+            bundle_hash=bundle_hash,
+        )
+        verified = read_verified_feature_bundle(
+            self.base, relative_path, bundle_hash
+        )
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+
+        self.assertTrue(created)
+        self.assertTrue(stored)
+        self.assertEqual(feature_id, bundle_hash)
+        self.assertEqual(verified.canonical_bytes(), parsed.canonical_bytes())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 1, "blocked": 0},
+        )
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
 
     def test_progress_excludes_deleted_and_tampered_bundle_files(self):
         write_candidate_documents(

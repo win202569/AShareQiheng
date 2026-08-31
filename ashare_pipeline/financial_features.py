@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from ashare_pipeline.feature_contract import (
     CONTRACT_VERSION,
     DIMENSIONS,
+    FINANCIAL_PERIODS,
     ConfidenceInputs,
     DimensionInput,
     EvidenceRef,
@@ -50,15 +51,7 @@ _SOURCE_TIMESTAMP = re.compile(
 _SECURITY_CODE = re.compile(r"^\d{6}$")
 _SECUCODE = re.compile(r"^(\d{6})\.(SH|SZ)$")
 
-_REQUIRED_PERIODS = (
-    ("2021-12-31", "FY2021"),
-    ("2022-12-31", "FY2022"),
-    ("2023-12-31", "FY2023"),
-    ("2024-12-31", "FY2024"),
-    ("2025-12-31", "FY2025"),
-    ("2025-06-30", "2025H1"),
-    ("2026-06-30", "2026H1"),
-)
+_REQUIRED_PERIODS = FINANCIAL_PERIODS
 _PERIOD_KEY = dict(_REQUIRED_PERIODS)
 _OPENING_PERIOD = {
     "2022-12-31": "2021-12-31",

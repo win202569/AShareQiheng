@@ -13,6 +13,17 @@ from types import MappingProxyType
 
 CONTRACT_VERSION = "feature-contract-v1"
 DIMENSIONS = ("G", "V", "M", "EQ", "FS", "CA", "T")
+FINANCIAL_DIMENSIONS = ("G", "M", "EQ", "FS", "CA")
+FINANCIAL_PERIODS = (
+    ("2021-12-31", "FY2021"),
+    ("2022-12-31", "FY2022"),
+    ("2023-12-31", "FY2023"),
+    ("2024-12-31", "FY2024"),
+    ("2025-12-31", "FY2025"),
+    ("2025-06-30", "2025H1"),
+    ("2026-06-30", "2026H1"),
+)
+FINANCIAL_PERIOD_KEYS = tuple(period_key for _period_end, period_key in FINANCIAL_PERIODS)
 FEATURE_VALUE_STATES = frozenset({"observed", "derived", "missing", "not_applicable", "blocked"})
 DIMENSION_INPUT_STATES = frozenset({"input_ready", "partial", "missing", "not_applicable", "blocked"})
 FINANCIAL_STATUSES = frozenset({"partial", "financial_ready", "blocked"})
@@ -376,6 +387,8 @@ class FeatureBundle:
         self.validate()
 
     def validate(self) -> None:
+        from .industry_templates import TEMPLATES
+
         if (
             isinstance(self.schema_version, bool)
             or not isinstance(self.schema_version, int)
@@ -420,6 +433,18 @@ class FeatureBundle:
         financial_blockers = set(self.blockers) - {
             "formal_industry_mapping_missing"
         }
+        template = TEMPLATES[self.industry.template_id]
+        specialized_inputs_pending = (
+            template.template_id != "unclassified"
+            and template.specialized_inputs_required
+        )
+        if specialized_inputs_pending and (
+            self.financial_status != "blocked"
+            or "specialized_financial_inputs_missing" not in financial_blockers
+        ):
+            raise ValueError(
+                "specialized financial template requires blocked status and missing-input blocker"
+            )
         if self.financial_status == "financial_ready":
             if (
                 coverage != 1.0
@@ -428,6 +453,47 @@ class FeatureBundle:
             ):
                 raise ValueError(
                     "financial_ready requires full coverage and no financial blocker"
+                )
+            financial_inputs = {
+                dimension: self.dimension_inputs[dimension]
+                for dimension in FINANCIAL_DIMENSIONS
+            }
+            if any(
+                dimension.status not in {"input_ready", "not_applicable"}
+                for dimension in financial_inputs.values()
+            ) or any(
+                value.status in {"missing", "blocked"}
+                for dimension in financial_inputs.values()
+                for value in dimension.values
+            ):
+                raise ValueError(
+                    "financial_ready requires complete applicable financial dimensions"
+                )
+            registered_slot_periods = {
+                (slot, period_key)
+                for slot in template.financial_slots
+                for period_key in FINANCIAL_PERIOD_KEYS
+            }
+            supplied_slot_periods: list[tuple[str, str]] = []
+            for dimension_name, dimension in financial_inputs.items():
+                for value in dimension.values:
+                    parts = value.key.split(".")
+                    if (
+                        len(parts) == 3
+                        and parts[0] == dimension_name.lower()
+                        and parts[1] in template.financial_slots
+                        and parts[2] == value.period_key
+                        and value.period_key in FINANCIAL_PERIOD_KEYS
+                        and value.status in {"observed", "derived"}
+                    ):
+                        supplied_slot_periods.append((parts[1], value.period_key))
+            if (
+                not registered_slot_periods
+                or len(supplied_slot_periods) != len(registered_slot_periods)
+                or set(supplied_slot_periods) != registered_slot_periods
+            ):
+                raise ValueError(
+                    "financial_ready requires every registered slot for every financial period"
                 )
 
     def to_dict(self) -> dict[str, Any]:
