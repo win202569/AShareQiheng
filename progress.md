@@ -95,3 +95,10 @@
 - migration 计划表名与 forged-unclassified 回归的阶段边界已校正；本轮 focused 9/9、受影响模块 329/329、fresh full offline `unittest` 407/407 通过。后续 scoped re-review 与 controller verification 仍是独立门闸，本记录不预判其结论。
 - 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收；未迁移或改写 runtime/tracked data。
 - `formal_score_ready=false`、`seven_dimension_ready=false`；未发布 formal scores，正式等待价格池与正式强烈关注池继续关闭且为空。
+
+## 租约原子性与 heartbeat 收口（2026-09-01）
+
+- leased statement/feature 的 snapshot 文件与行、财务 facts、normalization issues、feature bundle 文件与 `feature_set`/`feature_value` 现均在同一个 `BEGIN IMMEDIATE` 写事务内核验当前 `job_id`、`worker_id`、`running` 状态与未过期租约，并在提交前再次核验；失租回滚只清理由本次尝试新建的 immutable 文件。
+- heartbeat 关闭会等待受 SQLite timeout 约束的在途续租完成，`KeyboardInterrupt`/`SystemExit` 不再被清理异常替换，普通异常的既有 retry 行为保持不变。
+- 本轮 focused 5/5、受影响模块 172/172、fresh full offline `unittest` 411/411 通过；未执行真实网络、migration、operational `120/114`、formal scoring、七维 readiness 或正式股票池验收，未改写 runtime/tracked data。
+- `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。

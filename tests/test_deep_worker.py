@@ -1104,6 +1104,68 @@ class DeepWorkerTestCase(unittest.TestCase):
         self.assertEqual([item["outcome"] for item in summary.items], ["lease_lost"])
         self._assert_no_feature_artifacts()
 
+    def test_stale_statement_owner_after_precheck_cannot_commit_any_effects(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        job_id = self._enqueue_statement()
+        calendar = self._calendar_ref()
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+        real_persist = self.repository.persist
+
+        def blocked_persist(*args, **kwargs):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test did not release stale snapshot writer")
+            return real_persist(*args, **kwargs)
+
+        def run_worker() -> None:
+            try:
+                self._run(
+                    source=FakeStatementSource(),
+                    trade_calendar_snapshot=calendar,
+                    limit=1,
+                    lease_seconds=120,
+                    heartbeat_seconds=60,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with patch.object(self.repository, "persist", side_effect=blocked_persist):
+            worker = threading.Thread(target=run_worker)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(timeout=5), repr(errors))
+                with closing(sqlite3.connect(self.store.db_path)) as connection:
+                    connection.execute(
+                        "UPDATE job SET lease_expires_at = ? WHERE id = ?",
+                        ("2000-01-01T00:00:00+00:00", job_id),
+                    )
+                    connection.commit()
+                self.assertEqual(self.store.recover_expired_leases(), 1)
+                acquired = self.store.lease_next_job(
+                    ["deep_statement"], "worker-b", 3600
+                )
+                self.assertEqual(acquired["id"], job_id)
+            finally:
+                release.set()
+            worker.join(timeout=10)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ValueError)
+        current = self.store.get_job(job_id)
+        self.assertEqual(current["status"], "running")
+        self.assertEqual(current["lease_worker"], "worker-b")
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM source_snapshot WHERE source = 'akshare'").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM financial_fact").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM quality_issue").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0], 0)
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+        self._assert_no_feature_artifacts()
+
     def _assert_feature_process_control_propagates(
         self, error_type: type[BaseException]
     ) -> None:
@@ -1137,6 +1199,43 @@ class DeepWorkerTestCase(unittest.TestCase):
 
     def test_feature_system_exit_propagates_without_retry_transition(self) -> None:
         self._assert_feature_process_control_propagates(SystemExit)
+
+    def test_inflight_heartbeat_shutdown_preserves_process_control_exception(self) -> None:
+        class BlockingRenewalStore:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def renew_job_lease(self, *_args, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return "2099-01-01T00:00:00+00:00"
+                self.entered.set()
+                if not self.release.wait(timeout=5):
+                    raise RuntimeError("test did not release bounded renewal")
+                return "2099-01-01T00:00:00+00:00"
+
+        for error_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(error_type=error_type.__name__):
+                store = BlockingRenewalStore()
+                heartbeat = deep_worker_module._LeaseHeartbeat(
+                    store, "job-id", "worker-a", 60, 0.001
+                )
+                real_join = heartbeat.thread.join
+
+                def controlled_join(timeout=None):
+                    if timeout is None:
+                        store.release.set()
+                        return real_join()
+                    return real_join(timeout=0)
+
+                heartbeat.thread.join = controlled_join
+                with self.assertRaises(error_type):
+                    with heartbeat:
+                        self.assertTrue(store.entered.wait(timeout=5))
+                        raise error_type("stop")
+                self.assertFalse(heartbeat.thread.is_alive())
 
     def test_feature_ordinary_exception_remains_a_retryable_failure(self) -> None:
         self._write_candidates({"SH600001": "包装印刷"})

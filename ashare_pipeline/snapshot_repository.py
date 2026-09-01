@@ -11,7 +11,7 @@ from typing import Mapping
 from .feature_contract import canonical_sha256, require_aware_utc
 from .snapshot_store import SnapshotStore
 from .sources import FetchBatch
-from .state_store import StateStore
+from .state_store import StateStore, _utc_now
 
 
 @dataclass(frozen=True)
@@ -50,7 +50,17 @@ class SnapshotRepository:
         if self.snapshot_store.root.resolve() != self.data_root:
             raise ValueError("snapshot store root must match repository data root")
 
-    def persist(self, batch: FetchBatch) -> tuple[SnapshotRef, bool]:
+    def persist(
+        self,
+        batch: FetchBatch,
+        *,
+        job_id: str | None = None,
+        worker_id: str | None = None,
+    ) -> tuple[SnapshotRef, bool]:
+        if (job_id is None) != (worker_id is None):
+            raise ValueError("job_id and worker_id must be provided together")
+        if job_id is not None and worker_id is not None:
+            return self._persist_owned(batch, job_id, worker_id)
         request_fingerprint = canonical_sha256(batch.request)
         target, digest, _ = self.snapshot_store.write(batch)
         winner = self.snapshot_store.read_verified(target, digest)
@@ -74,6 +84,65 @@ class SnapshotRepository:
         snapshot = self.get(snapshot_id)
         if snapshot is None:
             raise RuntimeError("recorded snapshot could not be retrieved")
+        return replace(
+            snapshot,
+            request=MappingProxyType(dict(winner.request)),
+        ), created
+
+    def _persist_owned(
+        self, batch: FetchBatch, job_id: str, worker_id: str
+    ) -> tuple[SnapshotRef, bool]:
+        request_fingerprint = canonical_sha256(batch.request)
+        target: Path | None = None
+        file_created = False
+        with self.state_store._transaction(immediate=True) as connection:
+            self.state_store._require_unexpired_job_owner(
+                connection, job_id, worker_id, _utc_now()
+            )
+            try:
+                target, digest, file_created = self.snapshot_store.write(batch)
+                winner = self.snapshot_store.read_verified(target, digest)
+                winner_fingerprint = canonical_sha256(winner.request)
+                if (
+                    winner.canonical_bytes() != batch.canonical_bytes()
+                    or winner_fingerprint != request_fingerprint
+                ):
+                    raise OSError(
+                        "published snapshot does not match the requested content"
+                    )
+                fetched_at = require_aware_utc(
+                    winner.fetched_at_utc, "snapshot fetched_at"
+                )
+                relative_path = self._project_relative_data_path(target)
+                snapshot_id, created = self.state_store.record_snapshot(
+                    winner.source,
+                    winner.dataset,
+                    winner_fingerprint,
+                    digest,
+                    relative_path,
+                    len(winner.records),
+                    fetched_at,
+                    _connection=connection,
+                )
+                row = connection.execute(
+                    """SELECT id, source, dataset, request_fingerprint, payload_hash,
+                              payload_path, row_count, fetched_at, created_at
+                       FROM source_snapshot WHERE id = ?""",
+                    (snapshot_id,),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("recorded snapshot could not be retrieved")
+                self.state_store._require_unexpired_job_owner(
+                    connection, job_id, worker_id, _utc_now()
+                )
+                snapshot = self._ref_from_row(row)
+            except BaseException:
+                if file_created and target is not None:
+                    try:
+                        target.unlink()
+                    except FileNotFoundError:
+                        pass
+                raise
         return replace(
             snapshot,
             request=MappingProxyType(dict(winner.request)),

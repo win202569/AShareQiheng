@@ -38,7 +38,7 @@ from ashare_pipeline.sources import (
     SourceBlocked,
     TerminalSourceError,
 )
-from ashare_pipeline.state_store import JobSpec, StateStore
+from ashare_pipeline.state_store import JobSpec, StateStore, _utc_now
 
 
 STATEMENT_DATASETS = ("balance_sheet", "profit_sheet", "cash_flow_sheet")
@@ -928,9 +928,7 @@ class _LeaseHeartbeat:
         self._stop.set()
         if not self.started:
             return
-        self.thread.join(timeout=max(1.0, self.heartbeat_seconds * 2.0))
-        if self.thread.is_alive():
-            raise RuntimeError("lease heartbeat thread did not stop")
+        self.thread.join()
 
     def ensure_owned(self) -> None:
         if self.lost.is_set():
@@ -1119,6 +1117,8 @@ def _record_fact_issues(
     dataset: str,
     issues: Sequence[object],
     ensure_owned: Callable[[], None] | None = None,
+    job_id: str | None = None,
+    worker_id: str | None = None,
 ) -> None:
     for issue in issues:
         if ensure_owned is not None:
@@ -1133,6 +1133,8 @@ def _record_fact_issues(
                 "dataset": dataset,
                 "details": _thaw(issue.details),
             },
+            job_id=job_id,
+            worker_id=worker_id,
         )
 
 
@@ -1166,6 +1168,8 @@ def _normalize_statement_snapshot(
     trading_days: Sequence[date] | None,
     record_issues: bool,
     ensure_owned: Callable[[], None] | None = None,
+    job_id: str | None = None,
+    worker_id: str | None = None,
 ) -> tuple[tuple[object, ...], tuple[object, ...]]:
     if trading_days is None:
         return (), ()
@@ -1179,7 +1183,9 @@ def _normalize_statement_snapshot(
     )
     if ensure_owned is not None:
         ensure_owned()
-    store.insert_financial_facts(result.facts)
+    store.insert_financial_facts(
+        result.facts, job_id=job_id, worker_id=worker_id
+    )
     if record_issues:
         _record_fact_issues(
             store,
@@ -1187,6 +1193,8 @@ def _normalize_statement_snapshot(
             snapshot.dataset,
             result.issues,
             ensure_owned,
+            job_id,
+            worker_id,
         )
     return result.facts, result.issues
 
@@ -1210,28 +1218,36 @@ def _write_and_store_feature_bundle(
     store: StateStore,
     bundle: FeatureBundle,
     ensure_owned: Callable[[], None],
+    job_id: str | None = None,
+    worker_id: str | None = None,
 ) -> tuple[str, str, bool]:
+    if (job_id is None) != (worker_id is None):
+        raise ValueError("job_id and worker_id must be provided together")
     ensure_owned()
-    relative_path, bundle_hash, file_created = write_feature_bundle(
-        project_root, bundle
-    )
-    try:
-        ensure_owned()
-        _feature_set_id, database_created = store.put_feature_bundle(
-            bundle,
-            bundle_path=relative_path,
-            bundle_hash=bundle_hash,
-        )
-    except BaseException:
-        if file_created:
-            committed = store.get_feature_bundle_row(
-                bundle.security_id, bundle.report_period, bundle.input_hash
+    relative_path = ""
+    bundle_hash = ""
+    file_created = False
+    with store._transaction(immediate=True) as connection:
+        if job_id is not None and worker_id is not None:
+            store._require_unexpired_job_owner(
+                connection, job_id, worker_id, _utc_now()
             )
-            if (
-                committed is None
-                or committed["bundle_path"] != relative_path
-                or committed["bundle_hash"] != bundle_hash
-            ):
+        try:
+            relative_path, bundle_hash, file_created = write_feature_bundle(
+                project_root, bundle
+            )
+            _feature_set_id, database_created = store.put_feature_bundle(
+                bundle,
+                bundle_path=relative_path,
+                bundle_hash=bundle_hash,
+                _connection=connection,
+            )
+            if job_id is not None and worker_id is not None:
+                store._require_unexpired_job_owner(
+                    connection, job_id, worker_id, _utc_now()
+                )
+        except BaseException:
+            if file_created:
                 target = _feature_file_target(project_root, relative_path)
                 try:
                     current = target.read_bytes()
@@ -1239,7 +1255,7 @@ def _write_and_store_feature_bundle(
                         target.unlink()
                 except FileNotFoundError:
                     pass
-        raise
+            raise
     return relative_path, bundle_hash, database_created
 
 
@@ -1329,6 +1345,8 @@ def _execute_feature_job(
             trading_days=trading_days,
             record_issues=False,
             ensure_owned=heartbeat.ensure_owned,
+            job_id=str(job["id"]),
+            worker_id=worker_id,
         )
         normalized_facts.extend(facts)
         issue_codes.update(issue.code for issue in issues)
@@ -1364,6 +1382,8 @@ def _execute_feature_job(
         store=store,
         bundle=bundle,
         ensure_owned=heartbeat.ensure_owned,
+        job_id=str(job["id"]),
+        worker_id=worker_id,
     )
     verified = read_verified_feature_bundle(root.parent, relative_path, bundle_hash)
     if verified != bundle:
@@ -1803,7 +1823,9 @@ def execute_queued_deep_work(
                     )
                     continue
                 heartbeat.ensure_owned()
-                snapshot, _created = snapshots.persist(batch)
+                snapshot, _created = snapshots.persist(
+                    batch, job_id=str(job["id"]), worker_id=worker
+                )
                 verified = snapshots.read_verified(snapshot)
                 facts, issues = _normalize_statement_snapshot(
                     store=store,
@@ -1815,6 +1837,8 @@ def execute_queued_deep_work(
                     ),
                     record_issues=True,
                     ensure_owned=heartbeat.ensure_owned,
+                    job_id=str(job["id"]),
+                    worker_id=worker,
                 )
 
             del facts

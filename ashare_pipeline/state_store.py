@@ -353,6 +353,20 @@ class StateStore:
         finally:
             connection.close()
 
+    @contextmanager
+    def owned_job_transaction(
+        self, job_id: str, worker_id: str
+    ) -> Iterator[sqlite3.Connection]:
+        """Fence a mutation with ownership checks at both transaction boundaries."""
+        with self._transaction(immediate=True) as connection:
+            self._require_unexpired_job_owner(
+                connection, job_id, worker_id, _utc_now()
+            )
+            yield connection
+            self._require_unexpired_job_owner(
+                connection, job_id, worker_id, _utc_now()
+            )
+
     @staticmethod
     def _user_tables(connection: sqlite3.Connection) -> set[str]:
         return {
@@ -738,31 +752,64 @@ class StateStore:
 
     def record_snapshot(
         self, source: str, dataset: str, request_fingerprint: str, payload_hash: str,
-        payload_path: str, row_count: int, fetched_at: str
+        payload_path: str, row_count: int, fetched_at: str,
+        *,
+        _connection: sqlite3.Connection | None = None,
+    ) -> tuple[str, bool]:
+        if _connection is not None:
+            return self._record_snapshot(
+                _connection, source, dataset, request_fingerprint, payload_hash,
+                payload_path, row_count, fetched_at,
+            )
+        with self._transaction(immediate=True) as connection:
+            return self._record_snapshot(
+                connection, source, dataset, request_fingerprint, payload_hash,
+                payload_path, row_count, fetched_at,
+            )
+
+    @staticmethod
+    def _record_snapshot(
+        connection: sqlite3.Connection,
+        source: str,
+        dataset: str,
+        request_fingerprint: str,
+        payload_hash: str,
+        payload_path: str,
+        row_count: int,
+        fetched_at: str,
     ) -> tuple[str, bool]:
         snapshot_id = str(uuid.uuid4())
-        with self._transaction(immediate=True) as connection:
-            existing = connection.execute(
-                """SELECT id FROM source_snapshot WHERE source = ? AND dataset = ?
-                AND request_fingerprint = ? AND payload_hash = ?""",
-                (source, dataset, request_fingerprint, payload_hash),
-            ).fetchone()
-            if existing:
-                return str(existing["id"]), False
-            connection.execute(
-                "INSERT INTO source_snapshot VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (snapshot_id, source, dataset, request_fingerprint, payload_hash, payload_path,
-                 row_count, _utc_iso(fetched_at), _utc_now()),
-            )
+        existing = connection.execute(
+            """SELECT id FROM source_snapshot WHERE source = ? AND dataset = ?
+            AND request_fingerprint = ? AND payload_hash = ?""",
+            (source, dataset, request_fingerprint, payload_hash),
+        ).fetchone()
+        if existing:
+            return str(existing["id"]), False
+        connection.execute(
+            "INSERT INTO source_snapshot VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (snapshot_id, source, dataset, request_fingerprint, payload_hash, payload_path,
+             row_count, _utc_iso(fetched_at), _utc_now()),
+        )
         return snapshot_id, True
 
     def insert_financial_facts(
         self,
         facts: Iterable[FinancialFact],
+        *,
+        job_id: str | None = None,
+        worker_id: str | None = None,
     ) -> tuple[int, int]:
         records = tuple(facts)
+        if (job_id is None) != (worker_id is None):
+            raise ValueError("job_id and worker_id must be provided together")
+        transaction = (
+            self.owned_job_transaction(job_id, worker_id)
+            if job_id is not None and worker_id is not None
+            else self._transaction(immediate=True)
+        )
         inserted = 0
-        with self._transaction(immediate=True) as connection:
+        with transaction as connection:
             for fact in records:
                 record = fact.to_record()
                 cursor = connection.execute(
@@ -1007,6 +1054,7 @@ class StateStore:
         *,
         bundle_path: str,
         bundle_hash: str,
+        _connection: sqlite3.Connection | None = None,
     ) -> tuple[str, bool]:
         bundle.validate()
         if bundle_hash != bundle.bundle_hash():
@@ -1014,60 +1062,77 @@ class StateStore:
         self._validate_feature_bundle_path(bundle_path)
         header, values = self._feature_bundle_content(bundle, bundle_hash)
 
+        if _connection is not None:
+            return self._put_feature_bundle(
+                _connection, bundle, header, values, bundle_path, bundle_hash
+            )
         with self._transaction(immediate=True) as connection:
-            self._validate_feature_bundle_evidence(connection, bundle)
-            existing = connection.execute(
-                """SELECT * FROM feature_set
-                WHERE security_id = ? AND report_period = ? AND as_of_utc = ? AND input_hash = ?""",
-                (
-                    header["security_id"],
-                    header["report_period"],
-                    header["as_of_utc"],
-                    header["input_hash"],
-                ),
-            ).fetchone()
-            if existing is not None:
-                self._validate_stored_feature_bundle_content(
-                    connection, existing, bundle
-                )
-                return str(existing["id"]), False
+            return self._put_feature_bundle(
+                connection, bundle, header, values, bundle_path, bundle_hash
+            )
 
-            feature_set_id = bundle_hash
+    def _put_feature_bundle(
+        self,
+        connection: sqlite3.Connection,
+        bundle: FeatureBundle,
+        header: Mapping[str, object],
+        values: Sequence[Mapping[str, object]],
+        bundle_path: str,
+        bundle_hash: str,
+    ) -> tuple[str, bool]:
+        self._validate_feature_bundle_evidence(connection, bundle)
+        existing = connection.execute(
+            """SELECT * FROM feature_set
+            WHERE security_id = ? AND report_period = ? AND as_of_utc = ? AND input_hash = ?""",
+            (
+                header["security_id"],
+                header["report_period"],
+                header["as_of_utc"],
+                header["input_hash"],
+            ),
+        ).fetchone()
+        if existing is not None:
+            self._validate_stored_feature_bundle_content(
+                connection, existing, bundle
+            )
+            return str(existing["id"]), False
+
+        feature_set_id = bundle_hash
+        connection.execute(
+            """INSERT INTO feature_set
+            (id,security_id,report_period,as_of_utc,candidate_set_hash,
+             template_id,template_version,contract_version,input_hash,status,
+             financial_coverage,dimension_status_json,confidence_inputs_json,
+             blockers_json,bundle_hash,bundle_path,missing_json,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                feature_set_id,
+                *(header[column] for column in _FEATURE_SET_CONTENT_COLUMNS[:-2]),
+                header["bundle_hash"],
+                bundle_path,
+                header["missing_json"],
+                _utc_now(),
+            ),
+        )
+        for value in values:
             connection.execute(
-                """INSERT INTO feature_set
-                (id,security_id,report_period,as_of_utc,candidate_set_hash,
-                 template_id,template_version,contract_version,input_hash,status,
-                 financial_coverage,dimension_status_json,confidence_inputs_json,
-                 blockers_json,bundle_hash,bundle_path,missing_json,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO feature_value
+                (feature_set_id,dimension,feature_key,period_key,value,unit,status,
+                 formula_version,evidence_json,missing_reason)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (
                     feature_set_id,
-                    *(header[column] for column in _FEATURE_SET_CONTENT_COLUMNS[:-2]),
-                    header["bundle_hash"],
-                    bundle_path,
-                    header["missing_json"],
-                    _utc_now(),
+                    *(value[column] for column in _FEATURE_VALUE_CONTENT_COLUMNS),
                 ),
             )
-            for value in values:
-                connection.execute(
-                    """INSERT INTO feature_value
-                    (feature_set_id,dimension,feature_key,period_key,value,unit,status,
-                     formula_version,evidence_json,missing_reason)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        feature_set_id,
-                        *(value[column] for column in _FEATURE_VALUE_CONTENT_COLUMNS),
-                    ),
-                )
-            inserted = connection.execute(
-                "SELECT * FROM feature_set WHERE id=?", (feature_set_id,)
-            ).fetchone()
-            if inserted is None:
-                raise ValueError("stored feature bundle content mismatch")
-            self._validate_stored_feature_bundle_content(
-                connection, inserted, bundle
-            )
+        inserted = connection.execute(
+            "SELECT * FROM feature_set WHERE id=?", (feature_set_id,)
+        ).fetchone()
+        if inserted is None:
+            raise ValueError("stored feature bundle content mismatch")
+        self._validate_stored_feature_bundle_content(
+            connection, inserted, bundle
+        )
         return feature_set_id, True
 
     def get_feature_bundle_row(
@@ -1113,9 +1178,18 @@ class StateStore:
         severity: str,
         code: str,
         details: Mapping[str, object],
+        job_id: str | None = None,
+        worker_id: str | None = None,
     ) -> str:
         issue_id = str(uuid.uuid4())
-        with self._transaction() as connection:
+        if (job_id is None) != (worker_id is None):
+            raise ValueError("job_id and worker_id must be provided together")
+        transaction = (
+            self.owned_job_transaction(job_id, worker_id)
+            if job_id is not None and worker_id is not None
+            else self._transaction()
+        )
+        with transaction as connection:
             connection.execute(
                 """INSERT INTO quality_issue
                 (id,run_id,score_run_id,severity,code,details_json,created_at)

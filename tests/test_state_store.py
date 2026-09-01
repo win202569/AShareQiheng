@@ -8,6 +8,7 @@ from contextlib import closing
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from ashare_pipeline.feature_contract import (
     CONTRACT_VERSION,
@@ -1622,6 +1623,65 @@ class StateStoreTestCase(unittest.TestCase):
         self.assertEqual(expiry, utc_at(150))
         with self.assertRaisesRegex(ValueError, "lease owner"):
             self.store.renew_job_lease(job_id, "worker-b", 120, utc_at(31))
+
+    def test_owned_job_transaction_fences_wrong_expired_and_valid_owners(self) -> None:
+        valid_id = self.store.enqueue_job("deep_statement", "owned-mutation:valid", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 3600)
+
+        with self.assertRaisesRegex(ValueError, "lease owner"):
+            with self.store.owned_job_transaction(valid_id, "worker-b") as connection:
+                connection.execute(
+                    "INSERT INTO quality_issue VALUES (?,?,?,?,?,?,?)",
+                    ("wrong", None, None, "warning", "wrong", "{}", utc_at(1)),
+                )
+
+        expired_id = self.store.enqueue_job("deep_statement", "owned-mutation:expired", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 3600)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE job SET lease_expires_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", expired_id),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(ValueError, "lease owner"):
+            with self.store.owned_job_transaction(expired_id, "worker-a") as connection:
+                connection.execute(
+                    "INSERT INTO quality_issue VALUES (?,?,?,?,?,?,?)",
+                    ("expired", None, None, "warning", "expired", "{}", utc_at(1)),
+                )
+
+        with self.store.owned_job_transaction(valid_id, "worker-a") as connection:
+            connection.execute(
+                "INSERT INTO quality_issue VALUES (?,?,?,?,?,?,?)",
+                ("valid", None, None, "warning", "valid", "{}", utc_at(1)),
+            )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            ids = [row[0] for row in connection.execute("SELECT id FROM quality_issue")]
+        self.assertEqual(ids, ["valid"])
+
+        expiring_id = self.store.enqueue_job(
+            "deep_statement", "owned-mutation:expires-before-commit", {}
+        )
+        self.store.lease_next_job(
+            ["deep_statement"], "worker-a", 60, utc_at(0)
+        )
+        with patch(
+            "ashare_pipeline.state_store._utc_now",
+            side_effect=(utc_at(1), utc_at(61)),
+        ), self.assertRaisesRegex(ValueError, "lease owner"):
+            with self.store.owned_job_transaction(
+                expiring_id, "worker-a"
+            ) as connection:
+                connection.execute(
+                    "INSERT INTO quality_issue VALUES (?,?,?,?,?,?,?)",
+                    ("late", None, None, "warning", "late", "{}", utc_at(1)),
+                )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM quality_issue WHERE id = 'late'"
+                ).fetchone()
+            )
 
     def test_renew_job_lease_rejects_nonpositive_duration(self) -> None:
         job_id = self.store.enqueue_job("deep_statement", "statement-duration", {})

@@ -132,6 +132,37 @@ class SnapshotRepositoryTestCase(unittest.TestCase):
         with closing(sqlite3.connect(self.data_root / "state.sqlite3")) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0], 1)
 
+    def test_owned_persist_rejects_stale_owner_and_preserves_immutable_winner(self):
+        batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+        winner_job = self.state_store.enqueue_job(
+            "deep_statement", "snapshot-owner:winner", {}
+        )
+        self.state_store.lease_next_job(["deep_statement"], "worker-b", 3600)
+        winner, created = self.repository.persist(
+            batch, job_id=winner_job, worker_id="worker-b"
+        )
+        winner_path = self.project_root / winner.payload_path
+        winner_bytes = winner_path.read_bytes()
+
+        stale_job = self.state_store.enqueue_job(
+            "deep_statement", "snapshot-owner:stale", {}
+        )
+        self.state_store.lease_next_job(["deep_statement"], "worker-a", 3600)
+        with closing(sqlite3.connect(self.data_root / "state.sqlite3")) as connection:
+            connection.execute(
+                "UPDATE job SET lease_expires_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", stale_job),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "lease owner"):
+            self.repository.persist(batch, job_id=stale_job, worker_id="worker-a")
+
+        self.assertTrue(created)
+        self.assertEqual(winner_path.read_bytes(), winner_bytes)
+        with closing(sqlite3.connect(self.data_root / "state.sqlite3")) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0], 1)
+
     def test_concurrent_same_target_persist_keeps_first_published_batch_and_db_ref(self):
         first_batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
         second_batch = statement_batch("SH600001", 100.0, "2026-08-29T01:00:00+00:00")
