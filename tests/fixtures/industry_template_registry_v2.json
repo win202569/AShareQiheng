@@ -1,0 +1,32 @@
+{
+  "template_version": "template-registry-v2",
+  "candidate_record_count": 120,
+  "candidate_industries": [
+    "半导体", "包装印刷", "出版", "电池", "电机Ⅱ", "电力", "电网设备", "电子化学品Ⅱ",
+    "多元金融", "房地产开发", "纺织制造", "服装家纺", "工程机械", "工程咨询服务Ⅱ", "工业金属",
+    "光伏设备", "光学光电子", "广告营销", "化学纤维", "化学原料", "化学制品", "化学制药", "环保设备Ⅱ",
+    "环境治理", "基础建设", "家电零部件Ⅱ", "家居用品", "军工电子Ⅱ", "炼化及贸易", "旅游及景区", "煤炭开采",
+    "农产品加工", "农化制品", "普钢", "其他电源设备Ⅱ", "其他电子Ⅱ", "汽车零部件", "燃气Ⅱ", "生物制品", "水泥",
+    "塑料", "文娱用品", "物流", "消费电子", "小家电", "小金属", "休闲食品", "养殖业", "一般零售", "医疗服务",
+    "医疗器械", "医药商业", "游戏Ⅱ", "元件", "中药Ⅱ", "专业服务", "专业工程", "专用设备", "综合Ⅱ", "IT服务Ⅱ"
+  ],
+  "candidate_templates": {
+    "半导体": "rd_growth", "包装印刷": "general_nonfinancial", "出版": "general_nonfinancial", "电池": "rd_growth",
+    "电机Ⅱ": "general_nonfinancial", "电力": "utility", "电网设备": "general_nonfinancial", "电子化学品Ⅱ": "rd_growth",
+    "多元金融": "unclassified", "房地产开发": "real_estate_high_leverage", "纺织制造": "general_nonfinancial",
+    "服装家纺": "general_nonfinancial", "工程机械": "general_nonfinancial", "工程咨询服务Ⅱ": "general_nonfinancial",
+    "工业金属": "resource_cycle", "光伏设备": "rd_growth", "光学光电子": "rd_growth", "广告营销": "general_nonfinancial",
+    "化学纤维": "general_nonfinancial", "化学原料": "resource_cycle", "化学制品": "general_nonfinancial", "化学制药": "rd_growth",
+    "环保设备Ⅱ": "general_nonfinancial", "环境治理": "general_nonfinancial", "基础建设": "general_nonfinancial",
+    "家电零部件Ⅱ": "general_nonfinancial", "家居用品": "general_nonfinancial", "军工电子Ⅱ": "rd_growth",
+    "炼化及贸易": "resource_cycle", "旅游及景区": "general_nonfinancial", "煤炭开采": "resource_cycle",
+    "农产品加工": "general_nonfinancial", "农化制品": "general_nonfinancial", "普钢": "resource_cycle",
+    "其他电源设备Ⅱ": "general_nonfinancial", "其他电子Ⅱ": "rd_growth", "汽车零部件": "general_nonfinancial",
+    "燃气Ⅱ": "utility", "生物制品": "rd_growth", "水泥": "resource_cycle", "塑料": "general_nonfinancial",
+    "文娱用品": "general_nonfinancial", "物流": "general_nonfinancial", "消费电子": "rd_growth", "小家电": "general_nonfinancial",
+    "小金属": "resource_cycle", "休闲食品": "general_nonfinancial", "养殖业": "general_nonfinancial", "一般零售": "general_nonfinancial",
+    "医疗服务": "general_nonfinancial", "医疗器械": "rd_growth", "医药商业": "general_nonfinancial", "游戏Ⅱ": "rd_growth",
+    "元件": "rd_growth", "中药Ⅱ": "rd_growth", "专业服务": "general_nonfinancial", "专业工程": "general_nonfinancial",
+    "专用设备": "general_nonfinancial", "综合Ⅱ": "unclassified", "IT服务Ⅱ": "rd_growth"
+  }
+}
