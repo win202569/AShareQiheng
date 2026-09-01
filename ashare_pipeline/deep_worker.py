@@ -30,7 +30,11 @@ from ashare_pipeline.financial_features import (
     trading_days_from_batch,
     validate_feature_calendar_request,
 )
-from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
+from ashare_pipeline.financial_schema import (
+    FINANCIAL_REQUEST_VERSION,
+    MAPPING_VERSION,
+)
+from ashare_pipeline.industry_templates import TEMPLATE_VERSION
 from ashare_pipeline.snapshot_repository import SnapshotRef, SnapshotRepository
 from ashare_pipeline.sources import (
     FinancialStatementSource,
@@ -1553,6 +1557,216 @@ def _statement_item(
     return MappingProxyType(item)
 
 
+def _legacy_midnight_report_date_hashes(
+    records: Sequence[object],
+) -> tuple[str, ...]:
+    midnight_hashes: set[str] = set()
+    for row in records:
+        if not isinstance(row, Mapping):
+            return ()
+        report_date = row.get("REPORT_DATE")
+        if not isinstance(report_date, str):
+            return ()
+        date_text = report_date[:10]
+        try:
+            canonical_date = date.fromisoformat(date_text).isoformat()
+        except ValueError:
+            return ()
+        if canonical_date != date_text:
+            return ()
+        if report_date == date_text:
+            continue
+        if report_date != f"{date_text} 00:00:00":
+            return ()
+        try:
+            midnight_hashes.add(canonical_sha256(dict(row)))
+        except (TypeError, ValueError):
+            return ()
+    return tuple(sorted(midnight_hashes))
+
+
+def _snapshot_matches_refresh_date(
+    snapshot: SnapshotRef, refresh_date: str
+) -> bool:
+    fetched = datetime.fromisoformat(
+        require_aware_utc(snapshot.fetched_at, "snapshot fetched_at")
+    )
+    return fetched.astimezone(SHANGHAI).date().isoformat() == refresh_date
+
+
+def _exact_target_period_present(
+    records: Sequence[object], report_period: str
+) -> bool:
+    accepted = {report_period, f"{report_period} 00:00:00"}
+    return any(
+        isinstance(row, Mapping) and row.get("REPORT_DATE") in accepted
+        for row in records
+    )
+
+
+def _reconcile_legacy_midnight_failures(
+    *,
+    store: StateStore,
+    snapshots: SnapshotRepository,
+    context: CandidateContext,
+    trade_calendar_snapshot: SnapshotRef | None,
+    logical_now_utc: str,
+    items: list[Mapping[str, object]],
+) -> int:
+    if (
+        trade_calendar_snapshot is None
+        or MAPPING_VERSION != "eastmoney-financial-mapping-v2"
+        or TEMPLATE_VERSION != "template-registry-v2"
+    ):
+        return 0
+    trading_days = _verified_calendar_days(
+        snapshots, trade_calendar_snapshot
+    )
+    if trading_days is None:
+        return 0
+    reconciled = 0
+    for job in store.list_jobs(["deep_statement"]):
+        if (
+            job.get("kind") != "deep_statement"
+            or job.get("status") != "terminal_failed"
+            or job.get("error")
+            != {"error_classification": "malformed_statement"}
+            or job.get("result") is not None
+            or job.get("next_retry_at") is not None
+            or job.get("lease_worker") is not None
+            or job.get("lease_expires_at") is not None
+        ):
+            continue
+        payload = job.get("payload")
+        try:
+            _validate_statement_payload(payload)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        security_id = payload["security_id"]
+        dataset = payload["dataset"]
+        report_period = payload["report_period"]
+        refresh_date = payload["refresh_date"]
+        if not all(
+            isinstance(value, str)
+            for value in (
+                security_id,
+                dataset,
+                report_period,
+                refresh_date,
+            )
+        ):
+            continue
+        try:
+            expected_spec = next(
+                spec
+                for spec in statement_job_specs(
+                    context,
+                    security_id=security_id,
+                    report_period=report_period,
+                    as_of_cn_date=refresh_date,
+                )
+                if spec.payload["dataset"] == dataset
+            )
+        except (StopIteration, TypeError, ValueError):
+            continue
+        if (
+            job.get("idempotency_key") != expected_spec.idempotency_key
+            or dict(payload) != expected_spec.payload
+        ):
+            continue
+        request = _statement_request(security_id, report_period)
+        eligible: list[tuple[SnapshotRef, tuple[object, ...]]] = []
+        for snapshot in snapshots.list_exact("akshare", dataset, request):
+            if not _snapshot_matches_refresh_date(snapshot, refresh_date):
+                continue
+            verified = snapshots.read_verified(snapshot)
+            midnight_hashes = _legacy_midnight_report_date_hashes(
+                verified.batch.records
+            )
+            if not midnight_hashes:
+                continue
+            if not any(
+                store.has_quality_issue(
+                    severity="error",
+                    code="statement_report_date_invalid",
+                    details={
+                        "security_id": security_id,
+                        "dataset": dataset,
+                        "details": {
+                            "security_id": security_id,
+                            "row_hash": row_hash,
+                        },
+                    },
+                )
+                for row_hash in midnight_hashes
+            ):
+                continue
+            result = build_financial_facts(
+                verified.batch,
+                source_snapshot_id=snapshot.id,
+                expected_security_id=security_id,
+                trading_days=trading_days,
+                created_at_utc=snapshot.fetched_at,
+            )
+            if result.issues or not result.facts:
+                continue
+            if (
+                context.reported_target_period[security_id]
+                and not _exact_target_period_present(
+                    verified.batch.records, report_period
+                )
+            ):
+                continue
+            eligible.append((snapshot, result.facts))
+        if len(eligible) != 1:
+            continue
+        snapshot, facts = eligible[0]
+        statement_refs: dict[str, SnapshotRef | None] = {
+            statement_dataset: None
+            for statement_dataset in STATEMENT_DATASETS
+        }
+        statement_refs[dataset] = snapshot
+        followup = _feature_build_spec(
+            security_id=security_id,
+            report_period=report_period,
+            as_of_utc=logical_now_utc,
+            candidate_context=context,
+            statement_snapshots=statement_refs,
+            trade_calendar_snapshot=trade_calendar_snapshot,
+        )
+        recovery_result = {
+            "outcome": "reconciled_verified_snapshot",
+            "snapshot_hash": snapshot.payload_hash,
+            "mapping_version": MAPPING_VERSION,
+            "recovered_error": "malformed_statement",
+        }
+        won = store.reconcile_malformed_statement(
+            str(job["id"]),
+            expected_idempotency_key=expected_spec.idempotency_key,
+            expected_payload=expected_spec.payload,
+            source_snapshot_id=snapshot.id,
+            source_snapshot_hash=snapshot.payload_hash,
+            facts=facts,
+            followup=followup,
+            result=recovery_result,
+        )
+        if not won:
+            continue
+        reconciled += 1
+        items.append(
+            _statement_item(
+                security_id=security_id,
+                dataset=dataset,
+                snapshot_hash=snapshot.payload_hash,
+                outcome="reconciled_verified_snapshot",
+                error_classification="malformed_statement",
+            )
+        )
+    return reconciled
+
+
 def execute_queued_deep_work(
     *,
     root: Path,
@@ -1599,6 +1813,24 @@ def execute_queued_deep_work(
 
     logical_now_utc = normalized_now.astimezone(timezone.utc).isoformat()
     items: list[Mapping[str, object]] = []
+    counters = {
+        "remote_attempts": 0,
+        "snapshots_reused": 0,
+        "statements_succeeded": 0,
+        "retryable_failed": 0,
+        "terminal_failed": 0,
+    }
+    if not online:
+        reconciled = _reconcile_legacy_midnight_failures(
+            store=store,
+            snapshots=snapshots,
+            context=context,
+            trade_calendar_snapshot=trade_calendar_snapshot,
+            logical_now_utc=logical_now_utc,
+            items=items,
+        )
+        counters["snapshots_reused"] += reconciled
+        counters["statements_succeeded"] += reconciled
     feature_sets_written = _process_feature_jobs(
         root=data_root,
         store=store,
@@ -1610,13 +1842,6 @@ def execute_queued_deep_work(
         heartbeat_seconds=heartbeat_seconds,
         items=items,
     )
-    counters = {
-        "remote_attempts": 0,
-        "snapshots_reused": 0,
-        "statements_succeeded": 0,
-        "retryable_failed": 0,
-        "terminal_failed": 0,
-    }
     circuits: list[str] = []
     if not online:
         return DeepRunSummary(
