@@ -191,6 +191,64 @@ class StateStoreTestCase(unittest.TestCase):
             "2026-06-30", "2026-08-31T08:00:00+08:00", "rules-v1", "universe-v1", "incremental"
         )
 
+    def malformed_reconciliation_case(self, label: str) -> dict[str, object]:
+        snapshot_hash = canonical_sha256({"reconciliation_snapshot": label})
+        snapshot_id, created = self.store.record_snapshot(
+            "akshare",
+            "profit_sheet",
+            canonical_sha256({"reconciliation_request": label}),
+            snapshot_hash,
+            f"data/raw/reconciliation-{label}.json",
+            1,
+            utc_at(0),
+        )
+        self.assertTrue(created)
+        payload = {
+            "security_id": "SH600001",
+            "dataset": "profit_sheet",
+            "report_period": "2026-06-30",
+            "candidate_set_hash": "a" * 64,
+            "performance_input_hash": "b" * 64,
+            "request_version": "eastmoney-financial-request-v1",
+            "refresh_date": "2026-08-31",
+        }
+        idempotency_key = f"deep_statement:reconciliation:{label}"
+        job_id = self.store.enqueue_job("deep_statement", idempotency_key, payload)
+        self.store.lease_next_job(["deep_statement"], f"worker-{label}", 3600)
+        self.store.fail_job_with_followups(
+            job_id,
+            f"worker-{label}",
+            {"error_classification": "malformed_statement"},
+            False,
+            None,
+            (),
+        )
+        fact = financial_fact(
+            snapshot_id=snapshot_id,
+            raw_row_hash=canonical_sha256({"reconciliation_row": label}),
+        )
+        followup = JobSpec(
+            "feature_build",
+            f"feature:reconciliation:{label}",
+            {"security_id": "SH600001", "report_period": "2026-06-30"},
+        )
+        result = {
+            "outcome": "reconciled_verified_snapshot",
+            "snapshot_hash": snapshot_hash,
+            "mapping_version": MAPPING_VERSION,
+            "recovered_error": "malformed_statement",
+        }
+        return {
+            "snapshot_hash": snapshot_hash,
+            "snapshot_id": snapshot_id,
+            "payload": payload,
+            "idempotency_key": idempotency_key,
+            "job_id": job_id,
+            "fact": fact,
+            "followup": followup,
+            "result": result,
+        }
+
     @staticmethod
     def evidence_for_fact(fact: FinancialFact) -> EvidenceRef:
         return EvidenceRef(
@@ -2125,6 +2183,355 @@ class StateStoreTestCase(unittest.TestCase):
         self.assertEqual(completed["status"], "succeeded")
         self.assertIsNone(completed["error"])
         self.assertIsNone(completed["next_retry_at"])
+
+    def test_malformed_statement_reconciliation_commits_verified_recovery_once(self) -> None:
+        case = self.malformed_reconciliation_case("success")
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """UPDATE job SET lease_worker = 'stale-worker',
+                lease_expires_at = ?, next_retry_at = ? WHERE id = ?""",
+                (utc_at(10), utc_at(20), case["job_id"]),
+            )
+            connection.commit()
+
+        recovered = self.store.reconcile_malformed_statement(
+            case["job_id"],
+            expected_idempotency_key=case["idempotency_key"],
+            expected_payload=case["payload"],
+            source_snapshot_id=case["snapshot_id"],
+            source_snapshot_hash=case["snapshot_hash"],
+            facts=(case["fact"],),
+            followup=case["followup"],
+            result=case["result"],
+        )
+
+        self.assertTrue(recovered)
+        completed = self.store.get_job(case["job_id"])
+        self.assertEqual(completed["status"], "succeeded")
+        self.assertEqual(completed["result"], case["result"])
+        self.assertIsNone(completed["error"])
+        self.assertIsNone(completed["lease_worker"])
+        self.assertIsNone(completed["lease_expires_at"])
+        self.assertIsNone(completed["next_retry_at"])
+        self.assertEqual(
+            self.store.list_financial_facts("SH600001"), [case["fact"]]
+        )
+        followups = self.store.list_jobs(["feature_build"])
+        self.assertEqual(len(followups), 1)
+        self.assertEqual(followups[0]["idempotency_key"], case["followup"].idempotency_key)
+        self.assertEqual(followups[0]["payload"], case["followup"].payload)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            stored_result = connection.execute(
+                "SELECT result_json FROM job WHERE id = ?", (case["job_id"],)
+            ).fetchone()[0]
+        self.assertEqual(
+            stored_result,
+            '{"mapping_version":"eastmoney-financial-mapping-v1",'
+            '"outcome":"reconciled_verified_snapshot",'
+            '"recovered_error":"malformed_statement",'
+            f'"snapshot_hash":"{case["snapshot_hash"]}"}}',
+        )
+
+        repeated = self.store.reconcile_malformed_statement(
+            case["job_id"],
+            expected_idempotency_key=case["idempotency_key"],
+            expected_payload=case["payload"],
+            source_snapshot_id=case["snapshot_id"],
+            source_snapshot_hash=case["snapshot_hash"],
+            facts=(case["fact"],),
+            followup=case["followup"],
+            result=case["result"],
+        )
+        self.assertFalse(repeated)
+        self.assertEqual(len(self.store.list_jobs(["feature_build"])), 1)
+        self.assertEqual(len(self.store.list_financial_facts("SH600001")), 1)
+
+    def test_malformed_statement_reconciliation_rejects_identity_mismatches_without_writes(self) -> None:
+        cases = (
+            ("wrong-kind", "UPDATE job SET kind='deep_financial' WHERE id=?", {}),
+            (
+                "wrong-error",
+                "UPDATE job SET last_error_json='{\"error_classification\":\"terminal_source\"}' WHERE id=?",
+                {},
+            ),
+            (
+                "extra-error",
+                "UPDATE job SET last_error_json='{\"detail\":\"old\",\"error_classification\":\"malformed_statement\"}' WHERE id=?",
+                {},
+            ),
+            (
+                "noncanonical-error",
+                "UPDATE job SET last_error_json='{ \"error_classification\": \"malformed_statement\" }' WHERE id=?",
+                {},
+            ),
+            ("wrong-key", None, {"expected_idempotency_key": "different:key"}),
+            (
+                "wrong-payload",
+                None,
+                {"expected_payload": {"security_id": "SH600001", "dataset": "profit_sheet"}},
+            ),
+            ("wrong-snapshot-id", None, {"source_snapshot_id": "missing-snapshot"}),
+            ("wrong-snapshot-hash", None, {"source_snapshot_hash": "f" * 64}),
+            (
+                "wrong-snapshot-dataset",
+                "UPDATE source_snapshot SET dataset='balance_sheet' WHERE id=?",
+                {},
+            ),
+            ("wrong-status", "UPDATE job SET status='retryable_failed' WHERE id=?", {}),
+        )
+        for label, mutation, overrides in cases:
+            with self.subTest(label=label):
+                case = self.malformed_reconciliation_case(label)
+                if mutation is not None:
+                    target_id = (
+                        case["snapshot_id"]
+                        if label == "wrong-snapshot-dataset"
+                        else case["job_id"]
+                    )
+                    with closing(sqlite3.connect(self.db_path)) as connection:
+                        connection.execute(mutation, (target_id,))
+                        connection.commit()
+                arguments = {
+                    "expected_idempotency_key": case["idempotency_key"],
+                    "expected_payload": case["payload"],
+                    "source_snapshot_id": case["snapshot_id"],
+                    "source_snapshot_hash": case["snapshot_hash"],
+                    "facts": (case["fact"],),
+                    "followup": case["followup"],
+                    "result": case["result"],
+                }
+                arguments.update(overrides)
+                before_job = self.store.get_job(case["job_id"])
+                before_fact_count = len(self.store.list_financial_facts("SH600001"))
+                before_followup_count = len(self.store.list_jobs(["feature_build"]))
+
+                recovered = self.store.reconcile_malformed_statement(
+                    case["job_id"], **arguments
+                )
+
+                self.assertFalse(recovered)
+                self.assertEqual(self.store.get_job(case["job_id"]), before_job)
+                self.assertEqual(
+                    len(self.store.list_financial_facts("SH600001")),
+                    before_fact_count,
+                )
+                self.assertEqual(
+                    len(self.store.list_jobs(["feature_build"])),
+                    before_followup_count,
+                )
+
+    def test_malformed_statement_reconciliation_rejects_nonexact_result_without_writes(self) -> None:
+        result_mutations = {
+            "wrong-outcome": {"outcome": "statement_persisted"},
+            "wrong-snapshot": {"snapshot_hash": "f" * 64},
+            "wrong-mapping": {"mapping_version": "legacy-mapping"},
+            "wrong-error": {"recovered_error": "terminal_source"},
+            "extra-field": {"unexpected": True},
+        }
+        for label, mutation in result_mutations.items():
+            with self.subTest(label=label):
+                case = self.malformed_reconciliation_case(f"result-{label}")
+                supplied_result = dict(case["result"])
+                supplied_result.update(mutation)
+                before_job = self.store.get_job(case["job_id"])
+                with closing(sqlite3.connect(self.db_path)) as connection:
+                    before_counts = (
+                        connection.execute(
+                            "SELECT COUNT(*) FROM financial_fact"
+                        ).fetchone()[0],
+                        connection.execute(
+                            "SELECT COUNT(*) FROM job WHERE kind='feature_build'"
+                        ).fetchone()[0],
+                    )
+
+                with self.assertRaisesRegex(ValueError, "result"):
+                    self.store.reconcile_malformed_statement(
+                        case["job_id"],
+                        expected_idempotency_key=case["idempotency_key"],
+                        expected_payload=case["payload"],
+                        source_snapshot_id=case["snapshot_id"],
+                        source_snapshot_hash=case["snapshot_hash"],
+                        facts=(case["fact"],),
+                        followup=case["followup"],
+                        result=supplied_result,
+                    )
+
+                self.assertEqual(self.store.get_job(case["job_id"]), before_job)
+                with closing(sqlite3.connect(self.db_path)) as connection:
+                    after_counts = (
+                        connection.execute(
+                            "SELECT COUNT(*) FROM financial_fact"
+                        ).fetchone()[0],
+                        connection.execute(
+                            "SELECT COUNT(*) FROM job WHERE kind='feature_build'"
+                        ).fetchone()[0],
+                    )
+                self.assertEqual(after_counts, before_counts)
+
+    def test_malformed_statement_reconciliation_rejects_unbound_facts_and_followup_without_writes(self) -> None:
+        labels = (
+            "empty-facts",
+            "wrong-fact-snapshot",
+            "wrong-fact-security",
+            "wrong-fact-statement",
+            "mixed-mapping-versions",
+            "wrong-followup-kind",
+        )
+        for label in labels:
+            with self.subTest(label=label):
+                case = self.malformed_reconciliation_case(f"binding-{label}")
+                facts = (case["fact"],)
+                followup = case["followup"]
+                if label == "empty-facts":
+                    facts = ()
+                elif label == "wrong-fact-snapshot":
+                    other_snapshot_id, _ = self.store.record_snapshot(
+                        "akshare",
+                        "profit_sheet",
+                        canonical_sha256({"other_request": label}),
+                        canonical_sha256({"other_snapshot": label}),
+                        f"data/raw/{label}.json",
+                        1,
+                        utc_at(1),
+                    )
+                    facts = (
+                        rebuild_fact(
+                            case["fact"], source_snapshot_id=other_snapshot_id
+                        ),
+                    )
+                elif label == "wrong-fact-security":
+                    facts = (rebuild_fact(case["fact"], security_id="SH600002"),)
+                elif label == "wrong-fact-statement":
+                    facts = (rebuild_fact(case["fact"], statement="balance"),)
+                elif label == "mixed-mapping-versions":
+                    second = rebuild_fact(
+                        case["fact"], raw_row_hash=canonical_sha256({"second": label})
+                    )
+                    facts = (case["fact"], replace(second, mapping_version="legacy"))
+                else:
+                    followup = JobSpec(
+                        "fetch",
+                        f"not-feature:{label}",
+                        {"security_id": "SH600001"},
+                    )
+                before_job = self.store.get_job(case["job_id"])
+                with closing(sqlite3.connect(self.db_path)) as connection:
+                    before_counts = (
+                        connection.execute(
+                            "SELECT COUNT(*) FROM financial_fact"
+                        ).fetchone()[0],
+                        connection.execute("SELECT COUNT(*) FROM job").fetchone()[0],
+                    )
+
+                with self.assertRaisesRegex(ValueError, "facts|follow-up"):
+                    self.store.reconcile_malformed_statement(
+                        case["job_id"],
+                        expected_idempotency_key=case["idempotency_key"],
+                        expected_payload=case["payload"],
+                        source_snapshot_id=case["snapshot_id"],
+                        source_snapshot_hash=case["snapshot_hash"],
+                        facts=facts,
+                        followup=followup,
+                        result=case["result"],
+                    )
+
+                self.assertEqual(self.store.get_job(case["job_id"]), before_job)
+                with closing(sqlite3.connect(self.db_path)) as connection:
+                    after_counts = (
+                        connection.execute(
+                            "SELECT COUNT(*) FROM financial_fact"
+                        ).fetchone()[0],
+                        connection.execute("SELECT COUNT(*) FROM job").fetchone()[0],
+                    )
+                self.assertEqual(after_counts, before_counts)
+
+    def test_malformed_statement_reconciliation_rolls_back_followup_conflict(self) -> None:
+        case = self.malformed_reconciliation_case("followup-conflict")
+        self.store.enqueue_job(
+            "feature_build",
+            case["followup"].idempotency_key,
+            {"security_id": "SH600002", "report_period": "2026-06-30"},
+        )
+        before_job = self.store.get_job(case["job_id"])
+
+        with self.assertRaisesRegex(ValueError, "idempotency"):
+            self.store.reconcile_malformed_statement(
+                case["job_id"],
+                expected_idempotency_key=case["idempotency_key"],
+                expected_payload=case["payload"],
+                source_snapshot_id=case["snapshot_id"],
+                source_snapshot_hash=case["snapshot_hash"],
+                facts=(case["fact"],),
+                followup=case["followup"],
+                result=case["result"],
+            )
+
+        self.assertEqual(self.store.get_job(case["job_id"]), before_job)
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+        feature_jobs = self.store.list_jobs(["feature_build"])
+        self.assertEqual(len(feature_jobs), 1)
+        self.assertEqual(feature_jobs[0]["payload"]["security_id"], "SH600002")
+
+    def test_malformed_statement_reconciliation_rolls_back_trigger_failure(self) -> None:
+        case = self.malformed_reconciliation_case("trigger-failure")
+        before_job = self.store.get_job(case["job_id"])
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """CREATE TRIGGER reject_reconciliation_followup
+                BEFORE INSERT ON job WHEN NEW.kind='feature_build'
+                BEGIN SELECT RAISE(ABORT, 'forced reconciliation failure'); END"""
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "forced reconciliation failure"
+        ):
+            self.store.reconcile_malformed_statement(
+                case["job_id"],
+                expected_idempotency_key=case["idempotency_key"],
+                expected_payload=case["payload"],
+                source_snapshot_id=case["snapshot_id"],
+                source_snapshot_hash=case["snapshot_hash"],
+                facts=(case["fact"],),
+                followup=case["followup"],
+                result=case["result"],
+            )
+
+        self.assertEqual(self.store.get_job(case["job_id"]), before_job)
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_malformed_statement_reconciliation_rolls_back_cas_trigger_side_effect(self) -> None:
+        case = self.malformed_reconciliation_case("cas-failure")
+        before_job = self.store.get_job(case["job_id"])
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                f"""CREATE TRIGGER force_reconciliation_cas_miss
+                BEFORE UPDATE OF status ON job
+                WHEN OLD.id='{case["job_id"]}' AND NEW.status='succeeded'
+                BEGIN
+                  UPDATE job SET last_error_json='{{"error_classification":"terminal_source"}}'
+                  WHERE id=OLD.id;
+                  SELECT RAISE(IGNORE);
+                END"""
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "CAS"):
+            self.store.reconcile_malformed_statement(
+                case["job_id"],
+                expected_idempotency_key=case["idempotency_key"],
+                expected_payload=case["payload"],
+                source_snapshot_id=case["snapshot_id"],
+                source_snapshot_hash=case["snapshot_hash"],
+                facts=(case["fact"],),
+                followup=case["followup"],
+                result=case["result"],
+            )
+
+        self.assertEqual(self.store.get_job(case["job_id"]), before_job)
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
 
     def test_legacy_success_clears_recovered_failure_fields(self) -> None:
         now = datetime.now(UTC)

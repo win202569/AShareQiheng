@@ -25,6 +25,7 @@ from ashare_pipeline.financial_formulas import (
     evaluate_derived_financial,
 )
 from ashare_pipeline.financial_schema import (
+    DATASET_TO_STATEMENT,
     FinancialFact,
     balance_equation_blockers,
     raw_financial_slot_descriptor,
@@ -836,20 +837,135 @@ class StateStore:
             if job_id is not None and worker_id is not None
             else self._transaction(immediate=True)
         )
-        inserted = 0
         with transaction as connection:
-            for fact in records:
-                record = fact.to_record()
-                cursor = connection.execute(
-                    """INSERT OR IGNORE INTO financial_fact
-                    (id,security_id,statement,metric_key,period_start,period_end,period_kind,
-                     value,unit,nature,announced_at_utc,effective_at_utc,source_updated_at_utc,
-                     source_snapshot_id,source_field,raw_row_hash,mapping_version,created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    tuple(record[key] for key in FINANCIAL_FACT_COLUMNS),
-                )
-                inserted += cursor.rowcount
+            inserted = self._insert_financial_facts(connection, records)
         return inserted, len(records) - inserted
+
+    @staticmethod
+    def _insert_financial_facts(
+        connection: sqlite3.Connection,
+        facts: Iterable[FinancialFact],
+    ) -> int:
+        inserted = 0
+        for fact in facts:
+            record = fact.to_record()
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO financial_fact
+                (id,security_id,statement,metric_key,period_start,period_end,period_kind,
+                 value,unit,nature,announced_at_utc,effective_at_utc,source_updated_at_utc,
+                 source_snapshot_id,source_field,raw_row_hash,mapping_version,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                tuple(record[key] for key in FINANCIAL_FACT_COLUMNS),
+            )
+            inserted += cursor.rowcount
+        return inserted
+
+    def reconcile_malformed_statement(
+        self,
+        job_id: str,
+        *,
+        expected_idempotency_key: str,
+        expected_payload: Mapping[str, object],
+        source_snapshot_id: str,
+        source_snapshot_hash: str,
+        facts: Iterable[FinancialFact],
+        followup: JobSpec,
+        result: Mapping[str, object],
+    ) -> bool:
+        records = tuple(facts)
+        payload_json = _json(dict(expected_payload))
+        malformed_error_json = _json(
+            {"error_classification": "malformed_statement"}
+        )
+        with self._transaction(immediate=True) as connection:
+            current = connection.execute(
+                """SELECT 1 FROM job WHERE id = ? AND kind = 'deep_statement'
+                AND idempotency_key = ? AND payload_json = ?
+                AND status = 'terminal_failed' AND last_error_json = ?""",
+                (
+                    job_id,
+                    expected_idempotency_key,
+                    payload_json,
+                    malformed_error_json,
+                ),
+            ).fetchone()
+            if current is None:
+                return False
+            snapshot = connection.execute(
+                """SELECT 1 FROM source_snapshot
+                WHERE id = ? AND payload_hash = ? AND dataset = ?""",
+                (
+                    source_snapshot_id,
+                    source_snapshot_hash,
+                    expected_payload.get("dataset"),
+                ),
+            ).fetchone()
+            if snapshot is None:
+                return False
+            if not records:
+                raise ValueError("reconciliation facts must not be empty")
+            if followup.kind != "feature_build":
+                raise ValueError("reconciliation follow-up must be feature_build")
+            if not all(isinstance(fact, FinancialFact) for fact in records):
+                raise ValueError("reconciliation facts must be FinancialFact values")
+            mapping_versions = {fact.mapping_version for fact in records}
+            if len(mapping_versions) != 1:
+                raise ValueError(
+                    "reconciliation facts must use exactly one mapping version"
+                )
+            security_id = expected_payload.get("security_id")
+            dataset = expected_payload.get("dataset")
+            expected_statement = DATASET_TO_STATEMENT.get(dataset)
+            for fact in records:
+                try:
+                    canonical_fact = FinancialFact.from_record(fact.to_record())
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "reconciliation facts must be canonical"
+                    ) from error
+                if (
+                    canonical_fact != fact
+                    or fact.source_snapshot_id != source_snapshot_id
+                    or fact.security_id != security_id
+                    or fact.statement != expected_statement
+                ):
+                    raise ValueError(
+                        "reconciliation facts do not match job and snapshot identity"
+                    )
+            mapping_version = next(iter(mapping_versions))
+            expected_result = {
+                "outcome": "reconciled_verified_snapshot",
+                "snapshot_hash": source_snapshot_hash,
+                "mapping_version": mapping_version,
+                "recovered_error": "malformed_statement",
+            }
+            if dict(result) != expected_result:
+                raise ValueError(
+                    "reconciliation result does not match verified recovery"
+                )
+            result_json = _json(expected_result)
+            transition_now = _utc_now()
+            cursor = connection.execute(
+                """UPDATE job SET status = 'succeeded', result_json = ?,
+                last_error_json = NULL, next_retry_at = NULL,
+                lease_worker = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND kind = 'deep_statement'
+                AND idempotency_key = ? AND payload_json = ?
+                AND status = 'terminal_failed' AND last_error_json = ?""",
+                (
+                    result_json,
+                    transition_now,
+                    job_id,
+                    expected_idempotency_key,
+                    payload_json,
+                    malformed_error_json,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("malformed statement reconciliation CAS failed")
+            self._insert_financial_facts(connection, records)
+            self._insert_followups(connection, (followup,), transition_now)
+        return True
 
     def list_financial_facts(
         self,
