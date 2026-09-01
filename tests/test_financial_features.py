@@ -966,6 +966,20 @@ class FeatureBundleBuildTests(unittest.TestCase):
         ))
         self.assertEqual(bundle.financial_status, "blocked")
 
+    def test_builder_recomputes_balance_equation_when_caller_omits_blocker(self):
+        imbalanced = self.replace_fact(
+            complete_general_facts(), "total_assets", "2021-12-31", 10_000.0
+        )
+
+        bundle = build_bundle_with_overrides(
+            facts=imbalanced, fact_blockers=()
+        )
+
+        self.assertEqual(bundle.financial_status, "blocked")
+        self.assertIn("balance_equation_mismatch", bundle.blockers)
+        for dimension in ("G", "M", "EQ", "FS", "CA"):
+            self.assertEqual(bundle.dimension_inputs[dimension].status, "blocked")
+
     def test_complete_financial_inputs_are_ready_despite_formal_mapping_blocker(self):
         bundle = build_bundle_with_overrides()
         self.assertEqual(bundle.financial_status, "financial_ready")

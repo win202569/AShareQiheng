@@ -26,6 +26,7 @@ from ashare_pipeline.financial_formulas import (
 )
 from ashare_pipeline.financial_schema import (
     FinancialFact,
+    balance_equation_blockers,
     raw_financial_slot_descriptor,
 )
 
@@ -833,6 +834,10 @@ class StateStore:
                         raise ValueError("feature evidence metadata conflicts for one fact")
                     evidence_by_id[evidence.financial_fact_id] = evidence
         if not evidence_by_id:
+            if "balance_equation_mismatch" in bundle.blockers:
+                raise ValueError(
+                    "balance equation semantics do not match canonical facts"
+                )
             return
 
         facts_by_id: dict[str, FinancialFact] = {}
@@ -887,6 +892,7 @@ class StateStore:
         }
         formula_inputs: dict[tuple[str, str], FormulaFact] = {}
         observed_raw_fact_ids: set[str] = set()
+        observed_raw_facts: list[FinancialFact] = []
         for dimension_name, dimension in bundle.dimension_inputs.items():
             for value in dimension.values:
                 if value.status != "observed":
@@ -932,6 +938,29 @@ class StateStore:
                     fact.unit,
                     fact.id,
                 )
+                observed_raw_facts.append(fact)
+
+        expected_balance_mismatch = (
+            "balance_equation_mismatch"
+            in balance_equation_blockers(observed_raw_facts)
+        )
+        advertised_balance_mismatch = (
+            "balance_equation_mismatch" in bundle.blockers
+        )
+        if expected_balance_mismatch != advertised_balance_mismatch:
+            raise ValueError(
+                "balance equation semantics do not match canonical facts"
+            )
+        if expected_balance_mismatch and (
+            bundle.financial_status != "blocked"
+            or any(
+                bundle.dimension_inputs[dimension].status != "blocked"
+                for dimension in FINANCIAL_DIMENSIONS
+            )
+        ):
+            raise ValueError(
+                "balance equation semantics require blocked financial status"
+            )
 
         formula_identities = {
             (spec.dimension, spec.canonical_key, spec.period_key)

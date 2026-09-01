@@ -79,3 +79,11 @@
 - V/T 维容器现同样参与全局财务命名空间认证，common template 的财务公式/原始槽位不能通过复制到非财务容器绕过闭集，无输出模板也拒绝该类值；本轮 fresh full `unittest` 回归为 391/391 通过。后续独立 scoped review 与 fresh whole-branch review 仍是必须门闸，本记录不预判结论。
 - 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
 - `formal_score_ready=false`，未发布 formal scores；正式等待价格池与正式强烈关注池继续关闭且为空。
+
+## 七维最终信任边界收口（2026-09-01）
+
+- verified progress 现将 bundle 的精确行业来源名称与注册模板绑定到当前冻结的 `CandidateContext`；不匹配记录 fail closed，且保持 visible newest-only、no-fallback。
+- 资产负债恒等式及容差/适用性由单一生产 authority 定义；builder 与 StateStore 首写、幂等复用、verified progress 路径均从已认证 canonical raw facts 重算，拒绝 blocker 或财务状态的语义伪造。
+- progress 在按证券选择最新记录之前强制 `feature_set.as_of_utc <= now_utc`；未来 bundle 不计数、不制造 unknown，也不能压制当前时点可见的较旧记录，等于截止时刻仍可见。
+- 本轮 focused 9/9、受影响模块 294/294、fresh full `unittest` 399/399 通过；尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
+- `formal_score_ready=false`、`seven_dimension_ready=false`；未发布 formal scores，正式等待价格池与正式强烈关注池继续关闭且为空。

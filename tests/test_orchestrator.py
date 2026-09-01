@@ -41,7 +41,11 @@ from tests.test_feature_contract import (
     retag_missing_revenue_slot,
 )
 from tests.test_financial_features import build_bundle_with_overrides, rebuild_fact
-from tests.test_state_store import installed_ready_bundle
+from tests.test_state_store import (
+    forge_balance_semantics,
+    installed_ready_bundle,
+    unsafe_materialize_feature_bundle,
+)
 
 
 def batch(source, dataset, records, request=None, fetched_at="2026-08-29T12:00:00+00:00"):
@@ -327,7 +331,7 @@ class OrchestratorTestCase(unittest.TestCase):
             self.root,
             store.db_path,
             "status",
-            now_cn="2026-08-29T20:00:00+08:00",
+            now_cn="2026-08-30T00:00:00+08:00",
         )
         self.assertEqual(exit_code, 0)
         self.assertEqual(
@@ -1144,7 +1148,7 @@ class OrchestratorTestCase(unittest.TestCase):
             store,
             SnapshotRepository(self.root, store),
             context,
-            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+            orchestrator._now_cn("2026-08-30T00:00:00+08:00"),
         )
 
         self.assertEqual(
@@ -1297,7 +1301,7 @@ class OrchestratorTestCase(unittest.TestCase):
             self.root,
             store.db_path,
             "status",
-            now_cn="2026-08-29T20:00:00+08:00",
+            now_cn="2026-08-30T00:00:00+08:00",
         )
 
         self.assertTrue(created)
@@ -1315,6 +1319,188 @@ class OrchestratorTestCase(unittest.TestCase):
             status["official_pool_counts"],
             {"waiting_price": 0, "strong_attention": 0},
         )
+
+    def test_progress_rejects_bundle_industry_that_mismatches_current_context(self):
+        write_candidate_documents(self.root, {"SH600001": "不存在行业"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        bundle, _facts, _snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="context-substitution",
+            source_industry_name="包装印刷",
+        )
+        relative_path, bundle_hash, _created = write_feature_bundle(
+            self.base, bundle
+        )
+        _feature_id, stored = store.put_feature_bundle(
+            bundle, bundle_path=relative_path, bundle_hash=bundle_hash
+        )
+        self.assertTrue(stored)
+        self.assertEqual(
+            read_verified_feature_bundle(
+                self.base, relative_path, bundle_hash
+            ).industry.template_id,
+            "general_nonfinancial",
+        )
+
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-30T00:00:00+08:00",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(status["deep"]["template_counts"], {})
+        self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
+
+    def test_progress_reauthenticates_balance_equation_without_fallback(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        older, _older_facts, _older_snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="balance-older",
+            as_of_utc="2026-08-28T16:00:00+00:00",
+        )
+        older_path, older_hash, _created = write_feature_bundle(self.base, older)
+        _older_id, stored = store.put_feature_bundle(
+            older, bundle_path=older_path, bundle_hash=older_hash
+        )
+        self.assertTrue(stored)
+
+        built, _facts, _snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="balance-newer",
+            as_of_utc="2026-08-29T16:00:00+00:00",
+            fact_values={("total_assets", "2021-12-31"): 10_000.0},
+        )
+        forged = forge_balance_semantics(
+            built,
+            status="financial_ready",
+            include_mismatch_blocker=False,
+        )
+        forged_path, forged_hash, _created = write_feature_bundle(
+            self.base, forged
+        )
+        unsafe_materialize_feature_bundle(
+            store, forged, bundle_path=forged_path
+        )
+        self.assertEqual(
+            read_verified_feature_bundle(
+                self.base, forged_path, forged_hash
+            ).canonical_bytes(),
+            forged.canonical_bytes(),
+        )
+
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-30T00:00:00+08:00",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+        self.assertFalse(status["formal_score_ready"])
+        self.assertFalse(status["seven_dimension_ready"])
+        self.assertEqual(
+            status["official_pool_counts"],
+            {"waiting_price": 0, "strong_attention": 0},
+        )
+
+    def test_progress_ignores_only_future_feature_bundle(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        future, _facts, _snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="future-only",
+            as_of_utc="2026-09-10T00:00:00+00:00",
+        )
+        relative_path, bundle_hash, _created = write_feature_bundle(
+            self.base, future
+        )
+        _feature_id, stored = store.put_feature_bundle(
+            future, bundle_path=relative_path, bundle_hash=bundle_hash
+        )
+        self.assertTrue(stored)
+
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-29T20:00:00+08:00",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 0, "blocked": 0},
+        )
+        self.assertEqual(status["deep"]["unknown_failure_count"], 0)
+
+    def test_future_bundle_does_not_suppress_exact_cutoff_visible_bundle(self):
+        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+        store = StateStore(self.root / "state.sqlite3")
+        store.initialize()
+        context = orchestrator.load_candidate_context(self.root)
+        visible, _visible_facts, _visible_snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="visible-cutoff",
+            as_of_utc="2026-08-29T16:00:00+00:00",
+            source_industry_name="包装印刷",
+        )
+        future, _future_facts, _future_snapshots = installed_ready_bundle(
+            store,
+            candidate_set_hash=context.candidate_set_hash,
+            snapshot_tag="future-suppressor",
+            as_of_utc="2026-09-10T00:00:00+00:00",
+            source_industry_name="电力",
+        )
+        for bundle in (visible, future):
+            relative_path, bundle_hash, _created = write_feature_bundle(
+                self.base, bundle
+            )
+            _feature_id, stored = store.put_feature_bundle(
+                bundle, bundle_path=relative_path, bundle_hash=bundle_hash
+            )
+            self.assertTrue(stored)
+
+        status, exit_code = orchestrator.run_command(
+            self.root,
+            store.db_path,
+            "status",
+            now_cn="2026-08-30T00:00:00+08:00",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            status["deep"]["feature_set_counts"],
+            {"partial": 0, "financial_ready": 1, "blocked": 0},
+        )
+        self.assertEqual(
+            status["deep"]["template_counts"], {"general_nonfinancial": 1}
+        )
+        self.assertEqual(status["deep"]["unknown_failure_count"], 0)
 
     def test_progress_rejects_newest_derived_numeric_mutation_without_fallback(self):
         store, newer, newer_path, _newer_hash, newer_id = self.install_ready_history(
@@ -1353,7 +1539,7 @@ class OrchestratorTestCase(unittest.TestCase):
             self.root,
             store.db_path,
             "status",
-            now_cn="2026-08-29T20:00:00+08:00",
+            now_cn="2026-08-30T00:00:00+08:00",
         )
         self.assertEqual(exit_code, 0)
         self.assertEqual(
@@ -1415,7 +1601,7 @@ class OrchestratorTestCase(unittest.TestCase):
             self.root,
             store.db_path,
             "status",
-            now_cn="2026-08-29T20:00:00+08:00",
+            now_cn="2026-08-30T00:00:00+08:00",
         )
         self.assertEqual(exit_code, 0)
         self.assertEqual(
@@ -1546,7 +1732,7 @@ class OrchestratorTestCase(unittest.TestCase):
             self.root,
             store.db_path,
             "status",
-            now_cn="2026-08-29T20:00:00+08:00",
+            now_cn="2026-08-30T00:00:00+08:00",
         )
         self.assertEqual(exit_code, 0)
         self.assertEqual(
@@ -1632,7 +1818,7 @@ class OrchestratorTestCase(unittest.TestCase):
             self.root,
             store.db_path,
             "status",
-            now_cn="2026-08-29T20:00:00+08:00",
+            now_cn="2026-08-30T00:00:00+08:00",
         )
 
         self.assertTrue(stored)
@@ -1689,7 +1875,7 @@ class OrchestratorTestCase(unittest.TestCase):
             self.root,
             store.db_path,
             "status",
-            now_cn="2026-08-29T20:00:00+08:00",
+            now_cn="2026-08-30T00:00:00+08:00",
         )
 
         self.assertEqual(exit_code, 0)
@@ -1740,7 +1926,7 @@ class OrchestratorTestCase(unittest.TestCase):
             store,
             SnapshotRepository(self.root, store),
             context,
-            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+            orchestrator._now_cn("2026-08-30T00:00:00+08:00"),
         )
 
         self.assertEqual(
@@ -1775,7 +1961,7 @@ class OrchestratorTestCase(unittest.TestCase):
             store,
             SnapshotRepository(self.root, store),
             context,
-            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+            orchestrator._now_cn("2026-08-30T00:00:00+08:00"),
         )
 
         self.assertEqual(
@@ -1808,7 +1994,7 @@ class OrchestratorTestCase(unittest.TestCase):
             store,
             SnapshotRepository(self.root, store),
             context,
-            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
+            orchestrator._now_cn("2026-08-30T00:00:00+08:00"),
         )
 
         self.assertEqual(

@@ -29,6 +29,7 @@ from .deep_worker import (
 )
 from .feature_contract import CONTRACT_VERSION, canonical_sha256
 from .financial_schema import FINANCIAL_REQUEST_VERSION
+from .industry_templates import resolve_template
 from .scoring import PREFILTER_REASON, build_prefilter
 from .snapshot_repository import SnapshotRef, SnapshotRepository
 from .state_store import StateStore
@@ -1055,8 +1056,14 @@ def build_deep_progress(
         rows = connection.execute(
             """SELECT * FROM feature_set
             WHERE candidate_set_hash=? AND contract_version=? AND report_period=?
+            AND as_of_utc<=?
             ORDER BY security_id,as_of_utc DESC,created_at DESC,id DESC""",
-            (context.candidate_set_hash, CONTRACT_VERSION, report_period),
+            (
+                context.candidate_set_hash,
+                CONTRACT_VERSION,
+                report_period,
+                now_utc.isoformat(),
+            ),
         ).fetchall()
         for row in rows:
             security_id = str(row["security_id"])
@@ -1074,6 +1081,15 @@ def build_deep_progress(
                     connection, row, bundle
                 )
                 store._validate_feature_bundle_evidence(connection, bundle)
+                source_industry_name = context.industries[security_id]
+                expected_template = resolve_template(source_industry_name)
+                if (
+                    bundle.industry.name != source_industry_name
+                    or bundle.industry.template_id != expected_template.template_id
+                ):
+                    raise ValueError(
+                        "feature bundle industry does not match candidate context"
+                    )
             except (KeyError, OSError, TypeError, UnicodeError, ValueError):
                 unknown_failures += 1
                 continue

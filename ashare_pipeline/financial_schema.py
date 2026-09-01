@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 import math
 import re
-from typing import Any, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from ashare_pipeline.feature_contract import (
     FINANCIAL_DIMENSIONS,
@@ -377,3 +377,34 @@ class FinancialFact:
             "mapping_version": self.mapping_version,
             "created_at": self.created_at,
         }
+
+
+def balance_equation_blockers(
+    facts: Iterable[FinancialFact],
+) -> frozenset[str]:
+    """Evaluate the canonical balance identity with frozen applicability/tolerance."""
+    blockers: set[str] = set()
+    by_period: dict[tuple[str, str], dict[str, FinancialFact]] = {}
+    for fact in facts:
+        if fact.metric_key in {"total_assets", "total_liabilities", "total_equity"}:
+            by_period.setdefault(
+                (fact.security_id, fact.period_end), {}
+            )[fact.metric_key] = fact
+    for period_facts in by_period.values():
+        if set(period_facts) != {
+            "total_assets",
+            "total_liabilities",
+            "total_equity",
+        }:
+            continue
+        units = {item.unit for item in period_facts.values()}
+        if len(units) != 1:
+            blockers.add("conflicting_fact_units")
+            continue
+        assets = period_facts["total_assets"].value
+        liabilities = period_facts["total_liabilities"].value
+        equity = period_facts["total_equity"].value
+        tolerance = max(1000.0, 0.001 * abs(assets))
+        if abs(assets - liabilities - equity) > tolerance:
+            blockers.add("balance_equation_mismatch")
+    return frozenset(blockers)

@@ -35,6 +35,7 @@ from ashare_pipeline.financial_schema import (
     DATASET_TO_STATEMENT,
     MAPPING_VERSION,
     FinancialFact,
+    balance_equation_blockers,
     classify_period,
     field_rules,
     raw_financial_slot_descriptor,
@@ -400,28 +401,6 @@ def _utc_datetime(value: object, field: str) -> datetime:
     return datetime.fromisoformat(require_aware_utc(value, field))
 
 
-def _balance_blockers(facts: Sequence[FinancialFact]) -> set[str]:
-    blockers: set[str] = set()
-    by_period: dict[tuple[str, str], dict[str, FinancialFact]] = {}
-    for fact in facts:
-        if fact.metric_key in {"total_assets", "total_liabilities", "total_equity"}:
-            by_period.setdefault((fact.security_id, fact.period_end), {})[fact.metric_key] = fact
-    for period_facts in by_period.values():
-        if set(period_facts) != {"total_assets", "total_liabilities", "total_equity"}:
-            continue
-        units = {item.unit for item in period_facts.values()}
-        if len(units) != 1:
-            blockers.add("conflicting_fact_units")
-            continue
-        assets = period_facts["total_assets"].value
-        liabilities = period_facts["total_liabilities"].value
-        equity = period_facts["total_equity"].value
-        tolerance = max(1000.0, 0.001 * abs(assets))
-        if abs(assets - liabilities - equity) > tolerance:
-            blockers.add("balance_equation_mismatch")
-    return blockers
-
-
 def select_visible_facts(
     facts: Iterable[FinancialFact],
     *,
@@ -479,7 +458,7 @@ def select_visible_facts(
             continue
         selected.append(max(tied, key=lambda item: (item.raw_row_hash, item.id)))
 
-    blockers.update(_balance_blockers(selected))
+    blockers.update(balance_equation_blockers(selected))
     return FactSelection(
         tuple(sorted(selected, key=lambda item: (item.security_id, item.period_end, item.metric_key, item.id))),
         tuple(blockers),
@@ -805,6 +784,7 @@ def build_feature_bundle(
         ),
         key=lambda item: (item.metric_key, item.period_end, item.effective_at_utc, item.id),
     ))
+    financial_blockers.update(balance_equation_blockers(selected))
     if template.template_id == "unclassified":
         financial_blockers.add("industry_template_unclassified")
     if (

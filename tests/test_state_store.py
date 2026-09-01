@@ -12,6 +12,7 @@ from pathlib import Path
 from ashare_pipeline.feature_contract import (
     CONTRACT_VERSION,
     DIMENSIONS,
+    FINANCIAL_DIMENSIONS,
     ConfidenceInputs,
     DimensionInput,
     EvidenceRef,
@@ -82,6 +83,95 @@ def installed_ready_bundle(
     return StateStoreTestCase.installed_ready_bundle(store, **overrides)
 
 
+def forge_balance_semantics(
+    bundle: FeatureBundle,
+    *,
+    status: str,
+    include_mismatch_blocker: bool,
+) -> FeatureBundle:
+    forged = copy.copy(bundle)
+    blockers = set(bundle.blockers)
+    if include_mismatch_blocker:
+        blockers.add("balance_equation_mismatch")
+    else:
+        blockers.discard("balance_equation_mismatch")
+    dimensions = dict(bundle.dimension_inputs)
+    dimension_status = "blocked" if status == "blocked" else status
+    if dimension_status == "financial_ready":
+        dimension_status = "input_ready"
+    for dimension in FINANCIAL_DIMENSIONS:
+        dimensions[dimension] = DimensionInput(
+            dimension_status,
+            bundle.dimension_inputs[dimension].values,
+        )
+    object.__setattr__(forged, "financial_status", status)
+    object.__setattr__(forged, "blockers", tuple(sorted(blockers)))
+    object.__setattr__(forged, "dimension_inputs", dimensions)
+    forged.validate()
+    return forged
+
+
+def unsafe_materialize_feature_bundle(
+    store: StateStore,
+    bundle: FeatureBundle,
+    *,
+    bundle_path: str,
+) -> str:
+    """Create reviewed pre-fix state without invoking a production validator."""
+    bundle_hash = bundle.bundle_hash()
+    header, values = store._feature_bundle_content(bundle, bundle_hash)
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        connection.execute(
+            """INSERT INTO feature_set
+            (id,security_id,report_period,as_of_utc,candidate_set_hash,
+             template_id,template_version,contract_version,input_hash,status,
+             financial_coverage,dimension_status_json,confidence_inputs_json,
+             blockers_json,bundle_hash,bundle_path,missing_json,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                bundle_hash,
+                header["security_id"],
+                header["report_period"],
+                header["as_of_utc"],
+                header["candidate_set_hash"],
+                header["template_id"],
+                header["template_version"],
+                header["contract_version"],
+                header["input_hash"],
+                header["status"],
+                header["financial_coverage"],
+                header["dimension_status_json"],
+                header["confidence_inputs_json"],
+                header["blockers_json"],
+                header["bundle_hash"],
+                bundle_path,
+                header["missing_json"],
+                utc_at(99),
+            ),
+        )
+        for value in values:
+            connection.execute(
+                """INSERT INTO feature_value
+                (feature_set_id,dimension,feature_key,period_key,value,unit,status,
+                 formula_version,evidence_json,missing_reason)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    bundle_hash,
+                    value["dimension"],
+                    value["feature_key"],
+                    value["period_key"],
+                    value["value"],
+                    value["unit"],
+                    value["status"],
+                    value["formula_version"],
+                    value["evidence_json"],
+                    value["missing_reason"],
+                ),
+            )
+        connection.commit()
+    return bundle_hash
+
+
 class StateStoreTestCase(unittest.TestCase):
     """Each test guards a durable public state-transition contract."""
 
@@ -127,6 +217,8 @@ class StateStoreTestCase(unittest.TestCase):
         snapshot_tag: str = "current",
         **overrides: object,
     ) -> tuple[FeatureBundle, tuple[FinancialFact, ...], dict[str, str]]:
+        fact_values = dict(overrides.pop("fact_values", {}))
+        omitted_slots = set(overrides.pop("omit_fact_slots", ()))
         dataset_by_statement = {
             "income": "profit_sheet",
             "balance": "balance_sheet",
@@ -158,8 +250,14 @@ class StateStoreTestCase(unittest.TestCase):
                 fact,
                 security_id=security_id,
                 source_snapshot_id=snapshot_ids[fact.statement],
+                **(
+                    {"value": fact_values[(fact.metric_key, fact.period_end)]}
+                    if (fact.metric_key, fact.period_end) in fact_values
+                    else {}
+                ),
             )
             for fact in complete_general_facts()
+            if (fact.metric_key, fact.period_end) not in omitted_slots
         )
         self_inserted, ignored = store.insert_financial_facts(facts)
         if self_inserted != len(facts) or ignored:
@@ -915,6 +1013,121 @@ class StateStoreTestCase(unittest.TestCase):
                         connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
                         0,
                     )
+
+    def test_balance_equation_semantics_reject_forged_ready_partial_and_blocked(self) -> None:
+        cases = (
+            ("ready_omission", 10_000.0, "financial_ready", False),
+            ("partial_omission", 10_000.0, "partial", False),
+            ("blocked_addition", 900.0, "blocked", True),
+        )
+        for case, assets, status, include_marker in cases:
+            with self.subTest(case=case):
+                case_store = StateStore(Path(self.tempdir.name) / f"{case}.sqlite3")
+                case_store.initialize()
+                built, _facts, _snapshots = self.installed_ready_bundle(
+                    case_store,
+                    snapshot_tag=case,
+                    fact_values={("total_assets", "2021-12-31"): assets},
+                )
+                forged = forge_balance_semantics(
+                    built,
+                    status=status,
+                    include_mismatch_blocker=include_marker,
+                )
+
+                with self.assertRaisesRegex(ValueError, "balance equation"):
+                    case_store.put_feature_bundle(
+                        forged,
+                        bundle_path=(
+                            "data/curated/formal_features/2026-06-30/SH600001/"
+                            f"{case}.json"
+                        ),
+                        bundle_hash=forged.bundle_hash(),
+                    )
+                with closing(sqlite3.connect(case_store.db_path)) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM feature_set"
+                        ).fetchone()[0],
+                        0,
+                    )
+
+    def test_balance_equation_is_reauthenticated_before_idempotent_success(self) -> None:
+        built, _facts, _snapshots = self.installed_ready_bundle(
+            self.store,
+            snapshot_tag="balance-idempotent",
+            fact_values={("total_assets", "2021-12-31"): 10_000.0},
+        )
+        forged = forge_balance_semantics(
+            built,
+            status="financial_ready",
+            include_mismatch_blocker=False,
+        )
+        path = (
+            "data/curated/formal_features/2026-06-30/SH600001/"
+            "balance-idempotent.json"
+        )
+        feature_id = unsafe_materialize_feature_bundle(
+            self.store, forged, bundle_path=path
+        )
+        stored = self.store.get_feature_bundle_row(
+            forged.security_id, forged.report_period, forged.input_hash
+        )
+        self.assertEqual(stored["status"], "financial_ready")
+        self.assertEqual(stored["id"], feature_id)
+
+        with self.assertRaisesRegex(ValueError, "balance equation"):
+            self.store.put_feature_bundle(
+                forged, bundle_path=path, bundle_hash=forged.bundle_hash()
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0],
+                363,
+            )
+
+    def test_balance_equation_accepts_exact_tolerance_and_missing_triplet(self) -> None:
+        cases = (
+            (
+                "exact_tolerance",
+                {("total_assets", "2021-12-31"): 1_900.0},
+                (),
+                "financial_ready",
+            ),
+            (
+                "missing_equity",
+                {},
+                (("total_equity", "2021-12-31"),),
+                "partial",
+            ),
+        )
+        for case, values, omitted, expected_status in cases:
+            with self.subTest(case=case):
+                case_store = StateStore(Path(self.tempdir.name) / f"{case}.sqlite3")
+                case_store.initialize()
+                bundle, _facts, _snapshots = self.installed_ready_bundle(
+                    case_store,
+                    snapshot_tag=case,
+                    fact_values=values,
+                    omit_fact_slots=omitted,
+                )
+                feature_id, created = case_store.put_feature_bundle(
+                    bundle,
+                    bundle_path=(
+                        "data/curated/formal_features/2026-06-30/SH600001/"
+                        f"{case}.json"
+                    ),
+                    bundle_hash=bundle.bundle_hash(),
+                )
+                self.assertTrue(created)
+                self.assertEqual(feature_id, bundle.bundle_hash())
+                self.assertEqual(bundle.financial_status, expected_status)
+                self.assertNotIn("balance_equation_mismatch", bundle.blockers)
 
     def test_first_persistence_rejects_financial_formula_copy_in_t(self) -> None:
         honest, _facts, _snapshots = self.installed_ready_bundle(
