@@ -454,6 +454,9 @@ class FinancialFactSelectionTests(unittest.TestCase):
         invalid_dates = (
             "2025-12-31junk", "20251231", "2025-W52-3", " 2025-12-31",
             "2025-12-31 ", "2025/12/31", "garbage",
+            "2025-12-31 00:00:01", "2025-12-31T00:00:00",
+            "2025-12-31 00:00:00Z", "2025-12-31 00:00:00+08:00",
+            "2025-12-31 00:00:00.000", "2025-12-31 00:00:00junk",
         )
         for report_date in invalid_dates:
             with self.subTest(report_date=report_date):
@@ -464,6 +467,25 @@ class FinancialFactSelectionTests(unittest.TestCase):
                 )
                 self.assertEqual(result.facts, ())
                 self.assertEqual(result.issues[-1].code, "statement_report_date_invalid")
+
+    def test_report_date_accepts_exact_space_midnight_without_rewriting_raw_row(self):
+        batch = one_row_batch(report_date="2025-12-31 00:00:00", TOTAL_ASSETS=1.0)
+        original_row = dict(batch.records[0])
+
+        result = build_financial_facts(
+            batch,
+            source_snapshot_id="midnight-report-date",
+            expected_security_id="SH600001",
+            trading_days=(date(2026, 4, 1),),
+            created_at_utc="2026-04-01T08:00:00+00:00",
+        )
+
+        self.assertEqual(result.issues, ())
+        self.assertEqual(len(result.facts), 1)
+        fact = result.facts[0]
+        self.assertEqual((fact.period_end, fact.period_kind), ("2025-12-31", "FY"))
+        self.assertEqual(fact.raw_row_hash, canonical_sha256(original_row))
+        self.assertEqual(batch.records[0], original_row)
 
     def test_source_dates_reject_compact_week_suffix_and_malformed_separators(self):
         invalid_dates = (
@@ -645,6 +667,7 @@ class TradeCalendarTests(unittest.TestCase):
             self.calendar_batch(records=[{"calendar_date": "2026-08-28", "is_trading_day": "yes"}]),
             self.calendar_batch(records=[{"calendar_date": "2026-08-28", "extra": "1"}]),
             self.calendar_batch(records=[{"calendar_date": "2026-08-28junk", "is_trading_day": "1"}]),
+            self.calendar_batch(records=[{"calendar_date": "2026-08-28 00:00:00", "is_trading_day": "1"}]),
             self.calendar_batch(request={"start_date": "2022-01-01", "end_date": "2026-09-07"}),
             self.calendar_batch(request={"start_date": "2021-01-01", "end_date": "2026-09-06"}),
         )
@@ -773,11 +796,40 @@ class FeatureInputHashTests(unittest.TestCase):
             },
             "trade_calendar_snapshot_hash": "4" * 64,
             "contract_version": "feature-contract-v1",
-            "mapping_version": "eastmoney-financial-mapping-v1",
+            "mapping_version": "eastmoney-financial-mapping-v2",
             "template_version": "template-registry-v1",
             "formula_version": "financial-derived-v1",
         })
         self.assertEqual(feature_input_hash(**self.hash_arguments()), expected)
+
+    def test_mapping_v2_fact_is_consumed_by_the_feature_bundle(self):
+        result = build_financial_facts(
+            one_row_batch(TOTAL_ASSETS=1.0),
+            source_snapshot_id="mapping-v2",
+            expected_security_id="SH600001",
+            trading_days=(date(2026, 4, 1),),
+            created_at_utc="2026-04-01T08:00:00+00:00",
+        )
+        self.assertEqual(len(result.facts), 1)
+        fact = result.facts[0]
+
+        bundle = build_feature_bundle(
+            **self.hash_arguments(),
+            source_industry_name="包装印刷",
+            facts=result.facts,
+            fact_blockers=(),
+            reported_target_period=True,
+        )
+        evidence_ids = {
+            evidence.financial_fact_id
+            for dimension in bundle.dimension_inputs.values()
+            for value in dimension.values
+            for evidence in value.evidence
+        }
+
+        self.assertEqual(fact.mapping_version, "eastmoney-financial-mapping-v2")
+        self.assertIn(fact.id, evidence_ids)
+        self.assertNotIn("financial_fact_mapping_version_mismatch", bundle.blockers)
 
     def test_omitted_statement_key_equals_explicit_null_but_real_snapshot_changes_hash(self):
         arguments = self.hash_arguments()
