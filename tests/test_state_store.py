@@ -2379,6 +2379,10 @@ class StateStoreTestCase(unittest.TestCase):
             "wrong-candidate-hash",
             "wrong-performance-hash",
             "wrong-key",
+            "empty-industry",
+            "nonboolean-reported",
+            "invalid-as-of",
+            "incomplete-calendar",
         )
         for label in labels:
             with self.subTest(label=label):
@@ -2399,8 +2403,19 @@ class StateStoreTestCase(unittest.TestCase):
                     payload["candidate_set_hash"] = "f" * 64
                 elif label == "wrong-performance-hash":
                     payload["performance_input_hash"] = "f" * 64
+                elif label == "empty-industry":
+                    payload["industry"] = ""
+                elif label == "nonboolean-reported":
+                    payload["reported_target_period"] = "yes"
+                elif label == "invalid-as-of":
+                    payload["as_of_utc"] = "not-a-timestamp"
+                elif label == "incomplete-calendar":
+                    payload["trade_calendar_snapshot"] = {
+                        "payload_hash": "e" * 64
+                    }
 
                 statements = payload["statement_snapshots"]
+                calendar = payload["trade_calendar_snapshot"]
                 input_hash = feature_input_hash(
                     security_id=payload["security_id"],
                     report_period=payload["report_period"],
@@ -2414,7 +2429,11 @@ class StateStoreTestCase(unittest.TestCase):
                         )
                         for dataset, value in statements.items()
                     },
-                    trade_calendar_snapshot_hash=None,
+                    trade_calendar_snapshot_hash=(
+                        calendar["payload_hash"]
+                        if isinstance(calendar, dict)
+                        else None
+                    ),
                 )
                 followup_key = (
                     "feature_build:v1:"
