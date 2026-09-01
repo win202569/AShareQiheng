@@ -24,6 +24,7 @@ from ashare_pipeline.feature_contract import (
     canonical_sha256,
 )
 from ashare_pipeline.financial_schema import MAPPING_VERSION, FinancialFact
+from ashare_pipeline.financial_features import feature_input_hash
 from ashare_pipeline.state_store import FinalizationBlocked, JobSpec, StateStore
 from tests.test_financial_features import (
     build_bundle_with_overrides,
@@ -63,6 +64,16 @@ def financial_fact(
         mapping_version=MAPPING_VERSION,
         created_at="2026-08-29T00:00:00+00:00",
     )
+
+
+def historical_mapping_fact(fact: FinancialFact) -> FinancialFact:
+    record = fact.to_record()
+    record["mapping_version"] = "eastmoney-financial-mapping-v1"
+    identity = dict(record)
+    identity.pop("id")
+    identity.pop("created_at")
+    record["id"] = canonical_sha256(identity)
+    return FinancialFact.from_record(record)
 
 
 def valid_feature_bundle(
@@ -182,6 +193,7 @@ class StateStoreTestCase(unittest.TestCase):
         self.db_path = Path(self.tempdir.name) / "state.sqlite3"
         self.store = StateStore(self.db_path)
         self.store.initialize()
+        self._reconciliation_case_index = 0
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -192,11 +204,20 @@ class StateStoreTestCase(unittest.TestCase):
         )
 
     def malformed_reconciliation_case(self, label: str) -> dict[str, object]:
+        self._reconciliation_case_index += 1
+        refresh_date = (
+            datetime(2026, 1, 1, tzinfo=UTC)
+            + timedelta(days=self._reconciliation_case_index)
+        ).date().isoformat()
         snapshot_hash = canonical_sha256({"reconciliation_snapshot": label})
+        statement_request = {
+            "symbol": "SH600001",
+            "report_period": "2026-06-30",
+        }
         snapshot_id, created = self.store.record_snapshot(
             "akshare",
             "profit_sheet",
-            canonical_sha256({"reconciliation_request": label}),
+            canonical_sha256(statement_request),
             snapshot_hash,
             f"data/raw/reconciliation-{label}.json",
             1,
@@ -210,9 +231,12 @@ class StateStoreTestCase(unittest.TestCase):
             "candidate_set_hash": "a" * 64,
             "performance_input_hash": "b" * 64,
             "request_version": "eastmoney-financial-request-v1",
-            "refresh_date": "2026-08-31",
+            "refresh_date": refresh_date,
         }
-        idempotency_key = f"deep_statement:reconciliation:{label}"
+        idempotency_key = (
+            "deep_statement:v1:SH600001:profit_sheet:2026-06-30:"
+            f"{refresh_date}"
+        )
         job_id = self.store.enqueue_job("deep_statement", idempotency_key, payload)
         self.store.lease_next_job(["deep_statement"], f"worker-{label}", 3600)
         self.store.fail_job_with_followups(
@@ -227,10 +251,42 @@ class StateStoreTestCase(unittest.TestCase):
             snapshot_id=snapshot_id,
             raw_row_hash=canonical_sha256({"reconciliation_row": label}),
         )
+        statement_snapshots = {
+            "balance_sheet": None,
+            "profit_sheet": {
+                "source_snapshot_id": snapshot_id,
+                "payload_hash": snapshot_hash,
+            },
+            "cash_flow_sheet": None,
+        }
+        feature_payload = {
+            "security_id": "SH600001",
+            "report_period": "2026-06-30",
+            "as_of_utc": "2026-08-31T16:00:00+00:00",
+            "candidate_set_hash": "a" * 64,
+            "industry": "包装印刷",
+            "reported_target_period": True,
+            "performance_input_hash": "b" * 64,
+            "statement_snapshots": statement_snapshots,
+            "trade_calendar_snapshot": None,
+        }
+        input_hash = feature_input_hash(
+            security_id="SH600001",
+            report_period="2026-06-30",
+            as_of_utc=feature_payload["as_of_utc"],
+            candidate_set_hash=feature_payload["candidate_set_hash"],
+            statement_snapshot_hashes={
+                dataset: (
+                    value["payload_hash"] if value is not None else None
+                )
+                for dataset, value in statement_snapshots.items()
+            },
+            trade_calendar_snapshot_hash=None,
+        )
         followup = JobSpec(
             "feature_build",
-            f"feature:reconciliation:{label}",
-            {"security_id": "SH600001", "report_period": "2026-06-30"},
+            f"feature_build:v1:SH600001:2026-06-30:{input_hash}",
+            feature_payload,
         )
         result = {
             "outcome": "reconciled_verified_snapshot",
@@ -664,6 +720,24 @@ class StateStoreTestCase(unittest.TestCase):
         stored = self.store.list_financial_facts("SH600001")
         self.assertEqual(len(stored), 2)
         self.assertEqual({fact.raw_row_hash for fact in stored}, {"1" * 64, "2" * 64})
+
+    def test_list_financial_facts_preserves_known_v1_and_v2_history(self) -> None:
+        snapshot_id, _ = self.store.record_snapshot(
+            "akshare", "profit_sheet", "request-history", "a" * 64,
+            "data/raw/history.json", 1, utc_at(0),
+        )
+        current = financial_fact(snapshot_id=snapshot_id)
+        historical = historical_mapping_fact(current)
+
+        self.assertEqual(
+            self.store.insert_financial_facts((historical, current)),
+            (2, 0),
+        )
+        stored = self.store.list_financial_facts("SH600001")
+        self.assertEqual(
+            {fact.mapping_version for fact in stored},
+            {"eastmoney-financial-mapping-v1", MAPPING_VERSION},
+        )
 
     def test_list_financial_facts_applies_exact_snapshot_and_effective_filters(self) -> None:
         first_snapshot, _ = self.store.record_snapshot(
@@ -2226,7 +2300,7 @@ class StateStoreTestCase(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(
             stored_result,
-            '{"mapping_version":"eastmoney-financial-mapping-v1",'
+            f'{{"mapping_version":"{MAPPING_VERSION}",'
             '"outcome":"reconciled_verified_snapshot",'
             '"recovered_error":"malformed_statement",'
             f'"snapshot_hash":"{case["snapshot_hash"]}"}}',
@@ -2245,6 +2319,137 @@ class StateStoreTestCase(unittest.TestCase):
         self.assertFalse(repeated)
         self.assertEqual(len(self.store.list_jobs(["feature_build"])), 1)
         self.assertEqual(len(self.store.list_financial_facts("SH600001")), 1)
+
+    def test_malformed_statement_reconciliation_rejects_historical_mapping_facts(self) -> None:
+        case = self.malformed_reconciliation_case("historical-mapping")
+        historical = historical_mapping_fact(case["fact"])
+        result = dict(case["result"])
+        result["mapping_version"] = historical.mapping_version
+        before_job = self.store.get_job(case["job_id"])
+
+        with self.assertRaisesRegex(ValueError, "current mapping"):
+            self.store.reconcile_malformed_statement(
+                case["job_id"],
+                expected_idempotency_key=case["idempotency_key"],
+                expected_payload=case["payload"],
+                source_snapshot_id=case["snapshot_id"],
+                source_snapshot_hash=case["snapshot_hash"],
+                facts=(historical,),
+                followup=case["followup"],
+                result=result,
+            )
+
+        self.assertEqual(self.store.get_job(case["job_id"]), before_job)
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_malformed_statement_reconciliation_rejects_same_id_fact_conflict(self) -> None:
+        case = self.malformed_reconciliation_case("same-id-conflict")
+        conflicting = replace(case["fact"], created_at=utc_at(99))
+        self.assertEqual(
+            self.store.insert_financial_facts((conflicting,)),
+            (1, 0),
+        )
+        before_job = self.store.get_job(case["job_id"])
+
+        with self.assertRaisesRegex(ValueError, "stored financial fact conflicts"):
+            self.store.reconcile_malformed_statement(
+                case["job_id"],
+                expected_idempotency_key=case["idempotency_key"],
+                expected_payload=case["payload"],
+                source_snapshot_id=case["snapshot_id"],
+                source_snapshot_hash=case["snapshot_hash"],
+                facts=(case["fact"],),
+                followup=case["followup"],
+                result=case["result"],
+            )
+
+        self.assertEqual(self.store.get_job(case["job_id"]), before_job)
+        self.assertEqual(
+            self.store.list_financial_facts("SH600001"),
+            [conflicting],
+        )
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_malformed_statement_reconciliation_rejects_unbound_feature_followup(self) -> None:
+        labels = (
+            "wrong-security",
+            "wrong-period",
+            "wrong-snapshot-slot",
+            "wrong-candidate-hash",
+            "wrong-performance-hash",
+            "wrong-key",
+        )
+        for label in labels:
+            with self.subTest(label=label):
+                case = self.malformed_reconciliation_case(
+                    f"followup-{label}"
+                )
+                payload = copy.deepcopy(case["followup"].payload)
+                if label == "wrong-security":
+                    payload["security_id"] = "SH600002"
+                elif label == "wrong-period":
+                    payload["report_period"] = "2025-12-31"
+                elif label == "wrong-snapshot-slot":
+                    payload["statement_snapshots"]["profit_sheet"] = {
+                        "source_snapshot_id": "other-snapshot",
+                        "payload_hash": "f" * 64,
+                    }
+                elif label == "wrong-candidate-hash":
+                    payload["candidate_set_hash"] = "f" * 64
+                elif label == "wrong-performance-hash":
+                    payload["performance_input_hash"] = "f" * 64
+
+                statements = payload["statement_snapshots"]
+                input_hash = feature_input_hash(
+                    security_id=payload["security_id"],
+                    report_period=payload["report_period"],
+                    as_of_utc=payload["as_of_utc"],
+                    candidate_set_hash=payload["candidate_set_hash"],
+                    statement_snapshot_hashes={
+                        dataset: (
+                            value["payload_hash"]
+                            if value is not None
+                            else None
+                        )
+                        for dataset, value in statements.items()
+                    },
+                    trade_calendar_snapshot_hash=None,
+                )
+                followup_key = (
+                    "feature_build:v1:"
+                    f"{payload['security_id']}:{payload['report_period']}:"
+                    f"{input_hash}"
+                )
+                if label == "wrong-key":
+                    followup_key = (
+                        "feature_build:v1:SH600001:2026-06-30:"
+                        + "0" * 64
+                    )
+                followup = JobSpec("feature_build", followup_key, payload)
+                before_job = self.store.get_job(case["job_id"])
+
+                with self.assertRaisesRegex(ValueError, "follow-up"):
+                    self.store.reconcile_malformed_statement(
+                        case["job_id"],
+                        expected_idempotency_key=case["idempotency_key"],
+                        expected_payload=case["payload"],
+                        source_snapshot_id=case["snapshot_id"],
+                        source_snapshot_hash=case["snapshot_hash"],
+                        facts=(case["fact"],),
+                        followup=followup,
+                        result=case["result"],
+                    )
+
+                self.assertEqual(
+                    self.store.get_job(case["job_id"]), before_job
+                )
+                self.assertEqual(
+                    self.store.list_financial_facts("SH600001"), []
+                )
+                self.assertEqual(
+                    self.store.list_jobs(["feature_build"]), []
+                )
 
     def test_malformed_statement_reconciliation_rejects_identity_mismatches_without_writes(self) -> None:
         cases = (
@@ -2277,6 +2482,16 @@ class StateStoreTestCase(unittest.TestCase):
                 "UPDATE source_snapshot SET dataset='balance_sheet' WHERE id=?",
                 {},
             ),
+            (
+                "wrong-snapshot-source",
+                "UPDATE source_snapshot SET source='baostock' WHERE id=?",
+                {},
+            ),
+            (
+                "wrong-snapshot-request",
+                f"UPDATE source_snapshot SET request_fingerprint='{'f' * 64}' WHERE id=?",
+                {},
+            ),
             ("wrong-status", "UPDATE job SET status='retryable_failed' WHERE id=?", {}),
         )
         for label, mutation, overrides in cases:
@@ -2285,7 +2500,7 @@ class StateStoreTestCase(unittest.TestCase):
                 if mutation is not None:
                     target_id = (
                         case["snapshot_id"]
-                        if label == "wrong-snapshot-dataset"
+                        if label.startswith("wrong-snapshot-")
                         else case["job_id"]
                     )
                     with closing(sqlite3.connect(self.db_path)) as connection:

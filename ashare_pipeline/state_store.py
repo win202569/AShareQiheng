@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
@@ -17,8 +17,10 @@ from ashare_pipeline.feature_contract import (
     FINANCIAL_PERIODS,
     EvidenceRef,
     FeatureBundle,
+    canonical_sha256,
     financial_projection_values,
 )
+from ashare_pipeline.financial_features import feature_input_hash
 from ashare_pipeline.financial_formulas import (
     DERIVED_FORMULA_SPECS,
     FormulaFact,
@@ -26,6 +28,8 @@ from ashare_pipeline.financial_formulas import (
 )
 from ashare_pipeline.financial_schema import (
     DATASET_TO_STATEMENT,
+    FINANCIAL_REQUEST_VERSION,
+    MAPPING_VERSION,
     FinancialFact,
     balance_equation_blockers,
     raw_financial_slot_descriptor,
@@ -39,6 +43,34 @@ RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
 _OWNED_JOB_KINDS = frozenset({"deep_financial", "deep_statement", "feature_build"})
 SCHEMA_VERSION = 3
 _EVIDENCE_QUERY_BATCH_SIZE = 256
+_STATEMENT_DATASETS = ("balance_sheet", "profit_sheet", "cash_flow_sheet")
+_RECONCILIATION_STATEMENT_PAYLOAD_KEYS = frozenset(
+    {
+        "security_id",
+        "dataset",
+        "report_period",
+        "candidate_set_hash",
+        "performance_input_hash",
+        "request_version",
+        "refresh_date",
+    }
+)
+_RECONCILIATION_FEATURE_PAYLOAD_KEYS = frozenset(
+    {
+        "security_id",
+        "report_period",
+        "as_of_utc",
+        "candidate_set_hash",
+        "industry",
+        "reported_target_period",
+        "performance_input_hash",
+        "statement_snapshots",
+        "trade_calendar_snapshot",
+    }
+)
+_FROZEN_STATEMENT_SNAPSHOT_KEYS = frozenset(
+    {"source_snapshot_id", "payload_hash"}
+)
 
 FINANCIAL_FACT_COLUMNS = (
     "id",
@@ -268,6 +300,140 @@ def _json(value: object) -> str:
         sort_keys=True,
         allow_nan=False,
     )
+
+
+def _reconciliation_sha256(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value.lower())
+    ):
+        raise ValueError(f"{field} must be a SHA-256 hex digest")
+    return value.lower()
+
+
+def _reconciliation_date(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a canonical ISO date")
+    try:
+        normalized = date.fromisoformat(value).isoformat()
+    except ValueError as error:
+        raise ValueError(f"{field} must be a canonical ISO date") from error
+    if normalized != value:
+        raise ValueError(f"{field} must be a canonical ISO date")
+    return normalized
+
+
+def _validate_reconciliation_statement_identity(
+    payload: Mapping[str, object], idempotency_key: str
+) -> tuple[str, str, str, str]:
+    if set(payload) != _RECONCILIATION_STATEMENT_PAYLOAD_KEYS:
+        raise ValueError("reconciliation statement payload is not canonical")
+    security_id = payload["security_id"]
+    if (
+        not isinstance(security_id, str)
+        or len(security_id) != 8
+        or security_id[:2] not in {"SH", "SZ"}
+        or not security_id[2:].isdigit()
+    ):
+        raise ValueError("reconciliation statement security is invalid")
+    dataset = payload["dataset"]
+    if dataset not in DATASET_TO_STATEMENT:
+        raise ValueError("reconciliation statement dataset is invalid")
+    report_period = _reconciliation_date(
+        payload["report_period"], "report_period"
+    )
+    refresh_date = _reconciliation_date(payload["refresh_date"], "refresh_date")
+    _reconciliation_sha256(payload["candidate_set_hash"], "candidate_set_hash")
+    _reconciliation_sha256(
+        payload["performance_input_hash"], "performance_input_hash"
+    )
+    if payload["request_version"] != FINANCIAL_REQUEST_VERSION:
+        raise ValueError("reconciliation statement request version is invalid")
+    expected_key = (
+        f"deep_statement:v1:{security_id}:{dataset}:{report_period}:{refresh_date}"
+    )
+    if idempotency_key != expected_key:
+        raise ValueError("reconciliation statement key is not canonical")
+    return security_id, dataset, report_period, refresh_date
+
+
+def _validate_reconciliation_followup(
+    followup: JobSpec,
+    *,
+    statement_payload: Mapping[str, object],
+    source_snapshot_id: str,
+    source_snapshot_hash: str,
+) -> None:
+    if followup.kind != "feature_build":
+        raise ValueError("reconciliation follow-up must be feature_build")
+    payload = followup.payload
+    if set(payload) != _RECONCILIATION_FEATURE_PAYLOAD_KEYS:
+        raise ValueError("reconciliation follow-up payload is not canonical")
+    for field in (
+        "security_id",
+        "report_period",
+        "candidate_set_hash",
+        "performance_input_hash",
+    ):
+        if payload[field] != statement_payload[field]:
+            raise ValueError(
+                "reconciliation follow-up does not match statement identity"
+            )
+    statement_snapshots = payload["statement_snapshots"]
+    if (
+        not isinstance(statement_snapshots, Mapping)
+        or set(statement_snapshots) != set(_STATEMENT_DATASETS)
+    ):
+        raise ValueError("reconciliation follow-up snapshots are not canonical")
+    statement_hashes: dict[str, str | None] = {}
+    for dataset in _STATEMENT_DATASETS:
+        value = statement_snapshots[dataset]
+        if value is None:
+            statement_hashes[dataset] = None
+            continue
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != _FROZEN_STATEMENT_SNAPSHOT_KEYS
+            or not isinstance(value["source_snapshot_id"], str)
+            or not value["source_snapshot_id"]
+        ):
+            raise ValueError("reconciliation follow-up snapshots are not canonical")
+        statement_hashes[dataset] = _reconciliation_sha256(
+            value["payload_hash"], "statement snapshot hash"
+        )
+    recovered = statement_snapshots[statement_payload["dataset"]]
+    if (
+        not isinstance(recovered, Mapping)
+        or recovered["source_snapshot_id"] != source_snapshot_id
+        or recovered["payload_hash"] != source_snapshot_hash
+    ):
+        raise ValueError(
+            "reconciliation follow-up does not bind the recovered snapshot"
+        )
+    calendar = payload["trade_calendar_snapshot"]
+    if calendar is None:
+        calendar_hash = None
+    elif isinstance(calendar, Mapping):
+        calendar_hash = _reconciliation_sha256(
+            calendar.get("payload_hash"), "trade calendar snapshot hash"
+        )
+    else:
+        raise ValueError("reconciliation follow-up calendar is not canonical")
+    input_hash = feature_input_hash(
+        security_id=payload["security_id"],
+        report_period=payload["report_period"],
+        as_of_utc=payload["as_of_utc"],
+        candidate_set_hash=payload["candidate_set_hash"],
+        statement_snapshot_hashes=statement_hashes,
+        trade_calendar_snapshot_hash=calendar_hash,
+    )
+    expected_key = (
+        f"feature_build:v1:{payload['security_id']}:{payload['report_period']}:"
+        f"{input_hash}"
+    )
+    if followup.idempotency_key != expected_key:
+        raise ValueError("reconciliation follow-up key is not canonical")
 
 
 class StateStore:
@@ -860,6 +1026,37 @@ class StateStore:
             inserted += cursor.rowcount
         return inserted
 
+    @staticmethod
+    def _insert_or_verify_reconciliation_facts(
+        connection: sqlite3.Connection,
+        facts: Iterable[FinancialFact],
+    ) -> None:
+        for fact in facts:
+            record = fact.to_record()
+            existing = connection.execute(
+                "SELECT * FROM financial_fact WHERE id = ?", (fact.id,)
+            ).fetchone()
+            if existing is not None:
+                try:
+                    stored = FinancialFact.from_record(dict(existing))
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "stored financial fact conflicts with reconciliation"
+                    ) from error
+                if stored != fact:
+                    raise ValueError(
+                        "stored financial fact conflicts with reconciliation"
+                    )
+                continue
+            connection.execute(
+                """INSERT INTO financial_fact
+                (id,security_id,statement,metric_key,period_start,period_end,period_kind,
+                 value,unit,nature,announced_at_utc,effective_at_utc,source_updated_at_utc,
+                 source_snapshot_id,source_field,raw_row_hash,mapping_version,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                tuple(record[key] for key in FINANCIAL_FACT_COLUMNS),
+            )
+
     def reconcile_malformed_statement(
         self,
         job_id: str,
@@ -891,21 +1088,29 @@ class StateStore:
             ).fetchone()
             if current is None:
                 return False
+            security_id, dataset, report_period, _refresh_date = (
+                _validate_reconciliation_statement_identity(
+                    expected_payload, expected_idempotency_key
+                )
+            )
+            request_fingerprint = canonical_sha256(
+                {"symbol": security_id, "report_period": report_period}
+            )
             snapshot = connection.execute(
                 """SELECT 1 FROM source_snapshot
-                WHERE id = ? AND payload_hash = ? AND dataset = ?""",
+                WHERE id = ? AND source = 'akshare' AND dataset = ?
+                AND request_fingerprint = ? AND payload_hash = ?""",
                 (
                     source_snapshot_id,
+                    dataset,
+                    request_fingerprint,
                     source_snapshot_hash,
-                    expected_payload.get("dataset"),
                 ),
             ).fetchone()
             if snapshot is None:
                 return False
             if not records:
                 raise ValueError("reconciliation facts must not be empty")
-            if followup.kind != "feature_build":
-                raise ValueError("reconciliation follow-up must be feature_build")
             if not all(isinstance(fact, FinancialFact) for fact in records):
                 raise ValueError("reconciliation facts must be FinancialFact values")
             mapping_versions = {fact.mapping_version for fact in records}
@@ -913,8 +1118,10 @@ class StateStore:
                 raise ValueError(
                     "reconciliation facts must use exactly one mapping version"
                 )
-            security_id = expected_payload.get("security_id")
-            dataset = expected_payload.get("dataset")
+            if mapping_versions != {MAPPING_VERSION}:
+                raise ValueError(
+                    "reconciliation facts must use the current mapping version"
+                )
             expected_statement = DATASET_TO_STATEMENT.get(dataset)
             for fact in records:
                 try:
@@ -932,6 +1139,12 @@ class StateStore:
                     raise ValueError(
                         "reconciliation facts do not match job and snapshot identity"
                     )
+            _validate_reconciliation_followup(
+                followup,
+                statement_payload=expected_payload,
+                source_snapshot_id=source_snapshot_id,
+                source_snapshot_hash=source_snapshot_hash,
+            )
             mapping_version = next(iter(mapping_versions))
             expected_result = {
                 "outcome": "reconciled_verified_snapshot",
@@ -945,6 +1158,8 @@ class StateStore:
                 )
             result_json = _json(expected_result)
             transition_now = _utc_now()
+            self._insert_or_verify_reconciliation_facts(connection, records)
+            self._insert_followups(connection, (followup,), transition_now)
             cursor = connection.execute(
                 """UPDATE job SET status = 'succeeded', result_json = ?,
                 last_error_json = NULL, next_retry_at = NULL,
@@ -963,8 +1178,6 @@ class StateStore:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("malformed statement reconciliation CAS failed")
-            self._insert_financial_facts(connection, records)
-            self._insert_followups(connection, (followup,), transition_now)
         return True
 
     def list_financial_facts(
