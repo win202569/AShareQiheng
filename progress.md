@@ -121,3 +121,9 @@
 - 默认 lease renewal 现仅在取得 `BEGIN IMMEDIATE` writer lock 后采样授权时间；显式 `now_utc` 仍保持确定性逻辑时钟语义。owned complete/fail 在事务内完成首次 owner 检查，并在 follow-up 准备完成后、guarded terminal UPDATE 前重新采样，过期时整笔事务回滚且不遗留 follow-up。
 - 本轮 focused lease 13/13、受影响 StateStore/DeepWorker 模块 163/163、staged-tree fresh full offline `unittest` 424/424 通过；未执行网络、runtime/tracked data、schema/migration、scoring/readiness、正式股票池或 operational `120/114`。
 - `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。
+
+### Authorized terminal-serialization micro-fix（2026-09-01）
+
+- owned complete/fail 现先完成 exact result/error JSON serialization，再采样 guarded terminal UPDATE 的最终授权时间；序列化跨越租约到期时，zero-row guard 回滚同一事务内的全部 follow-up，作业保持 running。
+- 本轮 exact RED regression 2/2、focused lease 15/15、受影响 StateStore/DeepWorker 模块 165/165、staged-tree fresh full offline `unittest` 426/426 通过；未执行网络、runtime/tracked data、schema/migration、scoring/readiness、正式股票池或 operational `120/114`。
+- `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。

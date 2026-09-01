@@ -592,6 +592,7 @@ class StateStore:
             now = _utc_now()
             self._require_unexpired_job_owner(connection, job_id, worker_id, now)
             self._insert_followups(connection, followups, now)
+            result_json = _json(result)
             transition_now = _utc_now()
             cursor = connection.execute(
                 """UPDATE job SET status = 'succeeded', result_json = ?,
@@ -599,7 +600,7 @@ class StateStore:
                 lease_worker = NULL, lease_expires_at = NULL, updated_at = ?
                 WHERE id = ? AND status = 'running' AND lease_worker = ?
                 AND lease_expires_at > ?""",
-                (_json(result), transition_now, job_id, worker_id, transition_now),
+                (result_json, transition_now, job_id, worker_id, transition_now),
             )
             if cursor.rowcount != 1:
                 raise ValueError(
@@ -621,6 +622,7 @@ class StateStore:
             now = _utc_now()
             self._require_unexpired_job_owner(connection, job_id, worker_id, now)
             self._insert_followups(connection, followups, now)
+            error_json = _json(error)
             transition_now = _utc_now()
             cursor = connection.execute(
                 """UPDATE job SET status = ?, last_error_json = ?, next_retry_at = ?,
@@ -629,7 +631,7 @@ class StateStore:
                 AND lease_expires_at > ?""",
                 (
                     state,
-                    _json(error),
+                    error_json,
                     retry_at,
                     transition_now,
                     job_id,

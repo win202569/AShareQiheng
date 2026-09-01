@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import ashare_pipeline.state_store as state_store_module
 from ashare_pipeline.feature_contract import (
     CONTRACT_VERSION,
     DIMENSIONS,
@@ -1863,6 +1864,86 @@ class StateStoreTestCase(unittest.TestCase):
                         None,
                     )
                 )
+
+    def _assert_terminal_serialization_resamples_before_update(
+        self, action: str
+    ) -> None:
+        job_id = self.store.enqueue_job(
+            "deep_statement", f"{action}:serialization-time-boundary", {}
+        )
+        self.store.lease_next_job(["deep_statement"], "worker-a", 10, utc_at(0))
+        job_before = self.store.get_job(job_id)
+        followup = JobSpec(
+            "feature_build", f"followup:{action}:serialization-time-boundary", {}
+        )
+        payload = {"outcome": "late"} if action == "complete" else {"reason": "late"}
+        serialization_entered = threading.Event()
+        release_serialization = threading.Event()
+        after_expiry = threading.Event()
+        errors: list[BaseException] = []
+        real_json = state_store_module._json
+
+        def controlled_now():
+            return utc_at(11) if after_expiry.is_set() else utc_at(9)
+
+        def blocked_json(value):
+            if value is payload:
+                serialization_entered.set()
+                if not release_serialization.wait(timeout=5):
+                    raise RuntimeError("test did not release terminal serialization")
+            return real_json(value)
+
+        def transition():
+            try:
+                if action == "complete":
+                    self.store.complete_job_with_followups(
+                        job_id, "worker-a", payload, (followup,)
+                    )
+                else:
+                    self.store.fail_job_with_followups(
+                        job_id,
+                        "worker-a",
+                        payload,
+                        False,
+                        None,
+                        (followup,),
+                    )
+            except BaseException as error:
+                errors.append(error)
+
+        with (
+            patch("ashare_pipeline.state_store._utc_now", side_effect=controlled_now),
+            patch("ashare_pipeline.state_store._json", side_effect=blocked_json),
+        ):
+            worker = threading.Thread(target=transition)
+            worker.start()
+            try:
+                self.assertTrue(serialization_entered.wait(timeout=5))
+                after_expiry.set()
+            finally:
+                release_serialization.set()
+            worker.join(timeout=10)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ValueError)
+        self.assertEqual(self.store.get_job(job_id), job_before)
+        self.assertIsNone(
+            next(
+                (
+                    item
+                    for item in self.store.list_jobs(["feature_build"])
+                    if item["idempotency_key"] == followup.idempotency_key
+                ),
+                None,
+            )
+        )
+
+    def test_complete_resamples_after_result_serialization(self) -> None:
+        self._assert_terminal_serialization_resamples_before_update("complete")
+
+    def test_fail_resamples_after_error_serialization(self) -> None:
+        self._assert_terminal_serialization_resamples_before_update("fail")
 
     def test_owned_job_transaction_fences_wrong_expired_and_valid_owners(self) -> None:
         valid_id = self.store.enqueue_job("deep_statement", "owned-mutation:valid", {})
