@@ -115,3 +115,9 @@
 - StateStore transaction 现仅在 `BEGIN` 成功后执行 attempt cleanup 与 rollback；未取得 writer lock 的 ownerless snapshot caller 不再删除另一个未提交合法 winner 已采用的 immutable payload，同时所有 post-BEGIN body/end-check/commit cleanup 顺序保持不变。
 - 本轮 focused 6/6、受影响模块 182/182、fresh full offline `unittest` 421/421 通过；未执行网络、runtime/tracked data、schema/migration、scoring/readiness、正式股票池或 operational `120/114`。
 - `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。
+
+### Final whole-branch fix wave（2026-09-01）
+
+- 默认 lease renewal 现仅在取得 `BEGIN IMMEDIATE` writer lock 后采样授权时间；显式 `now_utc` 仍保持确定性逻辑时钟语义。owned complete/fail 在事务内完成首次 owner 检查，并在 follow-up 准备完成后、guarded terminal UPDATE 前重新采样，过期时整笔事务回滚且不遗留 follow-up。
+- 本轮 focused lease 13/13、受影响 StateStore/DeepWorker 模块 163/163、staged-tree fresh full offline `unittest` 424/424 通过；未执行网络、runtime/tracked data、schema/migration、scoring/readiness、正式股票池或 operational `120/114`。
+- `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。

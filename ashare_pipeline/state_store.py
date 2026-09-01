@@ -565,10 +565,10 @@ class StateStore:
     ) -> str:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
-        now = _utc_iso(now_utc)
-        expires = datetime.fromisoformat(now).timestamp() + lease_seconds
-        expiry = datetime.fromtimestamp(expires, timezone.utc).isoformat()
         with self._transaction(immediate=True) as connection:
+            now = _utc_iso(now_utc)
+            expires = datetime.fromisoformat(now).timestamp() + lease_seconds
+            expiry = datetime.fromtimestamp(expires, timezone.utc).isoformat()
             cursor = connection.execute(
                 """UPDATE job SET lease_expires_at = ?, updated_at = ?
                 WHERE id = ? AND status = 'running' AND lease_worker = ?
@@ -588,17 +588,18 @@ class StateStore:
         result: dict,
         followups: Iterable[JobSpec],
     ) -> None:
-        now = _utc_now()
         with self._transaction(immediate=True) as connection:
+            now = _utc_now()
             self._require_unexpired_job_owner(connection, job_id, worker_id, now)
             self._insert_followups(connection, followups, now)
+            transition_now = _utc_now()
             cursor = connection.execute(
                 """UPDATE job SET status = 'succeeded', result_json = ?,
                 last_error_json = NULL, next_retry_at = NULL,
                 lease_worker = NULL, lease_expires_at = NULL, updated_at = ?
                 WHERE id = ? AND status = 'running' AND lease_worker = ?
                 AND lease_expires_at > ?""",
-                (_json(result), now, job_id, worker_id, now),
+                (_json(result), transition_now, job_id, worker_id, transition_now),
             )
             if cursor.rowcount != 1:
                 raise ValueError(
@@ -616,16 +617,25 @@ class StateStore:
     ) -> None:
         state = "retryable_failed" if retryable else "terminal_failed"
         retry_at = _utc_iso(next_retry_at) if retryable and next_retry_at else None
-        now = _utc_now()
         with self._transaction(immediate=True) as connection:
+            now = _utc_now()
             self._require_unexpired_job_owner(connection, job_id, worker_id, now)
             self._insert_followups(connection, followups, now)
+            transition_now = _utc_now()
             cursor = connection.execute(
                 """UPDATE job SET status = ?, last_error_json = ?, next_retry_at = ?,
                 lease_worker = NULL, lease_expires_at = NULL, updated_at = ?
                 WHERE id = ? AND status = 'running' AND lease_worker = ?
                 AND lease_expires_at > ?""",
-                (state, _json(error), retry_at, now, job_id, worker_id, now),
+                (
+                    state,
+                    _json(error),
+                    retry_at,
+                    transition_now,
+                    job_id,
+                    worker_id,
+                    transition_now,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValueError(

@@ -1624,6 +1624,246 @@ class StateStoreTestCase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "lease owner"):
             self.store.renew_job_lease(job_id, "worker-b", 120, utc_at(31))
 
+    def test_renew_samples_default_time_after_writer_lock_wait(self) -> None:
+        job_id = self.store.enqueue_job("deep_statement", "renew:lock-boundary", {})
+        self.store.lease_next_job(["deep_statement"], "worker-a", 10, utc_at(0))
+        holder = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        begin_attempted = threading.Event()
+        clock_sampled = threading.Event()
+        after_expiry = threading.Event()
+        sampled_before_begin: list[bool] = []
+        errors: list[BaseException] = []
+        results: list[str] = []
+        real_connect = self.store._connect
+
+        class ObservedConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def execute(self, sql, parameters=()):
+                if sql == "BEGIN IMMEDIATE":
+                    sampled_before_begin.append(clock_sampled.is_set())
+                    begin_attempted.set()
+                return self.connection.execute(sql, parameters)
+
+        def controlled_now():
+            clock_sampled.set()
+            return utc_at(11) if after_expiry.is_set() else utc_at(9)
+
+        def renew():
+            try:
+                results.append(
+                    self.store.renew_job_lease(job_id, "worker-a", 60)
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        try:
+            with (
+                patch.object(
+                    self.store,
+                    "_connect",
+                    side_effect=lambda: ObservedConnection(real_connect()),
+                ),
+                patch("ashare_pipeline.state_store._utc_now", side_effect=controlled_now),
+            ):
+                worker = threading.Thread(target=renew)
+                worker.start()
+                self.assertTrue(begin_attempted.wait(timeout=5))
+                after_expiry.set()
+                holder.rollback()
+                worker.join(timeout=10)
+        finally:
+            holder.close()
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(sampled_before_begin, [False])
+        self.assertEqual(results, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ValueError)
+        job = self.store.get_job(job_id)
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["lease_worker"], "worker-a")
+        self.assertEqual(job["lease_expires_at"], utc_at(10))
+
+    def test_final_transitions_sample_time_after_writer_lock_wait(self) -> None:
+        for action in ("complete", "fail"):
+            with self.subTest(action=action):
+                job_id = self.store.enqueue_job(
+                    "deep_statement", f"{action}:lock-boundary", {}
+                )
+                self.store.lease_next_job(
+                    ["deep_statement"], "worker-a", 10, utc_at(0)
+                )
+                followup = JobSpec(
+                    "feature_build", f"followup:{action}:lock-boundary", {}
+                )
+                holder = sqlite3.connect(
+                    self.db_path, timeout=5, isolation_level=None
+                )
+                holder.execute("BEGIN IMMEDIATE")
+                begin_attempted = threading.Event()
+                clock_sampled = threading.Event()
+                after_expiry = threading.Event()
+                sampled_before_begin: list[bool] = []
+                errors: list[BaseException] = []
+                real_connect = self.store._connect
+
+                class ObservedConnection:
+                    def __init__(self, connection):
+                        self.connection = connection
+
+                    def __getattr__(self, name):
+                        return getattr(self.connection, name)
+
+                    def execute(self, sql, parameters=()):
+                        if sql == "BEGIN IMMEDIATE":
+                            sampled_before_begin.append(clock_sampled.is_set())
+                            begin_attempted.set()
+                        return self.connection.execute(sql, parameters)
+
+                def controlled_now():
+                    clock_sampled.set()
+                    return utc_at(11) if after_expiry.is_set() else utc_at(9)
+
+                def transition():
+                    try:
+                        if action == "complete":
+                            self.store.complete_job_with_followups(
+                                job_id, "worker-a", {"outcome": "late"}, (followup,)
+                            )
+                        else:
+                            self.store.fail_job_with_followups(
+                                job_id,
+                                "worker-a",
+                                {"reason": "late"},
+                                False,
+                                None,
+                                (followup,),
+                            )
+                    except BaseException as error:
+                        errors.append(error)
+
+                try:
+                    with (
+                        patch.object(
+                            self.store,
+                            "_connect",
+                            side_effect=lambda: ObservedConnection(real_connect()),
+                        ),
+                        patch(
+                            "ashare_pipeline.state_store._utc_now",
+                            side_effect=controlled_now,
+                        ),
+                    ):
+                        worker = threading.Thread(target=transition)
+                        worker.start()
+                        self.assertTrue(begin_attempted.wait(timeout=5))
+                        after_expiry.set()
+                        holder.rollback()
+                        worker.join(timeout=10)
+                finally:
+                    holder.close()
+
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(sampled_before_begin, [False])
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], ValueError)
+                job = self.store.get_job(job_id)
+                self.assertEqual(job["status"], "running")
+                self.assertEqual(job["lease_worker"], "worker-a")
+                self.assertEqual(job["lease_expires_at"], utc_at(10))
+                self.assertIsNone(
+                    next(
+                        (
+                            item
+                            for item in self.store.list_jobs(["feature_build"])
+                            if item["idempotency_key"] == followup.idempotency_key
+                        ),
+                        None,
+                    )
+                )
+
+    def test_final_transitions_resample_after_followup_preparation(self) -> None:
+        for action in ("complete", "fail"):
+            with self.subTest(action=action):
+                job_id = self.store.enqueue_job(
+                    "deep_statement", f"{action}:followup-time-boundary", {}
+                )
+                self.store.lease_next_job(
+                    ["deep_statement"], "worker-a", 10, utc_at(0)
+                )
+                followup = JobSpec(
+                    "feature_build", f"followup:{action}:time-boundary", {}
+                )
+                followup_entered = threading.Event()
+                release_followup = threading.Event()
+                after_expiry = threading.Event()
+                errors: list[BaseException] = []
+                real_insert = self.store._insert_followups
+
+                def controlled_now():
+                    return utc_at(11) if after_expiry.is_set() else utc_at(9)
+
+                def blocked_insert(*args, **kwargs):
+                    followup_entered.set()
+                    if not release_followup.wait(timeout=5):
+                        raise RuntimeError("test did not release followup preparation")
+                    return real_insert(*args, **kwargs)
+
+                def transition():
+                    try:
+                        if action == "complete":
+                            self.store.complete_job_with_followups(
+                                job_id, "worker-a", {"outcome": "late"}, (followup,)
+                            )
+                        else:
+                            self.store.fail_job_with_followups(
+                                job_id,
+                                "worker-a",
+                                {"reason": "late"},
+                                False,
+                                None,
+                                (followup,),
+                            )
+                    except BaseException as error:
+                        errors.append(error)
+
+                with (
+                    patch("ashare_pipeline.state_store._utc_now", side_effect=controlled_now),
+                    patch.object(
+                        self.store, "_insert_followups", side_effect=blocked_insert
+                    ),
+                ):
+                    worker = threading.Thread(target=transition)
+                    worker.start()
+                    self.assertTrue(followup_entered.wait(timeout=5))
+                    after_expiry.set()
+                    release_followup.set()
+                    worker.join(timeout=10)
+
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], ValueError)
+                job = self.store.get_job(job_id)
+                self.assertEqual(job["status"], "running")
+                self.assertEqual(job["lease_worker"], "worker-a")
+                self.assertEqual(job["lease_expires_at"], utc_at(10))
+                self.assertIsNone(
+                    next(
+                        (
+                            item
+                            for item in self.store.list_jobs(["feature_build"])
+                            if item["idempotency_key"] == followup.idempotency_key
+                        ),
+                        None,
+                    )
+                )
+
     def test_owned_job_transaction_fences_wrong_expired_and_valid_owners(self) -> None:
         valid_id = self.store.enqueue_job("deep_statement", "owned-mutation:valid", {})
         self.store.lease_next_job(["deep_statement"], "worker-a", 3600)
