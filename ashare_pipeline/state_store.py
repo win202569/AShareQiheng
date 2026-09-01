@@ -393,6 +393,10 @@ def _validate_reconciliation_followup(
             raise ValueError(
                 "reconciliation follow-up does not match statement identity"
             )
+    if not isinstance(payload["as_of_utc"], str):
+        raise ValueError(
+            "reconciliation follow-up as_of_utc is not canonical"
+        )
     try:
         normalized_as_of = _utc_iso(payload["as_of_utc"])
     except (TypeError, ValueError) as error:
