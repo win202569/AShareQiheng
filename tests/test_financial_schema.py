@@ -101,7 +101,7 @@ class FinancialSchemaTests(unittest.TestCase):
             for rule in field_rules(statement)
         }
         self.assertEqual(DATASET_TO_STATEMENT["profit_sheet"], "income")
-        self.assertEqual(MAPPING_VERSION, "eastmoney-financial-mapping-v1")
+        self.assertEqual(MAPPING_VERSION, "eastmoney-financial-mapping-v2")
         self.assertEqual(FINANCIAL_REQUEST_VERSION, "eastmoney-financial-request-v1")
         self.assertEqual(rules["revenue"].source_fields, ("TOTAL_OPERATE_INCOME", "OPERATE_INCOME"))
         self.assertEqual(rules["operating_cost"].source_fields, ("TOTAL_OPERATE_COST", "OPERATE_COST"))

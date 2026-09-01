@@ -54,6 +54,7 @@ _CALENDAR_START = date(2021, 1, 1)
 _CALENDAR_END = date(2026, 9, 7)
 _MISSING_UPDATED_AT = datetime.min.replace(tzinfo=timezone.utc)
 _EXACT_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_REPORT_DATE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?: 00:00:00)?$")
 _SOURCE_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
     r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?$"
@@ -120,6 +121,18 @@ def _parse_date(value: object, field: str) -> date:
         return date.fromisoformat(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field} must be an ISO date") from exc
+
+
+def _normalize_report_date(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("REPORT_DATE must be an ISO date or space-delimited midnight")
+    match = _REPORT_DATE.fullmatch(value)
+    if match is None:
+        raise ValueError("REPORT_DATE must be an ISO date or space-delimited midnight")
+    try:
+        return date.fromisoformat(match.group(1)).isoformat()
+    except ValueError as exc:
+        raise ValueError("REPORT_DATE must be an ISO date or space-delimited midnight") from exc
 
 
 def validate_feature_calendar_request(
@@ -302,7 +315,7 @@ def build_financial_facts(
             return FactBuildResult((), tuple(issues))
         report_date = row.get("REPORT_DATE")
         try:
-            normalized_report_date = _parse_date(report_date, "REPORT_DATE").isoformat()
+            normalized_report_date = _normalize_report_date(report_date)
         except ValueError:
             normalized_report_date = ""
         period = classify_period(normalized_report_date, row.get("REPORT_DATE_NAME"), row.get("REPORT_TYPE"))

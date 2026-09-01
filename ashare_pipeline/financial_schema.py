@@ -15,7 +15,7 @@ from ashare_pipeline.feature_contract import (
 )
 
 
-MAPPING_VERSION = "eastmoney-financial-mapping-v1"
+MAPPING_VERSION = "eastmoney-financial-mapping-v2"
 FINANCIAL_REQUEST_VERSION = "eastmoney-financial-request-v1"
 
 StatementDataset = Literal["balance_sheet", "profit_sheet", "cash_flow_sheet"]
