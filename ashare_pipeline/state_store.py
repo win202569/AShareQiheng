@@ -20,7 +20,10 @@ from ashare_pipeline.feature_contract import (
     canonical_sha256,
     financial_projection_values,
 )
-from ashare_pipeline.financial_features import feature_input_hash
+from ashare_pipeline.financial_features import (
+    feature_input_hash,
+    validate_feature_calendar_request,
+)
 from ashare_pipeline.financial_formulas import (
     DERIVED_FORMULA_SPECS,
     FormulaFact,
@@ -70,6 +73,16 @@ _RECONCILIATION_FEATURE_PAYLOAD_KEYS = frozenset(
 )
 _FROZEN_STATEMENT_SNAPSHOT_KEYS = frozenset(
     {"source_snapshot_id", "payload_hash"}
+)
+_FROZEN_CALENDAR_SNAPSHOT_KEYS = frozenset(
+    {
+        "source_snapshot_id",
+        "payload_hash",
+        "source",
+        "dataset",
+        "request",
+        "request_fingerprint",
+    }
 )
 
 FINANCIAL_FACT_COLUMNS = (
@@ -380,6 +393,19 @@ def _validate_reconciliation_followup(
             raise ValueError(
                 "reconciliation follow-up does not match statement identity"
             )
+    try:
+        normalized_as_of = _utc_iso(payload["as_of_utc"])
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "reconciliation follow-up as_of_utc is not canonical"
+        ) from error
+    industry = payload["industry"]
+    if not isinstance(industry, str) or not industry.strip():
+        raise ValueError("reconciliation follow-up industry is invalid")
+    if not isinstance(payload["reported_target_period"], bool):
+        raise ValueError(
+            "reconciliation follow-up reported_target_period is invalid"
+        )
     statement_snapshots = payload["statement_snapshots"]
     if (
         not isinstance(statement_snapshots, Mapping)
@@ -414,16 +440,34 @@ def _validate_reconciliation_followup(
     calendar = payload["trade_calendar_snapshot"]
     if calendar is None:
         calendar_hash = None
-    elif isinstance(calendar, Mapping):
+    elif (
+        isinstance(calendar, Mapping)
+        and set(calendar) == _FROZEN_CALENDAR_SNAPSHOT_KEYS
+        and isinstance(calendar["source_snapshot_id"], str)
+        and bool(calendar["source_snapshot_id"])
+        and calendar["source"] == "baostock"
+        and calendar["dataset"] == "trade_dates"
+    ):
         calendar_hash = _reconciliation_sha256(
-            calendar.get("payload_hash"), "trade calendar snapshot hash"
+            calendar["payload_hash"], "trade calendar snapshot hash"
         )
+        calendar_request = validate_feature_calendar_request(
+            calendar["request"]
+        )
+        calendar_fingerprint = _reconciliation_sha256(
+            calendar["request_fingerprint"],
+            "trade calendar request fingerprint",
+        )
+        if calendar_fingerprint != canonical_sha256(calendar_request):
+            raise ValueError(
+                "reconciliation follow-up calendar fingerprint is invalid"
+            )
     else:
         raise ValueError("reconciliation follow-up calendar is not canonical")
     input_hash = feature_input_hash(
         security_id=payload["security_id"],
         report_period=payload["report_period"],
-        as_of_utc=payload["as_of_utc"],
+        as_of_utc=normalized_as_of,
         candidate_set_hash=payload["candidate_set_hash"],
         statement_snapshot_hashes=statement_hashes,
         trade_calendar_snapshot_hash=calendar_hash,
@@ -1562,6 +1606,21 @@ class StateStore:
                 ),
             )
         return issue_id
+
+    def has_quality_issue(
+        self,
+        *,
+        severity: str,
+        code: str,
+        details: Mapping[str, object],
+    ) -> bool:
+        with closing(self._connect()) as connection:
+            return connection.execute(
+                """SELECT 1 FROM quality_issue
+                WHERE severity = ? AND code = ? AND details_json = ?
+                LIMIT 1""",
+                (severity, code, _json(dict(details))),
+            ).fetchone() is not None
 
     def create_score_run(
         self, report_period: str, as_of_cn: str, ruleset_hash: str, universe_hash: str, mode: str
