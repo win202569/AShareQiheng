@@ -797,7 +797,7 @@ class FeatureInputHashTests(unittest.TestCase):
             "trade_calendar_snapshot_hash": "4" * 64,
             "contract_version": "feature-contract-v1",
             "mapping_version": "eastmoney-financial-mapping-v2",
-            "template_version": "template-registry-v1",
+            "template_version": "template-registry-v2",
             "formula_version": "financial-derived-v1",
         })
         self.assertEqual(feature_input_hash(**self.hash_arguments()), expected)

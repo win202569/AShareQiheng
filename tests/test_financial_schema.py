@@ -133,14 +133,20 @@ class FinancialSchemaTests(unittest.TestCase):
         self.assertEqual(resolve_template("房地产开发").template_id, "real_estate_high_leverage")
         self.assertEqual(resolve_template("银行").template_id, "bank")
         self.assertEqual(resolve_template("不存在行业").template_id, "unclassified")
-        self.assertEqual(TEMPLATE_VERSION, "template-registry-v1")
+
+    def test_registry_explicitly_maps_current_unclassified_industry(self):
+        self.assertIn("综合Ⅱ", INDUSTRY_TO_TEMPLATE)
+        self.assertEqual(INDUSTRY_TO_TEMPLATE.get("综合Ⅱ"), "unclassified")
+        self.assertEqual(resolve_template("综合Ⅱ").template_id, "unclassified")
 
     def test_registry_explicitly_lists_all_design_candidate_industries(self):
-        fixture = json.loads(Path("tests/fixtures/industry_template_registry_v1.json").read_text(encoding="utf-8"))
+        fixture = json.loads(Path("tests/fixtures/industry_template_registry_v2.json").read_text(encoding="utf-8"))
         prefilter = json.loads(Path("data/curated/prefilter.json").read_text(encoding="utf-8"))
         candidate_industries = {record["industry"] for record in prefilter["records"]}
         fixture_industries = set(fixture["candidate_industries"])
         expected_templates = fixture["candidate_templates"]
+        self.assertEqual(fixture["template_version"], TEMPLATE_VERSION)
+        self.assertEqual(fixture["candidate_record_count"], len(prefilter["records"]))
         self.assertEqual(fixture_industries, candidate_industries)
         self.assertEqual(set(expected_templates), candidate_industries)
         for industry in fixture_industries:
