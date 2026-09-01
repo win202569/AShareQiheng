@@ -2382,6 +2382,7 @@ class StateStoreTestCase(unittest.TestCase):
             "empty-industry",
             "nonboolean-reported",
             "invalid-as-of",
+            "nonstring-as-of",
             "incomplete-calendar",
         )
         for label in labels:
@@ -2409,6 +2410,8 @@ class StateStoreTestCase(unittest.TestCase):
                     payload["reported_target_period"] = "yes"
                 elif label == "invalid-as-of":
                     payload["as_of_utc"] = "not-a-timestamp"
+                elif label == "nonstring-as-of":
+                    payload["as_of_utc"] = None
                 elif label == "incomplete-calendar":
                     payload["trade_calendar_snapshot"] = {
                         "payload_hash": "e" * 64
@@ -2447,8 +2450,13 @@ class StateStoreTestCase(unittest.TestCase):
                     )
                 followup = JobSpec("feature_build", followup_key, payload)
                 before_job = self.store.get_job(case["job_id"])
+                expected_error = (
+                    "as_of_utc is not canonical"
+                    if label == "nonstring-as-of"
+                    else "follow-up"
+                )
 
-                with self.assertRaisesRegex(ValueError, "follow-up"):
+                with self.assertRaisesRegex(ValueError, expected_error):
                     self.store.reconcile_malformed_statement(
                         case["job_id"],
                         expected_idempotency_key=case["idempotency_key"],
