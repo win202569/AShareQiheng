@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 import unittest
 
+from ashare_pipeline.feature_contract import canonical_sha256
 from ashare_pipeline.financial_schema import (
     DATASET_TO_STATEMENT,
     FINANCIAL_REQUEST_VERSION,
@@ -139,14 +140,36 @@ class FinancialSchemaTests(unittest.TestCase):
         self.assertEqual(INDUSTRY_TO_TEMPLATE.get("综合Ⅱ"), "unclassified")
         self.assertEqual(resolve_template("综合Ⅱ").template_id, "unclassified")
 
+    def test_registry_preserves_the_v1_audit_mapping(self):
+        fixture = json.loads(
+            Path("tests/fixtures/industry_template_registry_v1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(fixture["template_version"], "template-registry-v1")
+        for industry, template_id in fixture["candidate_templates"].items():
+            with self.subTest(industry=industry):
+                self.assertIn(industry, INDUSTRY_TO_TEMPLATE)
+                self.assertEqual(INDUSTRY_TO_TEMPLATE[industry], template_id)
+
     def test_registry_explicitly_lists_all_design_candidate_industries(self):
         fixture = json.loads(Path("tests/fixtures/industry_template_registry_v2.json").read_text(encoding="utf-8"))
         prefilter = json.loads(Path("data/curated/prefilter.json").read_text(encoding="utf-8"))
         candidate_industries = {record["industry"] for record in prefilter["records"]}
         fixture_industries = set(fixture["candidate_industries"])
         expected_templates = fixture["candidate_templates"]
+        candidate_identity = [
+            [record["security_id"], record["industry"]]
+            for record in sorted(
+                prefilter["records"], key=lambda record: record["security_id"]
+            )
+        ]
         self.assertEqual(fixture["template_version"], TEMPLATE_VERSION)
         self.assertEqual(fixture["candidate_record_count"], len(prefilter["records"]))
+        self.assertEqual(
+            fixture["candidate_identity_hash"],
+            canonical_sha256(candidate_identity),
+        )
         self.assertEqual(fixture_industries, candidate_industries)
         self.assertEqual(set(expected_templates), candidate_industries)
         for industry in fixture_industries:
