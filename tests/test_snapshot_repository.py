@@ -295,6 +295,108 @@ class SnapshotRepositoryTestCase(unittest.TestCase):
                 1,
             )
 
+    def test_failed_begin_cannot_delete_uncommitted_ownerless_winner_file(self):
+        batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+        a_ready_for_begin = threading.Event()
+        allow_a_begin = threading.Event()
+        b_adopted = threading.Event()
+        b_row_inserted = threading.Event()
+        allow_b_commit = threading.Event()
+        a_errors: list[BaseException] = []
+        b_errors: list[BaseException] = []
+        b_results: list[tuple[object, bool]] = []
+        real_transaction = self.state_store._transaction
+        real_connect = self.state_store._connect
+        real_record = self.state_store.record_snapshot
+        real_write = self.snapshot_store.write
+        a_created = False
+        b_write_calls = 0
+
+        @contextmanager
+        def coordinated_transaction(*args, **kwargs):
+            if threading.current_thread().name == "begin-loser-a":
+                a_ready_for_begin.set()
+                if not allow_a_begin.wait(timeout=5):
+                    raise RuntimeError("test did not release caller A BEGIN")
+            with real_transaction(*args, **kwargs) as connection:
+                yield connection
+
+        def thread_connection():
+            connection = real_connect()
+            if threading.current_thread().name == "begin-loser-a":
+                connection.execute("PRAGMA busy_timeout = 0")
+            return connection
+
+        def observed_write(value):
+            nonlocal a_created, b_write_calls
+            target, digest, created = real_write(value)
+            if threading.current_thread().name == "begin-loser-a":
+                a_created = created
+            elif threading.current_thread().name == "winner-b":
+                b_write_calls += 1
+                if b_write_calls == 1:
+                    self.assertFalse(created)
+                    b_adopted.set()
+            return target, digest, created
+
+        def blocked_record(*args, **kwargs):
+            result = real_record(*args, **kwargs)
+            if threading.current_thread().name == "winner-b":
+                b_row_inserted.set()
+                if not allow_b_commit.wait(timeout=5):
+                    raise RuntimeError("test did not release caller B commit")
+            return result
+
+        def caller_a():
+            try:
+                self.repository.persist(batch)
+            except BaseException as error:
+                a_errors.append(error)
+
+        def caller_b():
+            try:
+                b_results.append(self.repository.persist(batch))
+            except BaseException as error:
+                b_errors.append(error)
+
+        with (
+            patch.object(
+                self.state_store, "_transaction", new=coordinated_transaction
+            ),
+            patch.object(self.state_store, "_connect", side_effect=thread_connection),
+            patch.object(
+                self.state_store, "record_snapshot", side_effect=blocked_record
+            ),
+            patch.object(self.snapshot_store, "write", side_effect=observed_write),
+        ):
+            a = threading.Thread(target=caller_a, name="begin-loser-a")
+            a.start()
+            self.assertTrue(a_ready_for_begin.wait(timeout=5))
+            self.assertTrue(a_created)
+            b = threading.Thread(target=caller_b, name="winner-b")
+            b.start()
+            self.assertTrue(b_adopted.wait(timeout=5))
+            self.assertTrue(b_row_inserted.wait(timeout=5), repr(b_errors))
+            allow_a_begin.set()
+            a.join(timeout=10)
+            self.assertFalse(a.is_alive())
+            allow_b_commit.set()
+            b.join(timeout=10)
+
+        self.assertFalse(b.is_alive())
+        self.assertEqual(len(a_errors), 1)
+        self.assertIsInstance(a_errors[0], sqlite3.OperationalError)
+        self.assertEqual(b_errors, [])
+        self.assertEqual(len(b_results), 1)
+        winner, created = b_results[0]
+        self.assertTrue(created)
+        self.assertEqual(self.repository.read_verified(winner).batch, batch)
+        with closing(sqlite3.connect(self.state_store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0],
+                1,
+            )
+
     def test_concurrent_same_target_persist_keeps_first_published_batch_and_db_ref(self):
         first_batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
         second_batch = statement_batch("SH600001", 100.0, "2026-08-29T01:00:00+00:00")

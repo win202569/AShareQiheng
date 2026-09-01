@@ -109,3 +109,9 @@
 - snapshot 与 feature 的 attempt-local 文件清理现覆盖 transaction context exit/commit failure；ownerless snapshot 在 SQLite 锁等待后重新 publish/reverify 再插行，使 stale cleanup 后的合法 winner 始终保有可验证的 immutable 文件/DB 对。
 - 本轮 focused 13/13、受影响模块 181/181、fresh full offline `unittest` 420/420 通过；未执行网络、runtime/tracked data、schema/migration、scoring/readiness、正式股票池或 operational `120/114`。
 - `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。
+
+### Independent review Fix Round 2（2026-09-01）
+
+- StateStore transaction 现仅在 `BEGIN` 成功后执行 attempt cleanup 与 rollback；未取得 writer lock 的 ownerless snapshot caller 不再删除另一个未提交合法 winner 已采用的 immutable payload，同时所有 post-BEGIN body/end-check/commit cleanup 顺序保持不变。
+- 本轮 focused 6/6、受影响模块 182/182、fresh full offline `unittest` 421/421 通过；未执行网络、runtime/tracked data、schema/migration、scoring/readiness、正式股票池或 operational `120/114`。
+- `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。

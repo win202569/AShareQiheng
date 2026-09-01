@@ -288,18 +288,21 @@ class StateStore:
         on_error: Callable[[sqlite3.Connection], None] | None = None,
     ) -> Iterator[sqlite3.Connection]:
         connection = self._connect()
+        begun = False
         try:
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            begun = True
             yield connection
             connection.commit()
         except BaseException as error:
-            try:
-                if on_error is not None:
-                    on_error(connection)
-            except BaseException as cleanup_error:
+            if begun:
+                try:
+                    if on_error is not None:
+                        on_error(connection)
+                except BaseException as cleanup_error:
+                    connection.rollback()
+                    raise error from cleanup_error
                 connection.rollback()
-                raise error from cleanup_error
-            connection.rollback()
             raise
         finally:
             connection.close()
