@@ -38,7 +38,7 @@ from ashare_pipeline.sources import (
     SourceBlocked,
     TerminalSourceError,
 )
-from ashare_pipeline.state_store import JobSpec, StateStore, _utc_now
+from ashare_pipeline.state_store import JobSpec, StateStore
 
 
 STATEMENT_DATASETS = ("balance_sheet", "profit_sheet", "cash_flow_sheet")
@@ -1227,35 +1227,35 @@ def _write_and_store_feature_bundle(
     relative_path = ""
     bundle_hash = ""
     file_created = False
-    with store._transaction(immediate=True) as connection:
-        if job_id is not None and worker_id is not None:
-            store._require_unexpired_job_owner(
-                connection, job_id, worker_id, _utc_now()
-            )
-        try:
-            relative_path, bundle_hash, file_created = write_feature_bundle(
-                project_root, bundle
-            )
-            _feature_set_id, database_created = store.put_feature_bundle(
-                bundle,
-                bundle_path=relative_path,
-                bundle_hash=bundle_hash,
-                _connection=connection,
-            )
-            if job_id is not None and worker_id is not None:
-                store._require_unexpired_job_owner(
-                    connection, job_id, worker_id, _utc_now()
-                )
-        except BaseException:
-            if file_created:
-                target = _feature_file_target(project_root, relative_path)
-                try:
-                    current = target.read_bytes()
-                    if hashlib.sha256(current).hexdigest() == bundle_hash:
-                        target.unlink()
-                except FileNotFoundError:
-                    pass
-            raise
+    database_created: bool | None = None
+
+    def cleanup(_connection: object) -> None:
+        if file_created and database_created is not False:
+            target = _feature_file_target(project_root, relative_path)
+            try:
+                current = target.read_bytes()
+                if hashlib.sha256(current).hexdigest() == bundle_hash:
+                    target.unlink()
+            except FileNotFoundError:
+                pass
+
+    transaction = (
+        store.owned_job_transaction(job_id, worker_id, on_error=cleanup)
+        if job_id is not None and worker_id is not None
+        else store._transaction(immediate=True, on_error=cleanup)
+    )
+    with transaction as connection:
+        relative_path, bundle_hash, file_created = write_feature_bundle(
+            project_root, bundle
+        )
+        _feature_set_id, database_created = store.put_feature_bundle(
+            bundle,
+            bundle_path=relative_path,
+            bundle_hash=bundle_hash,
+            _connection=connection,
+        )
+    if database_created is None:
+        raise RuntimeError("feature bundle transaction produced no database result")
     return relative_path, bundle_hash, database_created
 
 
@@ -1695,6 +1695,8 @@ def execute_queued_deep_work(
                     ),
                     record_issues=True,
                     ensure_owned=heartbeat.ensure_owned,
+                    job_id=str(job["id"]),
+                    worker_id=worker,
                 )
                 counters["snapshots_reused"] += 1
             else:
@@ -1947,6 +1949,8 @@ def execute_queued_deep_work(
             items.append(MappingProxyType(item_data))
             break
         except (SourceBlocked, RetryableSourceError, TerminalSourceError):
+            raise
+        except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException:
             # Unexpected local errors are allowed to surface only after the owned

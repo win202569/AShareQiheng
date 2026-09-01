@@ -292,6 +292,19 @@ class DeepWorkerTestCase(unittest.TestCase):
             payload,
         )
 
+    def _expire_recover_and_take_over(self, job_id: str) -> None:
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            connection.execute(
+                "UPDATE job SET lease_expires_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", job_id),
+            )
+            connection.commit()
+        self.assertEqual(self.store.recover_expired_leases(), 1)
+        acquired = self.store.lease_next_job(
+            ["deep_statement", "feature_build"], "worker-b", 3600
+        )
+        self.assertEqual(acquired["id"], job_id)
+
     def _assert_no_feature_artifacts(self) -> None:
         self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
         feature_root = self.data_root / "curated" / "formal_features"
@@ -1166,6 +1179,113 @@ class DeepWorkerTestCase(unittest.TestCase):
         self.assertEqual(self.store.list_jobs(["feature_build"]), [])
         self._assert_no_feature_artifacts()
 
+    def test_same_refresh_takeover_before_fact_write_is_fenced(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        self.repository.persist(fixture_statement_batch("balance_sheet"))
+        job_id = self._enqueue_statement()
+        calendar = self._calendar_ref()
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+        real_insert = self.store.insert_financial_facts
+
+        def blocked_insert(*args, **kwargs):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test did not release same-refresh fact write")
+            return real_insert(*args, **kwargs)
+
+        def run_worker() -> None:
+            try:
+                self._run(
+                    source=FakeStatementSource(),
+                    trade_calendar_snapshot=calendar,
+                    limit=1,
+                    lease_seconds=120,
+                    heartbeat_seconds=60,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with patch.object(
+            self.store, "insert_financial_facts", side_effect=blocked_insert
+        ):
+            worker = threading.Thread(target=run_worker)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(timeout=5), repr(errors))
+                self._expire_recover_and_take_over(job_id)
+            finally:
+                release.set()
+            worker.join(timeout=10)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ValueError)
+        self.assertEqual(self.store.get_job(job_id)["lease_worker"], "worker-b")
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM financial_fact").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM quality_issue").fetchone()[0], 0)
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_same_refresh_takeover_before_issue_write_is_fenced(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        malformed = fixture_statement_batch("balance_sheet")
+        del malformed.records[0]["REPORT_DATE"]
+        self.repository.persist(malformed)
+        job_id = self._enqueue_statement()
+        calendar = self._calendar_ref()
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+        real_record = self.store.record_quality_issue
+
+        def blocked_record(*args, **kwargs):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test did not release same-refresh issue write")
+            return real_record(*args, **kwargs)
+
+        def run_worker() -> None:
+            try:
+                self._run(
+                    source=FakeStatementSource(),
+                    trade_calendar_snapshot=calendar,
+                    limit=1,
+                    lease_seconds=120,
+                    heartbeat_seconds=60,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with (
+            patch.object(
+                self.store,
+                "insert_financial_facts",
+                side_effect=lambda facts, **_kwargs: (0, len(tuple(facts))),
+            ),
+            patch.object(
+                self.store, "record_quality_issue", side_effect=blocked_record
+            ),
+        ):
+            worker = threading.Thread(target=run_worker)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(timeout=5), repr(errors))
+                self._expire_recover_and_take_over(job_id)
+            finally:
+                release.set()
+            worker.join(timeout=10)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ValueError)
+        self.assertEqual(self.store.get_job(job_id)["lease_worker"], "worker-b")
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM financial_fact").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM quality_issue").fetchone()[0], 0)
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
     def _assert_feature_process_control_propagates(
         self, error_type: type[BaseException]
     ) -> None:
@@ -1180,19 +1300,65 @@ class DeepWorkerTestCase(unittest.TestCase):
             statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
             trade_calendar_snapshot=None,
         )
+        original = error_type("feature-stop")
+        renewal_entered = threading.Event()
+        release_renewal = threading.Event()
+        heartbeats: list[deep_worker_module._LeaseHeartbeat] = []
+        real_renew = self.store.renew_job_lease
+        real_init = deep_worker_module._LeaseHeartbeat.__init__
+        real_close = deep_worker_module._LeaseHeartbeat.close
+        renewal_calls = 0
+
+        def renew(*args, **kwargs):
+            nonlocal renewal_calls
+            renewal_calls += 1
+            if renewal_calls == 1:
+                return real_renew(*args, **kwargs)
+            renewal_entered.set()
+            if not release_renewal.wait(timeout=5):
+                raise RuntimeError("test did not release feature renewal")
+            return real_renew(*args, **kwargs)
+
+        def interrupt_build(**_kwargs):
+            if not renewal_entered.wait(timeout=5):
+                raise RuntimeError("feature renewal did not enter")
+            raise original
+
+        def capture_init(heartbeat, *args, **kwargs):
+            real_init(heartbeat, *args, **kwargs)
+            heartbeats.append(heartbeat)
+
+        def coordinated_close(heartbeat):
+            release_renewal.set()
+            return real_close(heartbeat)
 
         with (
+            patch.object(self.store, "renew_job_lease", side_effect=renew),
+            patch.object(
+                deep_worker_module._LeaseHeartbeat,
+                "__init__",
+                new=capture_init,
+            ),
+            patch.object(
+                deep_worker_module._LeaseHeartbeat,
+                "close",
+                new=coordinated_close,
+            ),
             patch.object(
                 deep_worker_module,
                 "build_feature_bundle",
-                side_effect=error_type("stop"),
+                side_effect=interrupt_build,
             ),
-            self.assertRaises(error_type),
         ):
-            self._run(source=None, online=False, heartbeat_seconds=0.01)
+            with self.assertRaises(error_type) as caught:
+                self._run(source=None, online=False, heartbeat_seconds=0.01)
 
+        self.assertIs(caught.exception, original)
         self.assertEqual(self.store.get_job(job_id)["status"], "running")
         self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
+        self.assertEqual(self.store.list_jobs(["deep_statement"]), [])
+        self.assertEqual(len(heartbeats), 1)
+        self.assertFalse(heartbeats[0].thread.is_alive())
 
     def test_feature_keyboard_interrupt_propagates_without_retry_transition(self) -> None:
         self._assert_feature_process_control_propagates(KeyboardInterrupt)
@@ -1236,6 +1402,93 @@ class DeepWorkerTestCase(unittest.TestCase):
                         self.assertTrue(store.entered.wait(timeout=5))
                         raise error_type("stop")
                 self.assertFalse(heartbeat.thread.is_alive())
+
+    def _assert_statement_process_control_with_inflight_renewal(
+        self, error_type: type[BaseException]
+    ) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        job_id = self._enqueue_statement()
+        calendar = self._calendar_ref()
+        original = error_type("original-stop")
+        renewal_entered = threading.Event()
+        allow_renewal_finish = threading.Event()
+        heartbeats: list[deep_worker_module._LeaseHeartbeat] = []
+        real_renew = self.store.renew_job_lease
+        real_init = deep_worker_module._LeaseHeartbeat.__init__
+        real_final = deep_worker_module._LeaseHeartbeat.final_transition
+        real_close = deep_worker_module._LeaseHeartbeat.close
+        renewal_calls = 0
+
+        class InterruptingSource:
+            def fetch_financial_statement(self, *_args):
+                self.assert_renewal()
+                raise original
+
+            @staticmethod
+            def assert_renewal():
+                if not renewal_entered.wait(timeout=5):
+                    raise RuntimeError("renewal did not enter")
+
+        def renew(*args, **kwargs):
+            nonlocal renewal_calls
+            renewal_calls += 1
+            if renewal_calls == 1:
+                return real_renew(*args, **kwargs)
+            renewal_entered.set()
+            if not allow_renewal_finish.wait(timeout=5):
+                raise RuntimeError("test did not release statement renewal")
+            raise ValueError("renewal lost")
+
+        def capture_init(heartbeat, *args, **kwargs):
+            real_init(heartbeat, *args, **kwargs)
+            heartbeats.append(heartbeat)
+
+        def coordinated_final(heartbeat, *args, **kwargs):
+            allow_renewal_finish.set()
+            return real_final(heartbeat, *args, **kwargs)
+
+        def coordinated_close(heartbeat):
+            allow_renewal_finish.set()
+            return real_close(heartbeat)
+
+        with (
+            patch.object(self.store, "renew_job_lease", side_effect=renew),
+            patch.object(
+                deep_worker_module._LeaseHeartbeat,
+                "__init__",
+                new=capture_init,
+            ),
+            patch.object(
+                deep_worker_module._LeaseHeartbeat,
+                "final_transition",
+                new=coordinated_final,
+            ),
+            patch.object(
+                deep_worker_module._LeaseHeartbeat,
+                "close",
+                new=coordinated_close,
+            ),
+        ):
+            with self.assertRaises(error_type) as caught:
+                self._run(
+                    source=InterruptingSource(),
+                    trade_calendar_snapshot=calendar,
+                    limit=1,
+                    lease_seconds=2,
+                    heartbeat_seconds=0.01,
+                )
+
+        self.assertIs(caught.exception, original)
+        self.assertEqual(self.store.get_job(job_id)["status"], "running")
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+        self.assertEqual(len(heartbeats), 1)
+        self.assertFalse(heartbeats[0].thread.is_alive())
+
+    def test_statement_keyboard_interrupt_with_inflight_renewal_is_unchanged(self) -> None:
+        self._assert_statement_process_control_with_inflight_renewal(KeyboardInterrupt)
+
+    def test_statement_system_exit_with_inflight_renewal_is_unchanged(self) -> None:
+        self._assert_statement_process_control_with_inflight_renewal(SystemExit)
 
     def test_feature_ordinary_exception_remains_a_retryable_failure(self) -> None:
         self._write_candidates({"SH600001": "包装印刷"})
@@ -1835,6 +2088,144 @@ class DeepWorkerTestCase(unittest.TestCase):
                 connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
                 0,
             )
+
+    def test_feature_commit_failure_cleans_only_attempt_created_file(self) -> None:
+        class CommitFailConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def commit(self):
+                raise sqlite3.OperationalError("forced commit failure")
+
+        for preexisting in (False, True):
+            with self.subTest(preexisting=preexisting):
+                bundle = self._empty_feature_bundle()
+                target = self.project_root / (
+                    f"data/curated/formal_features/{REPORT_PERIOD}/SH600001/"
+                    f"{bundle.input_hash}.json"
+                )
+                if preexisting:
+                    deep_worker_module.write_feature_bundle(self.project_root, bundle)
+                    original = target.read_bytes()
+                job_id = self.store.enqueue_job(
+                    "feature_build", f"feature-commit:{preexisting}", {}
+                )
+                self.store.lease_next_job(["feature_build"], "worker-a", 3600)
+                real_connect = self.store._connect
+
+                with patch.object(
+                    self.store,
+                    "_connect",
+                    side_effect=lambda: CommitFailConnection(real_connect()),
+                ), self.assertRaisesRegex(sqlite3.OperationalError, "commit failure"):
+                    deep_worker_module._write_and_store_feature_bundle(
+                        project_root=self.project_root,
+                        store=self.store,
+                        bundle=bundle,
+                        ensure_owned=lambda: None,
+                        job_id=job_id,
+                        worker_id="worker-a",
+                    )
+
+                with closing(sqlite3.connect(self.store.db_path)) as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0],
+                        0,
+                    )
+                if preexisting:
+                    self.assertEqual(target.read_bytes(), original)
+                else:
+                    self.assertFalse(target.exists())
+
+    def test_feature_end_expiry_after_publish_rolls_back_file_and_rows(self) -> None:
+        bundle = self._empty_feature_bundle()
+        target = self.project_root / (
+            f"data/curated/formal_features/{REPORT_PERIOD}/SH600001/"
+            f"{bundle.input_hash}.json"
+        )
+        job_id = self.store.enqueue_job("feature_build", "feature-end-expiry", {})
+        self.store.lease_next_job(["feature_build"], "worker-a", 3600)
+        published = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+        real_write = deep_worker_module.write_feature_bundle
+        real_now = deep_worker_module.datetime.now(timezone.utc).isoformat()
+        clock_calls = 0
+
+        def blocked_write(*args, **kwargs):
+            result = real_write(*args, **kwargs)
+            published.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test did not release feature publisher")
+            return result
+
+        def expiring_clock():
+            nonlocal clock_calls
+            clock_calls += 1
+            return "2099-01-01T00:00:00+00:00" if clock_calls >= 3 else real_now
+
+        def write_feature() -> None:
+            try:
+                deep_worker_module._write_and_store_feature_bundle(
+                    project_root=self.project_root,
+                    store=self.store,
+                    bundle=bundle,
+                    ensure_owned=lambda: None,
+                    job_id=job_id,
+                    worker_id="worker-a",
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with (
+            patch.object(
+                deep_worker_module,
+                "write_feature_bundle",
+                side_effect=blocked_write,
+            ),
+            patch("ashare_pipeline.state_store._utc_now", side_effect=expiring_clock),
+        ):
+            worker = threading.Thread(target=write_feature)
+            worker.start()
+            self.assertTrue(published.wait(timeout=5))
+            release.set()
+            worker.join(timeout=10)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ValueError)
+        self.assertFalse(target.exists())
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0], 0)
+
+    def test_statement_ordinary_exception_keeps_failure_transition(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        job_id = self._enqueue_statement()
+
+        class BrokenSource:
+            @staticmethod
+            def fetch_financial_statement(*_args):
+                raise RuntimeError("ordinary statement failure")
+
+        with self.assertRaisesRegex(RuntimeError, "ordinary statement failure"):
+            self._run(
+                source=BrokenSource(),
+                trade_calendar_snapshot=self._calendar_ref(),
+                limit=1,
+            )
+
+        job = self.store.get_job(job_id)
+        self.assertEqual(job["status"], "terminal_failed")
+        self.assertEqual(job["error"], {"error_classification": "worker_error"})
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
 
     def test_feature_path_is_project_relative_and_never_creates_data_data(self) -> None:
         bundle = self._empty_feature_bundle()

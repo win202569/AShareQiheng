@@ -102,3 +102,10 @@
 - heartbeat 关闭会等待受 SQLite timeout 约束的在途续租完成，`KeyboardInterrupt`/`SystemExit` 不再被清理异常替换，普通异常的既有 retry 行为保持不变。
 - 本轮 focused 5/5、受影响模块 172/172、fresh full offline `unittest` 411/411 通过；未执行真实网络、migration、operational `120/114`、formal scoring、七维 readiness 或正式股票池验收，未改写 runtime/tracked data。
 - `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。
+
+### Independent review Fix Round 1（2026-09-01）
+
+- same-refresh statement 的 fact/issue 写入现同样强制 owned transaction；statement `KeyboardInterrupt`/`SystemExit` 在任何 failure transition 前原样传播，并在在途续租退出后确认 heartbeat thread 已终止。
+- snapshot 与 feature 的 attempt-local 文件清理现覆盖 transaction context exit/commit failure；ownerless snapshot 在 SQLite 锁等待后重新 publish/reverify 再插行，使 stale cleanup 后的合法 winner 始终保有可验证的 immutable 文件/DB 对。
+- 本轮 focused 13/13、受影响模块 181/181、fresh full offline `unittest` 420/420 通过；未执行网络、runtime/tracked data、schema/migration、scoring/readiness、正式股票池或 operational `120/114`。
+- `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。

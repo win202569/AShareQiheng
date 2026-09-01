@@ -3,7 +3,8 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import subprocess
@@ -26,6 +27,17 @@ def statement_batch(symbol: str, total_assets: float, fetched_at: str) -> FetchB
         "1.0",
         {"report_period_match_count": 1},
     )
+
+
+class CommitFailConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def commit(self):
+        raise sqlite3.OperationalError("forced commit failure")
 
 
 class SnapshotRepositoryTestCase(unittest.TestCase):
@@ -162,6 +174,126 @@ class SnapshotRepositoryTestCase(unittest.TestCase):
         self.assertEqual(winner_path.read_bytes(), winner_bytes)
         with closing(sqlite3.connect(self.data_root / "state.sqlite3")) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0], 1)
+
+    def test_owned_snapshot_commit_failure_removes_attempt_file_and_row(self):
+        batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+        job_id = self.state_store.enqueue_job(
+            "deep_statement", "snapshot-owner:commit-failure", {}
+        )
+        self.state_store.lease_next_job(["deep_statement"], "worker-a", 3600)
+        real_connect = self.state_store._connect
+
+        with patch.object(
+            self.state_store,
+            "_connect",
+            side_effect=lambda: CommitFailConnection(real_connect()),
+        ), self.assertRaisesRegex(sqlite3.OperationalError, "commit failure"):
+            self.repository.persist(batch, job_id=job_id, worker_id="worker-a")
+
+        with closing(sqlite3.connect(self.state_store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0],
+                0,
+            )
+        self.assertEqual(list((self.data_root / "raw").rglob("*.json")), [])
+
+    def test_ownerless_winner_republishes_after_owned_end_expiry_cleanup(self):
+        batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+        job_id = self.state_store.enqueue_job(
+            "deep_statement", "snapshot-owner:adoption-race", {}
+        )
+        self.state_store.lease_next_job(["deep_statement"], "worker-a", 3600)
+        ownerless_transaction_started = threading.Event()
+        owned_published = threading.Event()
+        owned_errors: list[BaseException] = []
+        ownerless_errors: list[BaseException] = []
+        ownerless_results: list[tuple[object, bool]] = []
+        real_transaction = self.state_store._transaction
+        real_write = self.snapshot_store.write
+        snapshot_clock_calls = 0
+        state_clock_calls = 0
+
+        @contextmanager
+        def observed_transaction(*args, **kwargs):
+            if threading.current_thread().name == "ownerless-winner":
+                ownerless_transaction_started.set()
+            with real_transaction(*args, **kwargs) as connection:
+                yield connection
+
+        def observed_write(value):
+            result = real_write(value)
+            if threading.current_thread().name == "owned-loser":
+                owned_published.set()
+            return result
+
+        def snapshot_clock():
+            nonlocal snapshot_clock_calls
+            if threading.current_thread().name != "owned-loser":
+                return datetime.now(timezone.utc).isoformat()
+            snapshot_clock_calls += 1
+            if snapshot_clock_calls == 2:
+                self.assertTrue(ownerless_transaction_started.wait(timeout=5))
+                return "2099-01-01T00:00:00+00:00"
+            return datetime.now(timezone.utc).isoformat()
+
+        def state_clock():
+            nonlocal state_clock_calls
+            if threading.current_thread().name != "owned-loser":
+                return datetime.now(timezone.utc).isoformat()
+            state_clock_calls += 1
+            if state_clock_calls == 3:
+                self.assertTrue(ownerless_transaction_started.wait(timeout=5))
+                return "2099-01-01T00:00:00+00:00"
+            return datetime.now(timezone.utc).isoformat()
+
+        def owned_loser():
+            try:
+                self.repository.persist(
+                    batch, job_id=job_id, worker_id="worker-a"
+                )
+            except BaseException as error:
+                owned_errors.append(error)
+
+        def ownerless_winner():
+            try:
+                ownerless_results.append(self.repository.persist(batch))
+            except BaseException as error:
+                ownerless_errors.append(error)
+
+        with (
+            patch.object(self.state_store, "_transaction", new=observed_transaction),
+            patch.object(self.snapshot_store, "write", side_effect=observed_write),
+            patch(
+                "ashare_pipeline.snapshot_repository._utc_now",
+                side_effect=snapshot_clock,
+                create=True,
+            ),
+            patch("ashare_pipeline.state_store._utc_now", side_effect=state_clock),
+        ):
+            owned = threading.Thread(target=owned_loser, name="owned-loser")
+            owned.start()
+            self.assertTrue(owned_published.wait(timeout=5))
+            ownerless = threading.Thread(
+                target=ownerless_winner, name="ownerless-winner"
+            )
+            ownerless.start()
+            owned.join(timeout=10)
+            ownerless.join(timeout=10)
+
+        self.assertFalse(owned.is_alive())
+        self.assertFalse(ownerless.is_alive())
+        self.assertEqual(len(owned_errors), 1)
+        self.assertIsInstance(owned_errors[0], ValueError)
+        self.assertEqual(ownerless_errors, [])
+        self.assertEqual(len(ownerless_results), 1)
+        winner, created = ownerless_results[0]
+        self.assertTrue(created)
+        self.assertEqual(self.repository.read_verified(winner).batch, batch)
+        with closing(sqlite3.connect(self.state_store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0],
+                1,
+            )
 
     def test_concurrent_same_target_persist_keeps_first_published_batch_and_db_ref(self):
         first_batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")

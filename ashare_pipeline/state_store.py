@@ -9,7 +9,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
 from ashare_pipeline.feature_contract import (
     DIMENSIONS,
@@ -282,13 +282,23 @@ class StateStore:
         return connection
 
     @contextmanager
-    def _transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    def _transaction(
+        self,
+        immediate: bool = False,
+        on_error: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> Iterator[sqlite3.Connection]:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             yield connection
             connection.commit()
-        except BaseException:
+        except BaseException as error:
+            try:
+                if on_error is not None:
+                    on_error(connection)
+            except BaseException as cleanup_error:
+                connection.rollback()
+                raise error from cleanup_error
             connection.rollback()
             raise
         finally:
@@ -355,10 +365,13 @@ class StateStore:
 
     @contextmanager
     def owned_job_transaction(
-        self, job_id: str, worker_id: str
+        self,
+        job_id: str,
+        worker_id: str,
+        on_error: Callable[[sqlite3.Connection], None] | None = None,
     ) -> Iterator[sqlite3.Connection]:
         """Fence a mutation with ownership checks at both transaction boundaries."""
-        with self._transaction(immediate=True) as connection:
+        with self._transaction(immediate=True, on_error=on_error) as connection:
             self._require_unexpired_job_owner(
                 connection, job_id, worker_id, _utc_now()
             )
