@@ -150,6 +150,28 @@ class SnapshotRepository:
             request=MappingProxyType(dict(request)),
         )
 
+    def list_exact(
+        self, source: str, dataset: str, request: dict
+    ) -> tuple[SnapshotRef, ...]:
+        """Return every exact request revision in deterministic winner order."""
+        fingerprint = canonical_sha256(request)
+        with closing(self.state_store._connect()) as connection:
+            rows = connection.execute(
+                """SELECT id, source, dataset, request_fingerprint, payload_hash,
+                          payload_path, row_count, fetched_at, created_at
+                   FROM source_snapshot
+                   WHERE source = ? AND dataset = ? AND request_fingerprint = ?
+                   ORDER BY fetched_at DESC, created_at DESC, payload_hash DESC""",
+                (source, dataset, fingerprint),
+            ).fetchall()
+        return tuple(
+            replace(
+                self._ref_from_row(row),
+                request=MappingProxyType(dict(request)),
+            )
+            for row in rows
+        )
+
     def get(self, snapshot_id: str) -> SnapshotRef | None:
         with closing(self.state_store._connect()) as connection:
             row = connection.execute(
