@@ -103,6 +103,29 @@ class SnapshotRepositoryTestCase(unittest.TestCase):
 
         self.assertEqual(observed.id, max((second, third), key=lambda item: item.payload_hash).id)
 
+    def test_list_exact_returns_all_and_only_exact_revisions_in_winner_order(self):
+        request = {"symbol": "SH600001", "report_period": "2026-06-30"}
+        first, _ = self.repository.persist(
+            statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+        )
+        second, _ = self.repository.persist(
+            statement_batch("SH600001", 200.0, "2026-08-29T01:00:00+00:00")
+        )
+        self.repository.persist(
+            statement_batch("SH600002", 300.0, "2026-08-29T02:00:00+00:00")
+        )
+
+        observed = self.repository.list_exact(
+            "akshare", "balance_sheet", request
+        )
+
+        self.assertEqual([item.id for item in observed], [second.id, first.id])
+        self.assertTrue(all(dict(item.request) == request for item in observed))
+        self.assertEqual(
+            self.repository.list_exact("akshare", "profit_sheet", request),
+            (),
+        )
+
     def test_find_exact_returns_none_for_unmatched_request_source_or_dataset(self):
         self.repository.persist(
             statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
