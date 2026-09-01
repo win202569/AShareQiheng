@@ -1766,18 +1766,46 @@ class OrchestratorTestCase(unittest.TestCase):
                 if blocker != "industry_template_unclassified"
             ),
         )
-        crossed = False
-        try:
-            relative_path, bundle_hash, _created = write_feature_bundle(
-                self.base, forged
+        expected_contract_error = "unclassified template requires blocked status"
+        relative_path = (
+            "data/curated/formal_features/2026-06-30/SH600001/"
+            f"{forged.input_hash}.json"
+        )
+        feature_root = self.base / "data" / "curated" / "formal_features"
+        with self.assertRaisesRegex(OSError, "feature part is malformed"):
+            write_feature_bundle(self.base, forged)
+        self.assertEqual(list(feature_root.rglob("*.json")), [])
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                0,
             )
+
+        with self.assertRaisesRegex(ValueError, expected_contract_error):
             store.put_feature_bundle(
-                forged, bundle_path=relative_path, bundle_hash=bundle_hash
+                forged,
+                bundle_path=relative_path,
+                bundle_hash=forged.bundle_hash(),
             )
-            read_verified_feature_bundle(self.base, relative_path, bundle_hash)
-            crossed = True
-        except (OSError, ValueError):
-            pass
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                0,
+            )
+
+        forged_bytes = canonical_json_bytes(forged.to_dict())
+        forged_hash = hashlib.sha256(forged_bytes).hexdigest()
+        target = self.base.joinpath(*relative_path.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(forged_bytes)
+        self.assertEqual(len(list(feature_root.rglob("*.json"))), 1)
+        with self.assertRaisesRegex(OSError, "feature bundle is malformed"):
+            read_verified_feature_bundle(self.base, relative_path, forged_hash)
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                0,
+            )
 
         status, exit_code = orchestrator.run_command(
             self.root,
@@ -1785,7 +1813,6 @@ class OrchestratorTestCase(unittest.TestCase):
             "status",
             now_cn="2026-08-29T20:00:00+08:00",
         )
-        self.assertFalse(crossed)
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             status["deep"]["feature_set_counts"],
@@ -1797,6 +1824,99 @@ class OrchestratorTestCase(unittest.TestCase):
             status["official_pool_counts"],
             {"waiting_price": 0, "strong_attention": 0},
         )
+
+    def test_zero_slot_specialized_templates_keep_imbalanced_facts_auditable_without_balance_marker(self):
+        cases = (
+            ("银行", "bank"),
+            ("保险", "insurance"),
+            ("证券", "broker"),
+        )
+        for industry_name, template_id in cases:
+            with self.subTest(template=template_id):
+                case_base = self.base / template_id
+                case_root = case_base / "data"
+                write_candidate_documents(
+                    case_root, {"SH600001": industry_name}
+                )
+                store = StateStore(case_root / "state.sqlite3")
+                store.initialize()
+                context = orchestrator.load_candidate_context(case_root)
+                bundle, facts, _snapshot_ids = installed_ready_bundle(
+                    store,
+                    candidate_set_hash=context.candidate_set_hash,
+                    snapshot_tag=f"zero-slot-{template_id}",
+                    source_industry_name=industry_name,
+                    fact_values={("total_assets", "2021-12-31"): 10_000.0},
+                )
+
+                self.assertEqual(bundle.industry.template_id, template_id)
+                self.assertEqual(bundle.financial_status, "blocked")
+                self.assertEqual(bundle.financial_coverage, 0.0)
+                self.assertIn(
+                    "specialized_financial_inputs_missing", bundle.blockers
+                )
+                self.assertNotIn("balance_equation_mismatch", bundle.blockers)
+                relative_path, bundle_hash, file_created = write_feature_bundle(
+                    case_base, bundle
+                )
+                feature_id, database_created = store.put_feature_bundle(
+                    bundle,
+                    bundle_path=relative_path,
+                    bundle_hash=bundle_hash,
+                )
+                reused_id, reused_created = store.put_feature_bundle(
+                    bundle,
+                    bundle_path=relative_path,
+                    bundle_hash=bundle_hash,
+                )
+                verified = read_verified_feature_bundle(
+                    case_base, relative_path, bundle_hash
+                )
+                with closing(sqlite3.connect(store.db_path)) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM financial_fact"
+                        ).fetchone()[0],
+                        len(facts),
+                    )
+                    self.assertEqual(
+                        connection.execute(
+                            """SELECT value FROM financial_fact
+                            WHERE metric_key='total_assets' AND period_end='2021-12-31'"""
+                        ).fetchone()[0],
+                        10_000.0,
+                    )
+                status, exit_code = orchestrator.run_command(
+                    case_root,
+                    store.db_path,
+                    "status",
+                    now_cn="2026-08-30T00:00:00+08:00",
+                )
+
+                self.assertTrue(file_created)
+                self.assertTrue(database_created)
+                self.assertEqual(feature_id, bundle_hash)
+                self.assertEqual(reused_id, feature_id)
+                self.assertFalse(reused_created)
+                self.assertEqual(verified.canonical_bytes(), bundle.canonical_bytes())
+                self.assertNotIn(
+                    "balance_equation_mismatch", verified.blockers
+                )
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(
+                    status["deep"]["feature_set_counts"],
+                    {"partial": 0, "financial_ready": 0, "blocked": 1},
+                )
+                self.assertEqual(
+                    status["deep"]["template_counts"], {template_id: 1}
+                )
+                self.assertEqual(status["deep"]["unknown_failure_count"], 0)
+                self.assertFalse(status["formal_score_ready"])
+                self.assertFalse(status["seven_dimension_ready"])
+                self.assertEqual(
+                    status["official_pool_counts"],
+                    {"waiting_price": 0, "strong_attention": 0},
+                )
 
     def test_builder_unclassified_persists_reads_and_counts_blocked(self):
         write_candidate_documents(self.root, {"SH600001": "不存在行业"})

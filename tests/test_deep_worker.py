@@ -349,7 +349,7 @@ class DeepWorkerTestCase(unittest.TestCase):
         def renew(*args, **kwargs):
             nonlocal renewal_count
             renewal_count += 1
-            if renewal_count == 1:
+            if renewal_count == 1 or not entered.is_set():
                 return real_renew(*args, **kwargs)
             if transfer_owner:
                 with closing(sqlite3.connect(self.store.db_path)) as connection:
@@ -960,6 +960,217 @@ class DeepWorkerTestCase(unittest.TestCase):
         self.assertGreaterEqual(len(renewals), 2)
         self.assertEqual(summary.statements_succeeded, 1)
 
+    def test_statement_job_renews_lease_during_local_normalization(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        self._enqueue_statement()
+        calendar = self._calendar_ref()
+        renewals: list[str] = []
+        released = threading.Event()
+        entered = threading.Event()
+        real_renew = self.store.renew_job_lease
+        real_normalize = deep_worker_module._normalize_statement_snapshot
+        released_during_normalize = False
+
+        def renew(*args, **kwargs):
+            expiry = real_renew(*args, **kwargs)
+            renewals.append(expiry)
+            if len(renewals) >= 2:
+                released.set()
+            return expiry
+
+        def blocking_normalize(**kwargs):
+            nonlocal released_during_normalize
+            entered.set()
+            released_during_normalize = released.wait(timeout=0.5)
+            return real_normalize(**kwargs)
+
+        with (
+            patch.object(self.store, "renew_job_lease", side_effect=renew),
+            patch.object(
+                deep_worker_module,
+                "_normalize_statement_snapshot",
+                side_effect=blocking_normalize,
+            ),
+        ):
+            summary = self._run(
+                source=FakeStatementSource(),
+                trade_calendar_snapshot=calendar,
+                limit=1,
+                heartbeat_seconds=0.01,
+            )
+
+        self.assertTrue(entered.is_set())
+        self.assertTrue(released_during_normalize)
+        self.assertGreaterEqual(len(renewals), 2)
+        self.assertEqual(summary.statements_succeeded, 1)
+
+    def test_feature_job_renews_lease_during_feature_construction(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        job_id = deep_worker_module.enqueue_feature_build(
+            self.store,
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            candidate_context=context,
+            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+            trade_calendar_snapshot=None,
+        )
+        renewals: list[str] = []
+        released = threading.Event()
+        entered = threading.Event()
+        real_renew = self.store.renew_job_lease
+        real_build = deep_worker_module.build_feature_bundle
+        released_during_build = False
+
+        def renew(*args, **kwargs):
+            expiry = real_renew(*args, **kwargs)
+            renewals.append(expiry)
+            if len(renewals) >= 2:
+                released.set()
+            return expiry
+
+        def blocking_build(**kwargs):
+            nonlocal released_during_build
+            entered.set()
+            released_during_build = released.wait(timeout=0.5)
+            return real_build(**kwargs)
+
+        with (
+            patch.object(self.store, "renew_job_lease", side_effect=renew),
+            patch.object(
+                deep_worker_module,
+                "build_feature_bundle",
+                side_effect=blocking_build,
+            ),
+        ):
+            summary = self._run(
+                source=None,
+                online=False,
+                heartbeat_seconds=0.01,
+            )
+
+        self.assertTrue(entered.is_set())
+        self.assertTrue(released_during_build)
+        self.assertGreaterEqual(len(renewals), 2)
+        self.assertEqual(self.store.get_job(job_id)["status"], "succeeded")
+        self.assertEqual(summary.feature_sets_written, 1)
+
+    def test_feature_heartbeat_loss_before_publish_prevents_later_side_effects(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        job_id = deep_worker_module.enqueue_feature_build(
+            self.store,
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            candidate_context=context,
+            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+            trade_calendar_snapshot=None,
+        )
+        release = threading.Event()
+        real_renew = self.store.renew_job_lease
+        real_build = deep_worker_module.build_feature_bundle
+        renewal_count = 0
+
+        def renew(*args, **kwargs):
+            nonlocal renewal_count
+            renewal_count += 1
+            if renewal_count == 1:
+                return real_renew(*args, **kwargs)
+            release.set()
+            raise ValueError("lease owner changed")
+
+        def blocking_build(**kwargs):
+            release.wait(timeout=0.5)
+            return real_build(**kwargs)
+
+        with (
+            patch.object(self.store, "renew_job_lease", side_effect=renew),
+            patch.object(
+                deep_worker_module,
+                "build_feature_bundle",
+                side_effect=blocking_build,
+            ),
+        ):
+            summary = self._run(
+                source=None,
+                online=False,
+                heartbeat_seconds=0.01,
+            )
+
+        self.assertGreaterEqual(renewal_count, 2)
+        self.assertEqual(self.store.get_job(job_id)["status"], "running")
+        self.assertEqual([item["outcome"] for item in summary.items], ["lease_lost"])
+        self._assert_no_feature_artifacts()
+
+    def _assert_feature_process_control_propagates(
+        self, error_type: type[BaseException]
+    ) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        job_id = deep_worker_module.enqueue_feature_build(
+            self.store,
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            candidate_context=context,
+            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+            trade_calendar_snapshot=None,
+        )
+
+        with (
+            patch.object(
+                deep_worker_module,
+                "build_feature_bundle",
+                side_effect=error_type("stop"),
+            ),
+            self.assertRaises(error_type),
+        ):
+            self._run(source=None, online=False, heartbeat_seconds=0.01)
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "running")
+        self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
+
+    def test_feature_keyboard_interrupt_propagates_without_retry_transition(self) -> None:
+        self._assert_feature_process_control_propagates(KeyboardInterrupt)
+
+    def test_feature_system_exit_propagates_without_retry_transition(self) -> None:
+        self._assert_feature_process_control_propagates(SystemExit)
+
+    def test_feature_ordinary_exception_remains_a_retryable_failure(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        job_id = deep_worker_module.enqueue_feature_build(
+            self.store,
+            security_id="SH600001",
+            report_period=REPORT_PERIOD,
+            as_of_utc="2026-08-29T12:00:00+00:00",
+            candidate_context=context,
+            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+            trade_calendar_snapshot=None,
+        )
+
+        with patch.object(
+            deep_worker_module,
+            "build_feature_bundle",
+            side_effect=RuntimeError("ordinary failure"),
+        ):
+            summary = self._run(source=None, online=False, heartbeat_seconds=0.01)
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "retryable_failed")
+        self.assertEqual(
+            [dict(item) for item in summary.items],
+            [
+                {
+                    "security_id": "SH600001",
+                    "outcome": "feature_failed",
+                    "error_classification": "feature_build_error",
+                }
+            ],
+        )
+        self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
+
     def test_heartbeat_failure_prevents_stale_worker_completion(self) -> None:
         self._write_candidates({"SH600001": "包装印刷"})
         job_id = self._enqueue_statement()
@@ -1500,6 +1711,7 @@ class DeepWorkerTestCase(unittest.TestCase):
                 project_root=self.project_root,
                 store=self.store,
                 bundle=bundle,
+                ensure_owned=lambda: None,
             )
         self.assertFalse(target.exists())
 
@@ -1512,6 +1724,7 @@ class DeepWorkerTestCase(unittest.TestCase):
                 project_root=self.project_root,
                 store=self.store,
                 bundle=bundle,
+                ensure_owned=lambda: None,
             )
 
         self.assertTrue(created)

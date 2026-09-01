@@ -144,7 +144,14 @@ class SnapshotRepository:
             raise ValueError("snapshot payload path is required")
         posix_path = PurePosixPath(payload_path)
         if Path(payload_path).is_absolute() or PureWindowsPath(payload_path).is_absolute() or posix_path.is_absolute():
-            return Path(payload_path).resolve()
+            resolved = Path(payload_path).resolve()
+            try:
+                resolved.relative_to(self.data_root.resolve())
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    "absolute legacy snapshot path must stay inside repository data root"
+                ) from error
+            return resolved
         if "\\" in payload_path:
             raise ValueError("relative snapshot path must not contain a backslash")
         posix_parts = posix_path.parts

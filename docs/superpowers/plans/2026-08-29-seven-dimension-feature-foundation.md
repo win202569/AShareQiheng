@@ -473,7 +473,7 @@ def test_initialize_migrates_literal_v2_database_to_v3_without_changing_existing
 
 Add tests for two consecutive initializations, foreign-key rejection, invalid feature status/dimension, coverage -0.01 and 1.01, and preservation of final score-run immutability.
 
-The literal-v2 migration regression must not preserve only `run`. Seed representative, foreign-key-consistent rows in every existing v2 table (`run`, `snapshot`, `job`, `score_run`, `score_item`, `quality_issue`, and `export_artifact`), capture each table with a deterministic `SELECT * ... ORDER BY` before initialization, and compare every table row-for-row after migration. The v3 table/version assertions come only after those preservation assertions.
+The literal-v2 migration regression must not preserve only `run`. Seed representative, foreign-key-consistent rows in every existing v2 table (`run`, `source_snapshot`, `job`, `score_run`, `score_item`, `quality_issue`, and `artifact`), capture each table with a deterministic `SELECT * ... ORDER BY` before initialization, and compare every table row-for-row after migration. The v3 table/version assertions come only after those preservation assertions.
 
 - [ ] **Step 2: Run the migration test to verify RED**
 

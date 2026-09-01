@@ -784,7 +784,10 @@ def build_feature_bundle(
         ),
         key=lambda item: (item.metric_key, item.period_end, item.effective_at_utc, item.id),
     ))
-    financial_blockers.update(balance_equation_blockers(selected))
+    if template.financial_slots:
+        financial_blockers.update(balance_equation_blockers(selected))
+    else:
+        financial_blockers.discard("balance_equation_mismatch")
     if template.template_id == "unclassified":
         financial_blockers.add("industry_template_unclassified")
     if (

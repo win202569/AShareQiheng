@@ -250,7 +250,7 @@ class SnapshotRepositoryTestCase(unittest.TestCase):
         self.assertTrue(snapshot.payload_path.startswith("data/raw/"))
         self.assertTrue((self.project_root / snapshot.payload_path).is_file())
 
-    def test_read_verified_accepts_an_existing_absolute_legacy_path(self):
+    def test_read_verified_accepts_a_contained_absolute_legacy_path(self):
         batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
         path, digest, _ = self.snapshot_store.write(batch)
         snapshot_id, _ = self.state_store.record_snapshot(
@@ -267,6 +267,26 @@ class SnapshotRepositoryTestCase(unittest.TestCase):
 
         self.assertEqual(verified.ref.id, snapshot_id)
         self.assertEqual(verified.batch.records, batch.records)
+
+    def test_read_verified_rejects_an_absolute_legacy_path_outside_data_root(self):
+        batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+        contained, digest, _ = self.snapshot_store.write(batch)
+        outside = self.project_root / "outside-legacy.json"
+        outside.write_bytes(contained.read_bytes())
+        snapshot_id, _ = self.state_store.record_snapshot(
+            batch.source,
+            batch.dataset,
+            canonical_sha256(batch.request),
+            digest,
+            str(outside.resolve()),
+            len(batch.records),
+            batch.fetched_at_utc,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "absolute legacy snapshot path must stay inside"
+        ):
+            self.repository.read_verified(self.repository.get(snapshot_id))
 
     def test_read_verified_rejects_relative_parent_traversal(self):
         batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")

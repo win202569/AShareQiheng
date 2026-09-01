@@ -13,7 +13,7 @@ import re
 import tempfile
 import threading
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from ashare_pipeline.feature_contract import (
     FeatureBundle,
@@ -860,6 +860,10 @@ class DeepRunSummary:
         }
 
 
+class _LeaseLostError(RuntimeError):
+    """Signal that an owned job lease can no longer authorize side effects."""
+
+
 class _LeaseHeartbeat:
     def __init__(
         self,
@@ -875,6 +879,7 @@ class _LeaseHeartbeat:
         self.lease_seconds = lease_seconds
         self.heartbeat_seconds = heartbeat_seconds
         self._stop = threading.Event()
+        self._renew_lock = threading.Lock()
         self.lost = threading.Event()
         self.error: BaseException | None = None
         self.thread = threading.Thread(
@@ -883,13 +888,17 @@ class _LeaseHeartbeat:
             daemon=True,
         )
         self.started = False
+        self.closed = False
 
     def _run(self) -> None:
         while not self._stop.wait(self.heartbeat_seconds):
             try:
-                self.store.renew_job_lease(
-                    self.job_id, self.worker_id, self.lease_seconds
-                )
+                with self._renew_lock:
+                    if self._stop.is_set():
+                        return
+                    self.store.renew_job_lease(
+                        self.job_id, self.worker_id, self.lease_seconds
+                    )
             except BaseException as error:
                 self.error = error
                 self.lost.set()
@@ -897,9 +906,10 @@ class _LeaseHeartbeat:
 
     def __enter__(self) -> "_LeaseHeartbeat":
         try:
-            self.store.renew_job_lease(
-                self.job_id, self.worker_id, self.lease_seconds
-            )
+            with self._renew_lock:
+                self.store.renew_job_lease(
+                    self.job_id, self.worker_id, self.lease_seconds
+                )
         except BaseException as error:
             self.error = error
             self.lost.set()
@@ -909,12 +919,34 @@ class _LeaseHeartbeat:
         return self
 
     def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
         self._stop.set()
         if not self.started:
             return
         self.thread.join(timeout=max(1.0, self.heartbeat_seconds * 2.0))
         if self.thread.is_alive():
             raise RuntimeError("lease heartbeat thread did not stop")
+
+    def ensure_owned(self) -> None:
+        if self.lost.is_set():
+            raise _LeaseLostError("job lease heartbeat was lost") from self.error
+
+    def final_transition(
+        self,
+        transition: Callable[..., None],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        """Serialize the final owned transition against periodic renewal."""
+        with self._renew_lock:
+            self.ensure_owned()
+            transition(*args, **kwargs)
+            self._stop.set()
 
 
 def _thaw(value: object) -> object:
@@ -1086,8 +1118,11 @@ def _record_fact_issues(
     security_id: str,
     dataset: str,
     issues: Sequence[object],
+    ensure_owned: Callable[[], None] | None = None,
 ) -> None:
     for issue in issues:
+        if ensure_owned is not None:
+            ensure_owned()
         store.record_quality_issue(
             run_id=None,
             score_run_id=None,
@@ -1130,6 +1165,7 @@ def _normalize_statement_snapshot(
     security_id: str,
     trading_days: Sequence[date] | None,
     record_issues: bool,
+    ensure_owned: Callable[[], None] | None = None,
 ) -> tuple[tuple[object, ...], tuple[object, ...]]:
     if trading_days is None:
         return (), ()
@@ -1141,10 +1177,16 @@ def _normalize_statement_snapshot(
         trading_days=trading_days,
         created_at_utc=snapshot.fetched_at,
     )
+    if ensure_owned is not None:
+        ensure_owned()
     store.insert_financial_facts(result.facts)
     if record_issues:
         _record_fact_issues(
-            store, security_id, snapshot.dataset, result.issues
+            store,
+            security_id,
+            snapshot.dataset,
+            result.issues,
+            ensure_owned,
         )
     return result.facts, result.issues
 
@@ -1167,11 +1209,14 @@ def _write_and_store_feature_bundle(
     project_root: Path,
     store: StateStore,
     bundle: FeatureBundle,
+    ensure_owned: Callable[[], None],
 ) -> tuple[str, str, bool]:
+    ensure_owned()
     relative_path, bundle_hash, file_created = write_feature_bundle(
         project_root, bundle
     )
     try:
+        ensure_owned()
         _feature_set_id, database_created = store.put_feature_bundle(
             bundle,
             bundle_path=relative_path,
@@ -1206,6 +1251,7 @@ def _execute_feature_job(
     context: CandidateContext,
     job: Mapping[str, object],
     worker_id: str,
+    heartbeat: _LeaseHeartbeat,
 ) -> tuple[bool, Mapping[str, object]]:
     payload = _validate_feature_payload(job["payload"])
     security_id = payload["security_id"]
@@ -1282,6 +1328,7 @@ def _execute_feature_job(
             security_id=security_id,
             trading_days=trading_days,
             record_issues=False,
+            ensure_owned=heartbeat.ensure_owned,
         )
         normalized_facts.extend(facts)
         issue_codes.update(issue.code for issue in issues)
@@ -1311,19 +1358,23 @@ def _execute_feature_job(
     )
     if bundle.input_hash != expected_input_hash:
         raise ValueError("feature bundle input hash does not match frozen payload")
+    heartbeat.ensure_owned()
     relative_path, bundle_hash, created = _write_and_store_feature_bundle(
         project_root=root.parent,
         store=store,
         bundle=bundle,
+        ensure_owned=heartbeat.ensure_owned,
     )
     verified = read_verified_feature_bundle(root.parent, relative_path, bundle_hash)
     if verified != bundle:
         raise OSError("stored feature bundle does not match built bundle")
-    store.complete_job_with_followups(
-        job["id"],
-        worker_id,
-        {"outcome": "feature_built", "bundle_hash": bundle_hash},
-        (),
+    heartbeat.final_transition(
+        lambda: store.complete_job_with_followups(
+            job["id"],
+            worker_id,
+            {"outcome": "feature_built", "bundle_hash": bundle_hash},
+            (),
+        )
     )
     return created, MappingProxyType(
         {
@@ -1343,6 +1394,7 @@ def _process_feature_jobs(
     logical_now_utc: str,
     worker_id: str,
     lease_seconds: int,
+    heartbeat_seconds: float,
     items: list[Mapping[str, object]],
 ) -> int:
     created_count = 0
@@ -1356,7 +1408,16 @@ def _process_feature_jobs(
         )
         if job is None:
             return created_count
+        heartbeat = _LeaseHeartbeat(
+            store,
+            job["id"],
+            worker_id,
+            lease_seconds,
+            heartbeat_seconds,
+        )
+        heartbeat.__enter__()
         try:
+            heartbeat.ensure_owned()
             created, item = _execute_feature_job(
                 root=root,
                 store=store,
@@ -1364,23 +1425,50 @@ def _process_feature_jobs(
                 context=context,
                 job=job,
                 worker_id=worker_id,
+                heartbeat=heartbeat,
             )
-        except BaseException as error:
+        except _LeaseLostError:
+            payload = job.get("payload")
+            item_data: dict[str, object] = {
+                "outcome": "lease_lost",
+                "error_classification": "lease_lost",
+            }
+            if isinstance(payload, Mapping) and isinstance(
+                payload.get("security_id"), str
+            ):
+                item_data["security_id"] = payload["security_id"]
+            items.append(MappingProxyType(item_data))
+            break
+        except Exception as error:
             retryable = not isinstance(error, ValueError)
             try:
-                store.fail_job_with_followups(
-                    job["id"],
-                    worker_id,
-                    {"error_classification": "feature_build_error"},
-                    retryable,
-                    (
-                        datetime.fromisoformat(logical_now_utc)
-                        + timedelta(hours=6)
-                    ).isoformat()
-                    if retryable
-                    else None,
-                    (),
+                heartbeat.final_transition(
+                    lambda: store.fail_job_with_followups(
+                        job["id"],
+                        worker_id,
+                        {"error_classification": "feature_build_error"},
+                        retryable,
+                        (
+                            datetime.fromisoformat(logical_now_utc)
+                            + timedelta(hours=6)
+                        ).isoformat()
+                        if retryable
+                        else None,
+                        (),
+                    )
                 )
+            except _LeaseLostError:
+                payload = job.get("payload")
+                item_data = {
+                    "outcome": "lease_lost",
+                    "error_classification": "lease_lost",
+                }
+                if isinstance(payload, Mapping) and isinstance(
+                    payload.get("security_id"), str
+                ):
+                    item_data["security_id"] = payload["security_id"]
+                items.append(MappingProxyType(item_data))
+                break
             except ValueError:
                 raise error
             payload = job.get("payload")
@@ -1397,8 +1485,11 @@ def _process_feature_jobs(
                 item_data["security_id"] = security_id
             items.append(MappingProxyType(item_data))
             continue
+        finally:
+            heartbeat.close()
         created_count += int(created)
         items.append(item)
+    return created_count
 
 
 def _statement_followup(
@@ -1496,6 +1587,7 @@ def execute_queued_deep_work(
         logical_now_utc=logical_now_utc,
         worker_id=worker,
         lease_seconds=lease_seconds,
+        heartbeat_seconds=heartbeat_seconds,
         items=items,
     )
     counters = {
@@ -1532,7 +1624,18 @@ def execute_queued_deep_work(
         )
         if job is None:
             break
+        heartbeat = _LeaseHeartbeat(
+            store,
+            job["id"],
+            worker,
+            lease_seconds,
+            heartbeat_seconds,
+        )
+        heartbeat.__enter__()
+        security_id: str | None = None
+        dataset: str | None = None
         try:
+            heartbeat.ensure_owned()
             _validate_statement_payload(job["payload"])
             payload = job["payload"]
             if not isinstance(payload, Mapping):
@@ -1571,43 +1674,27 @@ def execute_queued_deep_work(
                         snapshots, trade_calendar_snapshot
                     ),
                     record_issues=True,
+                    ensure_owned=heartbeat.ensure_owned,
                 )
                 counters["snapshots_reused"] += 1
             else:
-                heartbeat = _LeaseHeartbeat(
-                    store,
-                    job["id"],
-                    worker,
-                    lease_seconds,
-                    heartbeat_seconds,
-                )
                 batch = None
                 source_error: (
                     SourceBlocked | RetryableSourceError | TerminalSourceError | None
                 ) = None
-                with heartbeat:
-                    if not heartbeat.lost.is_set():
-                        counters["remote_attempts"] += 1
-                        try:
-                            batch = source.fetch_financial_statement(
-                                security_id, dataset, report_period
-                            )
-                        except (
-                            SourceBlocked,
-                            RetryableSourceError,
-                            TerminalSourceError,
-                        ) as error:
-                            source_error = error
-                if heartbeat.lost.is_set():
-                    items.append(
-                        _statement_item(
-                            security_id=security_id,
-                            dataset=dataset,
-                            outcome="lease_lost",
-                            error_classification="lease_lost",
-                        )
+                heartbeat.ensure_owned()
+                counters["remote_attempts"] += 1
+                try:
+                    batch = source.fetch_financial_statement(
+                        security_id, dataset, report_period
                     )
-                    break
+                except (
+                    SourceBlocked,
+                    RetryableSourceError,
+                    TerminalSourceError,
+                ) as error:
+                    source_error = error
+                heartbeat.ensure_owned()
                 if source_error is not None:
                     blocked = isinstance(source_error, SourceBlocked)
                     retryable = blocked or isinstance(
@@ -1628,7 +1715,8 @@ def execute_queued_deep_work(
                         as_of_utc=logical_now_utc,
                         trade_calendar_snapshot=trade_calendar_snapshot,
                     )
-                    store.fail_job_with_followups(
+                    heartbeat.final_transition(
+                        store.fail_job_with_followups,
                         job["id"],
                         worker,
                         {"error_classification": classification},
@@ -1653,6 +1741,7 @@ def execute_queued_deep_work(
                     )
                     if blocked:
                         circuits.append("akshare")
+                    heartbeat.close()
                     feature_sets_written += _process_feature_jobs(
                         root=data_root,
                         store=store,
@@ -1661,6 +1750,7 @@ def execute_queued_deep_work(
                         logical_now_utc=logical_now_utc,
                         worker_id=worker,
                         lease_seconds=lease_seconds,
+                        heartbeat_seconds=heartbeat_seconds,
                         items=items,
                     )
                     if blocked:
@@ -1681,7 +1771,8 @@ def execute_queued_deep_work(
                         as_of_utc=logical_now_utc,
                         trade_calendar_snapshot=trade_calendar_snapshot,
                     )
-                    store.fail_job_with_followups(
+                    heartbeat.final_transition(
+                        store.fail_job_with_followups,
                         job["id"],
                         worker,
                         {"error_classification": "mismatched_source_batch"},
@@ -1698,6 +1789,7 @@ def execute_queued_deep_work(
                             error_classification="mismatched_source_batch",
                         )
                     )
+                    heartbeat.close()
                     feature_sets_written += _process_feature_jobs(
                         root=data_root,
                         store=store,
@@ -1706,9 +1798,11 @@ def execute_queued_deep_work(
                         logical_now_utc=logical_now_utc,
                         worker_id=worker,
                         lease_seconds=lease_seconds,
+                        heartbeat_seconds=heartbeat_seconds,
                         items=items,
                     )
                     continue
+                heartbeat.ensure_owned()
                 snapshot, _created = snapshots.persist(batch)
                 verified = snapshots.read_verified(snapshot)
                 facts, issues = _normalize_statement_snapshot(
@@ -1720,6 +1814,7 @@ def execute_queued_deep_work(
                         snapshots, trade_calendar_snapshot
                     ),
                     record_issues=True,
+                    ensure_owned=heartbeat.ensure_owned,
                 )
 
             del facts
@@ -1738,7 +1833,8 @@ def execute_queued_deep_work(
                 verified.batch, report_period
             )
             if terminal_issue is not None:
-                store.fail_job_with_followups(
+                heartbeat.final_transition(
+                    store.fail_job_with_followups,
                     job["id"],
                     worker,
                     {"error_classification": "malformed_statement"},
@@ -1758,7 +1854,8 @@ def execute_queued_deep_work(
                 )
             elif context.reported_target_period[security_id] and not target_present:
                 after_cutoff = normalized_now > _TARGET_PERIOD_CUTOFF_CN
-                store.fail_job_with_followups(
+                heartbeat.final_transition(
+                    store.fail_job_with_followups,
                     job["id"],
                     worker,
                     {"error_classification": "target_period_missing"},
@@ -1783,7 +1880,8 @@ def execute_queued_deep_work(
                     )
                 )
             else:
-                store.complete_job_with_followups(
+                heartbeat.final_transition(
+                    store.complete_job_with_followups,
                     job["id"],
                     worker,
                     {
@@ -1801,6 +1899,7 @@ def execute_queued_deep_work(
                         outcome="snapshot_reused" if same_refresh else "statement_succeeded",
                     )
                 )
+            heartbeat.close()
             feature_sets_written += _process_feature_jobs(
                 root=data_root,
                 store=store,
@@ -1809,15 +1908,28 @@ def execute_queued_deep_work(
                 logical_now_utc=logical_now_utc,
                 worker_id=worker,
                 lease_seconds=lease_seconds,
+                heartbeat_seconds=heartbeat_seconds,
                 items=items,
             )
+        except _LeaseLostError:
+            item_data: dict[str, object] = {
+                "outcome": "lease_lost",
+                "error_classification": "lease_lost",
+            }
+            if security_id is not None:
+                item_data["security_id"] = security_id
+            if dataset is not None:
+                item_data["dataset"] = dataset
+            items.append(MappingProxyType(item_data))
+            break
         except (SourceBlocked, RetryableSourceError, TerminalSourceError):
             raise
         except BaseException:
             # Unexpected local errors are allowed to surface only after the owned
             # job is safely transitioned when its lease is still valid.
             try:
-                store.fail_job_with_followups(
+                heartbeat.final_transition(
+                    store.fail_job_with_followups,
                     job["id"],
                     worker,
                     {"error_classification": "worker_error"},
@@ -1828,6 +1940,8 @@ def execute_queued_deep_work(
             except ValueError:
                 pass
             raise
+        finally:
+            heartbeat.close()
 
     return DeepRunSummary(
         expanded,

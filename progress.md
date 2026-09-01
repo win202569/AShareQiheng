@@ -87,3 +87,11 @@
 - progress 在按证券选择最新记录之前强制 `feature_set.as_of_utc <= now_utc`；未来 bundle 不计数、不制造 unknown，也不能压制当前时点可见的较旧记录，等于截止时刻仍可见。
 - 本轮 focused 9/9、受影响模块 294/294、fresh full `unittest` 399/399 通过；尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
 - `formal_score_ready=false`、`seven_dimension_ready=false`；未发布 formal scores，正式等待价格池与正式强烈关注池继续关闭且为空。
+
+## 七维最终六项 Minor 收口（2026-09-01）
+
+- deep statement 与 feature job 现由同一个 owned heartbeat 覆盖完整租约生命周期；本地持久化、标准化、feature 构造及最终 owned transition 前均 fail closed，最终 transition 与周期续租串行化，`KeyboardInterrupt`/`SystemExit` 清理 heartbeat 后继续向外传播。
+- legacy absolute snapshot 仅在 resolved target 保持于配置 `data_root` 内时兼容；零财务槽位的 bank/insurance/broker bundle 不再宣告不适用的资产负债恒等式 marker，但 canonical raw facts 继续保留且 bundle 仍由 specialized blocker 保持 blocked。
+- migration 计划表名与 forged-unclassified 回归的阶段边界已校正；本轮 focused 9/9、受影响模块 329/329、fresh full offline `unittest` 407/407 通过。后续 scoped re-review 与 controller verification 仍是独立门闸，本记录不预判其结论。
+- 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收；未迁移或改写 runtime/tracked data。
+- `formal_score_ready=false`、`seven_dimension_ready=false`；未发布 formal scores，正式等待价格池与正式强烈关注池继续关闭且为空。
