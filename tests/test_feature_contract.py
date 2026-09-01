@@ -221,7 +221,7 @@ class FeatureContractTests(unittest.TestCase):
         candidate = FeatureBundle(
             1, CONTRACT_VERSION, "SH600001", "2026-06-30",
             "2026-08-29T16:00:00+00:00", "c" * 64,
-            IndustryContext("eastmoney-provisional", None, "包装印刷", "general_nonfinancial", "template-registry-v1", False),
+            IndustryContext("eastmoney-provisional", None, "包装印刷", "general_nonfinancial", "template-registry-v2", False),
             "1" * 64, "partial", 0.0,
             ConfidenceInputs(0.0, raw_counts, 3, True, None), raw_dimensions,
             raw_blockers, False)

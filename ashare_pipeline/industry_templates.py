@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-TEMPLATE_VERSION = "template-registry-v1"
+TEMPLATE_VERSION = "template-registry-v2"
 
 _COMMON_FINANCIAL_SLOTS = (
     "revenue", "operating_cost", "operating_profit", "total_profit", "income_tax",
@@ -72,6 +72,7 @@ INDUSTRY_TO_TEMPLATE: dict[str, str] = {
     "游戏Ⅱ": "rd_growth",
     "IT服务Ⅱ": "rd_growth",
     "多元金融": "unclassified",
+    "综合Ⅱ": "unclassified",
     "包装印刷": "general_nonfinancial",
     "出版": "general_nonfinancial",
     "电机Ⅱ": "general_nonfinancial",
