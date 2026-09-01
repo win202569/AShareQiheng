@@ -8,6 +8,7 @@ from contextlib import closing
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Mapping
 from unittest.mock import patch
 
 import ashare_pipeline.state_store as state_store_module
@@ -205,10 +206,11 @@ class StateStoreTestCase(unittest.TestCase):
 
     def malformed_reconciliation_case(self, label: str) -> dict[str, object]:
         self._reconciliation_case_index += 1
-        refresh_date = (
-            datetime(2026, 1, 1, tzinfo=UTC)
+        refresh_at = (
+            datetime(2026, 8, 1, 1, tzinfo=UTC)
             + timedelta(days=self._reconciliation_case_index)
-        ).date().isoformat()
+        )
+        refresh_date = refresh_at.date().isoformat()
         snapshot_hash = canonical_sha256({"reconciliation_snapshot": label})
         statement_request = {
             "symbol": "SH600001",
@@ -221,9 +223,24 @@ class StateStoreTestCase(unittest.TestCase):
             snapshot_hash,
             f"data/raw/reconciliation-{label}.json",
             1,
-            utc_at(0),
+            refresh_at.isoformat(),
         )
         self.assertTrue(created)
+        calendar_request = {
+            "start_date": "2021-01-01",
+            "end_date": "2026-09-08",
+        }
+        calendar_hash = canonical_sha256({"reconciliation_calendar": label})
+        calendar_id, calendar_created = self.store.record_snapshot(
+            "baostock",
+            "trade_dates",
+            canonical_sha256(calendar_request),
+            calendar_hash,
+            f"data/raw/reconciliation-calendar-{label}.json",
+            1,
+            "2026-01-01T00:00:00+00:00",
+        )
+        self.assertTrue(calendar_created)
         payload = {
             "security_id": "SH600001",
             "dataset": "profit_sheet",
@@ -238,18 +255,37 @@ class StateStoreTestCase(unittest.TestCase):
             f"{refresh_date}"
         )
         job_id = self.store.enqueue_job("deep_statement", idempotency_key, payload)
-        self.store.lease_next_job(["deep_statement"], f"worker-{label}", 3600)
+        worker_id = f"worker-{label}"
+        self.store.lease_next_job(["deep_statement"], worker_id, 3600)
+        fact = financial_fact(
+            snapshot_id=snapshot_id,
+            raw_row_hash=canonical_sha256({"reconciliation_row": label}),
+        )
+        issue_details = {
+            "security_id": "SH600001",
+            "dataset": "profit_sheet",
+            "details": {
+                "security_id": "SH600001",
+                "row_hash": fact.raw_row_hash,
+            },
+        }
+        issue_id = self.store.record_quality_issue(
+            run_id=None,
+            score_run_id=None,
+            severity="error",
+            code="statement_report_date_invalid",
+            details=issue_details,
+            job_id=job_id,
+            worker_id=worker_id,
+            source_snapshot_id=snapshot_id,
+        )
         self.store.fail_job_with_followups(
             job_id,
-            f"worker-{label}",
+            worker_id,
             {"error_classification": "malformed_statement"},
             False,
             None,
             (),
-        )
-        fact = financial_fact(
-            snapshot_id=snapshot_id,
-            raw_row_hash=canonical_sha256({"reconciliation_row": label}),
         )
         statement_snapshots = {
             "balance_sheet": None,
@@ -268,7 +304,14 @@ class StateStoreTestCase(unittest.TestCase):
             "reported_target_period": True,
             "performance_input_hash": "b" * 64,
             "statement_snapshots": statement_snapshots,
-            "trade_calendar_snapshot": None,
+            "trade_calendar_snapshot": {
+                "source_snapshot_id": calendar_id,
+                "payload_hash": calendar_hash,
+                "source": "baostock",
+                "dataset": "trade_dates",
+                "request": calendar_request,
+                "request_fingerprint": canonical_sha256(calendar_request),
+            },
         }
         input_hash = feature_input_hash(
             security_id="SH600001",
@@ -281,7 +324,7 @@ class StateStoreTestCase(unittest.TestCase):
                 )
                 for dataset, value in statement_snapshots.items()
             },
-            trade_calendar_snapshot_hash=None,
+            trade_calendar_snapshot_hash=calendar_hash,
         )
         followup = JobSpec(
             "feature_build",
@@ -301,8 +344,123 @@ class StateStoreTestCase(unittest.TestCase):
             "idempotency_key": idempotency_key,
             "job_id": job_id,
             "fact": fact,
+            "issue_id": issue_id,
+            "issue_details": issue_details,
+            "calendar_id": calendar_id,
+            "calendar_hash": calendar_hash,
+            "calendar_request": calendar_request,
+            "snapshot_fetched_at": refresh_at.isoformat(),
             "followup": followup,
             "result": result,
+        }
+
+    def reconciliation_followup(
+        self,
+        case: Mapping[str, object],
+        *,
+        statement_snapshots: Mapping[str, object] | None = None,
+        trade_calendar_snapshot: object = ...,
+    ) -> JobSpec:
+        payload = copy.deepcopy(case["followup"].payload)
+        if statement_snapshots is not None:
+            payload["statement_snapshots"] = copy.deepcopy(statement_snapshots)
+        if trade_calendar_snapshot is not ...:
+            payload["trade_calendar_snapshot"] = copy.deepcopy(
+                trade_calendar_snapshot
+            )
+        calendar = payload["trade_calendar_snapshot"]
+        input_hash = feature_input_hash(
+            security_id=payload["security_id"],
+            report_period=payload["report_period"],
+            as_of_utc=payload["as_of_utc"],
+            candidate_set_hash=payload["candidate_set_hash"],
+            statement_snapshot_hashes={
+                dataset: (
+                    value["payload_hash"] if value is not None else None
+                )
+                for dataset, value in payload["statement_snapshots"].items()
+            },
+            trade_calendar_snapshot_hash=(
+                calendar["payload_hash"] if calendar is not None else None
+            ),
+        )
+        return JobSpec(
+            "feature_build",
+            f"feature_build:v1:{payload['security_id']}:{payload['report_period']}:{input_hash}",
+            payload,
+        )
+
+    def add_succeeded_reconciliation_sibling(
+        self,
+        case: Mapping[str, object],
+        dataset: str,
+        *,
+        label: str,
+        outcome: str = "statement_persisted",
+    ) -> tuple[dict[str, str], str]:
+        statement_payload = dict(case["payload"])
+        statement_payload["dataset"] = dataset
+        statement_key = (
+            f"deep_statement:v1:{statement_payload['security_id']}:{dataset}:"
+            f"{statement_payload['report_period']}:{statement_payload['refresh_date']}"
+        )
+        snapshot_hash = canonical_sha256(
+            {"reconciliation_sibling": label, "dataset": dataset}
+        )
+        statement_request = {
+            "symbol": statement_payload["security_id"],
+            "report_period": statement_payload["report_period"],
+        }
+        snapshot_id, created = self.store.record_snapshot(
+            "akshare",
+            dataset,
+            canonical_sha256(statement_request),
+            snapshot_hash,
+            f"data/raw/reconciliation-sibling-{label}-{dataset}.json",
+            1,
+            case["snapshot_fetched_at"],
+        )
+        self.assertTrue(created)
+        sibling_job_id = self.store.enqueue_job(
+            "deep_statement", statement_key, statement_payload
+        )
+        sibling_worker = f"sibling-{label}-{dataset}"
+        self.store.lease_next_job(["deep_statement"], sibling_worker, 3600)
+        if outcome == "reconciled_verified_snapshot":
+            result = {
+                "outcome": outcome,
+                "snapshot_hash": snapshot_hash,
+                "mapping_version": MAPPING_VERSION,
+                "recovered_error": "malformed_statement",
+            }
+        else:
+            result = {"outcome": outcome, "snapshot_hash": snapshot_hash}
+        self.store.complete_job_with_followups(
+            sibling_job_id, sibling_worker, result, ()
+        )
+        return {
+            "source_snapshot_id": snapshot_id,
+            "payload_hash": snapshot_hash,
+        }, sibling_job_id
+
+    @staticmethod
+    def reconciliation_arguments(
+        case: Mapping[str, object],
+        *,
+        followup: JobSpec | None = None,
+        issue_id: str | None = None,
+        issue_details: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "expected_idempotency_key": case["idempotency_key"],
+            "expected_payload": case["payload"],
+            "expected_quality_issue_id": issue_id or case["issue_id"],
+            "expected_quality_issue_details": issue_details or case["issue_details"],
+            "source_snapshot_id": case["snapshot_id"],
+            "source_snapshot_hash": case["snapshot_hash"],
+            "facts": (case["fact"],),
+            "followup": followup or case["followup"],
+            "result": case["result"],
         }
 
     @staticmethod
@@ -443,7 +601,7 @@ class StateStoreTestCase(unittest.TestCase):
             ),
         )
 
-    def test_initialize_migrates_literal_v2_database_to_v3_without_changing_existing_rows(self) -> None:
+    def test_initialize_migrates_literal_v2_database_to_v4_without_changing_existing_rows(self) -> None:
         legacy_path = Path(self.tempdir.name) / "legacy.sqlite3"
         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
         ordered_tables = {
@@ -503,13 +661,21 @@ class StateStoreTestCase(unittest.TestCase):
                 )
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,)],
+                [(2,), (3,), (4,)],
             )
             tables = {
                 row[0]
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }
-        self.assertTrue({"financial_fact", "feature_set", "feature_value"} <= tables)
+        self.assertTrue(
+            {
+                "financial_fact",
+                "feature_set",
+                "feature_value",
+                "quality_issue_binding",
+            }
+            <= tables
+        )
 
         with self.assertRaises(ValueError):
             StateStore(legacy_path).upsert_score_item(
@@ -523,22 +689,32 @@ class StateStoreTestCase(unittest.TestCase):
                 before["score_item"],
             )
 
-    def test_initialize_twice_keeps_one_complete_v3_schema_and_ledger(self) -> None:
+    def test_initialize_twice_keeps_one_complete_v4_schema_and_ledger(self) -> None:
         self.store.initialize()
 
         with closing(sqlite3.connect(self.db_path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,)],
+                [(2,), (3,), (4,)],
             )
             counts = dict(
                 connection.execute(
                     """SELECT name, COUNT(*) FROM sqlite_master
-                    WHERE type = 'table' AND name IN ('financial_fact','feature_set','feature_value')
+                    WHERE type = 'table' AND name IN (
+                        'financial_fact','feature_set','feature_value','quality_issue_binding'
+                    )
                     GROUP BY name"""
                 )
             )
-        self.assertEqual(counts, {"financial_fact": 1, "feature_set": 1, "feature_value": 1})
+        self.assertEqual(
+            counts,
+            {
+                "financial_fact": 1,
+                "feature_set": 1,
+                "feature_value": 1,
+                "quality_issue_binding": 1,
+            },
+        )
 
     def test_initialize_rejects_partial_v2_database_without_creating_ledger(self) -> None:
         corrupt_path = Path(self.tempdir.name) / "partial.sqlite3"
@@ -593,9 +769,9 @@ class StateStoreTestCase(unittest.TestCase):
             StateStore._normalized_ddl(changed_literal),
         )
 
-    def test_initialize_rejects_migration_ledgers_other_than_two_or_two_three(self) -> None:
+    def test_initialize_rejects_migration_ledgers_outside_contiguous_v2_to_v4(self) -> None:
         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
-        for index, versions in enumerate(((3,), (2, 4), (2, 3, 4))):
+        for index, versions in enumerate(((3,), (2, 4), (2, 3, 5), (2, 3, 4, 5))):
             with self.subTest(versions=versions):
                 legacy_path = Path(self.tempdir.name) / f"invalid-ledger-{index}.sqlite3"
                 with closing(sqlite3.connect(legacy_path)) as connection:
@@ -612,7 +788,7 @@ class StateStoreTestCase(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "migration versions"):
                     StateStore(legacy_path).initialize()
 
-    def test_initialize_applies_v3_when_migration_ledger_contains_only_v2(self) -> None:
+    def test_initialize_applies_v3_and_v4_when_migration_ledger_contains_only_v2(self) -> None:
         legacy_path = Path(self.tempdir.name) / "ledger-v2.sqlite3"
         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
         with closing(sqlite3.connect(legacy_path)) as connection:
@@ -628,7 +804,42 @@ class StateStoreTestCase(unittest.TestCase):
         with closing(sqlite3.connect(legacy_path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,)],
+                [(2,), (3,), (4,)],
+            )
+
+    def test_initialize_migrates_complete_v3_database_to_v4_preserving_issues(self) -> None:
+        legacy_path = Path(self.tempdir.name) / "ledger-v3.sqlite3"
+        schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.executescript(schema_sql)
+            connection.execute(
+                "CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO schema_migration VALUES (2, ?)", (utc_at(2),))
+            StateStore._apply_v3_migration(connection)
+            connection.execute(
+                "INSERT INTO quality_issue VALUES (?,?,?,?,?,?,?)",
+                ("legacy-issue", None, None, "error", "legacy", "{}", utc_at(3)),
+            )
+            connection.commit()
+
+        StateStore(legacy_path).initialize()
+
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT version FROM schema_migration ORDER BY version"
+                ).fetchall(),
+                [(2,), (3,), (4,)],
+            )
+            self.assertEqual(
+                connection.execute("SELECT * FROM quality_issue").fetchall(),
+                [("legacy-issue", None, None, "error", "legacy", "{}", utc_at(3))],
+            )
+            self.assertEqual(
+                connection.execute("SELECT * FROM quality_issue_binding").fetchall(),
+                [],
             )
 
     def test_initialize_rolls_back_v3_when_approved_index_name_is_preoccupied(self) -> None:
@@ -1593,6 +1804,102 @@ class StateStoreTestCase(unittest.TestCase):
                 connection.execute("SELECT COUNT(*) FROM quality_issue").fetchone()[0], 0
             )
 
+    def test_owned_quality_issue_and_snapshot_binding_commit_together(self) -> None:
+        snapshot_id, _ = self.store.record_snapshot(
+            "akshare",
+            "profit_sheet",
+            canonical_sha256({"symbol": "SH600001", "report_period": "2026-06-30"}),
+            "a" * 64,
+            "data/raw/bound-quality.json",
+            1,
+            "2026-08-31T01:00:00+00:00",
+        )
+        job_id = self.store.enqueue_job("deep_statement", "quality:bound", {})
+        self.store.lease_next_job(["deep_statement"], "quality-worker", 3600)
+
+        issue_id = self.store.record_quality_issue(
+            run_id=None,
+            score_run_id=None,
+            severity="error",
+            code="statement_report_date_invalid",
+            details={"row_hash": "1" * 64},
+            job_id=job_id,
+            worker_id="quality-worker",
+            source_snapshot_id=snapshot_id,
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT issue_id,job_id,source_snapshot_id FROM quality_issue_binding"
+                ).fetchall(),
+                [(issue_id, job_id, snapshot_id)],
+            )
+
+    def test_owned_quality_issue_invalid_snapshot_rolls_back_issue(self) -> None:
+        job_id = self.store.enqueue_job("deep_statement", "quality:missing-snapshot", {})
+        self.store.lease_next_job(["deep_statement"], "quality-worker", 3600)
+
+        with self.assertRaisesRegex(ValueError, "snapshot"):
+            self.store.record_quality_issue(
+                run_id=None,
+                score_run_id=None,
+                severity="error",
+                code="statement_report_date_invalid",
+                details={"row_hash": "1" * 64},
+                job_id=job_id,
+                worker_id="quality-worker",
+                source_snapshot_id="missing-snapshot",
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM quality_issue").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM quality_issue_binding"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_find_quality_issue_ids_is_exact_canonical_and_stably_sorted(self) -> None:
+        matching = tuple(
+            self.store.record_quality_issue(
+                run_id=None,
+                score_run_id=None,
+                severity="error",
+                code="statement_report_date_invalid",
+                details={"z": 1, "a": [2, 1]},
+            )
+            for _ in range(2)
+        )
+        self.store.record_quality_issue(
+            run_id=None,
+            score_run_id=None,
+            severity="warning",
+            code="statement_report_date_invalid",
+            details={"a": [2, 1], "z": 1},
+        )
+
+        self.assertEqual(
+            self.store.find_quality_issue_ids(
+                severity="error",
+                code="statement_report_date_invalid",
+                details={"a": [2, 1], "z": 1},
+            ),
+            tuple(sorted(matching)),
+        )
+        self.assertEqual(
+            self.store.find_quality_issue_ids(
+                severity="error",
+                code="statement_report_date_invalid",
+                details={"a": [1, 2], "z": 1},
+            ),
+            (),
+        )
+
     def test_duplicate_enqueue_returns_original_job_without_second_row(self) -> None:
         job_id = self.store.enqueue_job("fetch", "source:000001", {"request": "first"})
         repeated_id = self.store.enqueue_job("fetch", "source:000001", {"request": "changed"})
@@ -2260,6 +2567,25 @@ class StateStoreTestCase(unittest.TestCase):
 
     def test_malformed_statement_reconciliation_commits_verified_recovery_once(self) -> None:
         case = self.malformed_reconciliation_case("success")
+        statement_snapshots = copy.deepcopy(
+            case["followup"].payload["statement_snapshots"]
+        )
+        statement_snapshots["balance_sheet"], _ = (
+            self.add_succeeded_reconciliation_sibling(
+                case, "balance_sheet", label="success-balance"
+            )
+        )
+        statement_snapshots["cash_flow_sheet"], _ = (
+            self.add_succeeded_reconciliation_sibling(
+                case,
+                "cash_flow_sheet",
+                label="success-cash",
+                outcome="reconciled_verified_snapshot",
+            )
+        )
+        followup = self.reconciliation_followup(
+            case, statement_snapshots=statement_snapshots
+        )
         with closing(sqlite3.connect(self.db_path)) as connection:
             connection.execute(
                 """UPDATE job SET lease_worker = 'stale-worker',
@@ -2272,10 +2598,12 @@ class StateStoreTestCase(unittest.TestCase):
             case["job_id"],
             expected_idempotency_key=case["idempotency_key"],
             expected_payload=case["payload"],
+            expected_quality_issue_id=case["issue_id"],
+            expected_quality_issue_details=case["issue_details"],
             source_snapshot_id=case["snapshot_id"],
             source_snapshot_hash=case["snapshot_hash"],
             facts=(case["fact"],),
-            followup=case["followup"],
+            followup=followup,
             result=case["result"],
         )
 
@@ -2292,8 +2620,8 @@ class StateStoreTestCase(unittest.TestCase):
         )
         followups = self.store.list_jobs(["feature_build"])
         self.assertEqual(len(followups), 1)
-        self.assertEqual(followups[0]["idempotency_key"], case["followup"].idempotency_key)
-        self.assertEqual(followups[0]["payload"], case["followup"].payload)
+        self.assertEqual(followups[0]["idempotency_key"], followup.idempotency_key)
+        self.assertEqual(followups[0]["payload"], followup.payload)
         with closing(sqlite3.connect(self.db_path)) as connection:
             stored_result = connection.execute(
                 "SELECT result_json FROM job WHERE id = ?", (case["job_id"],)
@@ -2310,15 +2638,292 @@ class StateStoreTestCase(unittest.TestCase):
             case["job_id"],
             expected_idempotency_key=case["idempotency_key"],
             expected_payload=case["payload"],
+            expected_quality_issue_id=case["issue_id"],
+            expected_quality_issue_details=case["issue_details"],
             source_snapshot_id=case["snapshot_id"],
             source_snapshot_hash=case["snapshot_hash"],
             facts=(case["fact"],),
-            followup=case["followup"],
+            followup=followup,
             result=case["result"],
         )
         self.assertFalse(repeated)
         self.assertEqual(len(self.store.list_jobs(["feature_build"])), 1)
         self.assertEqual(len(self.store.list_financial_facts("SH600001")), 1)
+
+    def test_reconciliation_rejects_primary_wrong_refresh_or_future_as_of(self) -> None:
+        for label in ("wrong-refresh", "future-as-of"):
+            with self.subTest(label=label):
+                case = self.malformed_reconciliation_case(f"primary-{label}")
+                followup = case["followup"]
+                if label == "wrong-refresh":
+                    wrong_day = (
+                        datetime.fromisoformat(case["snapshot_fetched_at"])
+                        + timedelta(days=1)
+                    ).isoformat()
+                    with closing(sqlite3.connect(self.db_path)) as connection:
+                        connection.execute(
+                            "UPDATE source_snapshot SET fetched_at=? WHERE id=?",
+                            (wrong_day, case["snapshot_id"]),
+                        )
+                        connection.commit()
+                else:
+                    payload = copy.deepcopy(case["followup"].payload)
+                    payload["as_of_utc"] = (
+                        datetime.fromisoformat(case["snapshot_fetched_at"])
+                        - timedelta(minutes=1)
+                    ).isoformat()
+                    seeded = dict(case)
+                    seeded["followup"] = JobSpec(
+                        "feature_build",
+                        case["followup"].idempotency_key,
+                        payload,
+                    )
+                    followup = self.reconciliation_followup(seeded)
+
+                with self.assertRaisesRegex(ValueError, "snapshot"):
+                    self.store.reconcile_malformed_statement(
+                        case["job_id"],
+                        **self.reconciliation_arguments(case, followup=followup),
+                    )
+                self.assertEqual(
+                    self.store.get_job(case["job_id"])["status"],
+                    "terminal_failed",
+                )
+                self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+
+    def test_reconciliation_rejects_missing_or_mismatched_calendar_snapshot(self) -> None:
+        labels = (
+            "missing",
+            "fake-id",
+            "wrong-source",
+            "wrong-dataset",
+            "wrong-request",
+            "wrong-hash",
+            "future",
+        )
+        for label in labels:
+            with self.subTest(label=label):
+                case = self.malformed_reconciliation_case(f"calendar-{label}")
+                calendar = copy.deepcopy(
+                    case["followup"].payload["trade_calendar_snapshot"]
+                )
+                if label == "missing":
+                    calendar = None
+                elif label == "fake-id":
+                    calendar["source_snapshot_id"] = "missing-calendar"
+                elif label == "wrong-hash":
+                    calendar["payload_hash"] = "f" * 64
+                else:
+                    mutations = {
+                        "wrong-source": ("source", "akshare"),
+                        "wrong-dataset": ("dataset", "daily"),
+                        "wrong-request": ("request_fingerprint", "f" * 64),
+                        "future": ("fetched_at", "2026-09-01T16:00:01+00:00"),
+                    }
+                    column, value = mutations[label]
+                    with closing(sqlite3.connect(self.db_path)) as connection:
+                        connection.execute(
+                            f"UPDATE source_snapshot SET {column}=? WHERE id=?",
+                            (value, case["calendar_id"]),
+                        )
+                        connection.commit()
+                followup = self.reconciliation_followup(
+                    case, trade_calendar_snapshot=calendar
+                )
+
+                with self.assertRaisesRegex(ValueError, "calendar"):
+                    self.store.reconcile_malformed_statement(
+                        case["job_id"],
+                        **self.reconciliation_arguments(case, followup=followup),
+                    )
+                self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+
+    def test_reconciliation_rejects_unbound_or_mismatched_sibling_snapshot(self) -> None:
+        labels = (
+            "fake-snapshot-id",
+            "wrong-snapshot-db",
+            "missing-job",
+            "wrong-job-payload",
+            "wrong-job-result",
+        )
+        for label in labels:
+            with self.subTest(label=label):
+                case = self.malformed_reconciliation_case(f"sibling-{label}")
+                sibling, sibling_job_id = self.add_succeeded_reconciliation_sibling(
+                    case, "balance_sheet", label=label
+                )
+                if label == "fake-snapshot-id":
+                    sibling["source_snapshot_id"] = "missing-sibling"
+                elif label == "wrong-snapshot-db":
+                    with closing(sqlite3.connect(self.db_path)) as connection:
+                        connection.execute(
+                            "UPDATE source_snapshot SET source='baostock' WHERE id=?",
+                            (sibling["source_snapshot_id"],),
+                        )
+                        connection.commit()
+                elif label == "missing-job":
+                    with closing(sqlite3.connect(self.db_path)) as connection:
+                        connection.execute(
+                            "DELETE FROM job WHERE id=?", (sibling_job_id,)
+                        )
+                        connection.commit()
+                elif label == "wrong-job-payload":
+                    with closing(sqlite3.connect(self.db_path)) as connection:
+                        connection.execute(
+                            "UPDATE job SET payload_json='{}' WHERE id=?",
+                            (sibling_job_id,),
+                        )
+                        connection.commit()
+                else:
+                    with closing(sqlite3.connect(self.db_path)) as connection:
+                        connection.execute(
+                            "UPDATE job SET result_json=? WHERE id=?",
+                            (
+                                '{"outcome":"statement_persisted",'
+                                f'"snapshot_hash":"{"f" * 64}"}}',
+                                sibling_job_id,
+                            ),
+                        )
+                        connection.commit()
+                snapshots = copy.deepcopy(
+                    case["followup"].payload["statement_snapshots"]
+                )
+                snapshots["balance_sheet"] = sibling
+                followup = self.reconciliation_followup(
+                    case, statement_snapshots=snapshots
+                )
+
+                with self.assertRaisesRegex(ValueError, "snapshot|sibling"):
+                    self.store.reconcile_malformed_statement(
+                        case["job_id"],
+                        **self.reconciliation_arguments(case, followup=followup),
+                    )
+                self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+
+    def test_reconciliation_requires_exact_issue_binding_and_fact_row_hash(self) -> None:
+        labels = (
+            "bound-other-job",
+            "bound-other-snapshot",
+            "wrong-details",
+            "wrong-row-hash",
+        )
+        for label in labels:
+            with self.subTest(label=label):
+                case = self.malformed_reconciliation_case(f"issue-{label}")
+                issue_id = case["issue_id"]
+                issue_details = copy.deepcopy(case["issue_details"])
+                if label == "bound-other-job":
+                    other_job_id = self.store.enqueue_job("fetch", f"other:{label}", {})
+                    with closing(sqlite3.connect(self.db_path)) as connection:
+                        connection.execute(
+                            "UPDATE quality_issue_binding SET job_id=? WHERE issue_id=?",
+                            (other_job_id, issue_id),
+                        )
+                        connection.commit()
+                elif label == "bound-other-snapshot":
+                    with closing(sqlite3.connect(self.db_path)) as connection:
+                        connection.execute(
+                            "UPDATE quality_issue_binding SET source_snapshot_id=? WHERE issue_id=?",
+                            (case["calendar_id"], issue_id),
+                        )
+                        connection.commit()
+                elif label == "wrong-details":
+                    issue_details["dataset"] = "balance_sheet"
+                else:
+                    issue_details["details"]["row_hash"] = "f" * 64
+                    issue_id = self.store.record_quality_issue(
+                        run_id=None,
+                        score_run_id=None,
+                        severity="error",
+                        code="statement_report_date_invalid",
+                        details=issue_details,
+                    )
+
+                with self.assertRaisesRegex(ValueError, "quality issue|row hash"):
+                    self.store.reconcile_malformed_statement(
+                        case["job_id"],
+                        **self.reconciliation_arguments(
+                            case,
+                            issue_id=issue_id,
+                            issue_details=issue_details,
+                        ),
+                    )
+                self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+
+    def test_reconciliation_uniquely_binds_legacy_issue(self) -> None:
+        case = self.malformed_reconciliation_case("legacy-unique")
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM quality_issue_binding WHERE issue_id=?",
+                (case["issue_id"],),
+            )
+            connection.commit()
+
+        recovered = self.store.reconcile_malformed_statement(
+            case["job_id"], **self.reconciliation_arguments(case)
+        )
+
+        self.assertTrue(recovered)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT issue_id,job_id,source_snapshot_id FROM quality_issue_binding"
+                ).fetchall(),
+                [(case["issue_id"], case["job_id"], case["snapshot_id"])],
+            )
+
+    def test_reconciliation_rejects_ambiguous_unbound_legacy_issue_or_job(self) -> None:
+        for label in ("duplicate-issue", "duplicate-job"):
+            with self.subTest(label=label):
+                case = self.malformed_reconciliation_case(f"legacy-{label}")
+                with closing(sqlite3.connect(self.db_path)) as connection:
+                    connection.execute(
+                        "DELETE FROM quality_issue_binding WHERE issue_id=?",
+                        (case["issue_id"],),
+                    )
+                    connection.commit()
+                if label == "duplicate-issue":
+                    self.store.record_quality_issue(
+                        run_id=None,
+                        score_run_id=None,
+                        severity="error",
+                        code="statement_report_date_invalid",
+                        details=case["issue_details"],
+                    )
+                else:
+                    payload = dict(case["payload"])
+                    payload["refresh_date"] = (
+                        datetime.fromisoformat(case["snapshot_fetched_at"])
+                        + timedelta(days=1)
+                    ).date().isoformat()
+                    key = (
+                        f"deep_statement:v1:{payload['security_id']}:{payload['dataset']}:"
+                        f"{payload['report_period']}:{payload['refresh_date']}"
+                    )
+                    other_job = self.store.enqueue_job("deep_statement", key, payload)
+                    worker = f"ambiguous-{label}"
+                    self.store.lease_next_job(["deep_statement"], worker, 3600)
+                    self.store.fail_job_with_followups(
+                        other_job,
+                        worker,
+                        {"error_classification": "malformed_statement"},
+                        False,
+                        None,
+                        (),
+                    )
+
+                with self.assertRaisesRegex(ValueError, "legacy|quality issue"):
+                    self.store.reconcile_malformed_statement(
+                        case["job_id"], **self.reconciliation_arguments(case)
+                    )
+                with closing(sqlite3.connect(self.db_path)) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM quality_issue_binding WHERE issue_id=?",
+                            (case["issue_id"],),
+                        ).fetchone()[0],
+                        0,
+                    )
 
     def test_malformed_statement_reconciliation_rejects_historical_mapping_facts(self) -> None:
         case = self.malformed_reconciliation_case("historical-mapping")
@@ -2332,6 +2937,8 @@ class StateStoreTestCase(unittest.TestCase):
                 case["job_id"],
                 expected_idempotency_key=case["idempotency_key"],
                 expected_payload=case["payload"],
+                expected_quality_issue_id=case["issue_id"],
+                expected_quality_issue_details=case["issue_details"],
                 source_snapshot_id=case["snapshot_id"],
                 source_snapshot_hash=case["snapshot_hash"],
                 facts=(historical,),
@@ -2357,6 +2964,8 @@ class StateStoreTestCase(unittest.TestCase):
                 case["job_id"],
                 expected_idempotency_key=case["idempotency_key"],
                 expected_payload=case["payload"],
+                expected_quality_issue_id=case["issue_id"],
+                expected_quality_issue_details=case["issue_details"],
                 source_snapshot_id=case["snapshot_id"],
                 source_snapshot_hash=case["snapshot_hash"],
                 facts=(case["fact"],),
@@ -2461,6 +3070,8 @@ class StateStoreTestCase(unittest.TestCase):
                         case["job_id"],
                         expected_idempotency_key=case["idempotency_key"],
                         expected_payload=case["payload"],
+                        expected_quality_issue_id=case["issue_id"],
+                        expected_quality_issue_details=case["issue_details"],
                         source_snapshot_id=case["snapshot_id"],
                         source_snapshot_hash=case["snapshot_hash"],
                         facts=(case["fact"],),
@@ -2536,6 +3147,8 @@ class StateStoreTestCase(unittest.TestCase):
                 arguments = {
                     "expected_idempotency_key": case["idempotency_key"],
                     "expected_payload": case["payload"],
+                    "expected_quality_issue_id": case["issue_id"],
+                    "expected_quality_issue_details": case["issue_details"],
                     "source_snapshot_id": case["snapshot_id"],
                     "source_snapshot_hash": case["snapshot_hash"],
                     "facts": (case["fact"],),
@@ -2591,6 +3204,8 @@ class StateStoreTestCase(unittest.TestCase):
                         case["job_id"],
                         expected_idempotency_key=case["idempotency_key"],
                         expected_payload=case["payload"],
+                        expected_quality_issue_id=case["issue_id"],
+                        expected_quality_issue_details=case["issue_details"],
                         source_snapshot_id=case["snapshot_id"],
                         source_snapshot_hash=case["snapshot_hash"],
                         facts=(case["fact"],),
@@ -2670,6 +3285,8 @@ class StateStoreTestCase(unittest.TestCase):
                         case["job_id"],
                         expected_idempotency_key=case["idempotency_key"],
                         expected_payload=case["payload"],
+                        expected_quality_issue_id=case["issue_id"],
+                        expected_quality_issue_details=case["issue_details"],
                         source_snapshot_id=case["snapshot_id"],
                         source_snapshot_hash=case["snapshot_hash"],
                         facts=facts,
@@ -2689,6 +3306,12 @@ class StateStoreTestCase(unittest.TestCase):
 
     def test_malformed_statement_reconciliation_rolls_back_followup_conflict(self) -> None:
         case = self.malformed_reconciliation_case("followup-conflict")
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM quality_issue_binding WHERE issue_id=?",
+                (case["issue_id"],),
+            )
+            connection.commit()
         self.store.enqueue_job(
             "feature_build",
             case["followup"].idempotency_key,
@@ -2701,6 +3324,8 @@ class StateStoreTestCase(unittest.TestCase):
                 case["job_id"],
                 expected_idempotency_key=case["idempotency_key"],
                 expected_payload=case["payload"],
+                expected_quality_issue_id=case["issue_id"],
+                expected_quality_issue_details=case["issue_details"],
                 source_snapshot_id=case["snapshot_id"],
                 source_snapshot_hash=case["snapshot_hash"],
                 facts=(case["fact"],),
@@ -2713,6 +3338,14 @@ class StateStoreTestCase(unittest.TestCase):
         feature_jobs = self.store.list_jobs(["feature_build"])
         self.assertEqual(len(feature_jobs), 1)
         self.assertEqual(feature_jobs[0]["payload"]["security_id"], "SH600002")
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM quality_issue_binding WHERE issue_id=?",
+                    (case["issue_id"],),
+                ).fetchone()[0],
+                0,
+            )
 
     def test_malformed_statement_reconciliation_rolls_back_trigger_failure(self) -> None:
         case = self.malformed_reconciliation_case("trigger-failure")
@@ -2732,6 +3365,8 @@ class StateStoreTestCase(unittest.TestCase):
                 case["job_id"],
                 expected_idempotency_key=case["idempotency_key"],
                 expected_payload=case["payload"],
+                expected_quality_issue_id=case["issue_id"],
+                expected_quality_issue_details=case["issue_details"],
                 source_snapshot_id=case["snapshot_id"],
                 source_snapshot_hash=case["snapshot_hash"],
                 facts=(case["fact"],),
@@ -2747,6 +3382,10 @@ class StateStoreTestCase(unittest.TestCase):
         case = self.malformed_reconciliation_case("cas-failure")
         before_job = self.store.get_job(case["job_id"])
         with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM quality_issue_binding WHERE issue_id=?",
+                (case["issue_id"],),
+            )
             connection.execute(
                 f"""CREATE TRIGGER force_reconciliation_cas_miss
                 BEFORE UPDATE OF status ON job
@@ -2764,6 +3403,8 @@ class StateStoreTestCase(unittest.TestCase):
                 case["job_id"],
                 expected_idempotency_key=case["idempotency_key"],
                 expected_payload=case["payload"],
+                expected_quality_issue_id=case["issue_id"],
+                expected_quality_issue_details=case["issue_details"],
                 source_snapshot_id=case["snapshot_id"],
                 source_snapshot_hash=case["snapshot_hash"],
                 facts=(case["fact"],),
@@ -2774,6 +3415,14 @@ class StateStoreTestCase(unittest.TestCase):
         self.assertEqual(self.store.get_job(case["job_id"]), before_job)
         self.assertEqual(self.store.list_financial_facts("SH600001"), [])
         self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM quality_issue_binding WHERE issue_id=?",
+                    (case["issue_id"],),
+                ).fetchone()[0],
+                0,
+            )
 
     def test_legacy_success_clears_recovered_failure_fields(self) -> None:
         now = datetime.now(UTC)

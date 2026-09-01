@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
@@ -44,9 +44,10 @@ SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
 SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
 RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
 _OWNED_JOB_KINDS = frozenset({"deep_financial", "deep_statement", "feature_build"})
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _EVIDENCE_QUERY_BATCH_SIZE = 256
 _STATEMENT_DATASETS = ("balance_sheet", "profit_sheet", "cash_flow_sheet")
+_SHANGHAI = timezone(timedelta(hours=8))
 _RECONCILIATION_STATEMENT_PAYLOAD_KEYS = frozenset(
     {
         "security_id",
@@ -265,6 +266,16 @@ _V3_INDEX_DDL = {
         ON feature_set(security_id,report_period,contract_version,as_of_utc DESC,created_at DESC)""",
 }
 
+_V4_TABLE_DDL = {
+    "quality_issue_binding": """CREATE TABLE IF NOT EXISTS quality_issue_binding(
+        issue_id TEXT PRIMARY KEY REFERENCES quality_issue(id),
+        job_id TEXT NOT NULL REFERENCES job(id),
+        source_snapshot_id TEXT NOT NULL REFERENCES source_snapshot(id)
+    )""",
+}
+
+_V4_INDEX_DDL: dict[str, str] = {}
+
 
 class FinalizationBlocked(RuntimeError):
     """The final publication gate has not yet been satisfied."""
@@ -371,7 +382,83 @@ def _validate_reconciliation_statement_identity(
     return security_id, dataset, report_period, refresh_date
 
 
+def _reconciliation_timestamp(value: object, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} is not canonical")
+    try:
+        return datetime.fromisoformat(_utc_iso(value))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field} is not canonical") from error
+
+
+def _require_reconciliation_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    snapshot_id: str,
+    source: str,
+    dataset: str,
+    request_fingerprint: str,
+    payload_hash: str,
+    label: str,
+) -> sqlite3.Row:
+    row = connection.execute(
+        """SELECT source,dataset,request_fingerprint,payload_hash,fetched_at
+        FROM source_snapshot WHERE id = ?""",
+        (snapshot_id,),
+    ).fetchone()
+    if row is None or (
+        row["source"] != source
+        or row["dataset"] != dataset
+        or row["request_fingerprint"] != request_fingerprint
+        or row["payload_hash"] != payload_hash
+    ):
+        raise ValueError(f"reconciliation follow-up {label} snapshot identity is invalid")
+    return row
+
+
+def _validate_reconciliation_sibling_job(
+    connection: sqlite3.Connection,
+    *,
+    statement_payload: Mapping[str, object],
+    dataset: str,
+    snapshot_hash: str,
+) -> None:
+    sibling_payload = dict(statement_payload)
+    sibling_payload["dataset"] = dataset
+    sibling_key = (
+        f"deep_statement:v1:{statement_payload['security_id']}:{dataset}:"
+        f"{statement_payload['report_period']}:{statement_payload['refresh_date']}"
+    )
+    row = connection.execute(
+        """SELECT kind,payload_json,status,result_json FROM job
+        WHERE idempotency_key = ?""",
+        (sibling_key,),
+    ).fetchone()
+    normal_results = {
+        _json({"outcome": outcome, "snapshot_hash": snapshot_hash})
+        for outcome in ("snapshot_reused", "statement_persisted")
+    }
+    legacy_result = _json(
+        {
+            "outcome": "reconciled_verified_snapshot",
+            "snapshot_hash": snapshot_hash,
+            "mapping_version": MAPPING_VERSION,
+            "recovered_error": "malformed_statement",
+        }
+    )
+    if row is None or (
+        row["kind"] != "deep_statement"
+        or row["payload_json"] != _json(sibling_payload)
+        or row["status"] != "succeeded"
+        or row["result_json"] not in normal_results | {legacy_result}
+    ):
+        raise ValueError(
+            "reconciliation follow-up sibling statement job is not canonical"
+        )
+
+
 def _validate_reconciliation_followup(
+    connection: sqlite3.Connection,
     followup: JobSpec,
     *,
     statement_payload: Mapping[str, object],
@@ -397,12 +484,10 @@ def _validate_reconciliation_followup(
         raise ValueError(
             "reconciliation follow-up as_of_utc is not canonical"
         )
-    try:
-        normalized_as_of = _utc_iso(payload["as_of_utc"])
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            "reconciliation follow-up as_of_utc is not canonical"
-        ) from error
+    as_of = _reconciliation_timestamp(
+        payload["as_of_utc"], "reconciliation follow-up as_of_utc"
+    )
+    normalized_as_of = as_of.isoformat()
     industry = payload["industry"]
     if not isinstance(industry, str) or not industry.strip():
         raise ValueError("reconciliation follow-up industry is invalid")
@@ -417,6 +502,13 @@ def _validate_reconciliation_followup(
     ):
         raise ValueError("reconciliation follow-up snapshots are not canonical")
     statement_hashes: dict[str, str | None] = {}
+    seen_snapshot_ids: set[str] = set()
+    statement_fingerprint = canonical_sha256(
+        {
+            "symbol": statement_payload["security_id"],
+            "report_period": statement_payload["report_period"],
+        }
+    )
     for dataset in _STATEMENT_DATASETS:
         value = statement_snapshots[dataset]
         if value is None:
@@ -429,9 +521,46 @@ def _validate_reconciliation_followup(
             or not value["source_snapshot_id"]
         ):
             raise ValueError("reconciliation follow-up snapshots are not canonical")
-        statement_hashes[dataset] = _reconciliation_sha256(
+        snapshot_id = value["source_snapshot_id"]
+        if snapshot_id in seen_snapshot_ids:
+            raise ValueError(
+                "reconciliation follow-up snapshot occupies multiple slots"
+            )
+        seen_snapshot_ids.add(snapshot_id)
+        snapshot_hash = _reconciliation_sha256(
             value["payload_hash"], "statement snapshot hash"
         )
+        statement_hashes[dataset] = snapshot_hash
+        snapshot = _require_reconciliation_snapshot(
+            connection,
+            snapshot_id=snapshot_id,
+            source="akshare",
+            dataset=dataset,
+            request_fingerprint=statement_fingerprint,
+            payload_hash=snapshot_hash,
+            label="statement",
+        )
+        fetched_at = _reconciliation_timestamp(
+            snapshot["fetched_at"], "reconciliation statement snapshot fetched_at"
+        )
+        if fetched_at > as_of:
+            raise ValueError(
+                "reconciliation follow-up statement snapshot is newer than as_of_utc"
+            )
+        if (
+            fetched_at.astimezone(_SHANGHAI).date().isoformat()
+            != statement_payload["refresh_date"]
+        ):
+            raise ValueError(
+                "reconciliation follow-up statement snapshot refresh date is invalid"
+            )
+        if dataset != statement_payload["dataset"]:
+            _validate_reconciliation_sibling_job(
+                connection,
+                statement_payload=statement_payload,
+                dataset=dataset,
+                snapshot_hash=snapshot_hash,
+            )
     recovered = statement_snapshots[statement_payload["dataset"]]
     if (
         not isinstance(recovered, Mapping)
@@ -442,9 +571,7 @@ def _validate_reconciliation_followup(
             "reconciliation follow-up does not bind the recovered snapshot"
         )
     calendar = payload["trade_calendar_snapshot"]
-    if calendar is None:
-        calendar_hash = None
-    elif (
+    if (
         isinstance(calendar, Mapping)
         and set(calendar) == _FROZEN_CALENDAR_SNAPSHOT_KEYS
         and isinstance(calendar["source_snapshot_id"], str)
@@ -458,6 +585,10 @@ def _validate_reconciliation_followup(
         calendar_request = validate_feature_calendar_request(
             calendar["request"]
         )
+        if dict(calendar["request"]) != calendar_request:
+            raise ValueError(
+                "reconciliation follow-up calendar request is not canonical"
+            )
         calendar_fingerprint = _reconciliation_sha256(
             calendar["request_fingerprint"],
             "trade calendar request fingerprint",
@@ -466,8 +597,27 @@ def _validate_reconciliation_followup(
             raise ValueError(
                 "reconciliation follow-up calendar fingerprint is invalid"
             )
+        calendar_snapshot = _require_reconciliation_snapshot(
+            connection,
+            snapshot_id=calendar["source_snapshot_id"],
+            source="baostock",
+            dataset="trade_dates",
+            request_fingerprint=calendar_fingerprint,
+            payload_hash=calendar_hash,
+            label="calendar",
+        )
+        calendar_fetched_at = _reconciliation_timestamp(
+            calendar_snapshot["fetched_at"],
+            "reconciliation calendar snapshot fetched_at",
+        )
+        if calendar_fetched_at > as_of:
+            raise ValueError(
+                "reconciliation follow-up calendar snapshot is newer than as_of_utc"
+            )
     else:
-        raise ValueError("reconciliation follow-up calendar is not canonical")
+        raise ValueError(
+            "reconciliation follow-up calendar is required and must be canonical"
+        )
     input_hash = feature_input_hash(
         security_id=payload["security_id"],
         report_period=payload["report_period"],
@@ -482,6 +632,106 @@ def _validate_reconciliation_followup(
     )
     if followup.idempotency_key != expected_key:
         raise ValueError("reconciliation follow-up key is not canonical")
+
+
+def _validate_and_bind_reconciliation_issue(
+    connection: sqlite3.Connection,
+    *,
+    issue_id: str,
+    issue_details: Mapping[str, object],
+    job_id: str,
+    source_snapshot_id: str,
+    security_id: str,
+    dataset: str,
+    facts: Sequence[FinancialFact],
+) -> None:
+    if not isinstance(issue_id, str) or not issue_id:
+        raise ValueError("reconciliation quality issue id is invalid")
+    if not isinstance(issue_details, Mapping):
+        raise ValueError("reconciliation quality issue details are invalid")
+    details_json = _json(dict(issue_details))
+    row = connection.execute(
+        """SELECT binding.job_id,binding.source_snapshot_id
+        FROM quality_issue AS issue
+        LEFT JOIN quality_issue_binding AS binding ON binding.issue_id=issue.id
+        WHERE issue.id=? AND issue.severity='error'
+        AND issue.code='statement_report_date_invalid'
+        AND issue.details_json=?""",
+        (issue_id, details_json),
+    ).fetchone()
+    if row is None:
+        raise ValueError("reconciliation quality issue does not match exact evidence")
+    nested = issue_details.get("details")
+    if (
+        issue_details.get("security_id") != security_id
+        or issue_details.get("dataset") != dataset
+        or not isinstance(nested, Mapping)
+        or nested.get("security_id") != security_id
+    ):
+        raise ValueError("reconciliation quality issue identity is invalid")
+    row_hash = nested.get("row_hash")
+    if not isinstance(row_hash, str) or row_hash not in {
+        fact.raw_row_hash for fact in facts
+    }:
+        raise ValueError(
+            "reconciliation quality issue row hash does not belong to facts"
+        )
+
+    bound_job_id = row["job_id"]
+    bound_snapshot_id = row["source_snapshot_id"]
+    if bound_job_id is not None or bound_snapshot_id is not None:
+        if (
+            bound_job_id != job_id
+            or bound_snapshot_id != source_snapshot_id
+        ):
+            raise ValueError(
+                "reconciliation quality issue binding does not match job and snapshot"
+            )
+        return
+
+    unbound = connection.execute(
+        """SELECT issue.id FROM quality_issue AS issue
+        LEFT JOIN quality_issue_binding AS binding ON binding.issue_id=issue.id
+        WHERE issue.severity='error'
+        AND issue.code='statement_report_date_invalid'
+        AND issue.details_json=? AND binding.issue_id IS NULL
+        ORDER BY issue.id""",
+        (details_json,),
+    ).fetchall()
+    if tuple(str(candidate["id"]) for candidate in unbound) != (issue_id,):
+        raise ValueError(
+            "legacy quality issue is not the unique unbound exact match"
+        )
+
+    malformed_error_json = _json(
+        {"error_classification": "malformed_statement"}
+    )
+    matching_jobs: list[str] = []
+    for candidate in connection.execute(
+        """SELECT id,payload_json FROM job
+        WHERE kind='deep_statement' AND status='terminal_failed'
+        AND last_error_json=? ORDER BY id""",
+        (malformed_error_json,),
+    ):
+        try:
+            candidate_payload = json.loads(candidate["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(candidate_payload, Mapping)
+            and candidate_payload.get("security_id") == security_id
+            and candidate_payload.get("dataset") == dataset
+        ):
+            matching_jobs.append(str(candidate["id"]))
+    if tuple(matching_jobs) != (job_id,):
+        raise ValueError(
+            "legacy quality issue does not have a unique malformed statement job"
+        )
+    connection.execute(
+        """INSERT INTO quality_issue_binding
+        (issue_id,job_id,source_snapshot_id) VALUES (?,?,?)""",
+        (issue_id, job_id, source_snapshot_id),
+    )
 
 
 class StateStore:
@@ -536,6 +786,7 @@ class StateStore:
                     (_utc_now(),),
                 )
                 self._apply_v3_migration(connection)
+                self._apply_v4_migration(connection)
             elif "schema_migration" not in tables:
                 if tables != set(_V2_TABLE_DDL):
                     raise RuntimeError("database does not match the complete v2 schema")
@@ -546,6 +797,7 @@ class StateStore:
                     (_utc_now(),),
                 )
                 self._apply_v3_migration(connection)
+                self._apply_v4_migration(connection)
             else:
                 self._assert_schema_ddl(
                     connection,
@@ -557,22 +809,46 @@ class StateStore:
                     int(row[0])
                     for row in connection.execute("SELECT version FROM schema_migration")
                 }
-                if versions not in ({2}, {2, 3}):
+                if versions not in ({2}, {2, 3}, {2, 3, 4}):
                     raise RuntimeError(f"unsupported migration versions: {sorted(versions)}")
                 self._assert_v2_schema(connection)
                 if versions == {2}:
-                    partial_v3_tables = tables & set(_V3_TABLE_DDL)
-                    if partial_v3_tables:
+                    later_tables = tables & (
+                        set(_V3_TABLE_DDL) | set(_V4_TABLE_DDL)
+                    )
+                    if later_tables:
                         raise RuntimeError(
-                            f"version-2 ledger has unexpected v3 tables: {sorted(partial_v3_tables)}"
+                            "version-2 ledger has unexpected later tables: "
+                            f"{sorted(later_tables)}"
                         )
                     self._apply_v3_migration(connection)
+                    self._apply_v4_migration(connection)
+                elif versions == {2, 3}:
+                    self._assert_schema_ddl(
+                        connection,
+                        _V3_TABLE_DDL,
+                        _V3_INDEX_DDL,
+                        "v3 schema",
+                    )
+                    partial_v4_tables = tables & set(_V4_TABLE_DDL)
+                    if partial_v4_tables:
+                        raise RuntimeError(
+                            "version-3 ledger has unexpected v4 tables: "
+                            f"{sorted(partial_v4_tables)}"
+                        )
+                    self._apply_v4_migration(connection)
                 else:
                     self._assert_schema_ddl(
                         connection,
                         _V3_TABLE_DDL,
                         _V3_INDEX_DDL,
                         "v3 schema",
+                    )
+                    self._assert_schema_ddl(
+                        connection,
+                        _V4_TABLE_DDL,
+                        _V4_INDEX_DDL,
+                        "v4 schema",
                     )
             connection.commit()
         except BaseException:
@@ -699,6 +975,21 @@ class StateStore:
         )
         connection.execute(
             "INSERT INTO schema_migration(version, applied_at) VALUES (3, ?)",
+            (_utc_now(),),
+        )
+
+    @classmethod
+    def _apply_v4_migration(cls, connection: sqlite3.Connection) -> None:
+        for statement in (*_V4_TABLE_DDL.values(), *_V4_INDEX_DDL.values()):
+            connection.execute(statement)
+        cls._assert_schema_ddl(
+            connection,
+            _V4_TABLE_DDL,
+            _V4_INDEX_DDL,
+            "v4 schema",
+        )
+        connection.execute(
+            "INSERT INTO schema_migration(version, applied_at) VALUES (4, ?)",
             (_utc_now(),),
         )
 
@@ -1111,6 +1402,8 @@ class StateStore:
         *,
         expected_idempotency_key: str,
         expected_payload: Mapping[str, object],
+        expected_quality_issue_id: str,
+        expected_quality_issue_details: Mapping[str, object],
         source_snapshot_id: str,
         source_snapshot_hash: str,
         facts: Iterable[FinancialFact],
@@ -1188,6 +1481,7 @@ class StateStore:
                         "reconciliation facts do not match job and snapshot identity"
                     )
             _validate_reconciliation_followup(
+                connection,
                 followup,
                 statement_payload=expected_payload,
                 source_snapshot_id=source_snapshot_id,
@@ -1206,6 +1500,16 @@ class StateStore:
                 )
             result_json = _json(expected_result)
             transition_now = _utc_now()
+            _validate_and_bind_reconciliation_issue(
+                connection,
+                issue_id=expected_quality_issue_id,
+                issue_details=expected_quality_issue_details,
+                job_id=job_id,
+                source_snapshot_id=source_snapshot_id,
+                security_id=security_id,
+                dataset=dataset,
+                facts=records,
+            )
             self._insert_or_verify_reconciliation_facts(connection, records)
             self._insert_followups(connection, (followup,), transition_now)
             cursor = connection.execute(
@@ -1585,10 +1889,20 @@ class StateStore:
         details: Mapping[str, object],
         job_id: str | None = None,
         worker_id: str | None = None,
+        source_snapshot_id: str | None = None,
     ) -> str:
         issue_id = str(uuid.uuid4())
         if (job_id is None) != (worker_id is None):
             raise ValueError("job_id and worker_id must be provided together")
+        if source_snapshot_id is not None and job_id is None:
+            raise ValueError(
+                "source_snapshot_id requires job_id and worker_id"
+            )
+        if source_snapshot_id is not None and (
+            not isinstance(source_snapshot_id, str) or not source_snapshot_id
+        ):
+            raise ValueError("source_snapshot_id must identify a snapshot")
+        details_json = _json(dict(details))
         transaction = (
             self.owned_job_transaction(job_id, worker_id)
             if job_id is not None and worker_id is not None
@@ -1605,11 +1919,41 @@ class StateStore:
                     score_run_id,
                     severity,
                     code,
-                    _json(dict(details)),
+                    details_json,
                     _utc_now(),
                 ),
             )
+            if source_snapshot_id is not None:
+                snapshot = connection.execute(
+                    "SELECT 1 FROM source_snapshot WHERE id = ?",
+                    (source_snapshot_id,),
+                ).fetchone()
+                if snapshot is None:
+                    raise ValueError("source_snapshot_id does not exist")
+                connection.execute(
+                    """INSERT INTO quality_issue_binding
+                    (issue_id,job_id,source_snapshot_id) VALUES (?,?,?)""",
+                    (issue_id, job_id, source_snapshot_id),
+                )
         return issue_id
+
+    def find_quality_issue_ids(
+        self,
+        *,
+        severity: str,
+        code: str,
+        details: Mapping[str, object],
+    ) -> tuple[str, ...]:
+        with closing(self._connect()) as connection:
+            return tuple(
+                str(row["id"])
+                for row in connection.execute(
+                    """SELECT id FROM quality_issue
+                    WHERE severity = ? AND code = ? AND details_json = ?
+                    ORDER BY id""",
+                    (severity, code, _json(dict(details))),
+                )
+            )
 
     def has_quality_issue(
         self,
