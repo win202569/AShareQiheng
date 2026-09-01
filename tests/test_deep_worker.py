@@ -31,7 +31,7 @@ from ashare_pipeline.financial_features import (
     feature_input_hash,
     trading_days_from_batch,
 )
-from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
+from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION, MAPPING_VERSION
 from ashare_pipeline.snapshot_repository import SnapshotRepository
 from ashare_pipeline.sources import (
     FetchBatch,
@@ -263,6 +263,56 @@ class DeepWorkerTestCase(unittest.TestCase):
             if item.payload["dataset"] == dataset
         )
         return self.store.enqueue_job(spec.kind, spec.idempotency_key, spec.payload)
+
+    def _seed_legacy_midnight_failure(
+        self,
+        *,
+        refresh_date: str = "2026-09-01",
+        fetched_at_utc: str = "2026-09-01T00:00:00+00:00",
+        mutate_batch=None,
+        record_issue: bool = True,
+    ):
+        self._write_candidates({"SH600001": "包装印刷"})
+        job_id = self._enqueue_statement(refresh_date=refresh_date)
+        batch = fixture_statement_batch(
+            "balance_sheet", fetched_at_utc=fetched_at_utc
+        )
+        for row in batch.records:
+            row["REPORT_DATE"] = f"{row['REPORT_DATE']} 00:00:00"
+        if mutate_batch is not None:
+            mutate_batch(batch)
+        snapshot = self.repository.persist(batch)[0]
+        leased = self.store.lease_next_job(
+            ["deep_statement"], "legacy-worker", 3600
+        )
+        self.assertEqual(leased["id"], job_id)
+        issue_row = min(batch.records, key=canonical_sha256)
+        if record_issue:
+            self.store.record_quality_issue(
+                run_id=None,
+                score_run_id=None,
+                severity="error",
+                code="statement_report_date_invalid",
+                details={
+                    "security_id": "SH600001",
+                    "dataset": "balance_sheet",
+                    "details": {
+                        "security_id": "SH600001",
+                        "row_hash": canonical_sha256(issue_row),
+                    },
+                },
+                job_id=job_id,
+                worker_id="legacy-worker",
+            )
+        self.store.fail_job_with_followups(
+            job_id,
+            "legacy-worker",
+            {"error_classification": "malformed_statement"},
+            False,
+            None,
+            (),
+        )
+        return job_id, snapshot, batch
 
     def _enqueue_direct_feature_payload(self, payload: dict[str, object]) -> str:
         statements = payload["statement_snapshots"]
@@ -1700,6 +1750,334 @@ class DeepWorkerTestCase(unittest.TestCase):
                 "SELECT code, details_json FROM quality_issue ORDER BY created_at, id"
             ).fetchall()
         self.assertIn("statement_report_date_invalid", {row[0] for row in issues})
+
+    def test_offline_reconciles_exact_legacy_midnight_failure_and_preserves_audit_history(self) -> None:
+        self._write_candidates({"SH600001": "包装印刷"})
+        context = load_candidate_context(self.data_root)
+        refresh_date = "2026-09-01"
+        job_id = self._enqueue_statement(refresh_date=refresh_date)
+        calendar = self._calendar_ref()
+        batch = fixture_statement_batch(
+            "balance_sheet",
+            fetched_at_utc="2026-09-01T00:00:00+00:00",
+        )
+        for row in batch.records:
+            row["REPORT_DATE"] = f"{row['REPORT_DATE']} 00:00:00"
+        snapshot = self.repository.persist(batch)[0]
+        raw_path = self.project_root.joinpath(*snapshot.payload_path.split("/"))
+        raw_bytes = raw_path.read_bytes()
+
+        leased = self.store.lease_next_job(
+            ["deep_statement"], "legacy-worker", 3600
+        )
+        self.assertEqual(leased["id"], job_id)
+        issue_row = min(batch.records, key=canonical_sha256)
+        self.store.record_quality_issue(
+            run_id=None,
+            score_run_id=None,
+            severity="error",
+            code="statement_report_date_invalid",
+            details={
+                "security_id": "SH600001",
+                "dataset": "balance_sheet",
+                "details": {
+                    "security_id": "SH600001",
+                    "row_hash": canonical_sha256(issue_row),
+                },
+            },
+            job_id=job_id,
+            worker_id="legacy-worker",
+        )
+        self.store.fail_job_with_followups(
+            job_id,
+            "legacy-worker",
+            {"error_classification": "malformed_statement"},
+            False,
+            None,
+            (),
+        )
+
+        old_bundle = build_bundle_with_overrides(
+            facts=(),
+            candidate_set_hash=context.candidate_set_hash,
+            as_of_utc="2026-08-30T16:00:00+00:00",
+            statement_snapshot_hashes={
+                "balance_sheet": snapshot.payload_hash,
+                "profit_sheet": None,
+                "cash_flow_sheet": None,
+            },
+            trade_calendar_snapshot_hash=calendar.payload_hash,
+        )
+        old_path, old_hash, old_created = deep_worker_module.write_feature_bundle(
+            self.project_root, old_bundle
+        )
+        self.assertTrue(old_created)
+        self.store.put_feature_bundle(
+            old_bundle,
+            bundle_path=old_path,
+            bundle_hash=old_hash,
+        )
+        old_bundle_bytes = self.project_root.joinpath(
+            *old_path.split("/")
+        ).read_bytes()
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            before_counts = {
+                "quality_issue": connection.execute(
+                    "SELECT COUNT(*) FROM quality_issue"
+                ).fetchone()[0],
+                "feature_set": connection.execute(
+                    "SELECT COUNT(*) FROM feature_set"
+                ).fetchone()[0],
+            }
+
+        source = FakeStatementSource()
+        summary = self._run(
+            source=source,
+            online=False,
+            trade_calendar_snapshot=calendar,
+            limit=1,
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(source.calls, [])
+        self.assertEqual(summary.remote_attempts, 0)
+        self.assertEqual(summary.snapshots_reused, 1)
+        self.assertEqual(summary.statements_succeeded, 1)
+        self.assertEqual(summary.feature_sets_written, 1)
+        self.assertIn(
+            "reconciled_verified_snapshot",
+            {item.get("outcome") for item in summary.items},
+        )
+        completed = self.store.get_job(job_id)
+        self.assertEqual(completed["status"], "succeeded")
+        self.assertEqual(
+            completed["result"],
+            {
+                "outcome": "reconciled_verified_snapshot",
+                "snapshot_hash": snapshot.payload_hash,
+                "mapping_version": MAPPING_VERSION,
+                "recovered_error": "malformed_statement",
+            },
+        )
+        facts = self.store.list_financial_facts("SH600001")
+        self.assertGreater(len(facts), 0)
+        self.assertEqual({fact.mapping_version for fact in facts}, {MAPPING_VERSION})
+        self.assertEqual({fact.source_snapshot_id for fact in facts}, {snapshot.id})
+        feature_jobs = self.store.list_jobs(["feature_build"])
+        self.assertEqual(len(feature_jobs), 1)
+        self.assertEqual(feature_jobs[0]["status"], "succeeded")
+        latest = self.store.latest_feature_set("SH600001", REPORT_PERIOD)
+        self.assertIsNotNone(latest)
+        self.assertNotEqual(latest["bundle_hash"], old_hash)
+
+        self.assertEqual(raw_path.read_bytes(), raw_bytes)
+        self.assertEqual(
+            self.project_root.joinpath(*old_path.split("/")).read_bytes(),
+            old_bundle_bytes,
+        )
+        self.assertIsNotNone(
+            self.store.get_feature_bundle_row(
+                "SH600001", REPORT_PERIOD, old_bundle.input_hash
+            )
+        )
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM quality_issue").fetchone()[0],
+                before_counts["quality_issue"],
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                before_counts["feature_set"] + 1,
+            )
+
+        repeated = self._run(
+            source=source,
+            online=False,
+            trade_calendar_snapshot=calendar,
+            limit=1,
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+        self.assertEqual(repeated.snapshots_reused, 0)
+        self.assertEqual(repeated.statements_succeeded, 0)
+        self.assertEqual(repeated.feature_sets_written, 0)
+        self.assertEqual(source.calls, [])
+
+    def test_offline_midnight_reconciliation_requires_verified_calendar(self) -> None:
+        job_id, _snapshot, _batch = self._seed_legacy_midnight_failure()
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=None,
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.snapshots_reused, 0)
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_offline_midnight_reconciliation_requires_matching_prior_quality_issue(self) -> None:
+        job_id, _snapshot, _batch = self._seed_legacy_midnight_failure(
+            record_issue=False
+        )
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=self._calendar_ref(),
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.snapshots_reused, 0)
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_offline_midnight_reconciliation_rejects_remaining_source_date_issue(self) -> None:
+        def corrupt_notice_date(batch):
+            batch.records[0]["NOTICE_DATE"] = "not-a-timestamp"
+
+        job_id, _snapshot, _batch = self._seed_legacy_midnight_failure(
+            mutate_batch=corrupt_notice_date
+        )
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=self._calendar_ref(),
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.snapshots_reused, 0)
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+
+    def test_offline_midnight_reconciliation_requires_same_cn_refresh_date(self) -> None:
+        job_id, _snapshot, _batch = self._seed_legacy_midnight_failure(
+            fetched_at_utc="2026-08-31T00:00:00+00:00"
+        )
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=self._calendar_ref(),
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.snapshots_reused, 0)
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+
+    def test_offline_midnight_reconciliation_rejects_missing_target_or_other_issues(self) -> None:
+        def remove_target(batch):
+            batch.records[:] = [
+                row
+                for row in batch.records
+                if not str(row.get("REPORT_DATE", "")).startswith(REPORT_PERIOD)
+            ]
+
+        job_id, _snapshot, _batch = self._seed_legacy_midnight_failure(
+            mutate_batch=remove_target
+        )
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=self._calendar_ref(),
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.snapshots_reused, 0)
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+
+    def test_offline_midnight_reconciliation_rejects_ambiguous_same_day_snapshots(self) -> None:
+        job_id, _snapshot, _batch = self._seed_legacy_midnight_failure()
+        second = fixture_statement_batch(
+            "balance_sheet",
+            fetched_at_utc="2026-09-01T01:00:00+00:00",
+        )
+        for row in second.records:
+            row["REPORT_DATE"] = f"{row['REPORT_DATE']} 00:00:00"
+        second.records[0]["TOTAL_ASSETS"] = float(
+            second.records[0]["TOTAL_ASSETS"]
+        ) + 1.0
+        self.repository.persist(second)
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=self._calendar_ref(),
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.snapshots_reused, 0)
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+
+    def test_midnight_reconciliation_never_runs_in_online_mode(self) -> None:
+        job_id, _snapshot, _batch = self._seed_legacy_midnight_failure()
+        source = FakeStatementSource()
+
+        summary = self._run(
+            source=source,
+            online=True,
+            trade_calendar_snapshot=self._calendar_ref(),
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(source.calls, [])
+        self.assertEqual(summary.snapshots_reused, 0)
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+
+    def test_offline_midnight_reconciliation_rejects_stale_job_identity(self) -> None:
+        job_id, _snapshot, _batch = self._seed_legacy_midnight_failure()
+        payload = dict(self.store.get_job(job_id)["payload"])
+        payload["candidate_set_hash"] = "f" * 64
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            connection.execute(
+                "UPDATE job SET payload_json = ? WHERE id = ?",
+                (
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    job_id,
+                ),
+            )
+            connection.commit()
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=self._calendar_ref(),
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.snapshots_reused, 0)
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+
+    def test_offline_midnight_reconciliation_fails_closed_on_tampered_snapshot(self) -> None:
+        job_id, snapshot, _batch = self._seed_legacy_midnight_failure()
+        raw_path = self.project_root.joinpath(*snapshot.payload_path.split("/"))
+        raw_path.write_text("{}", encoding="utf-8")
+
+        with self.assertRaisesRegex(OSError, "snapshot payload|hash mismatch"):
+            self._run(
+                source=FakeStatementSource(),
+                online=False,
+                trade_calendar_snapshot=self._calendar_ref(),
+                now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+            )
+
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
 
     def test_terminal_source_error_marks_job_terminal_without_crashing_run(self) -> None:
         self._write_candidates({"SH600001": "包装印刷"})
