@@ -17,6 +17,9 @@ from ashare_pipeline.feature_contract import (
 
 MAPPING_VERSION = "eastmoney-financial-mapping-v2"
 FINANCIAL_REQUEST_VERSION = "eastmoney-financial-request-v1"
+_HISTORICAL_MAPPING_VERSIONS = frozenset(
+    {"eastmoney-financial-mapping-v1"}
+)
 
 StatementDataset = Literal["balance_sheet", "profit_sheet", "cash_flow_sheet"]
 StatementKind = Literal["balance", "income", "cash_flow"]
@@ -263,13 +266,21 @@ class FinancialFact:
     def from_record(cls, value: Mapping[str, Any]) -> "FinancialFact":
         data = dict(value)
         supplied_id = data.pop("id", None)
-        fact = cls.create(**data)
+        normalized = cls._normalized_fields(data, allow_historical=True)
+        identity_fields = dict(normalized)
+        identity_fields.pop("created_at")
+        fact = cls(id=canonical_sha256(identity_fields), **normalized)
         if supplied_id is not None and supplied_id != fact.id:
             raise ValueError("financial fact id does not match canonical content")
         return fact
 
     @classmethod
-    def _normalized_fields(cls, data: Mapping[str, Any]) -> dict[str, Any]:
+    def _normalized_fields(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        allow_historical: bool = False,
+    ) -> dict[str, Any]:
         expected = {
             "security_id", "statement", "metric_key", "period_start", "period_end", "period_kind",
             "value", "unit", "nature", "announced_at_utc", "effective_at_utc", "source_updated_at_utc",
@@ -325,7 +336,10 @@ class FinancialFact:
         if not isinstance(source_field, str) or not source_field:
             raise ValueError("source_field is required")
         mapping_version = data["mapping_version"]
-        if mapping_version != MAPPING_VERSION:
+        allowed_mapping_versions = {MAPPING_VERSION}
+        if allow_historical:
+            allowed_mapping_versions.update(_HISTORICAL_MAPPING_VERSIONS)
+        if mapping_version not in allowed_mapping_versions:
             raise ValueError("unsupported mapping_version")
         source_updated = data["source_updated_at_utc"]
         if source_updated is not None:

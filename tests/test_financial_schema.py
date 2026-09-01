@@ -69,6 +69,26 @@ class FinancialSchemaTests(unittest.TestCase):
         self.assertEqual(first.announced_at_utc, "2026-03-31T08:00:00+00:00")
         self.assertEqual(FinancialFact.from_record(first.to_record()), first)
 
+    def test_financial_fact_reads_known_v1_history_but_new_writes_require_v2(self):
+        current = FinancialFact.create(**fact_fields())
+        historical_record = current.to_record()
+        historical_record["mapping_version"] = "eastmoney-financial-mapping-v1"
+        historical_identity = dict(historical_record)
+        historical_identity.pop("id")
+        historical_identity.pop("created_at")
+        historical_record["id"] = canonical_sha256(historical_identity)
+
+        historical = FinancialFact.from_record(historical_record)
+
+        self.assertEqual(
+            historical.mapping_version, "eastmoney-financial-mapping-v1"
+        )
+        self.assertEqual(historical.id, historical_record["id"])
+        with self.assertRaisesRegex(ValueError, "unsupported mapping_version"):
+            FinancialFact.create(
+                **fact_fields(mapping_version="eastmoney-financial-mapping-v1")
+            )
+
     def test_financial_fact_rejects_nonfinite_values_invalid_units_and_bad_nature_periods(self):
         for invalid in (True, math.nan, math.inf, -math.inf):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
