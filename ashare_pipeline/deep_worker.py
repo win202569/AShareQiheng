@@ -1119,6 +1119,7 @@ def _record_fact_issues(
     store: StateStore,
     security_id: str,
     dataset: str,
+    source_snapshot_id: str,
     issues: Sequence[object],
     ensure_owned: Callable[[], None] | None = None,
     job_id: str | None = None,
@@ -1139,6 +1140,7 @@ def _record_fact_issues(
             },
             job_id=job_id,
             worker_id=worker_id,
+            source_snapshot_id=source_snapshot_id,
         )
 
 
@@ -1195,6 +1197,7 @@ def _normalize_statement_snapshot(
             store,
             security_id,
             snapshot.dataset,
+            snapshot.id,
             result.issues,
             ensure_owned,
             job_id,
@@ -1594,6 +1597,106 @@ def _snapshot_matches_refresh_date(
     return fetched.astimezone(SHANGHAI).date().isoformat() == refresh_date
 
 
+def _snapshot_not_after(snapshot: SnapshotRef, cutoff_utc: str) -> bool:
+    fetched = datetime.fromisoformat(
+        require_aware_utc(snapshot.fetched_at, "snapshot fetched_at")
+    )
+    cutoff = datetime.fromisoformat(
+        require_aware_utc(cutoff_utc, "reconciliation cutoff")
+    )
+    return fetched <= cutoff
+
+
+def _successful_statement_snapshot_hash(result: object) -> str | None:
+    if not isinstance(result, Mapping):
+        return None
+    keys = set(result)
+    if keys == {"outcome", "snapshot_hash"}:
+        if result["outcome"] not in {"statement_persisted", "snapshot_reused"}:
+            return None
+    elif keys == {
+        "outcome",
+        "snapshot_hash",
+        "mapping_version",
+        "recovered_error",
+    }:
+        if (
+            result["outcome"] != "reconciled_verified_snapshot"
+            or result["mapping_version"] != MAPPING_VERSION
+            or result["recovered_error"] != "malformed_statement"
+        ):
+            return None
+    else:
+        return None
+    try:
+        return _require_sha256(result["snapshot_hash"], "statement snapshot hash")
+    except ValueError:
+        return None
+
+
+def _same_refresh_statement_refs(
+    *,
+    snapshots: SnapshotRepository,
+    context: CandidateContext,
+    statement_jobs: Mapping[str, Mapping[str, object]],
+    security_id: str,
+    report_period: str,
+    refresh_date: str,
+    logical_now_utc: str,
+    recovering_dataset: str,
+    recovering_snapshot: SnapshotRef,
+) -> dict[str, SnapshotRef | None]:
+    refs: dict[str, SnapshotRef | None] = {
+        dataset: None for dataset in STATEMENT_DATASETS
+    }
+    refs[recovering_dataset] = recovering_snapshot
+    specs = statement_job_specs(
+        context,
+        security_id=security_id,
+        report_period=report_period,
+        as_of_cn_date=refresh_date,
+    )
+    request = _statement_request(security_id, report_period)
+    for spec in specs:
+        dataset = spec.payload["dataset"]
+        if dataset == recovering_dataset:
+            continue
+        sibling = statement_jobs.get(spec.idempotency_key)
+        if (
+            not isinstance(sibling, Mapping)
+            or sibling.get("kind") != "deep_statement"
+            or sibling.get("status") != "succeeded"
+            or sibling.get("idempotency_key") != spec.idempotency_key
+            or sibling.get("payload") != spec.payload
+        ):
+            continue
+        snapshot_hash = _successful_statement_snapshot_hash(
+            sibling.get("result")
+        )
+        if snapshot_hash is None:
+            continue
+        eligible: list[SnapshotRef] = []
+        for snapshot in snapshots.list_exact("akshare", dataset, request):
+            if (
+                snapshot.payload_hash != snapshot_hash
+                or not _snapshot_matches_refresh_date(snapshot, refresh_date)
+                or not _snapshot_not_after(snapshot, logical_now_utc)
+            ):
+                continue
+            verified = snapshots.read_verified(snapshot)
+            if (
+                context.reported_target_period[security_id]
+                and not _exact_target_period_present(
+                    verified.batch.records, report_period
+                )
+            ):
+                continue
+            eligible.append(snapshot)
+        if len(eligible) == 1:
+            refs[dataset] = eligible[0]
+    return refs
+
+
 def _exact_target_period_present(
     records: Sequence[object], report_period: str
 ) -> bool:
@@ -1613,8 +1716,15 @@ def _reconcile_legacy_midnight_failures(
     logical_now_utc: str,
     items: list[Mapping[str, object]],
 ) -> int:
+    stored_calendar = (
+        snapshots.get(trade_calendar_snapshot.id)
+        if trade_calendar_snapshot is not None
+        else None
+    )
     if (
-        trade_calendar_snapshot is None
+        stored_calendar is None
+        or stored_calendar != trade_calendar_snapshot
+        or not _snapshot_not_after(stored_calendar, logical_now_utc)
         or MAPPING_VERSION != "eastmoney-financial-mapping-v2"
         or TEMPLATE_VERSION != "template-registry-v2"
     ):
@@ -1625,7 +1735,11 @@ def _reconcile_legacy_midnight_failures(
     if trading_days is None:
         return 0
     reconciled = 0
-    for job in store.list_jobs(["deep_statement"]):
+    statement_jobs = {
+        str(job["idempotency_key"]): job
+        for job in store.list_jobs(["deep_statement"])
+    }
+    for job in tuple(statement_jobs.values()):
         if (
             job.get("kind") != "deep_statement"
             or job.get("status") != "terminal_failed"
@@ -1677,9 +1791,19 @@ def _reconcile_legacy_midnight_failures(
         ):
             continue
         request = _statement_request(security_id, report_period)
-        eligible: list[tuple[SnapshotRef, tuple[object, ...]]] = []
+        eligible: list[
+            tuple[
+                SnapshotRef,
+                tuple[object, ...],
+                str,
+                Mapping[str, object],
+            ]
+        ] = []
         for snapshot in snapshots.list_exact("akshare", dataset, request):
-            if not _snapshot_matches_refresh_date(snapshot, refresh_date):
+            if (
+                not _snapshot_matches_refresh_date(snapshot, refresh_date)
+                or not _snapshot_not_after(snapshot, logical_now_utc)
+            ):
                 continue
             verified = snapshots.read_verified(snapshot)
             midnight_hashes = _legacy_midnight_report_date_hashes(
@@ -1687,21 +1811,32 @@ def _reconcile_legacy_midnight_failures(
             )
             if not midnight_hashes:
                 continue
-            if not any(
-                store.has_quality_issue(
+            bound_issue_matches: list[tuple[str, Mapping[str, object]]] = []
+            legacy_issue_matches: list[tuple[str, Mapping[str, object]]] = []
+            for row_hash in midnight_hashes:
+                issue_details = {
+                    "security_id": security_id,
+                    "dataset": dataset,
+                    "details": {
+                        "security_id": security_id,
+                        "row_hash": row_hash,
+                    },
+                }
+                issue_match = store.resolve_reconciliation_quality_issue(
                     severity="error",
                     code="statement_report_date_invalid",
-                    details={
-                        "security_id": security_id,
-                        "dataset": dataset,
-                        "details": {
-                            "security_id": security_id,
-                            "row_hash": row_hash,
-                        },
-                    },
+                    details=issue_details,
+                    job_id=str(job["id"]),
+                    source_snapshot_id=snapshot.id,
                 )
-                for row_hash in midnight_hashes
-            ):
+                if issue_match is None:
+                    continue
+                issue_id, evidence_kind = issue_match
+                if evidence_kind == "bound":
+                    bound_issue_matches.append((issue_id, issue_details))
+                else:
+                    legacy_issue_matches.append((issue_id, issue_details))
+            if not bound_issue_matches and not legacy_issue_matches:
                 continue
             result = build_financial_facts(
                 verified.batch,
@@ -1719,15 +1854,27 @@ def _reconcile_legacy_midnight_failures(
                 )
             ):
                 continue
-            eligible.append((snapshot, result.facts))
+            issue_id, issue_details = min(
+                bound_issue_matches or legacy_issue_matches,
+                key=lambda item: item[0],
+            )
+            eligible.append(
+                (snapshot, result.facts, issue_id, issue_details)
+            )
         if len(eligible) != 1:
             continue
-        snapshot, facts = eligible[0]
-        statement_refs: dict[str, SnapshotRef | None] = {
-            statement_dataset: None
-            for statement_dataset in STATEMENT_DATASETS
-        }
-        statement_refs[dataset] = snapshot
+        snapshot, facts, issue_id, issue_details = eligible[0]
+        statement_refs = _same_refresh_statement_refs(
+            snapshots=snapshots,
+            context=context,
+            statement_jobs=statement_jobs,
+            security_id=security_id,
+            report_period=report_period,
+            refresh_date=refresh_date,
+            logical_now_utc=logical_now_utc,
+            recovering_dataset=dataset,
+            recovering_snapshot=snapshot,
+        )
         followup = _feature_build_spec(
             security_id=security_id,
             report_period=report_period,
@@ -1742,19 +1889,32 @@ def _reconcile_legacy_midnight_failures(
             "mapping_version": MAPPING_VERSION,
             "recovered_error": "malformed_statement",
         }
-        won = store.reconcile_malformed_statement(
-            str(job["id"]),
-            expected_idempotency_key=expected_spec.idempotency_key,
-            expected_payload=expected_spec.payload,
-            source_snapshot_id=snapshot.id,
-            source_snapshot_hash=snapshot.payload_hash,
-            facts=facts,
-            followup=followup,
-            result=recovery_result,
-        )
+        try:
+            won = store.reconcile_malformed_statement(
+                str(job["id"]),
+                expected_idempotency_key=expected_spec.idempotency_key,
+                expected_payload=expected_spec.payload,
+                source_snapshot_id=snapshot.id,
+                source_snapshot_hash=snapshot.payload_hash,
+                facts=facts,
+                followup=followup,
+                result=recovery_result,
+                expected_quality_issue_id=issue_id,
+                expected_quality_issue_details=issue_details,
+            )
+        except ValueError as error:
+            if str(error).startswith("legacy quality issue"):
+                continue
+            raise
         if not won:
             continue
         reconciled += 1
+        statement_jobs[expected_spec.idempotency_key] = {
+            **job,
+            "status": "succeeded",
+            "result": recovery_result,
+            "error": None,
+        }
         items.append(
             _statement_item(
                 security_id=security_id,
