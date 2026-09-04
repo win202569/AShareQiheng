@@ -1500,6 +1500,101 @@ class StateStoreTestCase(unittest.TestCase):
                 sorted([(expected["snapshot_id"],), (extra_snapshot_id,)]),
             )
 
+    def test_formal_receipt_getter_reads_one_consistent_database_snapshot(self) -> None:
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "receipt-consistent-read", "receipt-generation", {}
+        )
+        raw_root = Path(self.tempdir.name) / "receipt-consistent-read-raw"
+        raw_store, fetch, stored, verification = written_formal_snapshot(
+            raw_root,
+            refresh_generation="receipt-generation",
+            producing_task_id=task_id,
+        )
+        store = StateStore(self.db_path, formal_snapshot_store=raw_store)
+        _, receipt = self.insert_formal_receipt_fixture(
+            task_id=task_id,
+            raw_store=raw_store,
+            fetch=fetch,
+            stored=stored,
+            verification=verification,
+        )
+        _, extra_fetch, extra_stored, extra_verification = written_formal_snapshot(
+            raw_root,
+            raw_bytes=b"extra producer before interleaving",
+            refresh_generation="extra-generation",
+            producing_task_id=task_id,
+        )
+        extra_snapshot_id, _ = self.insert_formal_receipt_fixture(
+            include_receipt=False,
+            task_id=task_id,
+            raw_store=raw_store,
+            fetch=extra_fetch,
+            stored=extra_stored,
+            verification=extra_verification,
+        )
+        real_connect = store._connect
+        database_path = self.db_path
+        interleaved = False
+
+        class ReceiptCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def fetchone(self):
+                nonlocal interleaved
+                row = self.cursor.fetchone()
+                with closing(sqlite3.connect(database_path)) as mutator:
+                    mutator.execute("PRAGMA foreign_keys = OFF")
+                    mutator.execute(
+                        "DELETE FROM formal_task_snapshot_receipt WHERE task_id = ?",
+                        (task_id,),
+                    )
+                    mutator.execute(
+                        "DELETE FROM formal_source_snapshot WHERE id = ?",
+                        (extra_snapshot_id,),
+                    )
+                    mutator.commit()
+                interleaved = True
+                return row
+
+        class ObservedConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def execute(self, sql, parameters=()):
+                cursor = self.connection.execute(sql, parameters)
+                if "SELECT * FROM formal_task_snapshot_receipt" in sql:
+                    return ReceiptCursor(cursor)
+                return cursor
+
+        with patch.object(
+            store,
+            "_connect",
+            side_effect=lambda: ObservedConnection(real_connect()),
+        ):
+            with self.assertRaisesRegex(ValueError, "producer set"):
+                store.get_formal_task_snapshot_receipt(task_id)
+
+        self.assertTrue(interleaved)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM formal_task_snapshot_receipt WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT id FROM formal_source_snapshot WHERE producing_task_id = ?",
+                    (task_id,),
+                ).fetchall(),
+                [(receipt["snapshot_id"],)],
+            )
+
     def test_formal_snapshot_lookup_never_reads_legacy_source_snapshot(self) -> None:
         store, _, fetch, stored, verification = self.configured_formal_store(
             label="legacy-isolation"

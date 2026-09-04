@@ -1722,7 +1722,7 @@ class StateStore:
         self._require_formal_snapshot_store()
         if type(task_id) is not str or not task_id.strip():
             raise ValueError("task_id must be a nonempty string")
-        with closing(self._connect()) as connection:
+        with self._transaction() as connection:
             receipt = connection.execute(
                 "SELECT * FROM formal_task_snapshot_receipt WHERE task_id = ?",
                 (task_id,),
