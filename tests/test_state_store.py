@@ -1116,6 +1116,9 @@ class StateStoreTestCase(unittest.TestCase):
         self.assertIsNone(self.store.get_job("missing"))
         for operation in (
             lambda: self.store.put_formal_snapshot(None, None, None),
+            lambda: self.store.put_formal_snapshot_for_leased_task(
+                None, None, None, task_id="task", worker_id="worker"
+            ),
             lambda: self.store.get_formal_snapshot("missing"),
             lambda: self.store.get_formal_task_snapshot_receipt("missing"),
         ):
@@ -1291,6 +1294,325 @@ class StateStoreTestCase(unittest.TestCase):
                         0,
                     )
 
+    def test_put_formal_snapshot_for_leased_task_is_atomic_replayable_and_durable_after_failure(self) -> None:
+        generation = "leased-generation"
+        raw_root = Path(self.tempdir.name) / "formal-leased-success"
+        raw_store, bootstrap_fetch, bootstrap_stored, bootstrap_verification = written_formal_snapshot(
+            raw_root,
+            refresh_generation=generation,
+        )
+        store = StateStore(self.db_path, formal_snapshot_store=raw_store)
+        bootstrap = store.put_formal_snapshot(
+            bootstrap_fetch, bootstrap_stored, bootstrap_verification
+        )
+        task_id = store.enqueue_formal_task(
+            "formal_statement", "leased-success", generation, {"slot": 1}
+        )
+        store.lease_next_formal_task(
+            ("formal_statement",), "worker-a", 30, now_utc=utc_at(0)
+        )
+        _, fetch, stored, verification = written_formal_snapshot(
+            raw_root,
+            refresh_generation=generation,
+            producing_task_id=task_id,
+        )
+
+        for invalid_task_id, invalid_worker_id in (
+            (None, "worker-a"),
+            (7, "worker-a"),
+            ("", "worker-a"),
+            (task_id, None),
+            (task_id, 7),
+            (task_id, "   "),
+        ):
+            with self.subTest(
+                invalid_task_id=invalid_task_id,
+                invalid_worker_id=invalid_worker_id,
+            ):
+                with self.assertRaises(ValueError):
+                    store.put_formal_snapshot_for_leased_task(
+                        fetch,
+                        stored,
+                        verification,
+                        task_id=invalid_task_id,
+                        worker_id=invalid_worker_id,
+                    )
+
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(1)):
+            ref = store.put_formal_snapshot_for_leased_task(
+                fetch,
+                stored,
+                verification,
+                task_id=task_id,
+                worker_id="worker-a",
+            )
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(2)):
+            replay = store.put_formal_snapshot_for_leased_task(
+                fetch,
+                stored,
+                verification,
+                task_id=task_id,
+                worker_id="worker-a",
+            )
+
+        self.assertEqual(replay, ref)
+        self.assertNotEqual(ref.snapshot_id, bootstrap.snapshot_id)
+        self.assertNotEqual(ref.manifest_sha256, bootstrap.manifest_sha256)
+        self.assertEqual(ref.content_path, bootstrap.content_path)
+        self.assertEqual(ref.producing_task_id, task_id)
+        receipt = store.get_formal_task_snapshot_receipt(task_id)
+        self.assertEqual(receipt["snapshot_id"], ref.snapshot_id)
+        self.assertEqual(receipt["manifest_sha256"], ref.manifest_sha256)
+        self.assertEqual(receipt["refresh_generation"], generation)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM formal_source_snapshot").fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM formal_task_snapshot_receipt"
+                ).fetchone()[0],
+                1,
+            )
+
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(3)):
+            store.fail_formal_task(
+                task_id,
+                "worker-a",
+                {"code": "parse_failed", "snapshot_id": ref.snapshot_id},
+                "terminal_failed",
+                None,
+            )
+        self.assertEqual(
+            store.get_formal_task_snapshot_receipt(task_id)["snapshot_id"],
+            ref.snapshot_id,
+        )
+
+    def test_put_formal_snapshot_for_leased_task_accepts_only_source_fetch_kinds(self) -> None:
+        for index, kind in enumerate(
+            ("formal_statement", "formal_context", "formal_universe_source")
+        ):
+            with self.subTest(kind=kind):
+                path = Path(self.tempdir.name) / f"formal-source-kind-{index}.sqlite3"
+                task_store = StateStore(path)
+                task_store.initialize()
+                generation = f"source-kind-generation-{index}"
+                task_id = task_store.enqueue_formal_task(
+                    kind, f"source-kind-{index}", generation, {}
+                )
+                task_store.lease_next_formal_task(
+                    (kind,), "worker-a", 30, now_utc=utc_at(0)
+                )
+                raw_store, fetch, stored, verification = written_formal_snapshot(
+                    Path(self.tempdir.name) / f"formal-source-kind-raw-{index}",
+                    refresh_generation=generation,
+                    producing_task_id=task_id,
+                )
+                configured = StateStore(path, formal_snapshot_store=raw_store)
+                with patch(
+                    "ashare_pipeline.state_store._utc_now", return_value=utc_at(1)
+                ):
+                    ref = configured.put_formal_snapshot_for_leased_task(
+                        fetch,
+                        stored,
+                        verification,
+                        task_id=task_id,
+                        worker_id="worker-a",
+                    )
+                self.assertEqual(ref.producing_task_id, task_id)
+
+    def test_put_formal_snapshot_for_leased_task_rejects_fencing_and_evidence_mismatches_without_rows(self) -> None:
+        cases = (
+            "pending",
+            "verified",
+            "wrong-worker",
+            "expired",
+            "taken-over",
+            "wrong-generation",
+            "non-source-kind",
+            "mismatched-producer",
+            "raw-mismatch",
+        )
+        for index, case in enumerate(cases):
+            with self.subTest(case=case):
+                path = Path(self.tempdir.name) / f"formal-leased-rejection-{index}.sqlite3"
+                task_store = StateStore(path)
+                task_store.initialize()
+                task_generation = "task-generation"
+                kind = "formal_feature" if case == "non-source-kind" else "formal_statement"
+                task_id = task_store.enqueue_formal_task(
+                    kind, f"leased-rejection-{index}", task_generation, {}
+                )
+                if case != "pending":
+                    task_store.lease_next_formal_task(
+                        (kind,), "worker-a", 10, now_utc=utc_at(0)
+                    )
+                if case == "verified":
+                    with closing(sqlite3.connect(path)) as connection:
+                        connection.execute(
+                            "UPDATE formal_collection_task SET status='verified' WHERE id=?",
+                            (task_id,),
+                        )
+                        connection.commit()
+                if case == "taken-over":
+                    task_store.lease_next_formal_task(
+                        (kind,), "worker-new", 30, now_utc=utc_at(10)
+                    )
+                fetch_generation = (
+                    "wrong-generation" if case == "wrong-generation" else task_generation
+                )
+                producer = "other-task" if case == "mismatched-producer" else task_id
+                raw_store, fetch, stored, verification = written_formal_snapshot(
+                    Path(self.tempdir.name) / f"formal-leased-rejection-raw-{index}",
+                    refresh_generation=fetch_generation,
+                    producing_task_id=producer,
+                )
+                if case == "raw-mismatch":
+                    fetch = replace(fetch, raw_bytes=b"caller-substituted-raw")
+                configured = StateStore(path, formal_snapshot_store=raw_store)
+                worker = "worker-b" if case == "wrong-worker" else "worker-a"
+                now = utc_at(11) if case in {"expired", "taken-over"} else utc_at(1)
+
+                with patch("ashare_pipeline.state_store._utc_now", return_value=now):
+                    with self.assertRaises(ValueError):
+                        configured.put_formal_snapshot_for_leased_task(
+                            fetch,
+                            stored,
+                            verification,
+                            task_id=task_id,
+                            worker_id=worker,
+                        )
+                with closing(sqlite3.connect(path)) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM formal_source_snapshot"
+                        ).fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM formal_task_snapshot_receipt"
+                        ).fetchone()[0],
+                        0,
+                    )
+
+    def test_put_formal_snapshot_for_leased_task_rejects_replacement_and_cross_task_attachment(self) -> None:
+        generation = "receipt-conflict-generation"
+        raw_root = Path(self.tempdir.name) / "formal-receipt-conflict-raw"
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "receipt-conflict-first", generation, {}
+        )
+        self.store.lease_next_formal_task(
+            ("formal_statement",), "worker-a", 30, now_utc=utc_at(0)
+        )
+        raw_store, first_fetch, first_stored, first_verification = written_formal_snapshot(
+            raw_root,
+            raw_bytes=b"first task evidence",
+            refresh_generation=generation,
+            producing_task_id=task_id,
+        )
+        store = StateStore(self.db_path, formal_snapshot_store=raw_store)
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(1)):
+            first_ref = store.put_formal_snapshot_for_leased_task(
+                first_fetch,
+                first_stored,
+                first_verification,
+                task_id=task_id,
+                worker_id="worker-a",
+            )
+        _, second_fetch, second_stored, second_verification = written_formal_snapshot(
+            raw_root,
+            raw_bytes=b"replacement task evidence",
+            refresh_generation=generation,
+            producing_task_id=task_id,
+        )
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(2)):
+            with self.assertRaisesRegex(ValueError, "receipt.*conflict"):
+                store.put_formal_snapshot_for_leased_task(
+                    second_fetch,
+                    second_stored,
+                    second_verification,
+                    task_id=task_id,
+                    worker_id="worker-a",
+                )
+
+        other_task_id = store.enqueue_formal_task(
+            "formal_statement", "receipt-conflict-second", generation, {}
+        )
+        store.lease_next_formal_task(
+            ("formal_statement",), "worker-b", 30, now_utc=utc_at(2)
+        )
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(3)):
+            with self.assertRaises(ValueError):
+                store.put_formal_snapshot_for_leased_task(
+                    first_fetch,
+                    first_stored,
+                    first_verification,
+                    task_id=other_task_id,
+                    worker_id="worker-b",
+                )
+
+        self.assertEqual(store.get_formal_snapshot(first_ref.snapshot_id), first_ref)
+        self.assertIsNone(store.get_formal_task_snapshot_receipt(other_task_id))
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM formal_source_snapshot").fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM formal_task_snapshot_receipt"
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_put_formal_snapshot_for_leased_task_rolls_back_snapshot_when_receipt_insert_fails(self) -> None:
+        path = Path(self.tempdir.name) / "formal-late-receipt-failure.sqlite3"
+        task_store = StateStore(path)
+        task_store.initialize()
+        generation = "late-failure-generation"
+        task_id = task_store.enqueue_formal_task(
+            "formal_statement", "late-receipt-failure", generation, {}
+        )
+        task_store.lease_next_formal_task(
+            ("formal_statement",), "worker-a", 30, now_utc=utc_at(0)
+        )
+        raw_store, fetch, stored, verification = written_formal_snapshot(
+            Path(self.tempdir.name) / "formal-late-receipt-failure-raw",
+            refresh_generation=generation,
+            producing_task_id=task_id,
+        )
+        store = StateStore(path, formal_snapshot_store=raw_store)
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute(
+                """CREATE TRIGGER force_late_receipt_failure
+                BEFORE INSERT ON formal_task_snapshot_receipt
+                BEGIN SELECT RAISE(ABORT, 'forced late receipt failure'); END"""
+            )
+            connection.commit()
+
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(1)):
+            with self.assertRaisesRegex(ValueError, "receipt.*conflict"):
+                store.put_formal_snapshot_for_leased_task(
+                    fetch,
+                    stored,
+                    verification,
+                    task_id=task_id,
+                    worker_id="worker-a",
+                )
+        with closing(sqlite3.connect(path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM formal_source_snapshot").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM formal_task_snapshot_receipt"
+                ).fetchone()[0],
+                0,
+            )
+
     def test_formal_snapshot_getter_rejects_malformed_ids_and_stored_tamper(self) -> None:
         store, raw_store, fetch, stored, verification = self.configured_formal_store(
             label="getter-inputs"
@@ -1382,6 +1704,8 @@ class StateStoreTestCase(unittest.TestCase):
         mutations = (
             ("formal_task_snapshot_receipt", "manifest_sha256", "0" * 64),
             ("formal_task_snapshot_receipt", "refresh_generation", "wrong-generation"),
+            ("formal_source_snapshot", "manifest_sha256", "0" * 64),
+            ("formal_source_snapshot", "refresh_generation", "wrong-generation"),
             ("formal_source_snapshot", "producing_task_id", None),
             ("formal_collection_task", "refresh_generation", "wrong-generation"),
             ("formal_task_snapshot_receipt", "recorded_at", "2026-09-04T08:00:00"),
