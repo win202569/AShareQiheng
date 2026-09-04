@@ -11,6 +11,7 @@ from ashare_pipeline.formal_evidence import (
     OfficialFetch,
     OfficialRequest,
     SourcePolicy,
+    VerifiedCalendarBinding,
     verify_official_fetch,
 )
 from ashare_pipeline.formal_snapshot_store import (
@@ -75,6 +76,99 @@ def rewrite_manifest(
 
 
 class FormalSnapshotStoreTests(unittest.TestCase):
+    def test_validate_stored_snapshot_recomputes_verification_instead_of_trusting_status(self):
+        """A public EvidenceVerification constructor must not mint trusted evidence."""
+        cases = (
+            (
+                lambda fetch: fetch,
+                lambda fetch: EvidenceVerification(
+                    "verified", fetch.content_sha256, ("forged_reason",), fetch.effective_at_utc
+                ),
+                "reasons",
+            ),
+            (
+                lambda fetch: fetch,
+                lambda fetch: EvidenceVerification(
+                    "verified",
+                    fetch.content_sha256,
+                    (),
+                    "2026-03-20T09:00:00+00:00",
+                ),
+                "effective",
+            ),
+            (
+                lambda fetch: replace(fetch, original_url="http://example.invalid/report.pdf"),
+                lambda fetch: EvidenceVerification(
+                    "verified", fetch.content_sha256, (), fetch.effective_at_utc
+                ),
+                "verification",
+            ),
+            (
+                lambda fetch: replace(fetch, published_at_utc="2026-03-20T08:00:00"),
+                lambda fetch: EvidenceVerification(
+                    "verified", fetch.content_sha256, (), fetch.effective_at_utc
+                ),
+                "verification",
+            ),
+        )
+        for mutate_fetch, build_verification, expected_error in cases:
+            with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as root:
+                store = FormalSnapshotStore(root)
+                fetch = mutate_fetch(verified_fetch())
+                verification = build_verification(fetch)
+                stored = store.write_verified(fetch, verification, producing_task_id=None)
+
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    store.validate_stored_snapshot(
+                        fetch, stored, verification, expected_producing_task_id=None
+                    )
+
+    def test_validate_stored_snapshot_rejects_self_consistent_invalid_nested_values(self):
+        """Runtime-invalid typed fields must not escape in the validated projection."""
+        cases = (
+            (
+                lambda fetch: replace(
+                    fetch,
+                    request=replace(fetch.request, security_id="SZ１２３４５６"),
+                    declared_security_id="SZ１２３４５６",
+                ),
+                "security",
+            ),
+            (
+                lambda fetch: replace(
+                    fetch,
+                    request=replace(fetch.request, period_or_date=20251231),
+                    declared_period=20251231,
+                ),
+                "period_or_date",
+            ),
+            (
+                lambda fetch: replace(
+                    fetch,
+                    request=replace(fetch.request, exchange=1),
+                ),
+                "exchange",
+            ),
+            (lambda fetch: replace(fetch, parser_id=7), "parser_id"),
+            (lambda fetch: replace(fetch, parser_version=""), "parser_version"),
+            (lambda fetch: replace(fetch, mapping_version=7), "mapping_version"),
+            (lambda fetch: replace(fetch, mapping_version=""), "mapping_version"),
+            (lambda fetch: replace(fetch, mapping_version="bad/version"), "mapping_version"),
+        )
+        for mutate_fetch, expected_error in cases:
+            with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as root:
+                store = FormalSnapshotStore(root)
+                fetch = mutate_fetch(verified_fetch())
+                verification = EvidenceVerification(
+                    "verified", fetch.content_sha256, (), fetch.effective_at_utc
+                )
+                stored = store.write_verified(fetch, verification, producing_task_id=None)
+
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    store.validate_stored_snapshot(
+                        fetch, stored, verification, expected_producing_task_id=None
+                    )
+
     def test_validate_stored_snapshot_returns_frozen_manifest_derived_projection(self):
         """Returning caller metadata would let StateStore persist uninspected lineage."""
         with tempfile.TemporaryDirectory() as root:
@@ -181,6 +275,39 @@ class FormalSnapshotStoreTests(unittest.TestCase):
                     fetch, bootstrap, verification,
                     expected_producing_task_id="formal-task-2",
                 )
+
+    def test_validate_stored_snapshot_preserves_verified_date_only_snapshot(self):
+        """Recomputation must retain valid calendar-bound Task 2 evidence."""
+        with tempfile.TemporaryDirectory() as root:
+            store = FormalSnapshotStore(root)
+            binding = VerifiedCalendarBinding(
+                snapshot_id="calendar-snapshot-1",
+                manifest_sha256="c" * 64,
+                exchange="SZ",
+                freeze_at_utc="2026-08-31T07:00:00+00:00",
+                registry_manifest_hash="r" * 64,
+                selector_hash="s" * 64,
+                prerequisite_task_id="calendar-task-1",
+            )
+            fetch = replace(
+                verified_fetch(),
+                request=replace(verified_fetch().request, exchange="SZ"),
+                published_precision="date_only",
+                effective_time_evidence_hash=binding.manifest_sha256,
+            )
+            verification = verify_official_fetch(
+                fetch, SourcePolicy.cninfo(), calendar_binding=binding
+            )
+            self.assertEqual(verification.status, "verified")
+            stored = store.write_verified(fetch, verification, producing_task_id=None)
+
+            inspected = store.validate_stored_snapshot(
+                fetch, stored, verification, expected_producing_task_id=None
+            )
+
+            self.assertEqual(
+                inspected.effective_time_evidence_hash, binding.manifest_sha256
+            )
 
     def test_validate_stored_snapshot_rejects_content_and_hash_forgery(self):
         """Trusting stored hashes or filenames would permit substituted bytes or lineage."""

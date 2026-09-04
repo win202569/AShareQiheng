@@ -3,14 +3,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 import hashlib
 import json
 import os
 from pathlib import Path, PureWindowsPath
+import re
 import tempfile
 from typing import Callable
 
-from .formal_evidence import EvidenceVerification, OfficialFetch, OfficialRequest
+from .formal_evidence import (
+    EvidenceVerification,
+    OfficialFetch,
+    OfficialRequest,
+    SourcePolicy,
+    VerifiedCalendarBinding,
+    verify_official_fetch,
+)
+
+
+_SECURITY_ID = re.compile(r"^(?:SH|SZ|BJ)[0-9]{6}$")
+_VERSION_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_EXCHANGES = frozenset({"SH", "SZ", "BJ"})
+_POLICY_FACTORIES = {
+    "cninfo": SourcePolicy.cninfo,
+    "sse": SourcePolicy.sse,
+    "szse": SourcePolicy.szse,
+    "bse": SourcePolicy.bse,
+    "csrc": SourcePolicy.csrc,
+}
 
 
 @dataclass(frozen=True)
@@ -173,6 +194,8 @@ class FormalSnapshotStore:
         self._validate_inspection_inputs(
             fetch, stored, verification, expected_producing_task_id
         )
+        self._validate_formal_fetch_values(fetch)
+        self._require_recomputed_verification(fetch, verification)
         content_sha256 = fetch.content_sha256
         self._require_sha256(content_sha256, "fetch content hash")
         self._require_sha256(verification.content_sha256, "verification content hash")
@@ -287,6 +310,94 @@ class FormalSnapshotStore:
             raise ValueError("expected producing_task_id must be a nonempty string or None")
         if type(stored.content_path) is not str or type(stored.manifest_path) is not str:
             raise ValueError("stored snapshot paths must have exact type str")
+
+    @classmethod
+    def _validate_formal_fetch_values(cls, fetch: OfficialFetch) -> None:
+        request = fetch.request
+        if type(request.source) is not str:
+            raise ValueError("formal request source must have exact type str")
+        if type(request.dataset) is not str:
+            raise ValueError("formal request dataset must have exact type str")
+        cls._safe_path_component(request.source, "source")
+        cls._safe_path_component(request.dataset, "dataset")
+        if request.security_id is not None and (
+            type(request.security_id) is not str
+            or _SECURITY_ID.fullmatch(request.security_id) is None
+        ):
+            raise ValueError("invalid formal request security_id")
+        if request.period_or_date is not None:
+            if type(request.period_or_date) is not str:
+                raise ValueError("formal request period_or_date must be a string or None")
+            try:
+                date.fromisoformat(request.period_or_date)
+            except ValueError as error:
+                raise ValueError("invalid formal request period_or_date") from error
+        if request.exchange is not None and (
+            type(request.exchange) is not str or request.exchange not in _EXCHANGES
+        ):
+            raise ValueError("invalid formal request exchange")
+        if request.security_id is not None and request.exchange is not None:
+            if request.security_id[:2] != request.exchange:
+                raise ValueError("formal request security_id does not match exchange")
+        if fetch.declared_security_id is not None and type(fetch.declared_security_id) is not str:
+            raise ValueError("declared_security_id must be a string or None")
+        if fetch.declared_period is not None and type(fetch.declared_period) is not str:
+            raise ValueError("declared_period must be a string or None")
+        cls._require_version_identifier(fetch.parser_id, "parser_id")
+        cls._require_version_identifier(fetch.parser_version, "parser_version")
+        cls._require_version_identifier(fetch.mapping_version, "mapping_version")
+        if type(fetch.refresh_generation) is not str or not fetch.refresh_generation:
+            raise ValueError("refresh_generation must be a nonempty string")
+
+    @staticmethod
+    def _require_version_identifier(value: object, field: str) -> None:
+        if type(value) is not str or _VERSION_IDENTIFIER.fullmatch(value) is None:
+            raise ValueError(f"invalid {field}")
+
+    @classmethod
+    def _require_recomputed_verification(
+        cls, fetch: OfficialFetch, verification: EvidenceVerification
+    ) -> None:
+        policy_factory = _POLICY_FACTORIES.get(fetch.request.source)
+        if policy_factory is None:
+            raise ValueError("fetch source has no canonical verification policy")
+        calendar_binding = cls._structural_calendar_binding(fetch)
+        recomputed = verify_official_fetch(
+            fetch, policy_factory(), calendar_binding=calendar_binding
+        )
+        if recomputed.status != "verified":
+            raise ValueError(
+                "fetch failed canonical verification: " + ",".join(recomputed.reasons)
+            )
+        if verification.reasons != recomputed.reasons:
+            raise ValueError("verification reasons do not match canonical verification")
+        if verification.effective_at_utc != recomputed.effective_at_utc:
+            raise ValueError("verification effective_at_utc does not match canonical verification")
+        if verification.content_sha256 != recomputed.content_sha256:
+            raise ValueError("verification content hash does not match canonical verification")
+
+    @staticmethod
+    def _structural_calendar_binding(
+        fetch: OfficialFetch,
+    ) -> VerifiedCalendarBinding | None:
+        if fetch.published_precision != "date_only":
+            return None
+        request = fetch.request
+        exchange = request.exchange
+        if exchange is None and isinstance(request.security_id, str):
+            exchange = request.security_id[:2]
+        evidence_hash = fetch.effective_time_evidence_hash
+        if exchange not in _EXCHANGES or not isinstance(evidence_hash, str):
+            return None
+        return VerifiedCalendarBinding(
+            snapshot_id="formal-raw-validation-calendar",
+            manifest_sha256=evidence_hash,
+            exchange=exchange,
+            freeze_at_utc=fetch.effective_at_utc,
+            registry_manifest_hash="0" * 64,
+            selector_hash="0" * 64,
+            prerequisite_task_id="formal-raw-validation-calendar-task",
+        )
 
     @staticmethod
     def _require_exact_manifest_payload(
