@@ -188,6 +188,35 @@ class FormalEvidenceTests(unittest.TestCase):
         self.assertEqual(result.status, "rejected")
         self.assertIn("invalid_timestamp", result.reasons)
 
+    def test_custom_akshare_policy_cannot_verify_formal_evidence(self):
+        fetch = OfficialFetch.minimal(
+            OfficialRequest("akshare", "daily", "SZ000001", "2026-08-31"),
+            b"rows",
+            "https://example.invalid/rows",
+            "2026-08-31T07:00:00+00:00",
+            "timestamp",
+            refresh_generation="fixture-index-v1",
+        )
+
+        result = verify_official_fetch(
+            fetch, SourcePolicy("akshare", frozenset({"example.invalid"}))
+        )
+
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("source_not_authoritative", result.reasons)
+
+    def test_rejects_unicode_decimal_digits_in_security_identity(self):
+        request = OfficialRequest("cninfo", "annual_report", "SZ１２３４５６", "2025-12-31")
+        fetch = timestamp_fetch(request=request)
+        unicode_identity = OfficialFetch(
+            **{**fetch.__dict__, "declared_security_id": "SZ１２３４５６"}
+        )
+
+        result = verify_official_fetch(unicode_identity, SourcePolicy.cninfo())
+
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("invalid_security_id", result.reasons)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,8 +11,15 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 
-_SECURITY_ID = re.compile(r"^(?:SH|SZ|BJ)\d{6}$")
+_SECURITY_ID = re.compile(r"^(?:SH|SZ|BJ)[0-9]{6}$")
 _EXCHANGES = frozenset({"SH", "SZ", "BJ"})
+_AUTHORITATIVE_HOSTS = {
+    "cninfo": frozenset({"www.cninfo.com.cn", "static.cninfo.com.cn"}),
+    "sse": frozenset({"www.sse.com.cn", "query.sse.com.cn", "static.sse.com.cn"}),
+    "szse": frozenset({"www.szse.cn", "docs.static.szse.cn"}),
+    "bse": frozenset({"www.bse.cn"}),
+    "csrc": frozenset({"www.csrc.gov.cn"}),
+}
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -194,25 +201,29 @@ class SourcePolicy:
             self, "allowed_hosts", frozenset(host.lower() for host in self.allowed_hosts)
         )
 
+    @property
+    def is_authoritative(self) -> bool:
+        return _AUTHORITATIVE_HOSTS.get(self.source) == self.allowed_hosts
+
     @classmethod
     def cninfo(cls) -> "SourcePolicy":
-        return cls("cninfo", frozenset({"www.cninfo.com.cn", "static.cninfo.com.cn"}))
+        return cls("cninfo", _AUTHORITATIVE_HOSTS["cninfo"])
 
     @classmethod
     def sse(cls) -> "SourcePolicy":
-        return cls("sse", frozenset({"www.sse.com.cn", "query.sse.com.cn", "static.sse.com.cn"}))
+        return cls("sse", _AUTHORITATIVE_HOSTS["sse"])
 
     @classmethod
     def szse(cls) -> "SourcePolicy":
-        return cls("szse", frozenset({"www.szse.cn", "docs.static.szse.cn"}))
+        return cls("szse", _AUTHORITATIVE_HOSTS["szse"])
 
     @classmethod
     def bse(cls) -> "SourcePolicy":
-        return cls("bse", frozenset({"www.bse.cn"}))
+        return cls("bse", _AUTHORITATIVE_HOSTS["bse"])
 
     @classmethod
     def csrc(cls) -> "SourcePolicy":
-        return cls("csrc", frozenset({"www.csrc.gov.cn"}))
+        return cls("csrc", _AUTHORITATIVE_HOSTS["csrc"])
 
     def verify(
         self,
@@ -278,6 +289,8 @@ def verify_official_fetch(
     if not isinstance(policy, SourcePolicy):
         reasons.add("invalid_policy")
         return EvidenceVerification("rejected", content_sha256, tuple(sorted(reasons)))
+    if not policy.is_authoritative:
+        reasons.add("source_not_authoritative")
 
     request = fetch.request
     if not isinstance(request, OfficialRequest):
