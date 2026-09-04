@@ -7574,6 +7574,66 @@ class StateStoreTestCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.replace_formal_universe_statuses(snapshot_id, decisions)
 
+    def test_formal_universe_status_reader_rejects_mixed_and_precreation_timestamps_without_mutation(self) -> None:
+        for index, case in enumerate(("different", "pre-header")):
+            with self.subTest(case=case):
+                path = Path(self.tempdir.name) / f"status-time-{index}.sqlite3"
+                store, frozen, _ = self.task_backed_frozen_universe(
+                    label=f"status-time-{index}", db_path=path
+                )
+                snapshot_id = store.put_formal_universe_snapshot(frozen)
+                decisions = tuple(
+                    FormalUniverseDecision(member.security_id, "formal_scored", (), (), "d" * 64)
+                    for member in frozen.members
+                )
+                with closing(sqlite3.connect(path)) as connection:
+                    header_created_at = connection.execute(
+                        "SELECT created_at FROM formal_universe_snapshot WHERE id=?",
+                        (snapshot_id,),
+                    ).fetchone()[0]
+                    offset = 1 if case == "different" else -1
+                    tampered_at = (
+                        datetime.fromisoformat(header_created_at) + timedelta(seconds=offset)
+                    ).isoformat()
+                    connection.execute(
+                        "UPDATE formal_universe_status SET updated_at=? WHERE snapshot_id=? AND security_id='BJ430001'",
+                        (tampered_at, snapshot_id),
+                    )
+                    connection.commit()
+                    before = connection.execute(
+                        "SELECT * FROM formal_universe_status WHERE snapshot_id=? ORDER BY security_id",
+                        (snapshot_id,),
+                    ).fetchall()
+
+                with self.assertRaises(ValueError):
+                    store.list_formal_universe_statuses(snapshot_id)
+                with self.assertRaises(ValueError):
+                    store.replace_formal_universe_statuses(snapshot_id, decisions)
+                with closing(sqlite3.connect(path)) as connection:
+                    after = connection.execute(
+                        "SELECT * FROM formal_universe_status WHERE snapshot_id=? ORDER BY security_id",
+                        (snapshot_id,),
+                    ).fetchall()
+                self.assertEqual(after, before)
+
+    def test_formal_universe_status_replacement_rejects_blank_reason_or_veto_without_mutation(self) -> None:
+        store, frozen, _ = self.task_backed_frozen_universe(label="status-blank")
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+        before = store.list_formal_universe_statuses(snapshot_id)
+        valid = [
+            FormalUniverseDecision(member.security_id, "formal_scored", (), (), "e" * 64)
+            for member in frozen.members
+        ]
+        invalid_sets = (
+            [replace(valid[0], status="out_of_scope", reasons=(" ",)), *valid[1:]],
+            [replace(valid[0], status="pool_vetoed", veto_flags=("\t",)), *valid[1:]],
+        )
+        for decisions in invalid_sets:
+            with self.subTest(decisions=decisions):
+                with self.assertRaises(ValueError):
+                    store.replace_formal_universe_statuses(snapshot_id, decisions)
+                self.assertEqual(store.list_formal_universe_statuses(snapshot_id), before)
+
     def test_formal_universe_finalizer_completion_and_getter_require_exact_bound_proof(self) -> None:
         store, frozen, source_task_ids = self.task_backed_frozen_universe(
             label="finalizer-valid"
@@ -7772,6 +7832,87 @@ class StateStoreTestCase(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             store.get_formal_universe_snapshot_from_task(wrong_kind)
+
+    def test_formal_universe_finalizer_and_getter_reject_status_timestamp_tamper_without_mutation(self) -> None:
+        for index, (operation, case) in enumerate(
+            (
+                ("complete", "different"),
+                ("complete", "pre-header"),
+                ("get", "different"),
+                ("get", "pre-header"),
+            )
+        ):
+            with self.subTest(operation=operation, case=case):
+                path = Path(self.tempdir.name) / f"finalizer-status-time-{index}.sqlite3"
+                store, frozen, source_task_ids = self.task_backed_frozen_universe(
+                    label=f"finalizer-status-time-{index}", db_path=path
+                )
+                snapshot_id = store.put_formal_universe_snapshot(frozen)
+                generation = f"finalizer-status-time-generation-{index}"
+                ordered_sources = [source_task_ids[e] for e in ("BJ", "SH", "SZ")]
+                finalizer_id = store.enqueue_formal_task(
+                    "formal_universe_finalize",
+                    f"formal-universe-finalize:status-time:{index}",
+                    generation,
+                    {
+                        "as_of_utc": frozen.as_of_utc,
+                        "registry_manifest_hash": frozen.registry_manifest_hash,
+                        "refresh_generation": generation,
+                        "source_task_ids": ordered_sources,
+                    },
+                    ordered_sources,
+                )
+                store.lease_next_formal_task(
+                    ("formal_universe_finalize",), "worker-finalizer", 300
+                )
+                result = {
+                    "universe_snapshot_id": snapshot_id,
+                    "frozen_input_hash": frozen.frozen_input_hash,
+                    "universe_hash": frozen.universe_hash,
+                    "registry_manifest_hash": frozen.registry_manifest_hash,
+                }
+                if operation == "get":
+                    store.complete_formal_task(finalizer_id, "worker-finalizer", result)
+
+                with closing(sqlite3.connect(path)) as connection:
+                    header_created_at = connection.execute(
+                        "SELECT created_at FROM formal_universe_snapshot WHERE id=?",
+                        (snapshot_id,),
+                    ).fetchone()[0]
+                    offset = 1 if case == "different" else -1
+                    tampered_at = (
+                        datetime.fromisoformat(header_created_at) + timedelta(seconds=offset)
+                    ).isoformat()
+                    connection.execute(
+                        "UPDATE formal_universe_status SET updated_at=? WHERE snapshot_id=? AND security_id='BJ430001'",
+                        (tampered_at, snapshot_id),
+                    )
+                    connection.commit()
+                    task_before = connection.execute(
+                        "SELECT * FROM formal_collection_task WHERE id=?", (finalizer_id,)
+                    ).fetchone()
+                    statuses_before = connection.execute(
+                        "SELECT * FROM formal_universe_status WHERE snapshot_id=? ORDER BY security_id",
+                        (snapshot_id,),
+                    ).fetchall()
+
+                if operation == "complete":
+                    with self.assertRaises(ValueError):
+                        store.complete_formal_task(finalizer_id, "worker-finalizer", result)
+                else:
+                    with self.assertRaises(ValueError):
+                        store.get_formal_universe_snapshot_from_task(finalizer_id)
+
+                with closing(sqlite3.connect(path)) as connection:
+                    task_after = connection.execute(
+                        "SELECT * FROM formal_collection_task WHERE id=?", (finalizer_id,)
+                    ).fetchone()
+                    statuses_after = connection.execute(
+                        "SELECT * FROM formal_universe_status WHERE snapshot_id=? ORDER BY security_id",
+                        (snapshot_id,),
+                    ).fetchall()
+                self.assertEqual(task_after, task_before)
+                self.assertEqual(statuses_after, statuses_before)
 
 
 if __name__ == "__main__":

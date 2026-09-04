@@ -767,11 +767,11 @@ def _require_formal_universe_status_values(
     if type(status) is not str or status not in _FORMAL_UNIVERSE_STATUSES:
         raise ValueError("formal universe status is not recognized")
     if type(reasons) is not tuple or any(
-        type(reason) is not str or not reason for reason in reasons
+        type(reason) is not str or not reason.strip() for reason in reasons
     ):
         raise ValueError("formal universe status reasons must be canonical strings")
     if type(veto_flags) is not tuple or any(
-        type(flag) is not str or not flag for flag in veto_flags
+        type(flag) is not str or not flag.strip() for flag in veto_flags
     ):
         raise ValueError("formal universe status veto flags must be canonical strings")
     if tuple(sorted(reasons)) != reasons or len(set(reasons)) != len(reasons):
@@ -2449,7 +2449,9 @@ class StateStore:
         header: sqlite3.Row,
     ) -> tuple[FormalFrozenUniverseInput, list[dict[str, object]]]:
         snapshot_id = _require_canonical_uuid(header["id"], "universe snapshot ID")
-        _require_canonical_utc(header["created_at"], "universe creation time")
+        header_created_at = _require_canonical_utc(
+            header["created_at"], "universe creation time"
+        )
         for field in (
             "registry_manifest_hash",
             "universe_hash",
@@ -2552,6 +2554,7 @@ class StateStore:
             != [member.security_id for member in members]
         ):
             raise ValueError("stored formal universe must have exactly one status per member")
+        status_updated_at_values: set[str] = set()
         for row in status_rows:
             reasons_list = _decode_canonical_formal_array(row["reasons_json"], "reasons")
             veto_flags_list = _decode_canonical_formal_array(
@@ -2567,7 +2570,22 @@ class StateStore:
                 evidence_hash=row["evidence_hash"],
                 frozen_input_hash=header["frozen_input_hash"],
             )
-            _require_canonical_utc(row["updated_at"], "universe status update time")
+            status_updated_at_values.add(
+                _require_canonical_utc(
+                    row["updated_at"], "universe status update time"
+                )
+            )
+        if len(status_updated_at_values) != 1:
+            raise ValueError(
+                "stored formal universe statuses must share one update time"
+            )
+        status_updated_at = next(iter(status_updated_at_values))
+        if datetime.fromisoformat(status_updated_at) < datetime.fromisoformat(
+            header_created_at
+        ):
+            raise ValueError(
+                "stored formal universe status update time predates snapshot"
+            )
 
         frozen = _create_frozen_universe_input(
             as_of_utc=header["as_of_utc"],
