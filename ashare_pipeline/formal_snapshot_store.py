@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 import hashlib
 import json
 import os
@@ -32,6 +32,8 @@ _POLICY_FACTORIES = {
     "bse": SourcePolicy.bse,
     "csrc": SourcePolicy.csrc,
 }
+
+CalendarBindingResolver = Callable[[OfficialRequest], VerifiedCalendarBinding]
 
 
 @dataclass(frozen=True)
@@ -100,8 +102,16 @@ def _unique_manifest_object(pairs: list[tuple[str, object]]) -> dict[str, object
 class FormalSnapshotStore:
     """Persist verified official fetches without decoding or re-encoding their bytes."""
 
-    def __init__(self, root: str | Path):
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        calendar_binding_resolver: CalendarBindingResolver | None = None,
+    ):
         self.root = Path(root).resolve()
+        if calendar_binding_resolver is not None and not callable(calendar_binding_resolver):
+            raise ValueError("calendar_binding_resolver must be callable or None")
+        self._calendar_binding_resolver = calendar_binding_resolver
 
     def write_verified(
         self,
@@ -113,6 +123,13 @@ class FormalSnapshotStore:
         """Atomically write one verified raw payload and its immutable lineage manifest."""
         self._validate_write_inputs(fetch, verification, producing_task_id)
         assert isinstance(fetch.request, OfficialRequest)
+        self._validate_formal_fetch_values(fetch)
+        calendar_binding = self._resolve_calendar_binding(
+            fetch.request,
+            fetch.published_precision,
+            fetch.effective_time_evidence_hash,
+        )
+        self._require_recomputed_verification(fetch, verification, calendar_binding)
         source = self._safe_path_component(fetch.request.source, "source")
         dataset = self._safe_path_component(fetch.request.dataset, "dataset")
         content_sha256 = fetch.content_sha256
@@ -175,6 +192,12 @@ class FormalSnapshotStore:
             raise ValueError(f"unable to read stored content: {content_path}") from error
         if _sha256_bytes(raw_bytes) != stored.content_sha256:
             raise ValueError("content hash verification failed")
+        manifest_request = self._official_request_from_manifest(request)
+        self._resolve_calendar_binding(
+            manifest_request,
+            envelope.get("published_precision"),
+            envelope.get("effective_time_evidence_hash"),
+        )
         return raw_bytes
 
     def validate_stored_snapshot(
@@ -195,7 +218,12 @@ class FormalSnapshotStore:
             fetch, stored, verification, expected_producing_task_id
         )
         self._validate_formal_fetch_values(fetch)
-        self._require_recomputed_verification(fetch, verification)
+        calendar_binding = self._resolve_calendar_binding(
+            fetch.request,
+            fetch.published_precision,
+            fetch.effective_time_evidence_hash,
+        )
+        self._require_recomputed_verification(fetch, verification, calendar_binding)
         content_sha256 = fetch.content_sha256
         self._require_sha256(content_sha256, "fetch content hash")
         self._require_sha256(verification.content_sha256, "verification content hash")
@@ -313,7 +341,19 @@ class FormalSnapshotStore:
 
     @classmethod
     def _validate_formal_fetch_values(cls, fetch: OfficialFetch) -> None:
-        request = fetch.request
+        cls._validate_request_values(fetch.request)
+        if fetch.declared_security_id is not None and type(fetch.declared_security_id) is not str:
+            raise ValueError("declared_security_id must be a string or None")
+        if fetch.declared_period is not None and type(fetch.declared_period) is not str:
+            raise ValueError("declared_period must be a string or None")
+        cls._require_version_identifier(fetch.parser_id, "parser_id")
+        cls._require_version_identifier(fetch.parser_version, "parser_version")
+        cls._require_version_identifier(fetch.mapping_version, "mapping_version")
+        if type(fetch.refresh_generation) is not str or not fetch.refresh_generation:
+            raise ValueError("refresh_generation must be a nonempty string")
+
+    @classmethod
+    def _validate_request_values(cls, request: OfficialRequest) -> None:
         if type(request.source) is not str:
             raise ValueError("formal request source must have exact type str")
         if type(request.dataset) is not str:
@@ -339,15 +379,6 @@ class FormalSnapshotStore:
         if request.security_id is not None and request.exchange is not None:
             if request.security_id[:2] != request.exchange:
                 raise ValueError("formal request security_id does not match exchange")
-        if fetch.declared_security_id is not None and type(fetch.declared_security_id) is not str:
-            raise ValueError("declared_security_id must be a string or None")
-        if fetch.declared_period is not None and type(fetch.declared_period) is not str:
-            raise ValueError("declared_period must be a string or None")
-        cls._require_version_identifier(fetch.parser_id, "parser_id")
-        cls._require_version_identifier(fetch.parser_version, "parser_version")
-        cls._require_version_identifier(fetch.mapping_version, "mapping_version")
-        if type(fetch.refresh_generation) is not str or not fetch.refresh_generation:
-            raise ValueError("refresh_generation must be a nonempty string")
 
     @staticmethod
     def _require_version_identifier(value: object, field: str) -> None:
@@ -356,12 +387,14 @@ class FormalSnapshotStore:
 
     @classmethod
     def _require_recomputed_verification(
-        cls, fetch: OfficialFetch, verification: EvidenceVerification
+        cls,
+        fetch: OfficialFetch,
+        verification: EvidenceVerification,
+        calendar_binding: VerifiedCalendarBinding | None,
     ) -> None:
         policy_factory = _POLICY_FACTORIES.get(fetch.request.source)
         if policy_factory is None:
             raise ValueError("fetch source has no canonical verification policy")
-        calendar_binding = cls._structural_calendar_binding(fetch)
         recomputed = verify_official_fetch(
             fetch, policy_factory(), calendar_binding=calendar_binding
         )
@@ -376,28 +409,79 @@ class FormalSnapshotStore:
         if verification.content_sha256 != recomputed.content_sha256:
             raise ValueError("verification content hash does not match canonical verification")
 
-    @staticmethod
-    def _structural_calendar_binding(
-        fetch: OfficialFetch,
+    def _resolve_calendar_binding(
+        self,
+        request: OfficialRequest,
+        published_precision: object,
+        effective_time_evidence_hash: object,
     ) -> VerifiedCalendarBinding | None:
-        if fetch.published_precision != "date_only":
+        if published_precision == "timestamp":
+            if effective_time_evidence_hash is not None:
+                raise ValueError("timestamp evidence cannot carry a calendar binding hash")
             return None
-        request = fetch.request
-        exchange = request.exchange
-        if exchange is None and isinstance(request.security_id, str):
-            exchange = request.security_id[:2]
-        evidence_hash = fetch.effective_time_evidence_hash
-        if exchange not in _EXCHANGES or not isinstance(evidence_hash, str):
-            return None
-        return VerifiedCalendarBinding(
-            snapshot_id="formal-raw-validation-calendar",
-            manifest_sha256=evidence_hash,
-            exchange=exchange,
-            freeze_at_utc=fetch.effective_at_utc,
-            registry_manifest_hash="0" * 64,
-            selector_hash="0" * 64,
-            prerequisite_task_id="formal-raw-validation-calendar-task",
+        if published_precision != "date_only":
+            raise ValueError("invalid published_precision")
+        if self._calendar_binding_resolver is None:
+            raise ValueError("date-only evidence requires a trusted calendar binding resolver")
+        try:
+            binding = self._calendar_binding_resolver(request)
+        except Exception as error:
+            raise ValueError("trusted calendar binding resolver failed") from error
+        if type(binding) is not VerifiedCalendarBinding:
+            raise ValueError("calendar binding resolver returned an invalid binding type")
+        self._require_calendar_binding_identity(binding)
+        self._require_sha256(
+            effective_time_evidence_hash, "effective_time_evidence_hash"
         )
+        expected_exchange = request.exchange
+        if expected_exchange is None and request.security_id is not None:
+            expected_exchange = request.security_id[:2]
+        if binding.exchange != expected_exchange:
+            raise ValueError("trusted calendar binding exchange mismatch")
+        if binding.manifest_sha256 != effective_time_evidence_hash:
+            raise ValueError("trusted calendar binding manifest mismatch")
+        return binding
+
+    @classmethod
+    def _require_calendar_binding_identity(cls, binding: VerifiedCalendarBinding) -> None:
+        for field, value in (
+            ("snapshot_id", binding.snapshot_id),
+            ("prerequisite_task_id", binding.prerequisite_task_id),
+        ):
+            if type(value) is not str or not value:
+                raise ValueError(f"trusted calendar binding {field} is invalid")
+        if type(binding.exchange) is not str or binding.exchange not in _EXCHANGES:
+            raise ValueError("trusted calendar binding exchange is invalid")
+        cls._require_sha256(binding.manifest_sha256, "calendar manifest_sha256")
+        cls._require_sha256(binding.registry_manifest_hash, "calendar registry_manifest_hash")
+        cls._require_sha256(binding.selector_hash, "calendar selector_hash")
+        if type(binding.freeze_at_utc) is not str:
+            raise ValueError("trusted calendar binding freeze_at_utc is invalid")
+        try:
+            freeze_at = datetime.fromisoformat(binding.freeze_at_utc.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("trusted calendar binding freeze_at_utc is invalid") from error
+        if freeze_at.tzinfo is None or freeze_at.utcoffset() is None:
+            raise ValueError("trusted calendar binding freeze_at_utc is invalid")
+
+    @classmethod
+    def _official_request_from_manifest(
+        cls, request: dict[str, object]
+    ) -> OfficialRequest:
+        expected_fields = {
+            "source", "dataset", "security_id", "period_or_date", "exchange"
+        }
+        if set(request) != expected_fields:
+            raise ValueError("manifest request fields are invalid")
+        official_request = OfficialRequest(
+            source=request["source"],
+            dataset=request["dataset"],
+            security_id=request["security_id"],
+            period_or_date=request["period_or_date"],
+            exchange=request["exchange"],
+        )
+        cls._validate_request_values(official_request)
+        return official_request
 
     @staticmethod
     def _require_exact_manifest_payload(
@@ -596,4 +680,9 @@ class FormalSnapshotStore:
             raise ValueError("formal snapshot path must stay inside the store root") from error
 
 
-__all__ = ["FormalSnapshotStore", "FormalStoredSnapshot", "ValidatedFormalSnapshot"]
+__all__ = [
+    "CalendarBindingResolver",
+    "FormalSnapshotStore",
+    "FormalStoredSnapshot",
+    "ValidatedFormalSnapshot",
+]

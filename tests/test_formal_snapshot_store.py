@@ -75,7 +75,240 @@ def rewrite_manifest(
     )
 
 
+def rewrite_manifest_for_fetch(
+    stored: FormalStoredSnapshot,
+    fetch: OfficialFetch,
+    verification: EvidenceVerification,
+) -> FormalStoredSnapshot:
+    def mutate(envelope: dict[str, object]) -> None:
+        envelope.update({
+            "request": {
+                "source": fetch.request.source,
+                "dataset": fetch.request.dataset,
+                "security_id": fetch.request.security_id,
+                "period_or_date": fetch.request.period_or_date,
+                "exchange": fetch.request.exchange,
+            },
+            "content_sha256": fetch.content_sha256,
+            "original_url": fetch.original_url,
+            "published_at_utc": fetch.published_at_utc,
+            "published_precision": fetch.published_precision,
+            "source_updated_at_utc": fetch.source_updated_at_utc,
+            "captured_at_utc": fetch.captured_at_utc,
+            "effective_at_utc": fetch.effective_at_utc,
+            "effective_time_evidence_hash": fetch.effective_time_evidence_hash,
+            "refresh_generation": fetch.refresh_generation,
+            "parser_id": fetch.parser_id,
+            "parser_version": fetch.parser_version,
+            "mapping_version": fetch.mapping_version,
+            "declared_security_id": fetch.declared_security_id,
+            "declared_period": fetch.declared_period,
+            "verification": {
+                "status": verification.status,
+                "content_sha256": verification.content_sha256,
+                "reasons": list(verification.reasons),
+                "effective_at_utc": verification.effective_at_utc,
+            },
+        })
+
+    return rewrite_manifest(stored, mutate)
+
+
+def verified_date_only_fetch() -> tuple[OfficialFetch, VerifiedCalendarBinding]:
+    binding = VerifiedCalendarBinding(
+        snapshot_id="calendar-snapshot-1",
+        manifest_sha256="c" * 64,
+        exchange="SZ",
+        freeze_at_utc="2026-08-31T07:00:00+00:00",
+        registry_manifest_hash="a" * 64,
+        selector_hash="b" * 64,
+        prerequisite_task_id="calendar-task-1",
+    )
+    fetch = replace(
+        verified_fetch(),
+        request=replace(verified_fetch().request, exchange="SZ"),
+        published_precision="date_only",
+        effective_time_evidence_hash=binding.manifest_sha256,
+    )
+    return fetch, binding
+
+
+def calendar_resolver_for(
+    expected_request: OfficialRequest, binding: VerifiedCalendarBinding
+):
+    expected_request_bytes = expected_request.canonical_json_bytes()
+
+    def resolve(request: OfficialRequest) -> VerifiedCalendarBinding:
+        if type(request) is not OfficialRequest:
+            raise ValueError("unexpected calendar request type")
+        if request.canonical_json_bytes() != expected_request_bytes:
+            raise ValueError("unexpected calendar request identity")
+        return binding
+
+    return resolve
+
+
 class FormalSnapshotStoreTests(unittest.TestCase):
+    def test_date_only_write_requires_configured_trusted_calendar_resolver(self):
+        """A caller-controlled effective hash alone must never mint date-only evidence."""
+        with tempfile.TemporaryDirectory() as root:
+            store = FormalSnapshotStore(root)
+            fetch, binding = verified_date_only_fetch()
+            verification = verify_official_fetch(
+                fetch, SourcePolicy.cninfo(), calendar_binding=binding
+            )
+
+            with self.assertRaisesRegex(ValueError, "calendar.*resolver"):
+                store.write_verified(fetch, verification, producing_task_id=None)
+            self.assertFalse(list(Path(root).rglob("*.bin")))
+            self.assertFalse(list(Path(root).rglob("*.manifest.json")))
+
+            trusted_store = FormalSnapshotStore(
+                root,
+                calendar_binding_resolver=calendar_resolver_for(fetch.request, binding),
+            )
+            stored = trusted_store.write_verified(
+                fetch, verification, producing_task_id=None
+            )
+            with self.assertRaisesRegex(ValueError, "calendar.*resolver"):
+                store.validate_stored_snapshot(
+                    fetch, stored, verification, expected_producing_task_id=None
+                )
+            with self.assertRaisesRegex(ValueError, "calendar.*resolver"):
+                store.read_verified_raw(stored)
+
+    def test_date_only_write_validate_and_read_use_injected_calendar_resolver(self):
+        """A context-resolved binding must authorize write and every later raw read."""
+        with tempfile.TemporaryDirectory() as root:
+            fetch, binding = verified_date_only_fetch()
+            store = FormalSnapshotStore(
+                root,
+                calendar_binding_resolver=calendar_resolver_for(fetch.request, binding),
+            )
+            verification = verify_official_fetch(
+                fetch, SourcePolicy.cninfo(), calendar_binding=binding
+            )
+
+            stored = store.write_verified(fetch, verification, producing_task_id=None)
+            inspected = store.validate_stored_snapshot(
+                fetch, stored, verification, expected_producing_task_id=None
+            )
+
+            self.assertEqual(inspected.effective_time_evidence_hash, binding.manifest_sha256)
+            self.assertEqual(store.read_verified_raw(stored), fetch.raw_bytes)
+
+    def test_date_only_rejects_mismatched_resolver_binding_on_write_and_reread(self):
+        """A binding for another calendar snapshot cannot authorize this manifest."""
+        with tempfile.TemporaryDirectory() as root:
+            fetch, binding = verified_date_only_fetch()
+            verification = verify_official_fetch(
+                fetch, SourcePolicy.cninfo(), calendar_binding=binding
+            )
+            good_store = FormalSnapshotStore(
+                root,
+                calendar_binding_resolver=calendar_resolver_for(fetch.request, binding),
+            )
+            stored = good_store.write_verified(
+                fetch, verification, producing_task_id=None
+            )
+            mismatched_binding = replace(binding, manifest_sha256="d" * 64)
+            mismatched_store = FormalSnapshotStore(
+                root,
+                calendar_binding_resolver=calendar_resolver_for(
+                    fetch.request, mismatched_binding
+                ),
+            )
+
+            with self.assertRaisesRegex(ValueError, "calendar.*mismatch"):
+                mismatched_store.write_verified(
+                    fetch, verification, producing_task_id=None
+                )
+            with self.assertRaisesRegex(ValueError, "calendar.*mismatch"):
+                mismatched_store.validate_stored_snapshot(
+                    fetch, stored, verification, expected_producing_task_id=None
+                )
+            with self.assertRaisesRegex(ValueError, "calendar.*mismatch"):
+                mismatched_store.read_verified_raw(stored)
+
+    def test_date_only_rejects_failed_or_invalid_resolver_output(self):
+        """Only a complete context-resolved binding may cross the trust boundary."""
+        fetch, binding = verified_date_only_fetch()
+        verification = verify_official_fetch(
+            fetch, SourcePolicy.cninfo(), calendar_binding=binding
+        )
+
+        def failed_resolver(_request: OfficialRequest) -> VerifiedCalendarBinding:
+            raise LookupError("calendar context unavailable")
+
+        resolvers = (
+            failed_resolver,
+            lambda _request: object(),
+            lambda _request: replace(binding, exchange="SH"),
+            lambda _request: replace(binding, registry_manifest_hash="r" * 64),
+            lambda _request: replace(binding, selector_hash="s" * 64),
+            lambda _request: replace(binding, freeze_at_utc="2026-08-31T07:00:00"),
+        )
+        for resolver in resolvers:
+            with self.subTest(resolver=resolver), tempfile.TemporaryDirectory() as root:
+                store = FormalSnapshotStore(
+                    root, calendar_binding_resolver=resolver
+                )
+                with self.assertRaisesRegex(ValueError, "calendar"):
+                    store.write_verified(
+                        fetch, verification, producing_task_id=None
+                    )
+                self.assertFalse(list(Path(root).rglob("*.bin")))
+
+    def test_date_only_self_forgery_cannot_validate_against_resolved_binding(self):
+        """Rehashing a manifest around an arbitrary evidence hash must fail closed."""
+        with tempfile.TemporaryDirectory() as root:
+            fetch, binding = verified_date_only_fetch()
+            verification = verify_official_fetch(
+                fetch, SourcePolicy.cninfo(), calendar_binding=binding
+            )
+            store = FormalSnapshotStore(
+                root,
+                calendar_binding_resolver=calendar_resolver_for(fetch.request, binding),
+            )
+            stored = store.write_verified(fetch, verification, producing_task_id=None)
+            forged_fetch = replace(fetch, effective_time_evidence_hash="d" * 64)
+            forged_verification = EvidenceVerification(
+                "verified",
+                forged_fetch.content_sha256,
+                (),
+                forged_fetch.effective_at_utc,
+            )
+            forged_stored = rewrite_manifest(
+                stored,
+                lambda envelope: envelope.__setitem__(
+                    "effective_time_evidence_hash", "d" * 64
+                ),
+            )
+
+            with self.assertRaisesRegex(ValueError, "calendar.*mismatch"):
+                store.validate_stored_snapshot(
+                    forged_fetch,
+                    forged_stored,
+                    forged_verification,
+                    expected_producing_task_id=None,
+                )
+
+    def test_timestamp_write_and_validation_need_no_calendar_resolver(self):
+        """The trusted resolver requirement is isolated to date-only publications."""
+        with tempfile.TemporaryDirectory() as root:
+            store = FormalSnapshotStore(root)
+            fetch = verified_fetch()
+            verification = verified(fetch)
+
+            stored = store.write_verified(fetch, verification, producing_task_id=None)
+
+            self.assertEqual(
+                store.validate_stored_snapshot(
+                    fetch, stored, verification, expected_producing_task_id=None
+                ).manifest_sha256,
+                stored.manifest_sha256,
+            )
+
     def test_validate_stored_snapshot_recomputes_verification_instead_of_trusting_status(self):
         """A public EvidenceVerification constructor must not mint trusted evidence."""
         cases = (
@@ -114,13 +347,23 @@ class FormalSnapshotStoreTests(unittest.TestCase):
         for mutate_fetch, build_verification, expected_error in cases:
             with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as root:
                 store = FormalSnapshotStore(root)
-                fetch = mutate_fetch(verified_fetch())
+                valid_fetch = verified_fetch()
+                valid_verification = verified(valid_fetch)
+                stored = store.write_verified(
+                    valid_fetch, valid_verification, producing_task_id=None
+                )
+                fetch = mutate_fetch(valid_fetch)
                 verification = build_verification(fetch)
-                stored = store.write_verified(fetch, verification, producing_task_id=None)
+                forged_stored = rewrite_manifest_for_fetch(stored, fetch, verification)
 
                 with self.assertRaisesRegex(ValueError, expected_error):
+                    store.write_verified(fetch, verification, producing_task_id=None)
+                with self.assertRaisesRegex(ValueError, expected_error):
                     store.validate_stored_snapshot(
-                        fetch, stored, verification, expected_producing_task_id=None
+                        fetch,
+                        forged_stored,
+                        verification,
+                        expected_producing_task_id=None,
                     )
 
     def test_validate_stored_snapshot_rejects_self_consistent_invalid_nested_values(self):
@@ -158,15 +401,25 @@ class FormalSnapshotStoreTests(unittest.TestCase):
         for mutate_fetch, expected_error in cases:
             with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as root:
                 store = FormalSnapshotStore(root)
-                fetch = mutate_fetch(verified_fetch())
+                valid_fetch = verified_fetch()
+                valid_verification = verified(valid_fetch)
+                stored = store.write_verified(
+                    valid_fetch, valid_verification, producing_task_id=None
+                )
+                fetch = mutate_fetch(valid_fetch)
                 verification = EvidenceVerification(
                     "verified", fetch.content_sha256, (), fetch.effective_at_utc
                 )
-                stored = store.write_verified(fetch, verification, producing_task_id=None)
+                forged_stored = rewrite_manifest_for_fetch(stored, fetch, verification)
 
                 with self.assertRaisesRegex(ValueError, expected_error):
+                    store.write_verified(fetch, verification, producing_task_id=None)
+                with self.assertRaisesRegex(ValueError, expected_error):
                     store.validate_stored_snapshot(
-                        fetch, stored, verification, expected_producing_task_id=None
+                        fetch,
+                        forged_stored,
+                        verification,
+                        expected_producing_task_id=None,
                     )
 
     def test_validate_stored_snapshot_returns_frozen_manifest_derived_projection(self):
@@ -276,39 +529,6 @@ class FormalSnapshotStoreTests(unittest.TestCase):
                     expected_producing_task_id="formal-task-2",
                 )
 
-    def test_validate_stored_snapshot_preserves_verified_date_only_snapshot(self):
-        """Recomputation must retain valid calendar-bound Task 2 evidence."""
-        with tempfile.TemporaryDirectory() as root:
-            store = FormalSnapshotStore(root)
-            binding = VerifiedCalendarBinding(
-                snapshot_id="calendar-snapshot-1",
-                manifest_sha256="c" * 64,
-                exchange="SZ",
-                freeze_at_utc="2026-08-31T07:00:00+00:00",
-                registry_manifest_hash="r" * 64,
-                selector_hash="s" * 64,
-                prerequisite_task_id="calendar-task-1",
-            )
-            fetch = replace(
-                verified_fetch(),
-                request=replace(verified_fetch().request, exchange="SZ"),
-                published_precision="date_only",
-                effective_time_evidence_hash=binding.manifest_sha256,
-            )
-            verification = verify_official_fetch(
-                fetch, SourcePolicy.cninfo(), calendar_binding=binding
-            )
-            self.assertEqual(verification.status, "verified")
-            stored = store.write_verified(fetch, verification, producing_task_id=None)
-
-            inspected = store.validate_stored_snapshot(
-                fetch, stored, verification, expected_producing_task_id=None
-            )
-
-            self.assertEqual(
-                inspected.effective_time_evidence_hash, binding.manifest_sha256
-            )
-
     def test_validate_stored_snapshot_rejects_content_and_hash_forgery(self):
         """Trusting stored hashes or filenames would permit substituted bytes or lineage."""
         with tempfile.TemporaryDirectory() as root:
@@ -353,20 +573,33 @@ class FormalSnapshotStoreTests(unittest.TestCase):
     def test_validate_stored_snapshot_rejects_non_lowercase_effective_evidence_hash(self):
         """Accepting a noncanonical evidence hash would create unstable calendar lineage."""
         with tempfile.TemporaryDirectory() as root:
-            store = FormalSnapshotStore(root)
-            fetch = replace(
-                verified_fetch(),
-                published_precision="date_only",
-                effective_time_evidence_hash="A" * 64,
+            valid_fetch, binding = verified_date_only_fetch()
+            store = FormalSnapshotStore(
+                root,
+                calendar_binding_resolver=calendar_resolver_for(
+                    valid_fetch.request, binding
+                ),
             )
+            valid_verification = verify_official_fetch(
+                valid_fetch, SourcePolicy.cninfo(), calendar_binding=binding
+            )
+            stored = store.write_verified(
+                valid_fetch, valid_verification, producing_task_id=None
+            )
+            fetch = replace(valid_fetch, effective_time_evidence_hash="A" * 64)
             verification = EvidenceVerification(
                 "verified", fetch.content_sha256, (), fetch.effective_at_utc
             )
-            stored = store.write_verified(fetch, verification, producing_task_id=None)
+            forged_stored = rewrite_manifest_for_fetch(stored, fetch, verification)
 
             with self.assertRaisesRegex(ValueError, "effective_time_evidence_hash"):
+                store.write_verified(fetch, verification, producing_task_id=None)
+            with self.assertRaisesRegex(ValueError, "effective_time_evidence_hash"):
                 store.validate_stored_snapshot(
-                    fetch, stored, verification, expected_producing_task_id=None
+                    fetch,
+                    forged_stored,
+                    verification,
+                    expected_producing_task_id=None,
                 )
 
     def test_validate_stored_snapshot_rejects_self_consistent_manifest_field_mismatches(self):
