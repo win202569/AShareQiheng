@@ -1533,14 +1533,227 @@ class StateStore:
             ]
             return self._formal_task_public(row, prerequisites)
 
+    def lease_next_formal_task(
+        self,
+        kinds: Iterable[str],
+        worker_id: str,
+        lease_seconds: int,
+        now_utc: str | None = None,
+    ) -> dict[str, object] | None:
+        if isinstance(kinds, (str, bytes)):
+            raise ValueError("kinds must be an iterable of nonempty strings")
+        try:
+            requested_kinds = tuple(kinds)
+        except TypeError as error:
+            raise ValueError("kinds must be iterable") from error
+        if not requested_kinds:
+            return None
+        if any(not isinstance(kind, str) or not kind.strip() for kind in requested_kinds):
+            raise ValueError("kinds must contain only nonempty strings")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise ValueError("worker_id must be a nonempty string")
+        if (
+            not isinstance(lease_seconds, int)
+            or isinstance(lease_seconds, bool)
+            or lease_seconds <= 0
+        ):
+            raise ValueError("lease_seconds must be a positive integer")
+        if now_utc is not None and not isinstance(now_utc, str):
+            raise ValueError("now_utc must be a timezone-aware timestamp")
+        explicit_now = _utc_iso(now_utc) if now_utc is not None else None
+        marks = ",".join("?" for _ in requested_kinds)
+
+        with self._transaction(immediate=True) as connection:
+            now = explicit_now if explicit_now is not None else _utc_iso(_utc_now())
+            expiry = (
+                datetime.fromisoformat(now) + timedelta(seconds=lease_seconds)
+            ).astimezone(timezone.utc).isoformat()
+            row = connection.execute(
+                f"""SELECT task.*
+                FROM formal_collection_task AS task
+                WHERE task.kind IN ({marks})
+                  AND (
+                    task.status = 'pending'
+                    OR (
+                        task.status = 'retryable_failed'
+                        AND task.next_retry_at IS NOT NULL
+                        AND task.next_retry_at <= ?
+                    )
+                    OR (
+                        task.status = 'leased'
+                        AND task.lease_expires_at IS NOT NULL
+                        AND task.lease_expires_at <= ?
+                    )
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM formal_collection_task_dependency AS dependency
+                    JOIN formal_collection_task AS prerequisite
+                      ON prerequisite.id = dependency.prerequisite_task_id
+                    WHERE dependency.task_id = task.id
+                      AND prerequisite.status <> 'verified'
+                  )
+                ORDER BY CASE
+                    WHEN task.status = 'pending' THEN task.created_at
+                    WHEN task.status = 'retryable_failed' THEN task.next_retry_at
+                    ELSE task.lease_expires_at
+                END, task.created_at, task.id
+                LIMIT 1""",
+                (*requested_kinds, now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            task_id = str(row["id"])
+            prerequisites = [
+                str(item["prerequisite_task_id"])
+                for item in connection.execute(
+                    """SELECT prerequisite_task_id
+                    FROM formal_collection_task_dependency
+                    WHERE task_id = ? ORDER BY prerequisite_task_id""",
+                    (task_id,),
+                )
+            ]
+            self._formal_task_public(row, prerequisites)
+            cursor = connection.execute(
+                f"""UPDATE formal_collection_task
+                SET status = 'leased', lease_worker = ?, lease_expires_at = ?,
+                    next_retry_at = NULL, updated_at = ?
+                WHERE id = ? AND kind IN ({marks})
+                  AND (
+                    status = 'pending'
+                    OR (
+                        status = 'retryable_failed'
+                        AND next_retry_at IS NOT NULL
+                        AND next_retry_at <= ?
+                    )
+                    OR (
+                        status = 'leased'
+                        AND lease_expires_at IS NOT NULL
+                        AND lease_expires_at <= ?
+                    )
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM formal_collection_task_dependency AS dependency
+                    JOIN formal_collection_task AS prerequisite
+                      ON prerequisite.id = dependency.prerequisite_task_id
+                    WHERE dependency.task_id = formal_collection_task.id
+                      AND prerequisite.status <> 'verified'
+                  )""",
+                (
+                    worker_id,
+                    expiry,
+                    now,
+                    task_id,
+                    *requested_kinds,
+                    now,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            leased = connection.execute(
+                "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
+            ).fetchone()
+            return self._formal_task_public(leased, prerequisites)
+
+    def renew_formal_task_lease(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int,
+        now_utc: str | None = None,
+    ) -> str:
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("task_id must be a nonempty string")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise ValueError("worker_id must be a nonempty string")
+        if (
+            not isinstance(lease_seconds, int)
+            or isinstance(lease_seconds, bool)
+            or lease_seconds <= 0
+        ):
+            raise ValueError("lease_seconds must be a positive integer")
+        if now_utc is not None and not isinstance(now_utc, str):
+            raise ValueError("now_utc must be a timezone-aware timestamp")
+        explicit_now = _utc_iso(now_utc) if now_utc is not None else None
+
+        with self._transaction(immediate=True) as connection:
+            now = explicit_now if explicit_now is not None else _utc_iso(_utc_now())
+            expiry = (
+                datetime.fromisoformat(now) + timedelta(seconds=lease_seconds)
+            ).astimezone(timezone.utc).isoformat()
+            cursor = connection.execute(
+                """UPDATE formal_collection_task
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'leased' AND lease_worker = ?
+                  AND lease_expires_at > ?""",
+                (expiry, now, task_id, worker_id, now),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "formal task is not held by the current unexpired lease owner"
+                )
+        return expiry
+
+    def fail_formal_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        error: Mapping[str, object],
+        status: str,
+        next_retry_at: str | None,
+    ) -> None:
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("task_id must be a nonempty string")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise ValueError("worker_id must be a nonempty string")
+        if (
+            not isinstance(status, str)
+            or status not in {"retryable_failed", "terminal_failed"}
+        ):
+            raise ValueError("status must be retryable_failed or terminal_failed")
+        error_json = _canonical_mapping_json(error, "error")
+        if status == "retryable_failed":
+            if not isinstance(next_retry_at, str):
+                raise ValueError("retryable failure requires next_retry_at")
+            retry_at = _utc_iso(next_retry_at)
+        else:
+            if next_retry_at is not None:
+                raise ValueError("terminal failure requires next_retry_at to be None")
+            retry_at = None
+
+        with self._transaction(immediate=True) as connection:
+            now = _utc_iso(_utc_now())
+            cursor = connection.execute(
+                """UPDATE formal_collection_task
+                SET status = ?, error_json = ?, next_retry_at = ?,
+                    lease_worker = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND status = 'leased' AND lease_worker = ?
+                  AND lease_expires_at > ?""",
+                (status, error_json, retry_at, now, task_id, worker_id, now),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "formal task is not held by the current unexpired lease owner"
+                )
+
     def resolve_formal_task_dependencies(self) -> int:
         changed = 0
         with self._transaction(immediate=True) as connection:
+            now = _utc_iso(_utc_now())
             while True:
                 candidates = connection.execute(
                     """SELECT task.id
                     FROM formal_collection_task AS task
-                    WHERE task.status IN ('pending','retryable_failed')
+                    WHERE (
+                        task.status IN ('pending','retryable_failed')
+                        OR (
+                            task.status = 'leased'
+                            AND task.lease_expires_at IS NOT NULL
+                            AND task.lease_expires_at <= ?
+                        )
+                      )
                       AND EXISTS (
                         SELECT 1
                         FROM formal_collection_task_dependency AS dependency
@@ -1549,7 +1762,8 @@ class StateStore:
                         WHERE dependency.task_id = task.id
                           AND prerequisite.status IN ('terminal_failed','superseded')
                       )
-                    ORDER BY task.id"""
+                    ORDER BY task.id""",
+                    (now,),
                 ).fetchall()
                 if not candidates:
                     break
@@ -1580,8 +1794,26 @@ class StateStore:
                         SET status = 'terminal_failed', lease_worker = NULL,
                             lease_expires_at = NULL, next_retry_at = NULL,
                             result_json = NULL, error_json = ?, updated_at = ?
-                        WHERE id = ? AND status IN ('pending','retryable_failed')""",
-                        (error_json, _utc_now(), task_id),
+                        WHERE id = ?
+                          AND (
+                            status IN ('pending','retryable_failed')
+                            OR (
+                                status = 'leased'
+                                AND lease_expires_at IS NOT NULL
+                                AND lease_expires_at <= ?
+                            )
+                          )
+                          AND EXISTS (
+                            SELECT 1
+                            FROM formal_collection_task_dependency AS dependency
+                            JOIN formal_collection_task AS prerequisite
+                              ON prerequisite.id = dependency.prerequisite_task_id
+                            WHERE dependency.task_id = formal_collection_task.id
+                              AND prerequisite.status IN (
+                                'terminal_failed','superseded'
+                              )
+                          )""",
+                        (error_json, now, task_id, now),
                     )
                     iteration_changed += cursor.rowcount
                 if iteration_changed == 0:

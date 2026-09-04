@@ -1208,6 +1208,610 @@ class StateStoreTestCase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "canonical"):
             self.store.get_formal_task(task_id)
 
+    def test_formal_lease_orders_all_ready_states_and_honors_exact_boundaries(self) -> None:
+        task_ids = {
+            name: self.store.enqueue_formal_task(
+                "formal_statement", f"lease-{name}", "generation-v1", {"name": name}
+            )
+            for name in (
+                "pending",
+                "retry-null",
+                "retry-boundary",
+                "retry-future",
+                "expired",
+                "expiry-boundary",
+                "live",
+                "verified",
+                "terminal",
+                "superseded",
+            )
+        }
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET created_at = ? WHERE id = ?",
+                (utc_at(3), task_ids["pending"]),
+            )
+            for name, retry_at in (
+                ("retry-null", None),
+                ("retry-boundary", utc_at(10)),
+                ("retry-future", utc_at(11)),
+            ):
+                connection.execute(
+                    """UPDATE formal_collection_task
+                    SET status = 'retryable_failed', next_retry_at = ?, created_at = ?
+                    WHERE id = ?""",
+                    (retry_at, utc_at(2), task_ids[name]),
+                )
+            for name, expiry, created_at in (
+                ("expired", utc_at(1), utc_at(1)),
+                ("expiry-boundary", utc_at(10), utc_at(1)),
+                ("live", utc_at(11), utc_at(0)),
+            ):
+                connection.execute(
+                    """UPDATE formal_collection_task
+                    SET status = 'leased', lease_worker = 'old-worker',
+                        lease_expires_at = ?, created_at = ? WHERE id = ?""",
+                    (expiry, created_at, task_ids[name]),
+                )
+            for name, status in (
+                ("verified", "verified"),
+                ("terminal", "terminal_failed"),
+                ("superseded", "superseded"),
+            ):
+                connection.execute(
+                    "UPDATE formal_collection_task SET status = ? WHERE id = ?",
+                    (status, task_ids[name]),
+                )
+            connection.commit()
+
+        lease = getattr(self.store, "lease_next_formal_task", None)
+        self.assertIsNotNone(lease, "formal lease API is missing")
+        first_wave = [
+            lease(("formal_statement",), "worker-a", 30, now_utc=utc_at(10))
+            for _ in range(4)
+        ]
+        self.assertEqual(
+            [row["id"] if row is not None else None for row in first_wave],
+            [
+                task_ids["expired"],
+                task_ids["pending"],
+                task_ids["expiry-boundary"],
+                task_ids["retry-boundary"],
+            ],
+        )
+        for row in first_wave:
+            self.assertEqual(row["status"], "leased")
+            self.assertEqual(row["lease_worker"], "worker-a")
+            self.assertEqual(row["lease_expires_at"], utc_at(40))
+            self.assertIsNone(row["next_retry_at"])
+        self.assertIsNone(
+            lease(("formal_statement",), "worker-a", 30, now_utc=utc_at(10))
+        )
+
+        boundary_wave = [
+            lease(("formal_statement",), "worker-b", 30, now_utc=utc_at(11))
+            for _ in range(2)
+        ]
+        self.assertEqual(
+            [row["id"] for row in boundary_wave],
+            [task_ids["live"], task_ids["retry-future"]],
+        )
+        self.assertIsNone(
+            lease(("formal_statement",), "worker-b", 30, now_utc=utc_at(11))
+        )
+
+    def test_formal_lease_blocks_until_every_prerequisite_is_verified(self) -> None:
+        first = self.store.enqueue_formal_task(
+            "formal_context", "lease-dependency-first", "generation-v1", {}
+        )
+        second = self.store.enqueue_formal_task(
+            "formal_context", "lease-dependency-second", "generation-v1", {}
+        )
+        child = self.store.enqueue_formal_task(
+            "formal_statement",
+            "lease-dependency-child",
+            "generation-v1",
+            {"security_id": "SH600001"},
+            prerequisite_task_ids=(second, first),
+        )
+
+        lease = getattr(self.store, "lease_next_formal_task", None)
+        self.assertIsNotNone(lease, "formal lease API is missing")
+        self.assertIsNone(
+            lease(("formal_statement",), "worker-a", 30, now_utc=utc_at(0))
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET status = 'verified' WHERE id = ?",
+                (first,),
+            )
+            connection.commit()
+        self.assertIsNone(
+            lease(("formal_statement",), "worker-a", 30, now_utc=utc_at(0))
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET status = 'verified' WHERE id = ?",
+                (second,),
+            )
+            connection.commit()
+
+        leased = lease(("formal_statement",), "worker-a", 30, now_utc=utc_at(0))
+
+        self.assertEqual(leased["id"], child)
+        self.assertEqual(leased["prerequisite_task_ids"], sorted((first, second)))
+
+    def test_formal_lease_cas_rechecks_dependency_after_candidate_selection(self) -> None:
+        prerequisite = self.store.enqueue_formal_task(
+            "formal_context", "lease-cas-prerequisite", "generation-v1", {}
+        )
+        child = self.store.enqueue_formal_task(
+            "formal_statement",
+            "lease-cas-child",
+            "generation-v1",
+            {},
+            prerequisite_task_ids=(prerequisite,),
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET status = 'verified' WHERE id = ?",
+                (prerequisite,),
+            )
+            connection.commit()
+        real_connect = self.store._connect
+        candidate_mutated = False
+
+        class CandidateCursor:
+            def __init__(self, connection, cursor):
+                self.connection = connection
+                self.cursor = cursor
+
+            def fetchone(self):
+                nonlocal candidate_mutated
+                row = self.cursor.fetchone()
+                self.connection.execute(
+                    "UPDATE formal_collection_task SET status = 'pending' WHERE id = ?",
+                    (prerequisite,),
+                )
+                candidate_mutated = True
+                return row
+
+        class ObservedConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def execute(self, sql, parameters=()):
+                cursor = self.connection.execute(sql, parameters)
+                if "SELECT task.*" in sql:
+                    return CandidateCursor(self.connection, cursor)
+                return cursor
+
+        with patch.object(
+            self.store,
+            "_connect",
+            side_effect=lambda: ObservedConnection(real_connect()),
+        ):
+            leased = self.store.lease_next_formal_task(
+                ("formal_statement",), "worker-a", 30, now_utc=utc_at(0)
+            )
+
+        self.assertTrue(candidate_mutated)
+        self.assertIsNone(leased)
+        row = self.store.get_formal_task(child)
+        self.assertEqual(row["status"], "pending")
+        self.assertIsNone(row["lease_worker"])
+        self.assertIsNone(row["lease_expires_at"])
+
+    def test_two_stores_lease_one_formal_task_and_distinct_worker_takes_over(self) -> None:
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "lease-contention", "generation-v1", {}
+        )
+        stores = (StateStore(self.db_path), StateStore(self.db_path))
+        barrier = threading.Barrier(2)
+        results: list[dict[str, object] | None] = []
+        errors: list[BaseException] = []
+
+        def claim(store: StateStore, worker_id: str) -> None:
+            try:
+                barrier.wait(timeout=5)
+                results.append(
+                    store.lease_next_formal_task(
+                        ("formal_statement",), worker_id, 30, now_utc=utc_at(0)
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        workers = [
+            threading.Thread(target=claim, args=(store, f"worker-{index}"))
+            for index, store in enumerate(stores)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        winners = [row for row in results if row is not None]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(winners[0]["id"], task_id)
+        self.assertEqual(sum(row is None for row in results), 1)
+
+        takeover = self.store.lease_next_formal_task(
+            ("formal_statement",), "worker-takeover", 30, now_utc=utc_at(30)
+        )
+        self.assertEqual(takeover["id"], task_id)
+        self.assertEqual(takeover["lease_worker"], "worker-takeover")
+
+    def test_formal_lease_rejects_invalid_inputs_and_rolls_back_tampered_payload(self) -> None:
+        self.assertIsNone(
+            self.store.lease_next_formal_task((), "worker-a", 30, now_utc=utc_at(0))
+        )
+        for worker_id in ("", "   ", None):
+            with self.subTest(worker_id=worker_id):
+                with self.assertRaises(ValueError):
+                    self.store.lease_next_formal_task(
+                        ("formal_statement",), worker_id, 30, now_utc=utc_at(0)
+                    )
+        for lease_seconds in (0, -1):
+            with self.subTest(lease_seconds=lease_seconds):
+                with self.assertRaises(ValueError):
+                    self.store.lease_next_formal_task(
+                        ("formal_statement",), "worker-a", lease_seconds,
+                        now_utc=utc_at(0),
+                    )
+        with self.assertRaisesRegex(ValueError, "timezone"):
+            self.store.lease_next_formal_task(
+                ("formal_statement",), "worker-a", 30,
+                now_utc="2026-08-31T00:00:00",
+            )
+
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "lease-tampered", "generation-v1", {"value": 1}
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET payload_sha256 = ? WHERE id = ?",
+                ("0" * 64, task_id),
+            )
+            before = connection.execute(
+                "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
+            ).fetchone()
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "payload hash"):
+            self.store.lease_next_formal_task(
+                ("formal_statement",), "worker-a", 30, now_utc=utc_at(0)
+            )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            after = connection.execute(
+                "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
+            ).fetchone()
+        self.assertEqual(after, before)
+
+    def test_formal_lease_samples_implicit_time_after_writer_lock(self) -> None:
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "formal-lease-lock-boundary", "generation-v1", {}
+        )
+        holder = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        begin_attempted = threading.Event()
+        clock_sampled = threading.Event()
+        after_wait = threading.Event()
+        sampled_before_begin: list[bool] = []
+        results: list[dict[str, object] | None] = []
+        errors: list[BaseException] = []
+        real_connect = self.store._connect
+
+        class ObservedConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def execute(self, sql, parameters=()):
+                if sql == "BEGIN IMMEDIATE":
+                    sampled_before_begin.append(clock_sampled.is_set())
+                    begin_attempted.set()
+                return self.connection.execute(sql, parameters)
+
+        def controlled_now() -> str:
+            clock_sampled.set()
+            return utc_at(20) if after_wait.is_set() else utc_at(0)
+
+        def claim() -> None:
+            try:
+                results.append(
+                    self.store.lease_next_formal_task(
+                        ("formal_statement",), "worker-a", 30
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        try:
+            with (
+                patch.object(
+                    self.store,
+                    "_connect",
+                    side_effect=lambda: ObservedConnection(real_connect()),
+                ),
+                patch("ashare_pipeline.state_store._utc_now", side_effect=controlled_now),
+            ):
+                worker = threading.Thread(target=claim)
+                worker.start()
+                self.assertTrue(begin_attempted.wait(timeout=5))
+                after_wait.set()
+                holder.rollback()
+                worker.join(timeout=10)
+        finally:
+            holder.close()
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(sampled_before_begin, [False])
+        self.assertEqual(errors, [])
+        self.assertEqual(results[0]["id"], task_id)
+        self.assertEqual(results[0]["lease_expires_at"], utc_at(50))
+
+    def test_renew_formal_lease_uses_current_time_and_preserves_task_content(self) -> None:
+        prerequisite = self.store.enqueue_formal_task(
+            "formal_context", "renew-prerequisite", "generation-v1", {}
+        )
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement",
+            "renew-task",
+            "generation-v1",
+            {"nested": {"value": 1}},
+            prerequisite_task_ids=(prerequisite,),
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET status = 'verified' WHERE id = ?",
+                (prerequisite,),
+            )
+            connection.commit()
+        self.store.lease_next_formal_task(
+            ("formal_statement",), "worker-a", 100, now_utc=utc_at(0)
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """UPDATE formal_collection_task
+                SET result_json = ?, error_json = ? WHERE id = ?""",
+                ('{"receipt":"keep"}', '{"code":"keep"}', task_id),
+            )
+            connection.commit()
+        before = self.store.get_formal_task(task_id)
+
+        expiry = self.store.renew_formal_task_lease(
+            task_id, "worker-a", 40, now_utc="2026-08-31T08:00:10+08:00"
+        )
+
+        after = self.store.get_formal_task(task_id)
+        self.assertEqual(expiry, utc_at(50))
+        self.assertEqual(after["lease_expires_at"], utc_at(50))
+        for field in (
+            "id",
+            "kind",
+            "idempotency_key",
+            "refresh_generation",
+            "payload_sha256",
+            "payload",
+            "result",
+            "error",
+            "prerequisite_task_ids",
+            "status",
+            "lease_worker",
+        ):
+            self.assertEqual(after[field], before[field], field)
+
+    def test_renew_formal_lease_fences_wrong_owner_and_exact_expiry_without_mutation(self) -> None:
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "renew-fencing", "generation-v1", {}
+        )
+        self.store.lease_next_formal_task(
+            ("formal_statement",), "worker-a", 30, now_utc=utc_at(0)
+        )
+        before = self.store.get_formal_task(task_id)
+
+        for worker_id, now in (("worker-b", utc_at(1)), ("worker-a", utc_at(30))):
+            with self.subTest(worker_id=worker_id, now=now):
+                with self.assertRaisesRegex(ValueError, "unexpired lease owner"):
+                    self.store.renew_formal_task_lease(
+                        task_id, worker_id, 30, now_utc=now
+                    )
+                self.assertEqual(self.store.get_formal_task(task_id), before)
+        for task, worker_id, duration, now in (
+            (task_id, "", 30, utc_at(1)),
+            (task_id, "worker-a", 0, utc_at(1)),
+            (task_id, "worker-a", -1, utc_at(1)),
+            (task_id, "worker-a", 30, "2026-08-31T00:00:01"),
+            ("missing-task", "worker-a", 30, utc_at(1)),
+        ):
+            with self.subTest(task=task, worker_id=worker_id, duration=duration, now=now):
+                with self.assertRaises(ValueError):
+                    self.store.renew_formal_task_lease(
+                        task, worker_id, duration, now_utc=now
+                    )
+        self.assertEqual(self.store.get_formal_task(task_id), before)
+
+    def test_fail_formal_task_retries_at_boundary_and_terminal_failure_is_permanent(self) -> None:
+        retry_id = self.store.enqueue_formal_task(
+            "formal_statement", "formal-fail-retry", "generation-v1", {"value": 1}
+        )
+        self.store.lease_next_formal_task(
+            ("formal_statement",), "worker-a", 30, now_utc=utc_at(-10)
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET result_json = ? WHERE id = ?",
+                ('{"receipt":"keep"}', retry_id),
+            )
+            connection.commit()
+        error = {"nested": {"attempt": 1}, "code": "timeout"}
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(0)):
+            self.store.fail_formal_task(
+                retry_id,
+                "worker-a",
+                error,
+                "retryable_failed",
+                "2026-08-31T08:00:00+08:00",
+            )
+        error["nested"]["attempt"] = 2
+
+        failed = self.store.get_formal_task(retry_id)
+        self.assertEqual(failed["status"], "retryable_failed")
+        self.assertEqual(failed["next_retry_at"], utc_at(0))
+        self.assertEqual(failed["error"], {"code": "timeout", "nested": {"attempt": 1}})
+        self.assertEqual(failed["result"], {"receipt": "keep"})
+        self.assertIsNone(failed["lease_worker"])
+        self.assertIsNone(failed["lease_expires_at"])
+        retry = self.store.lease_next_formal_task(
+            ("formal_statement",), "worker-b", 30, now_utc=utc_at(0)
+        )
+        self.assertEqual(retry["id"], retry_id)
+
+        terminal_id = self.store.enqueue_formal_task(
+            "formal_terminal_fixture", "formal-fail-terminal", "generation-v1", {}
+        )
+        self.store.lease_next_formal_task(
+            ("formal_terminal_fixture",), "worker-terminal", 30, now_utc=utc_at(1)
+        )
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(2)):
+            self.store.fail_formal_task(
+                terminal_id,
+                "worker-terminal",
+                {"code": "permanent"},
+                "terminal_failed",
+                None,
+            )
+        terminal = self.store.get_formal_task(terminal_id)
+        self.assertEqual(terminal["status"], "terminal_failed")
+        self.assertIsNone(terminal["next_retry_at"])
+        self.assertIsNone(
+            self.store.lease_next_formal_task(
+                ("formal_terminal_fixture",), "worker-c", 30, now_utc=utc_at(100)
+            )
+        )
+
+    def test_fail_formal_task_validates_inputs_and_fences_owner_at_final_update(self) -> None:
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "formal-fail-validation", "generation-v1", {}
+        )
+        self.store.lease_next_formal_task(
+            ("formal_statement",), "worker-a", 10, now_utc=utc_at(0)
+        )
+        before = self.store.get_formal_task(task_id)
+        invalid_calls = (
+            ("", {"code": "bad"}, "terminal_failed", None),
+            ("worker-a", [], "terminal_failed", None),
+            ("worker-a", {"value": math.nan}, "terminal_failed", None),
+            ("worker-a", {"code": "bad"}, "pending", None),
+            ("worker-a", {"code": "bad"}, [], None),
+            ("worker-a", {"code": "bad"}, "retryable_failed", None),
+            ("worker-a", {"code": "bad"}, "terminal_failed", utc_at(20)),
+            (
+                "worker-a",
+                {"code": "bad"},
+                "retryable_failed",
+                "2026-08-31T00:00:20",
+            ),
+        )
+        for worker_id, error, status, retry_at in invalid_calls:
+            with self.subTest(worker_id=worker_id, error=error, status=status):
+                with self.assertRaises(ValueError):
+                    self.store.fail_formal_task(
+                        task_id, worker_id, error, status, retry_at
+                    )
+                self.assertEqual(self.store.get_formal_task(task_id), before)
+
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(1)):
+            with self.assertRaisesRegex(ValueError, "unexpired lease owner"):
+                self.store.fail_formal_task(
+                    task_id,
+                    "worker-b",
+                    {"code": "wrong-owner"},
+                    "terminal_failed",
+                    None,
+                )
+        self.assertEqual(self.store.get_formal_task(task_id), before)
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(10)):
+            with self.assertRaisesRegex(ValueError, "unexpired lease owner"):
+                self.store.fail_formal_task(
+                    task_id,
+                    "worker-a",
+                    {"code": "expired"},
+                    "terminal_failed",
+                    None,
+                )
+        self.assertEqual(self.store.get_formal_task(task_id), before)
+
+    def test_expired_formal_owner_is_fenced_after_distinct_worker_takeover(self) -> None:
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "formal-takeover-fencing", "generation-v1", {}
+        )
+        self.store.lease_next_formal_task(
+            ("formal_statement",), "worker-old", 10, now_utc=utc_at(0)
+        )
+        self.store.lease_next_formal_task(
+            ("formal_statement",), "worker-new", 30, now_utc=utc_at(10)
+        )
+        before = self.store.get_formal_task(task_id)
+
+        with self.assertRaisesRegex(ValueError, "unexpired lease owner"):
+            self.store.renew_formal_task_lease(
+                task_id, "worker-old", 30, now_utc=utc_at(11)
+            )
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(11)):
+            with self.assertRaisesRegex(ValueError, "unexpired lease owner"):
+                self.store.fail_formal_task(
+                    task_id,
+                    "worker-old",
+                    {"code": "stale-owner"},
+                    "terminal_failed",
+                    None,
+                )
+        self.assertEqual(self.store.get_formal_task(task_id), before)
+
+    def test_fail_formal_task_samples_time_after_error_serialization(self) -> None:
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "formal-fail-serialization", "generation-v1", {}
+        )
+        self.store.lease_next_formal_task(
+            ("formal_statement",), "worker-a", 10, now_utc=utc_at(0)
+        )
+        before = self.store.get_formal_task(task_id)
+        error = {"code": "late"}
+        serialization_finished = False
+        real_canonical = state_store_module._canonical_mapping_json
+
+        def observed_canonical(value, field):
+            nonlocal serialization_finished
+            result = real_canonical(value, field)
+            if value is error:
+                serialization_finished = True
+            return result
+
+        def controlled_now() -> str:
+            return utc_at(11) if serialization_finished else utc_at(9)
+
+        with (
+            patch(
+                "ashare_pipeline.state_store._canonical_mapping_json",
+                side_effect=observed_canonical,
+            ),
+            patch("ashare_pipeline.state_store._utc_now", side_effect=controlled_now),
+        ):
+            with self.assertRaisesRegex(ValueError, "unexpired lease owner"):
+                self.store.fail_formal_task(
+                    task_id, "worker-a", error, "terminal_failed", None
+                )
+        self.assertEqual(self.store.get_formal_task(task_id), before)
+
     def test_resolve_formal_task_dependencies_cascades_terminal_and_superseded(self) -> None:
         terminal_parent = self.store.enqueue_formal_task(
             "formal_context", "terminal-parent", "generation-v1", {}
@@ -1333,12 +1937,65 @@ class StateStoreTestCase(unittest.TestCase):
             ).fetchone()
             connection.commit()
 
-        self.assertEqual(self.store.resolve_formal_task_dependencies(), 0)
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(10)):
+            self.assertEqual(self.store.resolve_formal_task_dependencies(), 0)
         with closing(sqlite3.connect(self.db_path)) as connection:
             after = connection.execute(
                 "SELECT * FROM formal_collection_task WHERE id = ?", (child,)
             ).fetchone()
         self.assertEqual(after, before)
+
+    def test_resolve_formal_task_dependencies_terminalizes_exactly_expired_lease(self) -> None:
+        parent = self.store.enqueue_formal_task(
+            "formal_context", "expired-child-parent", "generation-v1", {}
+        )
+        child = self.store.enqueue_formal_task(
+            "formal_statement",
+            "expired-child",
+            "generation-v1",
+            {},
+            prerequisite_task_ids=(parent,),
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET status = 'terminal_failed' WHERE id = ?",
+                (parent,),
+            )
+            connection.execute(
+                """UPDATE formal_collection_task SET status = 'leased',
+                lease_worker = 'worker-old', lease_expires_at = ?, next_retry_at = ?,
+                result_json = ?, error_json = ? WHERE id = ?""",
+                (
+                    utc_at(10),
+                    utc_at(20),
+                    '{"stale":true}',
+                    '{"code":"old"}',
+                    child,
+                ),
+            )
+            connection.commit()
+
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(10)):
+            self.assertEqual(self.store.resolve_formal_task_dependencies(), 1)
+
+        row = self.store.get_formal_task(child)
+        self.assertEqual(row["status"], "terminal_failed")
+        self.assertEqual(
+            row["error"],
+            {
+                "blocking_prerequisite_task_ids": [parent],
+                "code": "prerequisite_terminal_failed",
+            },
+        )
+        self.assertIsNone(row["lease_worker"])
+        self.assertIsNone(row["lease_expires_at"])
+        self.assertIsNone(row["next_retry_at"])
+        self.assertIsNone(row["result"])
+        self.assertIsNone(
+            self.store.lease_next_formal_task(
+                ("formal_statement",), "worker-new", 30, now_utc=utc_at(11)
+            )
+        )
 
     def test_formal_task_operations_leave_legacy_queue_contract_untouched(self) -> None:
         legacy_id = self.store.enqueue_job("legacy", "legacy-v1", {"value": 1})
