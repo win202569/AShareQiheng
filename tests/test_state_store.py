@@ -7043,6 +7043,26 @@ class StateStoreTestCase(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row, ("pool_vetoed", '["verified-risk"]', '["ST"]', "a" * 64))
 
+    def test_formal_universe_initial_status_recomputes_evidence_hash_on_read_and_replay(self) -> None:
+        store, frozen, _ = self.task_backed_frozen_universe(
+            label="initial-status-evidence"
+        )
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """UPDATE formal_universe_status SET evidence_hash=?
+                WHERE snapshot_id=? AND security_id='BJ430001'""",
+                ("a" * 64, snapshot_id),
+            )
+            connection.commit()
+
+        with self.assertRaises(ValueError):
+            store.get_formal_universe_snapshot_by_input_hash(
+                frozen.frozen_input_hash
+            )
+        with self.assertRaisesRegex(ValueError, "frozen_input_hash_conflict"):
+            store.put_formal_universe_snapshot(frozen)
+
     def test_formal_universe_snapshot_requires_exact_typed_recomputed_input(self) -> None:
         store, frozen, _ = self.task_backed_frozen_universe(label="typed")
         with self.assertRaises(ValueError):
@@ -7242,6 +7262,65 @@ class StateStoreTestCase(unittest.TestCase):
                         connection.execute("SELECT COUNT(*) FROM formal_universe_snapshot").fetchone()[0],
                         0,
                     )
+
+    def test_formal_universe_snapshot_rejects_impossible_verified_source_task_state(self) -> None:
+        cases = (
+            ("error_json", '{"code":"ghost-error"}'),
+            ("lease_worker", "ghost-worker"),
+            ("lease_expires_at", "2099-01-01T00:00:00+00:00"),
+            ("next_retry_at", "2099-01-01T00:00:00+00:00"),
+            ("created_at", "2099-01-01T00:00:00+00:00"),
+        )
+        for index, (field, value) in enumerate(cases):
+            with self.subTest(field=field):
+                path = Path(self.tempdir.name) / f"universe-task-state-{index}.sqlite3"
+                store, frozen, task_ids = self.task_backed_frozen_universe(
+                    label=f"task-state-{index}", db_path=path
+                )
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute(
+                        f"UPDATE formal_collection_task SET {field}=? WHERE id=?",
+                        (value, task_ids["BJ"]),
+                    )
+                    connection.commit()
+
+                with self.assertRaises(ValueError):
+                    store.put_formal_universe_snapshot(frozen)
+                with closing(sqlite3.connect(path)) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM formal_universe_snapshot"
+                        ).fetchone()[0],
+                        0,
+                    )
+
+    def test_formal_universe_getter_and_replay_reject_corrupt_verified_source_task_state(self) -> None:
+        cases = (
+            ("error_json", '{"code":"ghost-error"}'),
+            ("lease_worker", "ghost-worker"),
+            ("lease_expires_at", "2099-01-01T00:00:00+00:00"),
+            ("next_retry_at", "2099-01-01T00:00:00+00:00"),
+        )
+        for index, (field, value) in enumerate(cases):
+            with self.subTest(field=field):
+                path = Path(self.tempdir.name) / f"universe-stored-task-state-{index}.sqlite3"
+                store, frozen, task_ids = self.task_backed_frozen_universe(
+                    label=f"stored-task-state-{index}", db_path=path
+                )
+                store.put_formal_universe_snapshot(frozen)
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute(
+                        f"UPDATE formal_collection_task SET {field}=? WHERE id=?",
+                        (value, task_ids["BJ"]),
+                    )
+                    connection.commit()
+
+                with self.assertRaises(ValueError):
+                    store.get_formal_universe_snapshot_by_input_hash(
+                        frozen.frozen_input_hash
+                    )
+                with self.assertRaises(ValueError):
+                    store.put_formal_universe_snapshot(frozen)
 
     def test_formal_universe_snapshot_rolls_back_late_child_failure(self) -> None:
         store, frozen, _ = self.task_backed_frozen_universe(label="late-rollback")

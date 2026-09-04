@@ -722,6 +722,23 @@ def _formal_frozen_universe_payload(
     }
 
 
+def _formal_universe_initial_status_evidence_hash(
+    frozen_input_hash: str, security_id: str
+) -> str:
+    payload = {
+        "frozen_input_hash": frozen_input_hash,
+        "reasons": ["formal_collection_pending"],
+        "security_id": security_id,
+        "status": "pending_evidence",
+        "veto_flags": [],
+    }
+    return hashlib.sha256(
+        _canonical_formal_universe_json(
+            payload, "formal universe initial status evidence"
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _require_canonical_uuid(value: object, field: str) -> str:
     if type(value) is not str:
         raise ValueError(f"stored formal {field} must be a canonical UUID")
@@ -2328,6 +2345,7 @@ class StateStore:
         task = self._formal_task_public(task_row, prerequisites)
         if task["kind"] != "formal_universe_source" or task["status"] != "verified":
             raise ValueError("formal universe source task must be verified")
+        self._require_formal_verified_task_state(task_row, task)
         if task["refresh_generation"] != persisted_ref.refresh_generation:
             raise ValueError("formal universe source task generation mismatch")
         payload = task["payload"]
@@ -2489,7 +2507,21 @@ class StateStore:
                 or any(type(flag) is not str or not flag for flag in veto_flags)
             ):
                 raise ValueError("stored formal universe status fields are invalid")
-            _require_formal_sha256(row["evidence_hash"], "universe status evidence hash")
+            evidence_hash = _require_formal_sha256(
+                row["evidence_hash"], "universe status evidence hash"
+            )
+            if (
+                row["status"] == "pending_evidence"
+                and reasons == ["formal_collection_pending"]
+                and veto_flags == []
+                and evidence_hash
+                != _formal_universe_initial_status_evidence_hash(
+                    header["frozen_input_hash"], row["security_id"]
+                )
+            ):
+                raise ValueError(
+                    "stored formal universe initial status evidence hash mismatch"
+                )
             _require_canonical_utc(row["updated_at"], "universe status update time")
 
         frozen = _create_frozen_universe_input(
@@ -2602,18 +2634,9 @@ class StateStore:
                 status = "pending_evidence"
                 reasons = ["formal_collection_pending"]
                 veto_flags: list[str] = []
-                evidence_payload = {
-                    "frozen_input_hash": frozen.frozen_input_hash,
-                    "reasons": reasons,
-                    "security_id": member.security_id,
-                    "status": status,
-                    "veto_flags": veto_flags,
-                }
-                evidence_hash = hashlib.sha256(
-                    _canonical_formal_universe_json(
-                        evidence_payload, "formal universe initial status evidence"
-                    ).encode("utf-8")
-                ).hexdigest()
+                evidence_hash = _formal_universe_initial_status_evidence_hash(
+                    frozen.frozen_input_hash, member.security_id
+                )
                 connection.execute(
                     """INSERT INTO formal_universe_status
                     (snapshot_id,security_id,status,reasons_json,veto_flags_json,
@@ -4542,6 +4565,31 @@ class StateStore:
         )
         public["prerequisite_task_ids"] = sorted(prerequisite_task_ids)
         return public
+
+    @staticmethod
+    def _require_formal_verified_task_state(
+        row: sqlite3.Row, task: Mapping[str, object]
+    ) -> None:
+        _require_canonical_uuid(row["id"], "task ID")
+        created_at = _require_canonical_utc(row["created_at"], "task creation time")
+        updated_at = _require_canonical_utc(row["updated_at"], "task update time")
+        if datetime.fromisoformat(updated_at) < datetime.fromisoformat(created_at):
+            raise ValueError("stored formal verified task timestamps are out of order")
+        if (
+            task["status"] != "verified"
+            or task["result"] is None
+            or task["error"] is not None
+            or any(
+                row[field] is not None
+                for field in (
+                    "error_json",
+                    "lease_worker",
+                    "lease_expires_at",
+                    "next_retry_at",
+                )
+            )
+        ):
+            raise ValueError("stored formal verified task state is invalid")
 
     @staticmethod
     def _job_public(row: sqlite3.Row) -> dict:
