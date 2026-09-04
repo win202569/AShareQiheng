@@ -2360,6 +2360,75 @@ class DeepWorkerTestCase(unittest.TestCase):
         self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
         self.assertEqual(self.store.list_financial_facts("SH600001"), [])
 
+    def test_offline_midnight_reconciliation_allows_short_cross_day_fetch_within_job_lifetime(
+        self,
+    ) -> None:
+        refresh_date = "2026-09-01"
+        job_id, snapshot, batch = self._seed_legacy_midnight_failure(
+            refresh_date=refresh_date,
+            fetched_at_utc="2026-09-01T16:00:07.139744+00:00",
+        )
+        issue_row = min(batch.records, key=canonical_sha256)
+        issue_details = {
+            "security_id": "SH600001",
+            "dataset": "balance_sheet",
+            "details": {
+                "security_id": "SH600001",
+                "row_hash": canonical_sha256(issue_row),
+            },
+        }
+        issue_ids = self.store.find_quality_issue_ids(
+            severity="error",
+            code="statement_report_date_invalid",
+            details=issue_details,
+        )
+        self.assertEqual(len(issue_ids), 1)
+        issue_id = issue_ids[0]
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM quality_issue_binding WHERE issue_id=?", (issue_id,)
+            )
+            connection.execute(
+                """UPDATE job SET created_at=?, updated_at=? WHERE id=?""",
+                (
+                    "2026-09-01T15:55:54.784745+00:00",
+                    "2026-09-01T16:00:07.519713+00:00",
+                    job_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE source_snapshot SET created_at=? WHERE id=?",
+                ("2026-09-01T16:00:07.376303+00:00", snapshot.id),
+            )
+            connection.execute(
+                "UPDATE quality_issue SET created_at=? WHERE id=?",
+                ("2026-09-01T16:00:07.502424+00:00", issue_id),
+            )
+            connection.commit()
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=self._calendar_ref(),
+            now_cn=datetime(2026, 9, 2, 0, 1, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.remote_attempts, 0)
+        self.assertEqual(summary.snapshots_reused, 1)
+        self.assertEqual(summary.statements_succeeded, 1)
+        self.assertEqual(summary.feature_sets_written, 1)
+        self.assertEqual(self.store.get_job(job_id)["status"], "succeeded")
+        self.assertGreater(len(self.store.list_financial_facts("SH600001")), 0)
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    """SELECT job_id,source_snapshot_id FROM quality_issue_binding
+                    WHERE issue_id=?""",
+                    (issue_id,),
+                ).fetchone(),
+                (job_id, snapshot.id),
+            )
+
     def test_offline_midnight_reconciliation_rejects_missing_target_or_other_issues(self) -> None:
         def remove_target(batch):
             batch.records[:] = [

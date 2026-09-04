@@ -42,7 +42,11 @@ from ashare_pipeline.sources import (
     SourceBlocked,
     TerminalSourceError,
 )
-from ashare_pipeline.state_store import JobSpec, StateStore
+from ashare_pipeline.state_store import (
+    JobSpec,
+    StateStore,
+    reconciliation_snapshot_matches_job_refresh_date,
+)
 
 
 STATEMENT_DATASETS = ("balance_sheet", "profit_sheet", "cash_flow_sheet")
@@ -1597,6 +1601,22 @@ def _snapshot_matches_refresh_date(
     return fetched.astimezone(SHANGHAI).date().isoformat() == refresh_date
 
 
+def _snapshot_matches_reconciliation_refresh_date(
+    snapshot: SnapshotRef,
+    refresh_date: str,
+    job: Mapping[str, object],
+) -> bool:
+    try:
+        return reconciliation_snapshot_matches_job_refresh_date(
+            snapshot_fetched_at=snapshot.fetched_at,
+            refresh_date=refresh_date,
+            job_created_at=job.get("created_at"),
+            job_updated_at=job.get("updated_at"),
+        )
+    except ValueError:
+        return False
+
+
 def _snapshot_not_after(snapshot: SnapshotRef, cutoff_utc: str) -> bool:
     fetched = datetime.fromisoformat(
         require_aware_utc(snapshot.fetched_at, "snapshot fetched_at")
@@ -1801,7 +1821,9 @@ def _reconcile_legacy_midnight_failures(
         ] = []
         for snapshot in snapshots.list_exact("akshare", dataset, request):
             if (
-                not _snapshot_matches_refresh_date(snapshot, refresh_date)
+                not _snapshot_matches_reconciliation_refresh_date(
+                    snapshot, refresh_date, job
+                )
                 or not _snapshot_not_after(snapshot, logical_now_utc)
             ):
                 continue

@@ -48,6 +48,8 @@ SCHEMA_VERSION = 4
 _EVIDENCE_QUERY_BATCH_SIZE = 256
 _STATEMENT_DATASETS = ("balance_sheet", "profit_sheet", "cash_flow_sheet")
 _SHANGHAI = timezone(timedelta(hours=8))
+_RECONCILIATION_PRE_MIDNIGHT_WINDOW = timedelta(minutes=5)
+_RECONCILIATION_CROSS_MIDNIGHT_GRACE = timedelta(seconds=15)
 _RECONCILIATION_STATEMENT_PAYLOAD_KEYS = frozenset(
     {
         "security_id",
@@ -391,6 +393,84 @@ def _reconciliation_timestamp(value: object, field: str) -> datetime:
         raise ValueError(f"{field} is not canonical") from error
 
 
+def reconciliation_snapshot_matches_job_refresh_date(
+    *,
+    snapshot_fetched_at: object,
+    refresh_date: object,
+    job_created_at: object,
+    job_updated_at: object,
+) -> bool:
+    """Permit a tightly proven source fetch that crossed Shanghai midnight."""
+    refresh_day = date.fromisoformat(
+        _reconciliation_date(refresh_date, "reconciliation refresh_date")
+    )
+    snapshot_at = _reconciliation_timestamp(
+        snapshot_fetched_at, "reconciliation snapshot fetched_at"
+    )
+    snapshot_cn = snapshot_at.astimezone(_SHANGHAI)
+    if snapshot_cn.date() == refresh_day:
+        return True
+
+    next_day = refresh_day + timedelta(days=1)
+    if snapshot_cn.date() != next_day:
+        return False
+    job_started_at = _reconciliation_timestamp(
+        job_created_at, "reconciliation job created_at"
+    )
+    job_finished_at = _reconciliation_timestamp(
+        job_updated_at, "reconciliation job updated_at"
+    )
+    next_midnight = datetime.combine(next_day, datetime.min.time(), tzinfo=_SHANGHAI)
+    deadline = next_midnight + _RECONCILIATION_CROSS_MIDNIGHT_GRACE
+    if not (
+        next_midnight - _RECONCILIATION_PRE_MIDNIGHT_WINDOW
+        <= job_started_at.astimezone(_SHANGHAI)
+        < next_midnight
+        <= snapshot_cn
+        <= deadline
+        and job_started_at <= snapshot_at <= job_finished_at <= deadline
+    ):
+        return False
+    return True
+
+
+def _validate_cross_midnight_reconciliation_chronology(
+    *,
+    snapshot_fetched_at: object,
+    snapshot_created_at: object,
+    quality_issue_created_at: object,
+    refresh_date: object,
+    job_created_at: object,
+    job_updated_at: object,
+) -> None:
+    refresh_day = date.fromisoformat(
+        _reconciliation_date(refresh_date, "reconciliation refresh_date")
+    )
+    snapshot_at = _reconciliation_timestamp(
+        snapshot_fetched_at, "reconciliation snapshot fetched_at"
+    )
+    if snapshot_at.astimezone(_SHANGHAI).date() == refresh_day:
+        return
+    if not reconciliation_snapshot_matches_job_refresh_date(
+        snapshot_fetched_at=snapshot_fetched_at,
+        refresh_date=refresh_date,
+        job_created_at=job_created_at,
+        job_updated_at=job_updated_at,
+    ):
+        raise ValueError("reconciliation snapshot refresh date is invalid")
+    snapshot_created_at = _reconciliation_timestamp(
+        snapshot_created_at, "reconciliation snapshot created_at"
+    )
+    issue_created_at = _reconciliation_timestamp(
+        quality_issue_created_at, "reconciliation quality issue created_at"
+    )
+    job_finished_at = _reconciliation_timestamp(
+        job_updated_at, "reconciliation job updated_at"
+    )
+    if not snapshot_at <= snapshot_created_at <= issue_created_at <= job_finished_at:
+        raise ValueError("reconciliation cross-midnight chronology is invalid")
+
+
 def _require_reconciliation_snapshot(
     connection: sqlite3.Connection,
     *,
@@ -464,6 +544,8 @@ def _validate_reconciliation_followup(
     statement_payload: Mapping[str, object],
     source_snapshot_id: str,
     source_snapshot_hash: str,
+    reconciliation_job_created_at: object,
+    reconciliation_job_updated_at: object,
 ) -> None:
     if followup.kind != "feature_build":
         raise ValueError("reconciliation follow-up must be feature_build")
@@ -547,10 +629,24 @@ def _validate_reconciliation_followup(
             raise ValueError(
                 "reconciliation follow-up statement snapshot is newer than as_of_utc"
             )
-        if (
-            fetched_at.astimezone(_SHANGHAI).date().isoformat()
-            != statement_payload["refresh_date"]
-        ):
+        is_recovered_snapshot = (
+            dataset == statement_payload["dataset"]
+            and snapshot_id == source_snapshot_id
+            and snapshot_hash == source_snapshot_hash
+        )
+        if is_recovered_snapshot:
+            refresh_date_matches = reconciliation_snapshot_matches_job_refresh_date(
+                snapshot_fetched_at=snapshot["fetched_at"],
+                refresh_date=statement_payload["refresh_date"],
+                job_created_at=reconciliation_job_created_at,
+                job_updated_at=reconciliation_job_updated_at,
+            )
+        else:
+            refresh_date_matches = (
+                fetched_at.astimezone(_SHANGHAI).date().isoformat()
+                == statement_payload["refresh_date"]
+            )
+        if not refresh_date_matches:
             raise ValueError(
                 "reconciliation follow-up statement snapshot refresh date is invalid"
             )
@@ -702,6 +798,11 @@ def _validate_and_bind_reconciliation_issue(
     security_id: str,
     dataset: str,
     facts: Sequence[FinancialFact],
+    refresh_date: str,
+    snapshot_fetched_at: object,
+    snapshot_created_at: object,
+    job_created_at: object,
+    job_updated_at: object,
 ) -> None:
     if not isinstance(issue_id, str) or not issue_id:
         raise ValueError("reconciliation quality issue id is invalid")
@@ -709,7 +810,8 @@ def _validate_and_bind_reconciliation_issue(
         raise ValueError("reconciliation quality issue details are invalid")
     details_json = _json(dict(issue_details))
     row = connection.execute(
-        """SELECT binding.job_id,binding.source_snapshot_id
+        """SELECT issue.created_at AS issue_created_at,
+        binding.job_id,binding.source_snapshot_id
         FROM quality_issue AS issue
         LEFT JOIN quality_issue_binding AS binding ON binding.issue_id=issue.id
         WHERE issue.id=? AND issue.severity='error'
@@ -734,6 +836,14 @@ def _validate_and_bind_reconciliation_issue(
         raise ValueError(
             "reconciliation quality issue row hash does not belong to facts"
         )
+    _validate_cross_midnight_reconciliation_chronology(
+        snapshot_fetched_at=snapshot_fetched_at,
+        snapshot_created_at=snapshot_created_at,
+        quality_issue_created_at=row["issue_created_at"],
+        refresh_date=refresh_date,
+        job_created_at=job_created_at,
+        job_updated_at=job_updated_at,
+    )
 
     bound_job_id = row["job_id"]
     bound_snapshot_id = row["source_snapshot_id"]
@@ -1474,7 +1584,7 @@ class StateStore:
         )
         with self._transaction(immediate=True) as connection:
             current = connection.execute(
-                """SELECT 1 FROM job WHERE id = ? AND kind = 'deep_statement'
+                """SELECT created_at,updated_at FROM job WHERE id = ? AND kind = 'deep_statement'
                 AND idempotency_key = ? AND payload_json = ?
                 AND status = 'terminal_failed' AND last_error_json = ?""",
                 (
@@ -1486,7 +1596,7 @@ class StateStore:
             ).fetchone()
             if current is None:
                 return False
-            security_id, dataset, report_period, _refresh_date = (
+            security_id, dataset, report_period, refresh_date = (
                 _validate_reconciliation_statement_identity(
                     expected_payload, expected_idempotency_key
                 )
@@ -1495,7 +1605,7 @@ class StateStore:
                 {"symbol": security_id, "report_period": report_period}
             )
             snapshot = connection.execute(
-                """SELECT 1 FROM source_snapshot
+                """SELECT fetched_at,created_at FROM source_snapshot
                 WHERE id = ? AND source = 'akshare' AND dataset = ?
                 AND request_fingerprint = ? AND payload_hash = ?""",
                 (
@@ -1507,6 +1617,13 @@ class StateStore:
             ).fetchone()
             if snapshot is None:
                 return False
+            if not reconciliation_snapshot_matches_job_refresh_date(
+                snapshot_fetched_at=snapshot["fetched_at"],
+                refresh_date=refresh_date,
+                job_created_at=current["created_at"],
+                job_updated_at=current["updated_at"],
+            ):
+                raise ValueError("reconciliation snapshot refresh date is invalid")
             if not records:
                 raise ValueError("reconciliation facts must not be empty")
             if not all(isinstance(fact, FinancialFact) for fact in records):
@@ -1543,6 +1660,8 @@ class StateStore:
                 statement_payload=expected_payload,
                 source_snapshot_id=source_snapshot_id,
                 source_snapshot_hash=source_snapshot_hash,
+                reconciliation_job_created_at=current["created_at"],
+                reconciliation_job_updated_at=current["updated_at"],
             )
             mapping_version = next(iter(mapping_versions))
             expected_result = {
@@ -1566,6 +1685,11 @@ class StateStore:
                 security_id=security_id,
                 dataset=dataset,
                 facts=records,
+                refresh_date=refresh_date,
+                snapshot_fetched_at=snapshot["fetched_at"],
+                snapshot_created_at=snapshot["created_at"],
+                job_created_at=current["created_at"],
+                job_updated_at=current["updated_at"],
             )
             self._insert_or_verify_reconciliation_facts(connection, records)
             self._insert_followups(connection, (followup,), transition_now)
@@ -2320,4 +2444,5 @@ class StateStore:
             "result": json.loads(row["result_json"]) if row["result_json"] else None,
             "error": json.loads(row["last_error_json"]) if row["last_error_json"] else None,
             "next_retry_at": row["next_retry_at"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
         }
