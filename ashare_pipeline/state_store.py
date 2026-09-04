@@ -44,7 +44,7 @@ SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
 SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
 RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
 _OWNED_JOB_KINDS = frozenset({"deep_financial", "deep_statement", "feature_build"})
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _EVIDENCE_QUERY_BATCH_SIZE = 256
 _STATEMENT_DATASETS = ("balance_sheet", "profit_sheet", "cash_flow_sheet")
 _SHANGHAI = timezone(timedelta(hours=8))
@@ -277,6 +277,124 @@ _V4_TABLE_DDL = {
 }
 
 _V4_INDEX_DDL: dict[str, str] = {}
+
+_V5_TABLE_DDL = {
+    "formal_collection_task": """CREATE TABLE IF NOT EXISTS formal_collection_task(
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        refresh_generation TEXT NOT NULL CHECK(refresh_generation<>''),
+        payload_json TEXT NOT NULL,
+        payload_sha256 TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN(
+            'pending','leased','verified','retryable_failed','terminal_failed','superseded'
+        )),
+        lease_worker TEXT,
+        lease_expires_at TEXT,
+        next_retry_at TEXT,
+        result_json TEXT,
+        error_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+    "formal_source_snapshot": """CREATE TABLE IF NOT EXISTS formal_source_snapshot(
+        id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        dataset TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL UNIQUE,
+        content_path TEXT NOT NULL,
+        manifest_path TEXT NOT NULL,
+        original_url TEXT NOT NULL,
+        published_at_utc TEXT NOT NULL,
+        published_precision TEXT NOT NULL CHECK(published_precision IN('timestamp','date_only')),
+        source_updated_at_utc TEXT,
+        captured_at_utc TEXT NOT NULL,
+        effective_at_utc TEXT NOT NULL,
+        effective_time_evidence_hash TEXT,
+        parser_id TEXT NOT NULL,
+        parser_version TEXT NOT NULL,
+        mapping_version TEXT NOT NULL,
+        refresh_generation TEXT NOT NULL CHECK(refresh_generation<>''),
+        producing_task_id TEXT REFERENCES formal_collection_task(id),
+        verification_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""",
+    "formal_task_snapshot_receipt": """CREATE TABLE IF NOT EXISTS formal_task_snapshot_receipt(
+        task_id TEXT PRIMARY KEY REFERENCES formal_collection_task(id),
+        snapshot_id TEXT NOT NULL UNIQUE REFERENCES formal_source_snapshot(id),
+        manifest_sha256 TEXT NOT NULL UNIQUE,
+        refresh_generation TEXT NOT NULL CHECK(refresh_generation<>''),
+        recorded_at TEXT NOT NULL
+    )""",
+    "formal_universe_snapshot": """CREATE TABLE IF NOT EXISTS formal_universe_snapshot(
+        id TEXT PRIMARY KEY,
+        as_of_utc TEXT NOT NULL,
+        registry_manifest_hash TEXT NOT NULL,
+        universe_hash TEXT NOT NULL,
+        source_audit_hash TEXT NOT NULL,
+        frozen_input_hash TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    )""",
+    "formal_universe_source": """CREATE TABLE IF NOT EXISTS formal_universe_source(
+        universe_snapshot_id TEXT NOT NULL REFERENCES formal_universe_snapshot(id),
+        exchange TEXT NOT NULL CHECK(exchange IN('SH','SZ','BJ')),
+        source_snapshot_id TEXT NOT NULL REFERENCES formal_source_snapshot(id),
+        manifest_sha256 TEXT NOT NULL,
+        source_content_sha256 TEXT NOT NULL,
+        parser_id TEXT NOT NULL,
+        parser_version TEXT NOT NULL,
+        extraction_audit_hash TEXT NOT NULL,
+        extraction_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(universe_snapshot_id,exchange)
+    )""",
+    "formal_universe_member": """CREATE TABLE IF NOT EXISTS formal_universe_member(
+        snapshot_id TEXT NOT NULL REFERENCES formal_universe_snapshot(id),
+        security_id TEXT NOT NULL,
+        exchange TEXT NOT NULL CHECK(exchange IN('SH','SZ','BJ')),
+        code6 TEXT NOT NULL,
+        security_type TEXT NOT NULL,
+        listing_status TEXT NOT NULL,
+        raw_json TEXT NOT NULL,
+        PRIMARY KEY(snapshot_id,security_id)
+    )""",
+    "formal_universe_status": """CREATE TABLE IF NOT EXISTS formal_universe_status(
+        snapshot_id TEXT NOT NULL,
+        security_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN(
+            'out_of_scope','pending_evidence','pool_vetoed','formal_scored'
+        )),
+        reasons_json TEXT NOT NULL,
+        veto_flags_json TEXT NOT NULL,
+        evidence_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(snapshot_id,security_id),
+        FOREIGN KEY(snapshot_id,security_id)
+            REFERENCES formal_universe_member(snapshot_id,security_id)
+    )""",
+    "formal_collection_task_dependency": """CREATE TABLE IF NOT EXISTS formal_collection_task_dependency(
+        task_id TEXT NOT NULL REFERENCES formal_collection_task(id),
+        prerequisite_task_id TEXT NOT NULL REFERENCES formal_collection_task(id),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(task_id,prerequisite_task_id)
+    )""",
+}
+
+_V5_INDEX_DDL = {
+    "formal_source_snapshot_lineage_idx": """CREATE UNIQUE INDEX IF NOT EXISTS
+        formal_source_snapshot_lineage_idx ON formal_source_snapshot(
+            request_fingerprint,
+            refresh_generation,
+            COALESCE(producing_task_id,'bootstrap')
+        )""",
+    "formal_source_snapshot_exact_request_idx": """CREATE INDEX IF NOT EXISTS
+        formal_source_snapshot_exact_request_idx ON formal_source_snapshot(
+            source,dataset,request_fingerprint,refresh_generation,created_at DESC
+        )""",
+}
 
 
 class FinalizationBlocked(RuntimeError):
@@ -954,6 +1072,7 @@ class StateStore:
                 )
                 self._apply_v3_migration(connection)
                 self._apply_v4_migration(connection)
+                self._apply_v5_migration(connection)
             elif "schema_migration" not in tables:
                 if tables != set(_V2_TABLE_DDL):
                     raise RuntimeError("database does not match the complete v2 schema")
@@ -965,6 +1084,7 @@ class StateStore:
                 )
                 self._apply_v3_migration(connection)
                 self._apply_v4_migration(connection)
+                self._apply_v5_migration(connection)
             else:
                 self._assert_schema_ddl(
                     connection,
@@ -976,12 +1096,12 @@ class StateStore:
                     int(row[0])
                     for row in connection.execute("SELECT version FROM schema_migration")
                 }
-                if versions not in ({2}, {2, 3}, {2, 3, 4}):
+                if versions not in ({2}, {2, 3}, {2, 3, 4}, {2, 3, 4, 5}):
                     raise RuntimeError(f"unsupported migration versions: {sorted(versions)}")
                 self._assert_v2_schema(connection)
                 if versions == {2}:
                     later_tables = tables & (
-                        set(_V3_TABLE_DDL) | set(_V4_TABLE_DDL)
+                        set(_V3_TABLE_DDL) | set(_V4_TABLE_DDL) | set(_V5_TABLE_DDL)
                     )
                     if later_tables:
                         raise RuntimeError(
@@ -990,6 +1110,7 @@ class StateStore:
                         )
                     self._apply_v3_migration(connection)
                     self._apply_v4_migration(connection)
+                    self._apply_v5_migration(connection)
                 elif versions == {2, 3}:
                     self._assert_schema_ddl(
                         connection,
@@ -997,13 +1118,34 @@ class StateStore:
                         _V3_INDEX_DDL,
                         "v3 schema",
                     )
-                    partial_v4_tables = tables & set(_V4_TABLE_DDL)
-                    if partial_v4_tables:
+                    later_tables = tables & (set(_V4_TABLE_DDL) | set(_V5_TABLE_DDL))
+                    if later_tables:
                         raise RuntimeError(
                             "version-3 ledger has unexpected v4 tables: "
-                            f"{sorted(partial_v4_tables)}"
+                            f"{sorted(later_tables)}"
                         )
                     self._apply_v4_migration(connection)
+                    self._apply_v5_migration(connection)
+                elif versions == {2, 3, 4}:
+                    self._assert_schema_ddl(
+                        connection,
+                        _V3_TABLE_DDL,
+                        _V3_INDEX_DDL,
+                        "v3 schema",
+                    )
+                    self._assert_schema_ddl(
+                        connection,
+                        _V4_TABLE_DDL,
+                        _V4_INDEX_DDL,
+                        "v4 schema",
+                    )
+                    partial_v5_tables = tables & set(_V5_TABLE_DDL)
+                    if partial_v5_tables:
+                        raise RuntimeError(
+                            "version-4 ledger has unexpected v5 tables: "
+                            f"{sorted(partial_v5_tables)}"
+                        )
+                    self._apply_v5_migration(connection)
                 else:
                     self._assert_schema_ddl(
                         connection,
@@ -1016,6 +1158,12 @@ class StateStore:
                         _V4_TABLE_DDL,
                         _V4_INDEX_DDL,
                         "v4 schema",
+                    )
+                    self._assert_schema_ddl(
+                        connection,
+                        _V5_TABLE_DDL,
+                        _V5_INDEX_DDL,
+                        "v5 schema",
                     )
             connection.commit()
         except BaseException:
@@ -1157,6 +1305,21 @@ class StateStore:
         )
         connection.execute(
             "INSERT INTO schema_migration(version, applied_at) VALUES (4, ?)",
+            (_utc_now(),),
+        )
+
+    @classmethod
+    def _apply_v5_migration(cls, connection: sqlite3.Connection) -> None:
+        for statement in (*_V5_TABLE_DDL.values(), *_V5_INDEX_DDL.values()):
+            connection.execute(statement)
+        cls._assert_schema_ddl(
+            connection,
+            _V5_TABLE_DDL,
+            _V5_INDEX_DDL,
+            "v5 schema",
+        )
+        connection.execute(
+            "INSERT INTO schema_migration(version, applied_at) VALUES (5, ?)",
             (_utc_now(),),
         )
 

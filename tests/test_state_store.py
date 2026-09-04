@@ -607,7 +607,7 @@ class StateStoreTestCase(unittest.TestCase):
             ),
         )
 
-    def test_initialize_migrates_literal_v2_database_to_v4_without_changing_existing_rows(self) -> None:
+    def test_initialize_migrates_literal_v2_database_to_v5_without_changing_existing_rows(self) -> None:
         legacy_path = Path(self.tempdir.name) / "legacy.sqlite3"
         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
         ordered_tables = {
@@ -667,7 +667,7 @@ class StateStoreTestCase(unittest.TestCase):
                 )
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,)],
+                [(2,), (3,), (4,), (5,)],
             )
             tables = {
                 row[0]
@@ -695,13 +695,108 @@ class StateStoreTestCase(unittest.TestCase):
                 before["score_item"],
             )
 
-    def test_initialize_twice_keeps_one_complete_v4_schema_and_ledger(self) -> None:
+    def test_initialize_migrates_literal_v4_database_to_v5_without_changing_legacy_rows(self) -> None:
+        legacy_path = Path(self.tempdir.name) / "legacy-v4.sqlite3"
+        schema_sql = Path("tests/fixtures/schema_v4.sql").read_text(encoding="utf-8")
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.executescript(schema_sql)
+            connection.execute(
+                "INSERT INTO source_snapshot VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    "legacy-snapshot",
+                    "provider",
+                    "daily",
+                    "legacy-request",
+                    "legacy-payload",
+                    "raw/legacy.json",
+                    1,
+                    utc_at(0),
+                    utc_at(1),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO score_run VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "legacy-score",
+                    "2026-06-30",
+                    utc_at(0),
+                    "rules-v4",
+                    "universe-v4",
+                    "incremental",
+                    "final",
+                    utc_at(0),
+                    utc_at(1),
+                    utc_at(0),
+                    1,
+                    1,
+                    "{}",
+                    "{}",
+                ),
+            )
+            connection.commit()
+            before_snapshot = connection.execute(
+                "SELECT * FROM source_snapshot"
+            ).fetchall()
+            before_score_run = connection.execute("SELECT * FROM score_run").fetchall()
+
+        StateStore(legacy_path).initialize()
+
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT version FROM schema_migration ORDER BY version"
+                ).fetchall(),
+                [(2,), (3,), (4,), (5,)],
+            )
+            self.assertEqual(
+                connection.execute("SELECT * FROM source_snapshot").fetchall(),
+                before_snapshot,
+            )
+            self.assertEqual(
+                connection.execute("SELECT * FROM score_run").fetchall(),
+                before_score_run,
+            )
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            self.assertTrue(
+                {
+                    "formal_source_snapshot",
+                    "formal_universe_source",
+                    "formal_universe_status",
+                    "formal_collection_task",
+                }
+                <= tables
+            )
+            snapshot_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(formal_source_snapshot)")
+            }
+            self.assertIn("request_fingerprint", snapshot_columns)
+            self.assertEqual(
+                connection.execute("SELECT * FROM formal_source_snapshot").fetchall(),
+                [],
+            )
+
+        discontinuous_path = Path(self.tempdir.name) / "discontinuous-v4.sqlite3"
+        with closing(sqlite3.connect(discontinuous_path)) as connection:
+            connection.executescript(schema_sql)
+            connection.execute("DELETE FROM schema_migration WHERE version = 3")
+            connection.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "migration versions"):
+            StateStore(discontinuous_path).initialize()
+
+    def test_initialize_twice_keeps_one_complete_v5_schema_and_ledger(self) -> None:
         self.store.initialize()
 
         with closing(sqlite3.connect(self.db_path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,)],
+                [(2,), (3,), (4,), (5,)],
             )
             counts = dict(
                 connection.execute(
@@ -775,9 +870,9 @@ class StateStoreTestCase(unittest.TestCase):
             StateStore._normalized_ddl(changed_literal),
         )
 
-    def test_initialize_rejects_migration_ledgers_outside_contiguous_v2_to_v4(self) -> None:
+    def test_initialize_rejects_migration_ledgers_outside_contiguous_v2_to_v5(self) -> None:
         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
-        for index, versions in enumerate(((3,), (2, 4), (2, 3, 5), (2, 3, 4, 5))):
+        for index, versions in enumerate(((3,), (2, 4), (2, 3, 5), (2, 3, 4, 6))):
             with self.subTest(versions=versions):
                 legacy_path = Path(self.tempdir.name) / f"invalid-ledger-{index}.sqlite3"
                 with closing(sqlite3.connect(legacy_path)) as connection:
@@ -794,7 +889,7 @@ class StateStoreTestCase(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "migration versions"):
                     StateStore(legacy_path).initialize()
 
-    def test_initialize_applies_v3_and_v4_when_migration_ledger_contains_only_v2(self) -> None:
+    def test_initialize_applies_v3_through_v5_when_migration_ledger_contains_only_v2(self) -> None:
         legacy_path = Path(self.tempdir.name) / "ledger-v2.sqlite3"
         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
         with closing(sqlite3.connect(legacy_path)) as connection:
@@ -810,10 +905,10 @@ class StateStoreTestCase(unittest.TestCase):
         with closing(sqlite3.connect(legacy_path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,)],
+                [(2,), (3,), (4,), (5,)],
             )
 
-    def test_initialize_migrates_complete_v3_database_to_v4_preserving_issues(self) -> None:
+    def test_initialize_migrates_complete_v3_database_to_v5_preserving_issues(self) -> None:
         legacy_path = Path(self.tempdir.name) / "ledger-v3.sqlite3"
         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
         with closing(sqlite3.connect(legacy_path)) as connection:
@@ -837,7 +932,7 @@ class StateStoreTestCase(unittest.TestCase):
                 connection.execute(
                     "SELECT version FROM schema_migration ORDER BY version"
                 ).fetchall(),
-                [(2,), (3,), (4,)],
+                [(2,), (3,), (4,), (5,)],
             )
             self.assertEqual(
                 connection.execute("SELECT * FROM quality_issue").fetchall(),
