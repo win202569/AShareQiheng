@@ -3,6 +3,7 @@ import unittest
 
 from ashare_pipeline.formal_evidence import OfficialSnapshotRef
 from ashare_pipeline.formal_universe import (
+    FormalFrozenUniverseInput,
     FormalUniverseIngestor,
     FormalUniverseSourceDocument,
     build_universe_snapshot,
@@ -90,6 +91,36 @@ class FormalUniverseTests(unittest.TestCase):
         self.assertNotEqual(first.audit.excluded_rows_hash, second.audit.excluded_rows_hash)
         self.assertNotEqual(first.audit.audit_hash, second.audit.audit_hash)
 
+    def test_accepted_raw_json_is_defensively_copied_and_deeply_immutable(self):
+        raw_row = {
+            "security_id": "BJ430001",
+            "security_type": "ordinary_a",
+            "listing_status": "listed",
+            "metadata": {"aliases": ["alpha"]},
+        }
+        frozen = FormalUniverseIngestor().build(
+            FORMAL_FREEZE_AT_CN,
+            "m" * 64,
+            (
+                listing_document("BJ", (raw_row,)),
+                *verified_listing_documents("SH", "SZ"),
+            ),
+        )
+        member = frozen.members[0]
+        original_hashes = (member.raw_row_hash, frozen.universe_hash, frozen.frozen_input_hash)
+
+        raw_row["metadata"]["aliases"].append("source-mutation")
+        with self.assertRaises(TypeError):
+            member.raw_row["metadata"] = {}
+        with self.assertRaises(AttributeError):
+            member.raw_row["metadata"]["aliases"].append("member-mutation")
+
+        self.assertEqual(member.raw_row["metadata"]["aliases"], ("alpha",))
+        self.assertEqual(
+            (member.raw_row_hash, frozen.universe_hash, frozen.frozen_input_hash),
+            original_hashes,
+        )
+
     def test_extraction_fails_closed_for_bad_rows_and_zero_ordinary_a(self):
         invalid_rows = (
             ({"security_id": "SZ000001", "listing_status": "listed"}, "unknown security_type"),
@@ -123,6 +154,58 @@ class FormalUniverseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SH/SZ/BJ"):
             build_universe_snapshot(extractions[:2])
 
+    def test_frozen_input_constructor_rejects_bare_members_and_tampered_hash_graph(self):
+        with self.assertRaisesRegex(ValueError, "three verified SH/SZ/BJ sources"):
+            FormalFrozenUniverseInput(
+                as_of_utc=FORMAL_FREEZE_AT_CN,
+                registry_manifest_hash="m" * 64,
+                members=(),
+                sources=(),
+                universe_hash="u" * 64,
+                source_audit_hash="s" * 64,
+                frozen_input_hash="f" * 64,
+            )
+
+        frozen = FormalUniverseIngestor().build(
+            FORMAL_FREEZE_AT_CN,
+            "m" * 64,
+            verified_listing_documents("SH", "SZ", "BJ"),
+        )
+        for field in ("universe_hash", "source_audit_hash", "frozen_input_hash"):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                replace(frozen, **{field: "0" * 64})
+
+        first_source = frozen.sources[0]
+        bad_audit = replace(first_source.extraction.audit, audit_hash="0" * 64)
+        bad_source = replace(
+            first_source,
+            extraction=replace(first_source.extraction, audit=bad_audit),
+        )
+        with self.assertRaisesRegex(ValueError, "audit_hash"):
+            replace(frozen, sources=(bad_source, *frozen.sources[1:]))
+
+        malformed_source = replace(first_source, extraction=None)
+        with self.assertRaises(Exception) as caught:
+            replace(frozen, sources=(malformed_source, *frozen.sources[1:]))
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertIn("extraction", str(caught.exception))
+
+        with self.assertRaisesRegex(ValueError, "members must exactly match"):
+            replace(frozen, members=frozen.members[1:])
+
+    def test_member_constructor_rejects_noncanonical_or_non_ordinary_identity(self):
+        frozen = FormalUniverseIngestor().build(
+            FORMAL_FREEZE_AT_CN,
+            "m" * 64,
+            verified_listing_documents("SH", "SZ", "BJ"),
+        )
+        member = frozen.members[0]
+
+        with self.assertRaisesRegex(ValueError, "ordinary_a"):
+            replace(member, security_type="bond")
+        with self.assertRaisesRegex(ValueError, "raw row identity"):
+            replace(member, security_id="BJ430002")
+
     def test_ingestor_requires_three_verified_visible_exchange_scoped_documents(self):
         documents = verified_listing_documents("SH", "SZ", "BJ")
         frozen = FormalUniverseIngestor().build(FORMAL_FREEZE_AT_CN, "m" * 64, documents)
@@ -141,6 +224,20 @@ class FormalUniverseTests(unittest.TestCase):
         parser_mismatch = replace(documents[0], parser_version="other-parser-v2")
         with self.assertRaisesRegex(ValueError, "parser"):
             FormalUniverseIngestor().build(FORMAL_FREEZE_AT_CN, "m" * 64, (parser_mismatch, *documents[1:]))
+
+    def test_ingestor_rejects_verified_non_listing_dataset(self):
+        documents = verified_listing_documents("SH", "SZ", "BJ")
+        annual_report = replace(
+            documents[0],
+            snapshot=replace(documents[0].snapshot, dataset="annual_report"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "official listing dataset"):
+            FormalUniverseIngestor().build(
+                FORMAL_FREEZE_AT_CN,
+                "m" * 64,
+                (annual_report, *documents[1:]),
+            )
 
 
 if __name__ == "__main__":
