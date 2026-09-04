@@ -2730,6 +2730,163 @@ class StateStoreTestCase(unittest.TestCase):
         self.assertEqual(len(self.store.list_jobs(["feature_build"])), 1)
         self.assertEqual(len(self.store.list_financial_facts("SH600001")), 1)
 
+    def test_reconciliation_allows_short_cross_midnight_snapshot_within_job_lifetime(
+        self,
+    ) -> None:
+        case = self.malformed_reconciliation_case("cross-midnight")
+        refresh_date = case["payload"]["refresh_date"]
+        self.assertIsInstance(refresh_date, str)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE source_snapshot SET fetched_at=?, created_at=? WHERE id=?",
+                (
+                    f"{refresh_date}T16:00:07+00:00",
+                    f"{refresh_date}T16:00:07.250000+00:00",
+                    case["snapshot_id"],
+                ),
+            )
+            connection.execute(
+                """UPDATE job SET created_at=?, updated_at=? WHERE id=?""",
+                (
+                    f"{refresh_date}T15:55:00+00:00",
+                    f"{refresh_date}T16:00:08+00:00",
+                    case["job_id"],
+                ),
+            )
+            connection.execute(
+                "UPDATE quality_issue SET created_at=? WHERE id=?",
+                (f"{refresh_date}T16:00:07.500000+00:00", case["issue_id"]),
+            )
+            connection.commit()
+
+        recovered = self.store.reconcile_malformed_statement(
+            case["job_id"], **self.reconciliation_arguments(case)
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(self.store.get_job(case["job_id"])["status"], "succeeded")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [case["fact"]])
+
+    def test_reconciliation_rejects_cross_midnight_snapshot_outside_grace_without_writes(
+        self,
+    ) -> None:
+        case = self.malformed_reconciliation_case("cross-midnight-late")
+        refresh_date = case["payload"]["refresh_date"]
+        self.assertIsInstance(refresh_date, str)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE source_snapshot SET fetched_at=?, created_at=? WHERE id=?",
+                (
+                    f"{refresh_date}T16:00:15.001000+00:00",
+                    f"{refresh_date}T16:00:15.001500+00:00",
+                    case["snapshot_id"],
+                ),
+            )
+            connection.execute(
+                """UPDATE job SET created_at=?, updated_at=? WHERE id=?""",
+                (
+                    f"{refresh_date}T15:55:00+00:00",
+                    f"{refresh_date}T16:00:15.002000+00:00",
+                    case["job_id"],
+                ),
+            )
+            connection.execute(
+                "UPDATE quality_issue SET created_at=? WHERE id=?",
+                (f"{refresh_date}T16:00:15.001750+00:00", case["issue_id"]),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "snapshot refresh date"):
+            self.store.reconcile_malformed_statement(
+                case["job_id"], **self.reconciliation_arguments(case)
+            )
+
+        self.assertEqual(
+            self.store.get_job(case["job_id"])["status"], "terminal_failed"
+        )
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_reconciliation_rejects_cross_midnight_evidence_out_of_order_without_writes(
+        self,
+    ) -> None:
+        case = self.malformed_reconciliation_case("cross-midnight-out-of-order")
+        refresh_date = case["payload"]["refresh_date"]
+        self.assertIsInstance(refresh_date, str)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE source_snapshot SET fetched_at=?, created_at=? WHERE id=?",
+                (
+                    f"{refresh_date}T16:00:07.139000+00:00",
+                    f"{refresh_date}T16:00:07.100000+00:00",
+                    case["snapshot_id"],
+                ),
+            )
+            connection.execute(
+                """UPDATE job SET created_at=?, updated_at=? WHERE id=?""",
+                (
+                    f"{refresh_date}T15:55:00+00:00",
+                    f"{refresh_date}T16:00:08+00:00",
+                    case["job_id"],
+                ),
+            )
+            connection.execute(
+                "UPDATE quality_issue SET created_at=? WHERE id=?",
+                (f"{refresh_date}T16:00:07.500000+00:00", case["issue_id"]),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "cross-midnight chronology"):
+            self.store.reconcile_malformed_statement(
+                case["job_id"], **self.reconciliation_arguments(case)
+            )
+
+        self.assertEqual(
+            self.store.get_job(case["job_id"])["status"], "terminal_failed"
+        )
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+    def test_reconciliation_rejects_cross_midnight_job_started_too_early_without_writes(
+        self,
+    ) -> None:
+        case = self.malformed_reconciliation_case("cross-midnight-early-job")
+        refresh_date = case["payload"]["refresh_date"]
+        self.assertIsInstance(refresh_date, str)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE source_snapshot SET fetched_at=?, created_at=? WHERE id=?",
+                (
+                    f"{refresh_date}T16:00:07+00:00",
+                    f"{refresh_date}T16:00:07.250000+00:00",
+                    case["snapshot_id"],
+                ),
+            )
+            connection.execute(
+                """UPDATE job SET created_at=?, updated_at=? WHERE id=?""",
+                (
+                    f"{refresh_date}T15:54:59+00:00",
+                    f"{refresh_date}T16:00:08+00:00",
+                    case["job_id"],
+                ),
+            )
+            connection.execute(
+                "UPDATE quality_issue SET created_at=? WHERE id=?",
+                (f"{refresh_date}T16:00:07.500000+00:00", case["issue_id"]),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "snapshot refresh date"):
+            self.store.reconcile_malformed_statement(
+                case["job_id"], **self.reconciliation_arguments(case)
+            )
+
+        self.assertEqual(
+            self.store.get_job(case["job_id"])["status"], "terminal_failed"
+        )
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
     def test_reconciliation_rejects_primary_wrong_refresh_or_future_as_of(self) -> None:
         for label in ("wrong-refresh", "future-as-of"):
             with self.subTest(label=label):
