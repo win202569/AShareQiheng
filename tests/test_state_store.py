@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import json
 import math
 import sqlite3
 import tempfile
@@ -37,6 +38,12 @@ from ashare_pipeline.formal_evidence import (
     verify_official_fetch,
 )
 from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore, FormalStoredSnapshot
+from ashare_pipeline.formal_universe import (
+    FormalFrozenUniverseInput,
+    FormalUniverseIngestor,
+    FormalUniverseSourceDocument,
+    extract_formal_universe_members,
+)
 from ashare_pipeline.state_store import FinalizationBlocked, JobSpec, StateStore
 from tests.test_financial_features import (
     build_bundle_with_overrides,
@@ -1040,6 +1047,149 @@ class StateStoreTestCase(unittest.TestCase):
             stored,
             verification,
         )
+
+    def task_backed_frozen_universe(
+        self,
+        *,
+        label: str = "universe",
+        db_path: Path | None = None,
+    ) -> tuple[StateStore, FormalFrozenUniverseInput, dict[str, str]]:
+        path = db_path or self.db_path
+        if path != self.db_path:
+            StateStore(path).initialize()
+        raw_store = FormalSnapshotStore(
+            Path(self.tempdir.name) / f"formal-universe-raw-{label}"
+        )
+        store = StateStore(path, formal_snapshot_store=raw_store)
+        registry_manifest_hash = "7" * 64
+        as_of_utc = "2026-08-31T15:00:00+08:00"
+        exchange_values = {
+            "BJ": ("bse", "https://www.bse.cn/listing", "430001"),
+            "SH": ("sse", "https://www.sse.com.cn/listing", "600000"),
+            "SZ": ("szse", "https://www.szse.cn/listing", "000001"),
+        }
+        policies = {
+            "bse": SourcePolicy.bse(),
+            "sse": SourcePolicy.sse(),
+            "szse": SourcePolicy.szse(),
+        }
+        documents = []
+        task_ids: dict[str, str] = {}
+        for exchange in ("BJ", "SH", "SZ"):
+            source, original_url, code6 = exchange_values[exchange]
+            generation = f"universe-{exchange.lower()}-generation-v1"
+            parser_id = f"{source}-listing-json"
+            parser_version = f"{source}-listing-json-v1"
+            request = OfficialRequest(
+                source,
+                "official_security_listing",
+                None,
+                "2026-08-31",
+                exchange,
+            )
+            payload = {
+                "as_of_utc": as_of_utc,
+                "calendar_binding": None,
+                "calendar_prerequisite_task_id": None,
+                "exchange": exchange,
+                "official_request": json.loads(
+                    request.canonical_json_bytes().decode("utf-8")
+                ),
+                "refresh_generation": generation,
+                "registry_manifest_hash": registry_manifest_hash,
+                "relevant_registry_hashes": [["source_registry", "8" * 64]],
+                "request_version": "universe-listing-v1",
+                "source": source,
+                "upstream_generation": "9" * 64,
+            }
+            task_id = store.enqueue_formal_task(
+                "formal_universe_source",
+                f"formal-universe-source:{label}:{exchange}",
+                generation,
+                payload,
+            )
+            task_ids[exchange] = task_id
+            leased = store.lease_next_formal_task(
+                ("formal_universe_source",), f"worker-{exchange.lower()}", 300
+            )
+            self.assertEqual(leased["id"], task_id)
+            rows = ({
+                "listing_status": "listed",
+                "metadata": {
+                    "aliases": [f"{exchange}-alpha", {"language": "zh"}],
+                },
+                "security_id": exchange + code6,
+                "security_type": "ordinary_a",
+            },)
+            if exchange == "BJ":
+                rows += ({
+                    "listing_status": "listed",
+                    "security_id": "BJ899001",
+                    "security_type": "bond",
+                },)
+            raw_bytes = json.dumps(
+                list(rows),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            fetch = OfficialFetch(
+                request=request,
+                raw_bytes=raw_bytes,
+                original_url=original_url,
+                published_at_utc="2026-08-31T06:00:00+00:00",
+                published_precision="timestamp",
+                source_updated_at_utc=None,
+                captured_at_utc="2026-08-31T06:30:00+00:00",
+                effective_at_utc="2026-08-31T06:00:00+00:00",
+                effective_time_evidence_hash=None,
+                refresh_generation=generation,
+                parser_id=parser_id,
+                parser_version=parser_version,
+                mapping_version=f"{source}-listing-map-v1",
+                declared_security_id=None,
+                declared_period="2026-08-31",
+            )
+            verification = verify_official_fetch(fetch, policies[source])
+            self.assertEqual(verification.status, "verified")
+            stored = raw_store.write_verified(
+                fetch, verification, producing_task_id=task_id
+            )
+            ref = store.put_formal_snapshot_for_leased_task(
+                fetch,
+                stored,
+                verification,
+                task_id=task_id,
+                worker_id=f"worker-{exchange.lower()}",
+            )
+            document = FormalUniverseSourceDocument(
+                exchange=exchange,
+                snapshot=ref,
+                parser_id=parser_id,
+                parser_version=parser_version,
+                parsed_rows=rows,
+            )
+            extraction = extract_formal_universe_members(document)
+            store.complete_formal_task(
+                task_id,
+                f"worker-{exchange.lower()}",
+                {
+                    "exchange": exchange,
+                    "manifest_sha256": ref.manifest_sha256,
+                    "parsed_rows_hash": extraction.audit.parsed_rows_hash,
+                    "parser_id": parser_id,
+                    "parser_version": parser_version,
+                    "refresh_generation": generation,
+                    "registry_manifest_hash": registry_manifest_hash,
+                    "snapshot_id": ref.snapshot_id,
+                    "source_content_sha256": ref.content_sha256,
+                },
+            )
+            documents.append(document)
+        frozen = FormalUniverseIngestor().build(
+            as_of_utc, registry_manifest_hash, tuple(documents)
+        )
+        return store, frozen, task_ids
 
     def insert_formal_receipt_fixture(
         self,
@@ -6786,6 +6936,423 @@ class StateStoreTestCase(unittest.TestCase):
             connection.commit()
 
         self.assertEqual(self.store.progress_snapshot()["updated_at"], marker)
+
+    def test_formal_universe_snapshot_persists_complete_canonical_graph_and_initial_statuses(self) -> None:
+        store, frozen, _ = self.task_backed_frozen_universe(label="canonical")
+
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+
+        header = store.get_formal_universe_snapshot_by_input_hash(
+            frozen.frozen_input_hash
+        )
+        self.assertEqual(header["id"], snapshot_id)
+        self.assertEqual(
+            {
+                key: header[key]
+                for key in (
+                    "as_of_utc",
+                    "registry_manifest_hash",
+                    "universe_hash",
+                    "source_audit_hash",
+                    "frozen_input_hash",
+                )
+            },
+            {
+                "as_of_utc": frozen.as_of_utc,
+                "registry_manifest_hash": frozen.registry_manifest_hash,
+                "universe_hash": frozen.universe_hash,
+                "source_audit_hash": frozen.source_audit_hash,
+                "frozen_input_hash": frozen.frozen_input_hash,
+            },
+        )
+        sources = store.list_formal_universe_sources(snapshot_id)
+        self.assertEqual([source["exchange"] for source in sources], ["BJ", "SH", "SZ"])
+        self.assertEqual(
+            sources[0]["extraction"]["members"][0]["raw_row"]["metadata"]["aliases"],
+            ["BJ-alpha", {"language": "zh"}],
+        )
+        self.assertEqual(
+            sources[0]["extraction"]["audit"]["excluded_by_security_type"],
+            [["bond", 1]],
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            counts = {
+                table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in (
+                    "formal_universe_snapshot",
+                    "formal_universe_source",
+                    "formal_universe_member",
+                    "formal_universe_status",
+                )
+            }
+            members = connection.execute(
+                "SELECT security_id,raw_json FROM formal_universe_member ORDER BY security_id"
+            ).fetchall()
+            statuses = connection.execute(
+                """SELECT security_id,status,reasons_json,veto_flags_json,evidence_hash
+                FROM formal_universe_status ORDER BY security_id"""
+            ).fetchall()
+        self.assertEqual(counts, {
+            "formal_universe_snapshot": 1,
+            "formal_universe_source": 3,
+            "formal_universe_member": 3,
+            "formal_universe_status": 3,
+        })
+        self.assertEqual([row[0] for row in members], ["BJ430001", "SH600000", "SZ000001"])
+        self.assertIn('"aliases":["BJ-alpha",{"language":"zh"}]', members[0][1])
+        for security_id, status, reasons_json, veto_flags_json, evidence_hash in statuses:
+            self.assertEqual(status, "pending_evidence")
+            self.assertEqual(reasons_json, '["formal_collection_pending"]')
+            self.assertEqual(veto_flags_json, "[]")
+            expected = hashlib.sha256(json.dumps(
+                {
+                    "frozen_input_hash": frozen.frozen_input_hash,
+                    "reasons": ["formal_collection_pending"],
+                    "security_id": security_id,
+                    "status": "pending_evidence",
+                    "veto_flags": [],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")).hexdigest()
+            self.assertEqual(evidence_hash, expected)
+
+    def test_formal_universe_snapshot_replay_is_exact_and_never_resets_statuses(self) -> None:
+        store, frozen, _ = self.task_backed_frozen_universe(label="replay")
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """UPDATE formal_universe_status
+                SET status='pool_vetoed', reasons_json='[\"verified-risk\"]',
+                    veto_flags_json='[\"ST\"]', evidence_hash=?
+                WHERE snapshot_id=? AND security_id='BJ430001'""",
+                ("a" * 64, snapshot_id),
+            )
+            connection.commit()
+
+        self.assertEqual(store.put_formal_universe_snapshot(frozen), snapshot_id)
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            row = connection.execute(
+                """SELECT status,reasons_json,veto_flags_json,evidence_hash
+                FROM formal_universe_status
+                WHERE snapshot_id=? AND security_id='BJ430001'""",
+                (snapshot_id,),
+            ).fetchone()
+        self.assertEqual(row, ("pool_vetoed", '["verified-risk"]', '["ST"]', "a" * 64))
+
+    def test_formal_universe_snapshot_requires_exact_typed_recomputed_input(self) -> None:
+        store, frozen, _ = self.task_backed_frozen_universe(label="typed")
+        with self.assertRaises(ValueError):
+            store.put_formal_universe_snapshot({"frozen_input_hash": frozen.frozen_input_hash})
+
+        mutations = (
+            ("as_of_utc", "2026-08-31T14:59:59+08:00"),
+            ("registry_manifest_hash", ""),
+            ("members", tuple(reversed(frozen.members))),
+            ("sources", tuple(reversed(frozen.sources))),
+            ("universe_hash", "0" * 64),
+            ("source_audit_hash", "1" * 64),
+            ("frozen_input_hash", "2" * 64),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                forged = copy.copy(frozen)
+                object.__setattr__(forged, field, value)
+                with self.assertRaises(ValueError):
+                    store.put_formal_universe_snapshot(forged)
+
+    def test_formal_universe_snapshot_rejects_missing_duplicate_cross_exchange_and_untrusted_source_graphs(self) -> None:
+        store, frozen, task_ids = self.task_backed_frozen_universe(label="source-shape")
+        malformed_sources = (
+            frozen.sources[:2],
+            (frozen.sources[0], frozen.sources[0], frozen.sources[2]),
+            (replace(frozen.sources[0], exchange="SH"), *frozen.sources[1:]),
+            (
+                replace(
+                    frozen.sources[0],
+                    snapshot=replace(frozen.sources[0].snapshot, producing_task_id=None),
+                ),
+                *frozen.sources[1:],
+            ),
+        )
+        for sources in malformed_sources:
+            with self.subTest(sources=sources):
+                forged = copy.copy(frozen)
+                object.__setattr__(forged, "sources", tuple(sources))
+                with self.assertRaises(ValueError):
+                    store.put_formal_universe_snapshot(forged)
+
+        bootstrap_raw_store = FormalSnapshotStore(
+            Path(self.tempdir.name) / "formal-universe-raw-source-shape"
+        )
+        bootstrap_rows = ({
+            "listing_status": "listed",
+            "metadata": {"aliases": ["BJ-bootstrap"]},
+            "security_id": "BJ430001",
+            "security_type": "ordinary_a",
+        },)
+        bootstrap_fetch = OfficialFetch(
+            request=OfficialRequest(
+                "bse", "official_security_listing", None, "2026-08-31", "BJ"
+            ),
+            raw_bytes=b"bootstrap listing",
+            original_url="https://www.bse.cn/listing",
+            published_at_utc="2026-08-31T06:00:00+00:00",
+            published_precision="timestamp",
+            source_updated_at_utc=None,
+            captured_at_utc="2026-08-31T06:30:00+00:00",
+            effective_at_utc="2026-08-31T06:00:00+00:00",
+            effective_time_evidence_hash=None,
+            refresh_generation="bootstrap-universe-v1",
+            parser_id="bse-listing-json",
+            parser_version="bse-listing-json-v1",
+            mapping_version="bse-listing-map-v1",
+            declared_security_id=None,
+            declared_period="2026-08-31",
+        )
+        bootstrap_verification = verify_official_fetch(
+            bootstrap_fetch, SourcePolicy.bse()
+        )
+        bootstrap_stored = bootstrap_raw_store.write_verified(
+            bootstrap_fetch, bootstrap_verification, producing_task_id=None
+        )
+        bootstrap_ref = store.put_formal_snapshot(
+            bootstrap_fetch, bootstrap_stored, bootstrap_verification
+        )
+        bootstrap_documents = (
+            FormalUniverseSourceDocument(
+                "BJ",
+                bootstrap_ref,
+                bootstrap_ref.parser_id,
+                bootstrap_ref.parser_version,
+                bootstrap_rows,
+            ),
+            *(
+                FormalUniverseSourceDocument(
+                    source.exchange,
+                    source.snapshot,
+                    source.snapshot.parser_id,
+                    source.snapshot.parser_version,
+                    tuple(member.raw_row for member in source.extraction.members),
+                )
+                for source in frozen.sources[1:]
+            ),
+        )
+        bootstrap_frozen = FormalUniverseIngestor().build(
+            frozen.as_of_utc,
+            frozen.registry_manifest_hash,
+            bootstrap_documents,
+        )
+        with self.assertRaisesRegex(ValueError, "bootstrap"):
+            store.put_formal_universe_snapshot(bootstrap_frozen)
+
+        self.assertEqual(store.get_formal_task(task_ids["BJ"])["status"], "verified")
+
+    def test_formal_universe_snapshot_revalidates_task_receipt_and_result_lineage(self) -> None:
+        cases = (
+            "missing-receipt",
+            "duplicate-producer",
+            "wrong-kind",
+            "wrong-status",
+            "wrong-generation",
+            "wrong-manifest",
+            "wrong-result",
+            "cross-exchange-payload",
+        )
+        for index, case in enumerate(cases):
+            with self.subTest(case=case):
+                path = Path(self.tempdir.name) / f"universe-lineage-{index}.sqlite3"
+                store, frozen, task_ids = self.task_backed_frozen_universe(
+                    label=f"lineage-{index}", db_path=path
+                )
+                task_id = task_ids["BJ"]
+                with closing(sqlite3.connect(path)) as connection:
+                    if case == "missing-receipt":
+                        connection.execute(
+                            "DELETE FROM formal_task_snapshot_receipt WHERE task_id=?",
+                            (task_id,),
+                        )
+                    elif case == "duplicate-producer":
+                        row = connection.execute(
+                            "SELECT * FROM formal_source_snapshot WHERE producing_task_id=?",
+                            (task_id,),
+                        ).fetchone()
+                        values = list(row)
+                        values[0] = str(uuid.uuid4())
+                        values[6] = "0" * 64
+                        values[19] = "duplicate-generation"
+                        connection.execute(
+                            "INSERT INTO formal_source_snapshot VALUES (" + ",".join("?" for _ in values) + ")",
+                            values,
+                        )
+                    elif case == "wrong-kind":
+                        connection.execute(
+                            "UPDATE formal_collection_task SET kind='formal_statement' WHERE id=?",
+                            (task_id,),
+                        )
+                    elif case == "wrong-status":
+                        connection.execute(
+                            "UPDATE formal_collection_task SET status='terminal_failed' WHERE id=?",
+                            (task_id,),
+                        )
+                    elif case == "wrong-generation":
+                        connection.execute(
+                            "UPDATE formal_collection_task SET refresh_generation='wrong' WHERE id=?",
+                            (task_id,),
+                        )
+                    elif case == "wrong-manifest":
+                        connection.execute(
+                            "UPDATE formal_task_snapshot_receipt SET manifest_sha256=? WHERE task_id=?",
+                            ("0" * 64, task_id),
+                        )
+                    elif case == "wrong-result":
+                        result = json.loads(connection.execute(
+                            "SELECT result_json FROM formal_collection_task WHERE id=?",
+                            (task_id,),
+                        ).fetchone()[0])
+                        result["parsed_rows_hash"] = "0" * 64
+                        connection.execute(
+                            "UPDATE formal_collection_task SET result_json=? WHERE id=?",
+                            (json.dumps(result, sort_keys=True, separators=(",", ":")), task_id),
+                        )
+                    else:
+                        payload = json.loads(connection.execute(
+                            "SELECT payload_json FROM formal_collection_task WHERE id=?",
+                            (task_id,),
+                        ).fetchone()[0])
+                        payload["exchange"] = "SH"
+                        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                        connection.execute(
+                            """UPDATE formal_collection_task
+                            SET payload_json=?, payload_sha256=? WHERE id=?""",
+                            (
+                                payload_json,
+                                hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+                                task_id,
+                            ),
+                        )
+                    connection.commit()
+                with self.assertRaises(ValueError):
+                    store.put_formal_universe_snapshot(frozen)
+                with closing(sqlite3.connect(path)) as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM formal_universe_snapshot").fetchone()[0],
+                        0,
+                    )
+
+    def test_formal_universe_snapshot_rolls_back_late_child_failure(self) -> None:
+        store, frozen, _ = self.task_backed_frozen_universe(label="late-rollback")
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """CREATE TRIGGER fail_universe_status
+                BEFORE INSERT ON formal_universe_status
+                BEGIN SELECT RAISE(ABORT, 'forced status failure'); END"""
+            )
+            connection.commit()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            store.put_formal_universe_snapshot(frozen)
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                {
+                    table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in (
+                        "formal_universe_snapshot",
+                        "formal_universe_source",
+                        "formal_universe_member",
+                        "formal_universe_status",
+                    )
+                },
+                {
+                    "formal_universe_snapshot": 0,
+                    "formal_universe_source": 0,
+                    "formal_universe_member": 0,
+                    "formal_universe_status": 0,
+                },
+            )
+
+    def test_formal_universe_getters_and_replay_fail_closed_for_corrupt_existing_graph(self) -> None:
+        cases = (
+            "header-hash",
+            "source-json",
+            "missing-member",
+            "missing-status",
+            "bad-status-hash",
+        )
+        for index, case in enumerate(cases):
+            with self.subTest(case=case):
+                path = Path(self.tempdir.name) / f"universe-corrupt-{index}.sqlite3"
+                store, frozen, _ = self.task_backed_frozen_universe(
+                    label=f"corrupt-{index}", db_path=path
+                )
+                snapshot_id = store.put_formal_universe_snapshot(frozen)
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute("PRAGMA foreign_keys=OFF")
+                    if case == "header-hash":
+                        connection.execute(
+                            "UPDATE formal_universe_snapshot SET universe_hash=? WHERE id=?",
+                            ("0" * 64, snapshot_id),
+                        )
+                    elif case == "source-json":
+                        connection.execute(
+                            """UPDATE formal_universe_source SET extraction_json='{}'
+                            WHERE universe_snapshot_id=? AND exchange='BJ'""",
+                            (snapshot_id,),
+                        )
+                    elif case == "missing-member":
+                        connection.execute(
+                            "DELETE FROM formal_universe_status WHERE snapshot_id=? AND security_id='BJ430001'",
+                            (snapshot_id,),
+                        )
+                        connection.execute(
+                            "DELETE FROM formal_universe_member WHERE snapshot_id=? AND security_id='BJ430001'",
+                            (snapshot_id,),
+                        )
+                    elif case == "missing-status":
+                        connection.execute(
+                            "DELETE FROM formal_universe_status WHERE snapshot_id=? AND security_id='BJ430001'",
+                            (snapshot_id,),
+                        )
+                    else:
+                        connection.execute(
+                            """UPDATE formal_universe_status SET evidence_hash='not-a-hash'
+                            WHERE snapshot_id=? AND security_id='BJ430001'""",
+                            (snapshot_id,),
+                        )
+                    connection.commit()
+
+                with self.assertRaises(ValueError):
+                    store.get_formal_universe_snapshot_by_input_hash(
+                        frozen.frozen_input_hash
+                    )
+                with self.assertRaisesRegex(ValueError, "frozen_input_hash_conflict"):
+                    store.put_formal_universe_snapshot(frozen)
+
+    def test_formal_universe_persistence_does_not_read_or_modify_legacy_snapshots(self) -> None:
+        created = self.store.record_snapshot(
+            "akshare",
+            "stock_list",
+            "legacy-request",
+            "legacy-payload",
+            "data/raw/legacy.json",
+            1,
+            utc_at(0),
+        )
+        store, frozen, _ = self.task_backed_frozen_universe(label="legacy-isolation")
+        store.put_formal_universe_snapshot(frozen)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            legacy = connection.execute(
+                "SELECT source,dataset,request_fingerprint,payload_hash FROM source_snapshot"
+            ).fetchall()
+        self.assertEqual(created[1], True)
+        self.assertEqual(
+            legacy,
+            [("akshare", "stock_list", "legacy-request", "legacy-payload")],
+        )
 
 
 if __name__ == "__main__":

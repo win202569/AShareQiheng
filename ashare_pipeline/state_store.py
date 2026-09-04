@@ -50,6 +50,15 @@ from ashare_pipeline.formal_snapshot_store import (
     FormalStoredSnapshot,
     ValidatedFormalSnapshot,
 )
+from ashare_pipeline.formal_universe import (
+    FormalFrozenUniverseInput,
+    FormalUniverseExtraction,
+    FormalUniverseMember,
+    FormalUniverseSourceAudit,
+    FormalUniverseSourceEvidence,
+    _create_frozen_universe_input,
+    _validate_frozen_universe_input,
+)
 
 
 JOB_STATES = {"pending", "running", "succeeded", "retryable_failed", "terminal_failed"}
@@ -116,6 +125,36 @@ _FORMAL_VERIFICATION_KEYS = frozenset(
 )
 _FORMAL_SOURCE_FETCH_KINDS = frozenset(
     {"formal_statement", "formal_context", "formal_universe_source"}
+)
+_FORMAL_UNIVERSE_EXCHANGES = frozenset({"SH", "SZ", "BJ"})
+_FORMAL_UNIVERSE_STATUSES = frozenset(
+    {"out_of_scope", "pending_evidence", "pool_vetoed", "formal_scored"}
+)
+_FORMAL_UNIVERSE_EXTRACTION_KEYS = frozenset({"audit", "exchange", "members"})
+_FORMAL_UNIVERSE_AUDIT_KEYS = frozenset(
+    {
+        "accepted_members_hash",
+        "accepted_ordinary_a_count",
+        "audit_hash",
+        "exchange",
+        "excluded_by_security_type",
+        "excluded_rows_hash",
+        "parsed_rows_hash",
+        "parser_id",
+        "parser_version",
+        "source_content_sha256",
+        "source_row_count",
+    }
+)
+_FORMAL_UNIVERSE_MEMBER_KEYS = frozenset(
+    {
+        "exchange",
+        "listing_status",
+        "raw_row",
+        "raw_row_hash",
+        "security_id",
+        "security_type",
+    }
 )
 
 FINANCIAL_FACT_COLUMNS = (
@@ -543,6 +582,144 @@ def _decode_canonical_formal_json(value: object, field: str) -> dict[str, object
     if _json(decoded) != value:
         raise ValueError(f"stored formal snapshot {field} JSON is not canonical")
     return decoded
+
+
+def _plain_formal_universe_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        plain: dict[str, object] = {}
+        for key, nested in value.items():
+            if type(key) is not str:
+                raise ValueError("formal universe JSON object keys must be strings")
+            plain[key] = _plain_formal_universe_json(nested)
+        return plain
+    if isinstance(value, (list, tuple)):
+        return [_plain_formal_universe_json(nested) for nested in value]
+    return value
+
+
+def _canonical_formal_universe_json(value: object, field: str) -> str:
+    try:
+        return _json(_plain_formal_universe_json(value))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field} must be finite canonical JSON") from error
+
+
+def _decode_canonical_formal_array(value: object, field: str) -> list[object]:
+    if type(value) is not str:
+        raise ValueError(f"stored formal universe {field} JSON must be text")
+    try:
+        decoded = json.loads(
+            value,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"nonfinite JSON value: {constant}")
+            ),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"stored formal universe {field} JSON is invalid") from error
+    if type(decoded) is not list:
+        raise ValueError(f"stored formal universe {field} JSON is not an array")
+    if _json(decoded) != value:
+        raise ValueError(f"stored formal universe {field} JSON is not canonical")
+    return decoded
+
+
+def _formal_universe_member_payload(
+    member: FormalUniverseMember,
+) -> dict[str, object]:
+    return {
+        "exchange": member.exchange,
+        "listing_status": member.listing_status,
+        "raw_row": _plain_formal_universe_json(member.raw_row),
+        "raw_row_hash": member.raw_row_hash,
+        "security_id": member.security_id,
+        "security_type": member.security_type,
+    }
+
+
+def _formal_universe_audit_payload(
+    audit: FormalUniverseSourceAudit,
+) -> dict[str, object]:
+    return {
+        "accepted_members_hash": audit.accepted_members_hash,
+        "accepted_ordinary_a_count": audit.accepted_ordinary_a_count,
+        "audit_hash": audit.audit_hash,
+        "exchange": audit.exchange,
+        "excluded_by_security_type": audit.excluded_by_security_type,
+        "excluded_rows_hash": audit.excluded_rows_hash,
+        "parsed_rows_hash": audit.parsed_rows_hash,
+        "parser_id": audit.parser_id,
+        "parser_version": audit.parser_version,
+        "source_content_sha256": audit.source_content_sha256,
+        "source_row_count": audit.source_row_count,
+    }
+
+
+def _formal_universe_extraction_payload(
+    extraction: FormalUniverseExtraction,
+) -> dict[str, object]:
+    return {
+        "audit": _formal_universe_audit_payload(extraction.audit),
+        "exchange": extraction.exchange,
+        "members": [
+            _formal_universe_member_payload(member) for member in extraction.members
+        ],
+    }
+
+
+def _formal_snapshot_ref_payload(ref: OfficialSnapshotRef) -> dict[str, object]:
+    return {
+        field: getattr(ref, field)
+        for field in (
+            "snapshot_id",
+            "source",
+            "dataset",
+            "request_fingerprint",
+            "security_id",
+            "period_or_date",
+            "exchange",
+            "content_sha256",
+            "manifest_sha256",
+            "content_path",
+            "manifest_path",
+            "original_url",
+            "published_at_utc",
+            "published_precision",
+            "source_updated_at_utc",
+            "captured_at_utc",
+            "effective_at_utc",
+            "effective_time_evidence_hash",
+            "refresh_generation",
+            "producing_task_id",
+            "parser_id",
+            "parser_version",
+            "mapping_version",
+            "verification_status",
+        )
+    }
+
+
+def _formal_frozen_universe_payload(
+    frozen: FormalFrozenUniverseInput,
+) -> dict[str, object]:
+    return {
+        "as_of_utc": frozen.as_of_utc,
+        "frozen_input_hash": frozen.frozen_input_hash,
+        "members": [
+            _formal_universe_member_payload(member) for member in frozen.members
+        ],
+        "registry_manifest_hash": frozen.registry_manifest_hash,
+        "source_audit_hash": frozen.source_audit_hash,
+        "sources": [
+            {
+                "exchange": source.exchange,
+                "extraction": _formal_universe_extraction_payload(source.extraction),
+                "snapshot": _formal_snapshot_ref_payload(source.snapshot),
+            }
+            for source in frozen.sources
+        ],
+        "universe_hash": frozen.universe_hash,
+    }
 
 
 def _require_canonical_uuid(value: object, field: str) -> str:
@@ -1995,6 +2172,509 @@ class StateStore:
             return self._formal_task_snapshot_receipt_from_connection(
                 connection, task_id
             )
+
+    @staticmethod
+    def _require_formal_frozen_universe_input(
+        frozen: object,
+    ) -> FormalFrozenUniverseInput:
+        if type(frozen) is not FormalFrozenUniverseInput:
+            raise ValueError(
+                "frozen must have exact type FormalFrozenUniverseInput"
+            )
+        try:
+            _validate_frozen_universe_input(frozen)
+        except (AssertionError, AttributeError, TypeError, ValueError) as error:
+            raise ValueError("formal frozen universe input is invalid") from error
+        for field in (
+            "registry_manifest_hash",
+            "universe_hash",
+            "source_audit_hash",
+            "frozen_input_hash",
+        ):
+            _require_formal_sha256(getattr(frozen, field), f"universe {field}")
+        _canonical_formal_universe_json(
+            _formal_frozen_universe_payload(frozen), "formal frozen universe"
+        )
+        return frozen
+
+    @staticmethod
+    def _formal_universe_extraction_from_payload(
+        payload: dict[str, object],
+    ) -> FormalUniverseExtraction:
+        if frozenset(payload) != _FORMAL_UNIVERSE_EXTRACTION_KEYS:
+            raise ValueError("stored formal universe extraction keys mismatch")
+        exchange = payload["exchange"]
+        if type(exchange) is not str or exchange not in _FORMAL_UNIVERSE_EXCHANGES:
+            raise ValueError("stored formal universe extraction exchange is invalid")
+        member_payloads = payload["members"]
+        if type(member_payloads) is not list or not member_payloads:
+            raise ValueError("stored formal universe extraction members are invalid")
+        members: list[FormalUniverseMember] = []
+        for member_payload in member_payloads:
+            if (
+                type(member_payload) is not dict
+                or frozenset(member_payload) != _FORMAL_UNIVERSE_MEMBER_KEYS
+                or type(member_payload["raw_row"]) is not dict
+            ):
+                raise ValueError("stored formal universe member payload is invalid")
+            members.append(FormalUniverseMember(
+                security_id=member_payload["security_id"],
+                exchange=member_payload["exchange"],
+                security_type=member_payload["security_type"],
+                listing_status=member_payload["listing_status"],
+                raw_row=member_payload["raw_row"],
+                raw_row_hash=_require_formal_sha256(
+                    member_payload["raw_row_hash"], "universe member raw row hash"
+                ),
+            ))
+        audit_payload = payload["audit"]
+        if (
+            type(audit_payload) is not dict
+            or frozenset(audit_payload) != _FORMAL_UNIVERSE_AUDIT_KEYS
+        ):
+            raise ValueError("stored formal universe audit keys mismatch")
+        for count_field in ("source_row_count", "accepted_ordinary_a_count"):
+            count = audit_payload[count_field]
+            if type(count) is not int or count < 0:
+                raise ValueError(f"stored formal universe {count_field} is invalid")
+        excluded_payload = audit_payload["excluded_by_security_type"]
+        if type(excluded_payload) is not list:
+            raise ValueError("stored formal universe exclusion audit is invalid")
+        excluded: list[tuple[str, int]] = []
+        for item in excluded_payload:
+            if (
+                type(item) is not list
+                or len(item) != 2
+                or type(item[0]) is not str
+                or not item[0]
+                or type(item[1]) is not int
+                or item[1] <= 0
+            ):
+                raise ValueError("stored formal universe exclusion audit is invalid")
+            excluded.append((item[0], item[1]))
+        if excluded != sorted(excluded) or len({item[0] for item in excluded}) != len(excluded):
+            raise ValueError("stored formal universe exclusion audit is not canonical")
+        for text_field in ("parser_id", "parser_version"):
+            if type(audit_payload[text_field]) is not str or not audit_payload[text_field]:
+                raise ValueError(f"stored formal universe {text_field} is invalid")
+        audit = FormalUniverseSourceAudit(
+            exchange=audit_payload["exchange"],
+            source_content_sha256=_require_formal_sha256(
+                audit_payload["source_content_sha256"],
+                "universe audit source content hash",
+            ),
+            parser_id=audit_payload["parser_id"],
+            parser_version=audit_payload["parser_version"],
+            source_row_count=audit_payload["source_row_count"],
+            accepted_ordinary_a_count=audit_payload["accepted_ordinary_a_count"],
+            excluded_by_security_type=tuple(excluded),
+            parsed_rows_hash=_require_formal_sha256(
+                audit_payload["parsed_rows_hash"], "universe parsed rows hash"
+            ),
+            accepted_members_hash=_require_formal_sha256(
+                audit_payload["accepted_members_hash"],
+                "universe accepted members hash",
+            ),
+            excluded_rows_hash=_require_formal_sha256(
+                audit_payload["excluded_rows_hash"], "universe excluded rows hash"
+            ),
+            audit_hash=_require_formal_sha256(
+                audit_payload["audit_hash"], "universe extraction audit hash"
+            ),
+        )
+        return FormalUniverseExtraction(exchange, tuple(members), audit)
+
+    def _require_formal_universe_source_lineage(
+        self,
+        connection: sqlite3.Connection,
+        frozen: FormalFrozenUniverseInput,
+        source: FormalUniverseSourceEvidence,
+    ) -> OfficialSnapshotRef:
+        snapshot_row = connection.execute(
+            "SELECT * FROM formal_source_snapshot WHERE id = ?",
+            (source.snapshot.snapshot_id,),
+        ).fetchone()
+        if snapshot_row is None:
+            raise ValueError("formal universe source snapshot is missing")
+        persisted_ref = self._formal_snapshot_row_to_ref(snapshot_row)
+        if persisted_ref != source.snapshot:
+            raise ValueError("formal universe source snapshot identity mismatch")
+        task_id = persisted_ref.producing_task_id
+        if type(task_id) is not str or not task_id:
+            raise ValueError("formal universe bootstrap snapshot is not eligible")
+        receipt = self._formal_task_snapshot_receipt_from_connection(
+            connection, task_id
+        )
+        if receipt is None or (
+            receipt["snapshot_id"] != persisted_ref.snapshot_id
+            or receipt["manifest_sha256"] != persisted_ref.manifest_sha256
+            or receipt["refresh_generation"] != persisted_ref.refresh_generation
+        ):
+            raise ValueError("formal universe source receipt mismatch")
+        task_row = connection.execute(
+            "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task_row is None:
+            raise ValueError("formal universe source task is missing")
+        prerequisites = [
+            str(row["prerequisite_task_id"])
+            for row in connection.execute(
+                """SELECT prerequisite_task_id
+                FROM formal_collection_task_dependency
+                WHERE task_id = ? ORDER BY prerequisite_task_id""",
+                (task_id,),
+            )
+        ]
+        task = self._formal_task_public(task_row, prerequisites)
+        if task["kind"] != "formal_universe_source" or task["status"] != "verified":
+            raise ValueError("formal universe source task must be verified")
+        if task["refresh_generation"] != persisted_ref.refresh_generation:
+            raise ValueError("formal universe source task generation mismatch")
+        payload = task["payload"]
+        result = task["result"]
+        if type(payload) is not dict or type(result) is not dict:
+            raise ValueError("formal universe source task payload/result is missing")
+        expected_request = json.loads(
+            OfficialRequest(
+                persisted_ref.source,
+                persisted_ref.dataset,
+                persisted_ref.security_id,
+                persisted_ref.period_or_date,
+                persisted_ref.exchange,
+            ).canonical_json_bytes().decode("utf-8")
+        )
+        expected_payload = {
+            "as_of_utc": frozen.as_of_utc,
+            "exchange": source.exchange,
+            "official_request": expected_request,
+            "refresh_generation": persisted_ref.refresh_generation,
+            "registry_manifest_hash": frozen.registry_manifest_hash,
+            "source": persisted_ref.source,
+        }
+        if any(payload.get(key) != value for key, value in expected_payload.items()):
+            raise ValueError("formal universe source task payload lineage mismatch")
+        expected_result = {
+            "exchange": source.exchange,
+            "manifest_sha256": persisted_ref.manifest_sha256,
+            "parsed_rows_hash": source.extraction.audit.parsed_rows_hash,
+            "parser_id": persisted_ref.parser_id,
+            "parser_version": persisted_ref.parser_version,
+            "refresh_generation": persisted_ref.refresh_generation,
+            "registry_manifest_hash": frozen.registry_manifest_hash,
+            "snapshot_id": persisted_ref.snapshot_id,
+            "source_content_sha256": persisted_ref.content_sha256,
+        }
+        if any(result.get(key) != value for key, value in expected_result.items()):
+            raise ValueError("formal universe source task result lineage mismatch")
+        return persisted_ref
+
+    def _formal_universe_from_connection(
+        self,
+        connection: sqlite3.Connection,
+        header: sqlite3.Row,
+    ) -> tuple[FormalFrozenUniverseInput, list[dict[str, object]]]:
+        snapshot_id = _require_canonical_uuid(header["id"], "universe snapshot ID")
+        _require_canonical_utc(header["created_at"], "universe creation time")
+        for field in (
+            "registry_manifest_hash",
+            "universe_hash",
+            "source_audit_hash",
+            "frozen_input_hash",
+        ):
+            _require_formal_sha256(header[field], f"universe {field}")
+        source_rows = connection.execute(
+            """SELECT * FROM formal_universe_source
+            WHERE universe_snapshot_id = ? ORDER BY exchange""",
+            (snapshot_id,),
+        ).fetchall()
+        if (
+            len(source_rows) != 3
+            or {row["exchange"] for row in source_rows} != _FORMAL_UNIVERSE_EXCHANGES
+        ):
+            raise ValueError("stored formal universe requires exactly three SH/SZ/BJ sources")
+        sources: list[FormalUniverseSourceEvidence] = []
+        public_sources: list[dict[str, object]] = []
+        for row in source_rows:
+            if row["universe_snapshot_id"] != snapshot_id:
+                raise ValueError("stored formal universe source parent mismatch")
+            extraction_payload = _decode_canonical_formal_json(
+                row["extraction_json"], "universe extraction"
+            )
+            extraction = self._formal_universe_extraction_from_payload(
+                extraction_payload
+            )
+            snapshot_row = connection.execute(
+                "SELECT * FROM formal_source_snapshot WHERE id = ?",
+                (row["source_snapshot_id"],),
+            ).fetchone()
+            if snapshot_row is None:
+                raise ValueError("stored formal universe source snapshot is missing")
+            ref = self._formal_snapshot_row_to_ref(snapshot_row)
+            if (
+                row["exchange"] != extraction.exchange
+                or row["exchange"] != ref.exchange
+                or row["manifest_sha256"] != ref.manifest_sha256
+                or row["source_content_sha256"] != ref.content_sha256
+                or row["parser_id"] != ref.parser_id
+                or row["parser_version"] != ref.parser_version
+                or row["extraction_audit_hash"] != extraction.audit.audit_hash
+            ):
+                raise ValueError("stored formal universe source fields mismatch")
+            _require_formal_sha256(
+                row["manifest_sha256"], "universe source manifest hash"
+            )
+            _require_formal_sha256(
+                row["source_content_sha256"], "universe source content hash"
+            )
+            _require_formal_sha256(
+                row["extraction_audit_hash"], "universe source extraction hash"
+            )
+            _require_canonical_utc(row["created_at"], "universe source creation time")
+            source = FormalUniverseSourceEvidence(row["exchange"], ref, extraction)
+            sources.append(source)
+            public = dict(row)
+            public.pop("extraction_json")
+            public["extraction"] = extraction_payload
+            public_sources.append(public)
+
+        member_rows = connection.execute(
+            """SELECT * FROM formal_universe_member
+            WHERE snapshot_id = ? ORDER BY security_id""",
+            (snapshot_id,),
+        ).fetchall()
+        if not member_rows:
+            raise ValueError("stored formal universe has no members")
+        members: list[FormalUniverseMember] = []
+        for row in member_rows:
+            raw_payload = _decode_canonical_formal_json(
+                row["raw_json"], "universe member raw row"
+            )
+            member = FormalUniverseMember(
+                security_id=row["security_id"],
+                exchange=row["exchange"],
+                security_type=row["security_type"],
+                listing_status=row["listing_status"],
+                raw_row=raw_payload,
+                raw_row_hash=hashlib.sha256(
+                    row["raw_json"].encode("utf-8")
+                ).hexdigest(),
+            )
+            if (
+                row["snapshot_id"] != snapshot_id
+                or row["code6"] != member.security_id[2:]
+            ):
+                raise ValueError("stored formal universe member fields mismatch")
+            members.append(member)
+
+        status_rows = connection.execute(
+            """SELECT * FROM formal_universe_status
+            WHERE snapshot_id = ? ORDER BY security_id""",
+            (snapshot_id,),
+        ).fetchall()
+        if (
+            len(status_rows) != len(members)
+            or [row["security_id"] for row in status_rows]
+            != [member.security_id for member in members]
+        ):
+            raise ValueError("stored formal universe must have exactly one status per member")
+        for row in status_rows:
+            reasons = _decode_canonical_formal_array(row["reasons_json"], "reasons")
+            veto_flags = _decode_canonical_formal_array(
+                row["veto_flags_json"], "veto flags"
+            )
+            if (
+                row["snapshot_id"] != snapshot_id
+                or row["status"] not in _FORMAL_UNIVERSE_STATUSES
+                or any(type(reason) is not str or not reason for reason in reasons)
+                or any(type(flag) is not str or not flag for flag in veto_flags)
+            ):
+                raise ValueError("stored formal universe status fields are invalid")
+            _require_formal_sha256(row["evidence_hash"], "universe status evidence hash")
+            _require_canonical_utc(row["updated_at"], "universe status update time")
+
+        frozen = _create_frozen_universe_input(
+            as_of_utc=header["as_of_utc"],
+            registry_manifest_hash=header["registry_manifest_hash"],
+            members=tuple(members),
+            sources=tuple(sources),
+            universe_hash=header["universe_hash"],
+            source_audit_hash=header["source_audit_hash"],
+            frozen_input_hash=header["frozen_input_hash"],
+        )
+        for source in frozen.sources:
+            self._require_formal_universe_source_lineage(
+                connection, frozen, source
+            )
+        return frozen, public_sources
+
+    def put_formal_universe_snapshot(
+        self, frozen: FormalFrozenUniverseInput
+    ) -> str:
+        self._require_formal_snapshot_store()
+        frozen = self._require_formal_frozen_universe_input(frozen)
+        expected_graph_json = _canonical_formal_universe_json(
+            _formal_frozen_universe_payload(frozen), "formal frozen universe"
+        )
+        with self._transaction(immediate=True) as connection:
+            frozen = self._require_formal_frozen_universe_input(frozen)
+            for source in frozen.sources:
+                self._require_formal_universe_source_lineage(
+                    connection, frozen, source
+                )
+            existing = connection.execute(
+                """SELECT * FROM formal_universe_snapshot
+                WHERE frozen_input_hash = ?""",
+                (frozen.frozen_input_hash,),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    persisted, _ = self._formal_universe_from_connection(
+                        connection, existing
+                    )
+                    persisted_json = _canonical_formal_universe_json(
+                        _formal_frozen_universe_payload(persisted),
+                        "stored formal frozen universe",
+                    )
+                    if persisted_json != expected_graph_json:
+                        raise ValueError("immutable formal universe graph differs")
+                except ValueError as error:
+                    raise ValueError("frozen_input_hash_conflict") from error
+                return str(existing["id"])
+
+            snapshot_id = str(uuid.uuid4())
+            now = _utc_iso(_utc_now())
+            connection.execute(
+                """INSERT INTO formal_universe_snapshot
+                (id,as_of_utc,registry_manifest_hash,universe_hash,source_audit_hash,
+                 frozen_input_hash,created_at) VALUES (?,?,?,?,?,?,?)""",
+                (
+                    snapshot_id,
+                    frozen.as_of_utc,
+                    frozen.registry_manifest_hash,
+                    frozen.universe_hash,
+                    frozen.source_audit_hash,
+                    frozen.frozen_input_hash,
+                    now,
+                ),
+            )
+            for source in frozen.sources:
+                extraction_json = _canonical_formal_universe_json(
+                    _formal_universe_extraction_payload(source.extraction),
+                    "formal universe extraction",
+                )
+                connection.execute(
+                    """INSERT INTO formal_universe_source
+                    (universe_snapshot_id,exchange,source_snapshot_id,manifest_sha256,
+                     source_content_sha256,parser_id,parser_version,
+                     extraction_audit_hash,extraction_json,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        snapshot_id,
+                        source.exchange,
+                        source.snapshot.snapshot_id,
+                        source.snapshot.manifest_sha256,
+                        source.snapshot.content_sha256,
+                        source.snapshot.parser_id,
+                        source.snapshot.parser_version,
+                        source.extraction.audit.audit_hash,
+                        extraction_json,
+                        now,
+                    ),
+                )
+            for member in frozen.members:
+                raw_json = _canonical_formal_universe_json(
+                    member.raw_row, "formal universe member raw row"
+                )
+                connection.execute(
+                    """INSERT INTO formal_universe_member
+                    (snapshot_id,security_id,exchange,code6,security_type,
+                     listing_status,raw_json) VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        snapshot_id,
+                        member.security_id,
+                        member.exchange,
+                        member.security_id[2:],
+                        member.security_type,
+                        member.listing_status,
+                        raw_json,
+                    ),
+                )
+                status = "pending_evidence"
+                reasons = ["formal_collection_pending"]
+                veto_flags: list[str] = []
+                evidence_payload = {
+                    "frozen_input_hash": frozen.frozen_input_hash,
+                    "reasons": reasons,
+                    "security_id": member.security_id,
+                    "status": status,
+                    "veto_flags": veto_flags,
+                }
+                evidence_hash = hashlib.sha256(
+                    _canonical_formal_universe_json(
+                        evidence_payload, "formal universe initial status evidence"
+                    ).encode("utf-8")
+                ).hexdigest()
+                connection.execute(
+                    """INSERT INTO formal_universe_status
+                    (snapshot_id,security_id,status,reasons_json,veto_flags_json,
+                     evidence_hash,updated_at) VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        snapshot_id,
+                        member.security_id,
+                        status,
+                        _json(reasons),
+                        _json(veto_flags),
+                        evidence_hash,
+                        now,
+                    ),
+                )
+            inserted = connection.execute(
+                "SELECT * FROM formal_universe_snapshot WHERE id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            if inserted is None:
+                raise ValueError("formal universe insert was not visible")
+            persisted, _ = self._formal_universe_from_connection(
+                connection, inserted
+            )
+            if _canonical_formal_universe_json(
+                _formal_frozen_universe_payload(persisted),
+                "stored formal frozen universe",
+            ) != expected_graph_json:
+                raise ValueError("formal universe inserted graph mismatch")
+            return snapshot_id
+
+    def get_formal_universe_snapshot_by_input_hash(
+        self, frozen_input_hash: str
+    ) -> dict[str, object] | None:
+        self._require_formal_snapshot_store()
+        _require_formal_sha256(frozen_input_hash, "universe frozen input hash")
+        with self._transaction() as connection:
+            row = connection.execute(
+                """SELECT * FROM formal_universe_snapshot
+                WHERE frozen_input_hash = ?""",
+                (frozen_input_hash,),
+            ).fetchone()
+            if row is None:
+                return None
+            self._formal_universe_from_connection(connection, row)
+            return dict(row)
+
+    def list_formal_universe_sources(
+        self, universe_snapshot_id: str
+    ) -> list[dict[str, object]]:
+        self._require_formal_snapshot_store()
+        if type(universe_snapshot_id) is not str or not universe_snapshot_id.strip():
+            raise ValueError("universe_snapshot_id must be a nonempty string")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM formal_universe_snapshot WHERE id = ?",
+                (universe_snapshot_id,),
+            ).fetchone()
+            if row is None:
+                return []
+            _, sources = self._formal_universe_from_connection(connection, row)
+            return sources
 
     def enqueue_formal_task(
         self,
