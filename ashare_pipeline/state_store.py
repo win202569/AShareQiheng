@@ -2290,6 +2290,170 @@ class StateStore:
                 )
         return expiry
 
+    def complete_formal_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        result: Mapping[str, object],
+    ) -> None:
+        if type(task_id) is not str or not task_id.strip():
+            raise ValueError("task_id must be a nonempty string")
+        if type(worker_id) is not str or not worker_id.strip():
+            raise ValueError("worker_id must be a nonempty string")
+        result_json = _canonical_mapping_json(result, "result")
+
+        with self._transaction(immediate=True) as connection:
+            now = _utc_iso(_utc_now())
+            row = connection.execute(
+                "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    "formal task is not held by the current unexpired lease owner"
+                )
+            prerequisites = [
+                str(item["prerequisite_task_id"])
+                for item in connection.execute(
+                    """SELECT prerequisite_task_id
+                    FROM formal_collection_task_dependency
+                    WHERE task_id = ? ORDER BY prerequisite_task_id""",
+                    (task_id,),
+                )
+            ]
+            task = self._formal_task_public(row, prerequisites)
+            if (
+                task["status"] != "leased"
+                or task["lease_worker"] != worker_id
+                or task["lease_expires_at"] is None
+                or _require_canonical_utc(
+                    task["lease_expires_at"], "task lease expiry"
+                ) <= now
+            ):
+                raise ValueError(
+                    "formal task is not held by the current unexpired lease owner"
+                )
+            if task["kind"] == "formal_universe_finalize":
+                raise ValueError(
+                    "formal universe finalizer requires verified universe proof"
+                )
+
+            source_task = task["kind"] in _FORMAL_SOURCE_FETCH_KINDS
+            if source_task:
+                receipt = self._formal_task_snapshot_receipt_from_connection(
+                    connection, task_id
+                )
+                if receipt is None:
+                    raise ValueError(
+                        "formal source task completion requires an exact receipt"
+                    )
+
+            now = _utc_iso(_utc_now())
+            source_receipt_predicate = ""
+            if source_task:
+                source_receipt_predicate = """
+                  AND (
+                    SELECT COUNT(*)
+                    FROM formal_task_snapshot_receipt AS receipt
+                    JOIN formal_source_snapshot AS snapshot
+                      ON snapshot.id = receipt.snapshot_id
+                    WHERE receipt.task_id = formal_collection_task.id
+                      AND snapshot.producing_task_id = formal_collection_task.id
+                      AND receipt.manifest_sha256 = snapshot.manifest_sha256
+                      AND receipt.refresh_generation = snapshot.refresh_generation
+                      AND receipt.refresh_generation = formal_collection_task.refresh_generation
+                  ) = 1
+                  AND (
+                    SELECT COUNT(*) FROM formal_source_snapshot AS produced
+                    WHERE produced.producing_task_id = formal_collection_task.id
+                  ) = 1"""
+            cursor = connection.execute(
+                f"""UPDATE formal_collection_task
+                SET status = 'verified', result_json = ?, error_json = NULL,
+                    next_retry_at = NULL, lease_worker = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND status = 'leased' AND lease_worker = ?
+                  AND lease_expires_at > ? AND kind = ?
+                  AND refresh_generation = ? AND payload_json = ?
+                  AND payload_sha256 = ?{source_receipt_predicate}""",
+                (
+                    result_json,
+                    now,
+                    task_id,
+                    worker_id,
+                    now,
+                    task["kind"],
+                    task["refresh_generation"],
+                    row["payload_json"],
+                    row["payload_sha256"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "formal task is not held by the current unexpired lease owner"
+                )
+
+    def supersede_formal_tasks(
+        self,
+        scope: Mapping[str, object],
+        before_generation: str,
+    ) -> int:
+        if type(before_generation) is not str or not before_generation.strip():
+            raise ValueError("before_generation must be a nonempty string")
+        scope_json = _canonical_mapping_json(scope, "scope")
+        scope_values = _decode_canonical_mapping_json(scope_json, "scope")
+        if not scope_values:
+            raise ValueError("scope must be a nonempty mapping")
+
+        changed = 0
+        with self._transaction(immediate=True) as connection:
+            now = _utc_iso(_utc_now())
+            candidates = connection.execute(
+                """SELECT * FROM formal_collection_task
+                WHERE status IN ('pending','leased','retryable_failed')
+                  AND refresh_generation <> ?
+                ORDER BY id""",
+                (before_generation,),
+            ).fetchall()
+            for row in candidates:
+                task_id = str(row["id"])
+                prerequisites = [
+                    str(item["prerequisite_task_id"])
+                    for item in connection.execute(
+                        """SELECT prerequisite_task_id
+                        FROM formal_collection_task_dependency
+                        WHERE task_id = ? ORDER BY prerequisite_task_id""",
+                        (task_id,),
+                    )
+                ]
+                task = self._formal_task_public(row, prerequisites)
+                payload = task["payload"]
+                if any(
+                    key not in payload or _json(payload[key]) != _json(value)
+                    for key, value in scope_values.items()
+                ):
+                    continue
+                cursor = connection.execute(
+                    """UPDATE formal_collection_task
+                    SET status = 'superseded', lease_worker = NULL,
+                        lease_expires_at = NULL, next_retry_at = NULL, updated_at = ?
+                    WHERE id = ? AND status = ? AND refresh_generation = ?
+                      AND refresh_generation <> ? AND payload_json = ?
+                      AND payload_sha256 = ?""",
+                    (
+                        now,
+                        task_id,
+                        row["status"],
+                        row["refresh_generation"],
+                        before_generation,
+                        row["payload_json"],
+                        row["payload_sha256"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("formal task changed during supersession")
+                changed += 1
+        return changed
+
     def fail_formal_task(
         self,
         task_id: str,
