@@ -11,6 +11,7 @@ import threading
 from types import MappingProxyType
 import unittest
 from unittest.mock import patch
+from uuid import UUID
 
 import ashare_pipeline.deep_worker as deep_worker_module
 from ashare_pipeline.deep_worker import (
@@ -267,15 +268,18 @@ class DeepWorkerTestCase(unittest.TestCase):
     def _seed_legacy_midnight_failure(
         self,
         *,
+        dataset: str = "balance_sheet",
         refresh_date: str = "2026-09-01",
         fetched_at_utc: str = "2026-09-01T00:00:00+00:00",
         mutate_batch=None,
         record_issue: bool = True,
     ):
         self._write_candidates({"SH600001": "包装印刷"})
-        job_id = self._enqueue_statement(refresh_date=refresh_date)
+        job_id = self._enqueue_statement(
+            dataset=dataset, refresh_date=refresh_date
+        )
         batch = fixture_statement_batch(
-            "balance_sheet", fetched_at_utc=fetched_at_utc
+            dataset, fetched_at_utc=fetched_at_utc
         )
         for row in batch.records:
             row["REPORT_DATE"] = f"{row['REPORT_DATE']} 00:00:00"
@@ -295,7 +299,7 @@ class DeepWorkerTestCase(unittest.TestCase):
                 code="statement_report_date_invalid",
                 details={
                     "security_id": "SH600001",
-                    "dataset": "balance_sheet",
+                    "dataset": dataset,
                     "details": {
                         "security_id": "SH600001",
                         "row_hash": canonical_sha256(issue_row),
@@ -303,6 +307,7 @@ class DeepWorkerTestCase(unittest.TestCase):
                 },
                 job_id=job_id,
                 worker_id="legacy-worker",
+                source_snapshot_id=snapshot.id,
             )
         self.store.fail_job_with_followups(
             job_id,
@@ -488,6 +493,51 @@ class DeepWorkerTestCase(unittest.TestCase):
             f"legacy:{security_id}:{suffix}",
             {"security_id": security_id, "report_period": REPORT_PERIOD},
         )
+
+    def test_successful_statement_snapshot_hash_rejects_noncanonical_results(self) -> None:
+        snapshot_hash = "a" * 64
+        self.assertEqual(
+            deep_worker_module._successful_statement_snapshot_hash(
+                {"outcome": "statement_persisted", "snapshot_hash": snapshot_hash}
+            ),
+            snapshot_hash,
+        )
+        self.assertEqual(
+            deep_worker_module._successful_statement_snapshot_hash(
+                {
+                    "outcome": "reconciled_verified_snapshot",
+                    "snapshot_hash": snapshot_hash,
+                    "mapping_version": MAPPING_VERSION,
+                    "recovered_error": "malformed_statement",
+                }
+            ),
+            snapshot_hash,
+        )
+        for result in (
+            {
+                "outcome": "statement_persisted",
+                "snapshot_hash": snapshot_hash,
+                "unexpected": True,
+            },
+            {"outcome": "unknown", "snapshot_hash": snapshot_hash},
+            {"outcome": "statement_persisted"},
+            {
+                "outcome": "reconciled_verified_snapshot",
+                "snapshot_hash": snapshot_hash,
+                "mapping_version": "eastmoney-financial-mapping-v1",
+                "recovered_error": "malformed_statement",
+            },
+            {
+                "outcome": "reconciled_verified_snapshot",
+                "snapshot_hash": "not-a-hash",
+                "mapping_version": MAPPING_VERSION,
+                "recovered_error": "malformed_statement",
+            },
+        ):
+            with self.subTest(result=result):
+                self.assertIsNone(
+                    deep_worker_module._successful_statement_snapshot_hash(result)
+                )
 
     def test_limit_counts_only_remote_statement_requests(self) -> None:
         candidates = {f"SH{index:06d}": "包装印刷" for index in range(1, 11)}
@@ -1787,6 +1837,7 @@ class DeepWorkerTestCase(unittest.TestCase):
             },
             job_id=job_id,
             worker_id="legacy-worker",
+            source_snapshot_id=snapshot.id,
         )
         self.store.fail_job_with_followups(
             job_id,
@@ -1902,6 +1953,346 @@ class DeepWorkerTestCase(unittest.TestCase):
         self.assertEqual(repeated.feature_sets_written, 0)
         self.assertEqual(source.calls, [])
 
+    def test_offline_midnight_reconciliation_uses_current_bound_issue_despite_lower_other_issue_id(
+        self,
+    ) -> None:
+        job_id, snapshot, batch = self._seed_legacy_midnight_failure()
+        issue_row = min(batch.records, key=canonical_sha256)
+        issue_details = {
+            "security_id": "SH600001",
+            "dataset": "balance_sheet",
+            "details": {
+                "security_id": "SH600001",
+                "row_hash": canonical_sha256(issue_row),
+            },
+        }
+        current_issue_id = self.store.find_quality_issue_ids(
+            severity="error",
+            code="statement_report_date_invalid",
+            details=issue_details,
+        )[0]
+
+        other_job_id = self._enqueue_statement(refresh_date="2026-08-31")
+        other_batch = fixture_statement_batch(
+            "balance_sheet", fetched_at_utc="2026-08-31T00:00:00+00:00"
+        )
+        for row in other_batch.records:
+            row["REPORT_DATE"] = f"{row['REPORT_DATE']} 00:00:00"
+        other_batch = replace(
+            other_batch,
+            metadata={**other_batch.metadata, "fixture_revision": "other"},
+        )
+        self.assertEqual(
+            canonical_sha256(min(other_batch.records, key=canonical_sha256)),
+            issue_details["details"]["row_hash"],
+        )
+        other_snapshot = self.repository.persist(other_batch)[0]
+        leased = self.store.lease_next_job(
+            ["deep_statement"], "other-legacy-worker", 3600
+        )
+        self.assertEqual(leased["id"], other_job_id)
+        with patch(
+            "ashare_pipeline.state_store.uuid.uuid4",
+            return_value=UUID("00000000-0000-0000-0000-000000000001"),
+        ):
+            other_issue_id = self.store.record_quality_issue(
+                run_id=None,
+                score_run_id=None,
+                severity="error",
+                code="statement_report_date_invalid",
+                details=issue_details,
+                job_id=other_job_id,
+                worker_id="other-legacy-worker",
+                source_snapshot_id=other_snapshot.id,
+            )
+        self.store.fail_job_with_followups(
+            other_job_id,
+            "other-legacy-worker",
+            {"error_classification": "malformed_statement"},
+            False,
+            None,
+            (),
+        )
+        self.assertLess(other_issue_id, current_issue_id)
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=self._calendar_ref(),
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.remote_attempts, 0)
+        self.assertEqual(summary.statements_succeeded, 2)
+        self.assertEqual(self.store.get_job(job_id)["status"], "succeeded")
+        self.assertEqual(self.store.get_job(other_job_id)["status"], "succeeded")
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            bindings = {
+                row[0]: (row[1], row[2])
+                for row in connection.execute(
+                    """SELECT issue_id,job_id,source_snapshot_id
+                    FROM quality_issue_binding WHERE issue_id IN (?,?)""",
+                    (current_issue_id, other_issue_id),
+                )
+            }
+        self.assertEqual(
+            bindings[current_issue_id], (job_id, snapshot.id)
+        )
+        self.assertEqual(
+            bindings[other_issue_id], (other_job_id, other_snapshot.id)
+        )
+
+    def test_offline_midnight_reconciliation_skips_ambiguous_legacy_issue_and_continues(
+        self,
+    ) -> None:
+        balance_job_id, _balance_snapshot, balance_batch = (
+            self._seed_legacy_midnight_failure()
+        )
+        profit_job_id, _profit_snapshot, _profit_batch = (
+            self._seed_legacy_midnight_failure(dataset="profit_sheet")
+        )
+        balance_issue_row = min(balance_batch.records, key=canonical_sha256)
+        balance_issue_details = {
+            "security_id": "SH600001",
+            "dataset": "balance_sheet",
+            "details": {
+                "security_id": "SH600001",
+                "row_hash": canonical_sha256(balance_issue_row),
+            },
+        }
+        original_issue_id = self.store.find_quality_issue_ids(
+            severity="error",
+            code="statement_report_date_invalid",
+            details=balance_issue_details,
+        )[0]
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM quality_issue_binding WHERE issue_id=?",
+                (original_issue_id,),
+            )
+            connection.commit()
+        self.store.record_quality_issue(
+            run_id=None,
+            score_run_id=None,
+            severity="error",
+            code="statement_report_date_invalid",
+            details=balance_issue_details,
+        )
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=self._calendar_ref(),
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.remote_attempts, 0)
+        self.assertEqual(summary.statements_succeeded, 1)
+        self.assertEqual(self.store.get_job(balance_job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.get_job(profit_job_id)["status"], "succeeded")
+
+    def test_offline_midnight_reconciliation_defers_same_day_future_snapshot(self) -> None:
+        job_id, _snapshot, _batch = self._seed_legacy_midnight_failure(
+            fetched_at_utc="2026-09-01T07:00:00+00:00"
+        )
+        calendar = self._calendar_ref()
+
+        early = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=calendar,
+            now_cn=datetime(2026, 9, 1, 10, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(early.snapshots_reused, 0)
+        self.assertEqual(early.statements_succeeded, 0)
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+
+        late = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=calendar,
+            now_cn=datetime(2026, 9, 1, 16, 0, tzinfo=SHANGHAI),
+        )
+        self.assertEqual(late.snapshots_reused, 1)
+        self.assertEqual(late.statements_succeeded, 1)
+        self.assertEqual(self.store.get_job(job_id)["status"], "succeeded")
+
+        repeated = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=calendar,
+            now_cn=datetime(2026, 9, 1, 16, 0, tzinfo=SHANGHAI),
+        )
+        self.assertEqual(repeated.snapshots_reused, 0)
+        self.assertEqual(repeated.statements_succeeded, 0)
+
+    def test_offline_midnight_reconciliation_excludes_future_succeeded_sibling(
+        self,
+    ) -> None:
+        balance_job_id, balance_snapshot, _batch = (
+            self._seed_legacy_midnight_failure()
+        )
+        profit_job_id = self._enqueue_statement(dataset="profit_sheet")
+        future_profit_batch = replace(
+            fixture_statement_batch(
+                "profit_sheet", fetched_at_utc="2026-09-01T07:00:00+00:00"
+            ),
+            metadata={"fixture_revision": "future-profit"},
+        )
+        future_profit_snapshot = self.repository.persist(future_profit_batch)[0]
+        leased = self.store.lease_next_job(
+            ["deep_statement"], "future-profit-worker", 3600
+        )
+        self.assertEqual(leased["id"], profit_job_id)
+        self.store.complete_job_with_followups(
+            profit_job_id,
+            "future-profit-worker",
+            {
+                "outcome": "statement_persisted",
+                "snapshot_hash": future_profit_snapshot.payload_hash,
+            },
+            (),
+        )
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=self._calendar_ref(),
+            now_cn=datetime(2026, 9, 1, 10, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.statements_succeeded, 1)
+        self.assertEqual(self.store.get_job(balance_job_id)["status"], "succeeded")
+        self.assertEqual(self.store.get_job(profit_job_id)["status"], "succeeded")
+        feature_jobs = self.store.list_jobs(["feature_build"])
+        self.assertEqual(len(feature_jobs), 1)
+        feature_payload = feature_jobs[0]["payload"]
+        self.assertEqual(
+            feature_payload["statement_snapshots"]["balance_sheet"][
+                "source_snapshot_id"
+            ],
+            balance_snapshot.id,
+        )
+        self.assertIsNone(
+            feature_payload["statement_snapshots"]["profit_sheet"]
+        )
+        feature = self.store.latest_feature_set("SH600001", REPORT_PERIOD)
+        self.assertIsNotNone(feature)
+        bundle = deep_worker_module.read_verified_feature_bundle(
+            self.project_root, feature["bundle_path"], feature["bundle_hash"]
+        )
+        evidence_snapshot_ids = {
+            evidence.source_snapshot_id
+            for dimension in bundle.dimension_inputs.values()
+            for value in dimension.values
+            for evidence in value.evidence
+        }
+        self.assertIn(balance_snapshot.id, evidence_snapshot_ids)
+        self.assertNotIn(future_profit_snapshot.id, evidence_snapshot_ids)
+
+    def test_offline_midnight_reconciliation_emits_combined_three_statement_followup(self) -> None:
+        snapshots = {
+            dataset: self._seed_legacy_midnight_failure(dataset=dataset)[1]
+            for dataset in STATEMENT_DATASETS
+        }
+        calendar = self._calendar_ref()
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=calendar,
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.snapshots_reused, 3)
+        self.assertEqual(summary.statements_succeeded, 3)
+        self.assertGreater(summary.feature_sets_written, 0)
+        feature_jobs = self.store.list_jobs(["feature_build"])
+        combined_jobs = [
+            job
+            for job in feature_jobs
+            if all(
+                job["payload"]["statement_snapshots"][dataset]
+                is not None
+                for dataset in STATEMENT_DATASETS
+            )
+        ]
+        self.assertEqual(len(combined_jobs), 1)
+        self.assertEqual(combined_jobs[0]["status"], "succeeded")
+        self.assertEqual(
+            combined_jobs[0]["payload"]["statement_snapshots"],
+            {
+                dataset: {
+                    "source_snapshot_id": snapshots[dataset].id,
+                    "payload_hash": snapshots[dataset].payload_hash,
+                }
+                for dataset in STATEMENT_DATASETS
+            },
+        )
+        latest = self.store.latest_feature_set("SH600001", REPORT_PERIOD)
+        self.assertIsNotNone(latest)
+        self.assertEqual(
+            latest["input_hash"],
+            combined_jobs[0]["idempotency_key"].rsplit(":", 1)[-1],
+        )
+        bundle = deep_worker_module.read_verified_feature_bundle(
+            self.project_root, latest["bundle_path"], latest["bundle_hash"]
+        )
+        self.assertEqual(bundle.input_hash, latest["input_hash"])
+        evidence_snapshot_ids = {
+            evidence.source_snapshot_id
+            for dimension in bundle.dimension_inputs.values()
+            for value in dimension.values
+            for evidence in value.evidence
+        }
+        self.assertEqual(
+            evidence_snapshot_ids,
+            {snapshot.id for snapshot in snapshots.values()},
+        )
+        self.assertTrue(
+            all(
+                self.store.get_job(job["id"])["status"] == "succeeded"
+                for job in self.store.list_jobs(["deep_statement"])
+            )
+        )
+
+        repeated = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=calendar,
+            now_cn=datetime(2026, 9, 1, 20, 0, tzinfo=SHANGHAI),
+        )
+        self.assertEqual(repeated.snapshots_reused, 0)
+        self.assertEqual(repeated.statements_succeeded, 0)
+        self.assertEqual(repeated.feature_sets_written, 0)
+
+    def test_offline_midnight_reconciliation_rejects_forged_early_calendar_ref(self) -> None:
+        job_id, _snapshot, _batch = self._seed_legacy_midnight_failure()
+        future_calendar = self.repository.persist(
+            replace(
+                fixture_calendar_batch(),
+                fetched_at_utc="2026-09-01T07:00:00+00:00",
+            )
+        )[0]
+        forged_early = replace(
+            future_calendar, fetched_at="2026-09-01T01:00:00+00:00"
+        )
+
+        summary = self._run(
+            source=FakeStatementSource(),
+            online=False,
+            trade_calendar_snapshot=forged_early,
+            now_cn=datetime(2026, 9, 1, 10, 0, tzinfo=SHANGHAI),
+        )
+
+        self.assertEqual(summary.snapshots_reused, 0)
+        self.assertEqual(summary.statements_succeeded, 0)
+        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+        self.assertEqual(self.store.list_financial_facts("SH600001"), [])
+
     def test_offline_midnight_reconciliation_requires_verified_calendar(self) -> None:
         job_id, _snapshot, _batch = self._seed_legacy_midnight_failure()
 
@@ -1994,6 +2385,13 @@ class DeepWorkerTestCase(unittest.TestCase):
 
     def test_offline_midnight_reconciliation_rejects_ambiguous_same_day_snapshots(self) -> None:
         job_id, _snapshot, _batch = self._seed_legacy_midnight_failure()
+        # This exercises the legacy fallback: direct job/snapshot evidence would
+        # intentionally disambiguate the first revision.
+        with closing(sqlite3.connect(self.store.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM quality_issue_binding WHERE job_id=?", (job_id,)
+            )
+            connection.commit()
         second = fixture_statement_batch(
             "balance_sheet",
             fetched_at_utc="2026-09-01T01:00:00+00:00",

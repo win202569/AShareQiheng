@@ -634,6 +634,64 @@ def _validate_reconciliation_followup(
         raise ValueError("reconciliation follow-up key is not canonical")
 
 
+def _legacy_malformed_statement_job_ids(
+    connection: sqlite3.Connection,
+    *,
+    security_id: str,
+    dataset: str,
+) -> tuple[str, ...]:
+    malformed_error_json = _json(
+        {"error_classification": "malformed_statement"}
+    )
+    matching_jobs: list[str] = []
+    for candidate in connection.execute(
+        """SELECT id,payload_json FROM job
+        WHERE kind='deep_statement' AND status='terminal_failed'
+        AND last_error_json=? ORDER BY id""",
+        (malformed_error_json,),
+    ):
+        try:
+            candidate_payload = json.loads(candidate["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(candidate_payload, Mapping)
+            and candidate_payload.get("security_id") == security_id
+            and candidate_payload.get("dataset") == dataset
+        ):
+            matching_jobs.append(str(candidate["id"]))
+    return tuple(matching_jobs)
+
+
+def _legacy_issue_falls_within_job_lifetime(
+    connection: sqlite3.Connection,
+    *,
+    issue_id: str,
+    job_id: str,
+) -> bool:
+    row = connection.execute(
+        """SELECT issue.created_at AS issue_created_at,
+        job.created_at AS job_created_at,job.updated_at AS job_updated_at
+        FROM quality_issue AS issue JOIN job ON job.id=? WHERE issue.id=?""",
+        (job_id, issue_id),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        issue_created_at = _reconciliation_timestamp(
+            row["issue_created_at"], "legacy quality issue created_at"
+        )
+        job_created_at = _reconciliation_timestamp(
+            row["job_created_at"], "legacy reconciliation job created_at"
+        )
+        job_updated_at = _reconciliation_timestamp(
+            row["job_updated_at"], "legacy reconciliation job updated_at"
+        )
+    except ValueError:
+        return False
+    return job_created_at <= issue_created_at <= job_updated_at
+
+
 def _validate_and_bind_reconciliation_issue(
     connection: sqlite3.Connection,
     *,
@@ -702,30 +760,29 @@ def _validate_and_bind_reconciliation_issue(
         raise ValueError(
             "legacy quality issue is not the unique unbound exact match"
         )
+    conflicting_bound = connection.execute(
+        """SELECT 1 FROM quality_issue AS issue
+        JOIN quality_issue_binding AS binding ON binding.issue_id=issue.id
+        WHERE issue.severity='error' AND issue.code='statement_report_date_invalid'
+        AND issue.details_json=? LIMIT 1""",
+        (details_json,),
+    ).fetchone()
+    if conflicting_bound is not None:
+        raise ValueError(
+            "legacy quality issue has conflicting bound provenance"
+        )
 
-    malformed_error_json = _json(
-        {"error_classification": "malformed_statement"}
-    )
-    matching_jobs: list[str] = []
-    for candidate in connection.execute(
-        """SELECT id,payload_json FROM job
-        WHERE kind='deep_statement' AND status='terminal_failed'
-        AND last_error_json=? ORDER BY id""",
-        (malformed_error_json,),
-    ):
-        try:
-            candidate_payload = json.loads(candidate["payload_json"])
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if (
-            isinstance(candidate_payload, Mapping)
-            and candidate_payload.get("security_id") == security_id
-            and candidate_payload.get("dataset") == dataset
-        ):
-            matching_jobs.append(str(candidate["id"]))
-    if tuple(matching_jobs) != (job_id,):
+    if _legacy_malformed_statement_job_ids(
+        connection, security_id=security_id, dataset=dataset
+    ) != (job_id,):
         raise ValueError(
             "legacy quality issue does not have a unique malformed statement job"
+        )
+    if not _legacy_issue_falls_within_job_lifetime(
+        connection, issue_id=issue_id, job_id=job_id
+    ):
+        raise ValueError(
+            "legacy quality issue does not fall within current job lifetime"
         )
     connection.execute(
         """INSERT INTO quality_issue_binding
@@ -1954,6 +2011,74 @@ class StateStore:
                     (severity, code, _json(dict(details))),
                 )
             )
+
+    def resolve_reconciliation_quality_issue(
+        self,
+        *,
+        severity: str,
+        code: str,
+        details: Mapping[str, object],
+        job_id: str,
+        source_snapshot_id: str,
+    ) -> tuple[str, str] | None:
+        """Return direct evidence, or the only safely attributable legacy issue.
+
+        The returned evidence kind is ``"bound"`` when its provenance exactly
+        matches the requested job and snapshot, otherwise ``"legacy"``.  A
+        legacy issue is intentionally usable only when it is the sole unbound
+        exact match, has no conflicting bound match, was recorded during the
+        current job lifetime, and the job is the sole malformed statement
+        failure for that security and dataset.
+        """
+        if not isinstance(details, Mapping):
+            raise ValueError("reconciliation quality issue details are invalid")
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("reconciliation quality issue job id is invalid")
+        if not isinstance(source_snapshot_id, str) or not source_snapshot_id:
+            raise ValueError(
+                "reconciliation quality issue source snapshot id is invalid"
+            )
+        details_json = _json(dict(details))
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT issue.id,binding.job_id,binding.source_snapshot_id
+                FROM quality_issue AS issue
+                LEFT JOIN quality_issue_binding AS binding
+                ON binding.issue_id=issue.id
+                WHERE issue.severity=? AND issue.code=? AND issue.details_json=?
+                ORDER BY issue.id""",
+                (severity, code, details_json),
+            ).fetchall()
+            exact_bound = tuple(
+                str(row["id"])
+                for row in rows
+                if row["job_id"] == job_id
+                and row["source_snapshot_id"] == source_snapshot_id
+            )
+            if exact_bound:
+                return exact_bound[0], "bound"
+            if any(
+                row["job_id"] is not None
+                or row["source_snapshot_id"] is not None
+                for row in rows
+            ):
+                return None
+            unbound = tuple(str(row["id"]) for row in rows)
+            if len(unbound) != 1:
+                return None
+            security_id = details.get("security_id")
+            dataset = details.get("dataset")
+            if not isinstance(security_id, str) or not isinstance(dataset, str):
+                return None
+            if _legacy_malformed_statement_job_ids(
+                connection, security_id=security_id, dataset=dataset
+            ) != (job_id,):
+                return None
+            if not _legacy_issue_falls_within_job_lifetime(
+                connection, issue_id=unbound[0], job_id=job_id
+            ):
+                return None
+            return unbound[0], "legacy"
 
     def has_quality_issue(
         self,

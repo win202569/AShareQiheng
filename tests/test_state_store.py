@@ -204,7 +204,9 @@ class StateStoreTestCase(unittest.TestCase):
             "2026-06-30", "2026-08-31T08:00:00+08:00", "rules-v1", "universe-v1", "incremental"
         )
 
-    def malformed_reconciliation_case(self, label: str) -> dict[str, object]:
+    def malformed_reconciliation_case(
+        self, label: str, *, raw_row_hash: str | None = None
+    ) -> dict[str, object]:
         self._reconciliation_case_index += 1
         refresh_at = (
             datetime(2026, 8, 1, 1, tzinfo=UTC)
@@ -259,7 +261,11 @@ class StateStoreTestCase(unittest.TestCase):
         self.store.lease_next_job(["deep_statement"], worker_id, 3600)
         fact = financial_fact(
             snapshot_id=snapshot_id,
-            raw_row_hash=canonical_sha256({"reconciliation_row": label}),
+            raw_row_hash=(
+                raw_row_hash
+                if raw_row_hash is not None
+                else canonical_sha256({"reconciliation_row": label})
+            ),
         )
         issue_details = {
             "security_id": "SH600001",
@@ -1900,6 +1906,80 @@ class StateStoreTestCase(unittest.TestCase):
             (),
         )
 
+    def test_resolve_reconciliation_issue_prioritizes_exact_current_provenance(
+        self,
+    ) -> None:
+        shared_row_hash = "1" * 64
+        other = self.malformed_reconciliation_case(
+            "resolver-other", raw_row_hash=shared_row_hash
+        )
+        current = self.malformed_reconciliation_case(
+            "resolver-current", raw_row_hash=shared_row_hash
+        )
+
+        self.assertEqual(
+            self.store.resolve_reconciliation_quality_issue(
+                severity="error",
+                code="statement_report_date_invalid",
+                details=current["issue_details"],
+                job_id=current["job_id"],
+                source_snapshot_id=current["snapshot_id"],
+            ),
+            (current["issue_id"], "bound"),
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM quality_issue_binding WHERE issue_id=?",
+                (current["issue_id"],),
+            )
+            connection.commit()
+        self.assertIsNone(
+            self.store.resolve_reconciliation_quality_issue(
+                severity="error",
+                code="statement_report_date_invalid",
+                details=current["issue_details"],
+                job_id=current["job_id"],
+                source_snapshot_id=current["snapshot_id"],
+            )
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM quality_issue_binding WHERE issue_id=?",
+                (other["issue_id"],),
+            )
+            connection.execute(
+                "DELETE FROM quality_issue WHERE id=?", (other["issue_id"],)
+            )
+            connection.execute("DELETE FROM job WHERE id=?", (other["job_id"],))
+            connection.commit()
+        self.assertEqual(
+            self.store.resolve_reconciliation_quality_issue(
+                severity="error",
+                code="statement_report_date_invalid",
+                details=current["issue_details"],
+                job_id=current["job_id"],
+                source_snapshot_id=current["snapshot_id"],
+            ),
+            (current["issue_id"], "legacy"),
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE quality_issue SET created_at=? WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", current["issue_id"]),
+            )
+            connection.commit()
+        self.assertIsNone(
+            self.store.resolve_reconciliation_quality_issue(
+                severity="error",
+                code="statement_report_date_invalid",
+                details=current["issue_details"],
+                job_id=current["job_id"],
+                source_snapshot_id=current["snapshot_id"],
+            )
+        )
+
     def test_duplicate_enqueue_returns_original_job_without_second_row(self) -> None:
         job_id = self.store.enqueue_job("fetch", "source:000001", {"request": "first"})
         repeated_id = self.store.enqueue_job("fetch", "source:000001", {"request": "changed"})
@@ -2870,6 +2950,66 @@ class StateStoreTestCase(unittest.TestCase):
                     "SELECT issue_id,job_id,source_snapshot_id FROM quality_issue_binding"
                 ).fetchall(),
                 [(case["issue_id"], case["job_id"], case["snapshot_id"])],
+            )
+
+    def test_reconciliation_rejects_legacy_issue_with_conflicting_bound_provenance(
+        self,
+    ) -> None:
+        case = self.malformed_reconciliation_case("legacy-conflicting")
+        other = self.malformed_reconciliation_case(
+            "legacy-conflicting-other", raw_row_hash=case["fact"].raw_row_hash
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM quality_issue_binding WHERE issue_id=?",
+                (case["issue_id"],),
+            )
+            connection.execute(
+                """UPDATE job SET status='succeeded', result_json='{}',
+                last_error_json=NULL WHERE id=?""",
+                (other["job_id"],),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "legacy quality issue.*conflicting"):
+            self.store.reconcile_malformed_statement(
+                case["job_id"], **self.reconciliation_arguments(case)
+            )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM quality_issue_binding WHERE issue_id=?",
+                    (case["issue_id"],),
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_reconciliation_rejects_legacy_issue_outside_current_job_lifetime(
+        self,
+    ) -> None:
+        case = self.malformed_reconciliation_case("legacy-stale")
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM quality_issue_binding WHERE issue_id=?",
+                (case["issue_id"],),
+            )
+            connection.execute(
+                "UPDATE quality_issue SET created_at=? WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", case["issue_id"]),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "legacy quality issue.*lifetime"):
+            self.store.reconcile_malformed_statement(
+                case["job_id"], **self.reconciliation_arguments(case)
+            )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM quality_issue_binding WHERE issue_id=?",
+                    (case["issue_id"],),
+                ).fetchone()[0],
+                0,
             )
 
     def test_reconciliation_rejects_ambiguous_unbound_legacy_issue_or_job(self) -> None:
