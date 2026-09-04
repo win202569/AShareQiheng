@@ -7634,6 +7634,80 @@ class StateStoreTestCase(unittest.TestCase):
                     store.replace_formal_universe_statuses(snapshot_id, decisions)
                 self.assertEqual(store.list_formal_universe_statuses(snapshot_id), before)
 
+    def test_formal_universe_status_replacement_rejects_padded_reason_or_veto_without_mutation(self) -> None:
+        store, frozen, _ = self.task_backed_frozen_universe(label="status-padded")
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+        before = store.list_formal_universe_statuses(snapshot_id)
+        valid = [
+            FormalUniverseDecision(member.security_id, "formal_scored", (), (), "f" * 64)
+            for member in frozen.members
+        ]
+        invalid_sets = (
+            [
+                replace(
+                    valid[0], status="out_of_scope", reasons=(" padded_reason ",)
+                ),
+                *valid[1:],
+            ],
+            [
+                replace(
+                    valid[0], status="pool_vetoed", veto_flags=(" padded_veto ",)
+                ),
+                *valid[1:],
+            ],
+        )
+        for decisions in invalid_sets:
+            with self.subTest(decisions=decisions):
+                with self.assertRaises(ValueError):
+                    store.replace_formal_universe_statuses(snapshot_id, decisions)
+                self.assertEqual(store.list_formal_universe_statuses(snapshot_id), before)
+
+    def test_formal_universe_replace_tail_rejects_triggered_padded_tokens_without_mutation(self) -> None:
+        for index, field in enumerate(("reasons_json", "veto_flags_json")):
+            with self.subTest(field=field):
+                path = Path(self.tempdir.name) / f"status-padded-tail-{index}.sqlite3"
+                store, frozen, _ = self.task_backed_frozen_universe(
+                    label=f"status-padded-tail-{index}", db_path=path
+                )
+                snapshot_id = store.put_formal_universe_snapshot(frozen)
+                if field == "reasons_json":
+                    decisions = tuple(
+                        FormalUniverseDecision(
+                            member.security_id,
+                            "out_of_scope",
+                            ("ordinary_reason",),
+                            (),
+                            "1" * 64,
+                        )
+                        for member in frozen.members
+                    )
+                    padded_json = '[" padded_reason "]'
+                else:
+                    decisions = tuple(
+                        FormalUniverseDecision(
+                            member.security_id,
+                            "pool_vetoed",
+                            (),
+                            ("ST",),
+                            "2" * 64,
+                        )
+                        for member in frozen.members
+                    )
+                    padded_json = '[" padded_veto "]'
+                before = store.list_formal_universe_statuses(snapshot_id)
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute(
+                        f"""CREATE TRIGGER pad_status_token_{index}
+                        AFTER UPDATE OF status ON formal_universe_status
+                        WHEN NEW.snapshot_id='{snapshot_id}' AND NEW.security_id='BJ430001'
+                        BEGIN UPDATE formal_universe_status SET {field}='{padded_json}'
+                        WHERE snapshot_id=NEW.snapshot_id AND security_id=NEW.security_id; END"""
+                    )
+                    connection.commit()
+                with self.assertRaises(ValueError):
+                    store.replace_formal_universe_statuses(snapshot_id, decisions)
+                self.assertEqual(store.list_formal_universe_statuses(snapshot_id), before)
+
     def test_formal_universe_finalizer_completion_and_getter_require_exact_bound_proof(self) -> None:
         store, frozen, source_task_ids = self.task_backed_frozen_universe(
             label="finalizer-valid"
@@ -7897,6 +7971,90 @@ class StateStoreTestCase(unittest.TestCase):
                     ).fetchall()
 
                 if operation == "complete":
+                    with self.assertRaises(ValueError):
+                        store.complete_formal_task(finalizer_id, "worker-finalizer", result)
+                else:
+                    with self.assertRaises(ValueError):
+                        store.get_formal_universe_snapshot_from_task(finalizer_id)
+
+                with closing(sqlite3.connect(path)) as connection:
+                    task_after = connection.execute(
+                        "SELECT * FROM formal_collection_task WHERE id=?", (finalizer_id,)
+                    ).fetchone()
+                    statuses_after = connection.execute(
+                        "SELECT * FROM formal_universe_status WHERE snapshot_id=? ORDER BY security_id",
+                        (snapshot_id,),
+                    ).fetchall()
+                self.assertEqual(task_after, task_before)
+                self.assertEqual(statuses_after, statuses_before)
+
+    def test_formal_universe_persisted_padded_status_tokens_fail_closed_for_list_finalizer_and_getter(self) -> None:
+        for index, (field, operation) in enumerate(
+            (
+                ("reasons_json", "list"),
+                ("veto_flags_json", "list"),
+                ("reasons_json", "complete"),
+                ("veto_flags_json", "complete"),
+                ("reasons_json", "get"),
+                ("veto_flags_json", "get"),
+            )
+        ):
+            with self.subTest(field=field, operation=operation):
+                path = Path(self.tempdir.name) / f"persisted-padded-{index}.sqlite3"
+                store, frozen, source_task_ids = self.task_backed_frozen_universe(
+                    label=f"persisted-padded-{index}", db_path=path
+                )
+                snapshot_id = store.put_formal_universe_snapshot(frozen)
+                generation = f"persisted-padded-generation-{index}"
+                ordered_sources = [source_task_ids[e] for e in ("BJ", "SH", "SZ")]
+                finalizer_id = store.enqueue_formal_task(
+                    "formal_universe_finalize",
+                    f"formal-universe-finalize:persisted-padded:{index}",
+                    generation,
+                    {
+                        "as_of_utc": frozen.as_of_utc,
+                        "registry_manifest_hash": frozen.registry_manifest_hash,
+                        "refresh_generation": generation,
+                        "source_task_ids": ordered_sources,
+                    },
+                    ordered_sources,
+                )
+                store.lease_next_formal_task(
+                    ("formal_universe_finalize",), "worker-finalizer", 300
+                )
+                result = {
+                    "universe_snapshot_id": snapshot_id,
+                    "frozen_input_hash": frozen.frozen_input_hash,
+                    "universe_hash": frozen.universe_hash,
+                    "registry_manifest_hash": frozen.registry_manifest_hash,
+                }
+                if operation == "get":
+                    store.complete_formal_task(finalizer_id, "worker-finalizer", result)
+
+                padded_json = (
+                    '[" padded_reason "]'
+                    if field == "reasons_json"
+                    else '[" padded_veto "]'
+                )
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute(
+                        f"""UPDATE formal_universe_status SET {field}=?
+                        WHERE snapshot_id=? AND security_id='BJ430001'""",
+                        (padded_json, snapshot_id),
+                    )
+                    connection.commit()
+                    task_before = connection.execute(
+                        "SELECT * FROM formal_collection_task WHERE id=?", (finalizer_id,)
+                    ).fetchone()
+                    statuses_before = connection.execute(
+                        "SELECT * FROM formal_universe_status WHERE snapshot_id=? ORDER BY security_id",
+                        (snapshot_id,),
+                    ).fetchall()
+
+                if operation == "list":
+                    with self.assertRaises(ValueError):
+                        store.list_formal_universe_statuses(snapshot_id)
+                elif operation == "complete":
                     with self.assertRaises(ValueError):
                         store.complete_formal_task(finalizer_id, "worker-finalizer", result)
                 else:

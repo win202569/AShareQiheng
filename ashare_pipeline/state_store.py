@@ -767,11 +767,17 @@ def _require_formal_universe_status_values(
     if type(status) is not str or status not in _FORMAL_UNIVERSE_STATUSES:
         raise ValueError("formal universe status is not recognized")
     if type(reasons) is not tuple or any(
-        type(reason) is not str or not reason.strip() for reason in reasons
+        type(reason) is not str
+        or not reason
+        or reason != reason.strip()
+        for reason in reasons
     ):
         raise ValueError("formal universe status reasons must be canonical strings")
     if type(veto_flags) is not tuple or any(
-        type(flag) is not str or not flag.strip() for flag in veto_flags
+        type(flag) is not str
+        or not flag
+        or flag != flag.strip()
+        for flag in veto_flags
     ):
         raise ValueError("formal universe status veto flags must be canonical strings")
     if tuple(sorted(reasons)) != reasons or len(set(reasons)) != len(reasons):
