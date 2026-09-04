@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+import uuid
 from contextlib import closing
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,15 @@ from ashare_pipeline.feature_contract import (
 )
 from ashare_pipeline.financial_schema import MAPPING_VERSION, FinancialFact
 from ashare_pipeline.financial_features import feature_input_hash
+from ashare_pipeline.formal_evidence import (
+    EvidenceVerification,
+    OfficialFetch,
+    OfficialRequest,
+    OfficialSnapshotRef,
+    SourcePolicy,
+    verify_official_fetch,
+)
+from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore, FormalStoredSnapshot
 from ashare_pipeline.state_store import FinalizationBlocked, JobSpec, StateStore
 from tests.test_financial_features import (
     build_bundle_with_overrides,
@@ -96,6 +106,42 @@ def installed_ready_bundle(
 ) -> tuple[FeatureBundle, tuple[FinancialFact, ...], dict[str, str]]:
     """Share the real evidence prerequisite without exporting a TestCase class."""
     return StateStoreTestCase.installed_ready_bundle(store, **overrides)
+
+
+def written_formal_snapshot(
+    root: Path,
+    *,
+    raw_bytes: bytes = b"%PDF-1.7 official bootstrap",
+    refresh_generation: str = "bootstrap-v1",
+    producing_task_id: str | None = None,
+) -> tuple[FormalSnapshotStore, OfficialFetch, FormalStoredSnapshot, EvidenceVerification]:
+    raw_store = FormalSnapshotStore(root)
+    fetch = OfficialFetch(
+        request=OfficialRequest(
+            "cninfo", "annual_report", "SZ000001", "2025-12-31", "SZ"
+        ),
+        raw_bytes=raw_bytes,
+        original_url="https://static.cninfo.com.cn/finalpage/2026-03-20/123.pdf",
+        published_at_utc="2026-03-20T08:00:00+00:00",
+        published_precision="timestamp",
+        source_updated_at_utc=None,
+        captured_at_utc="2026-09-04T08:00:00+00:00",
+        effective_at_utc="2026-03-20T08:00:00+00:00",
+        effective_time_evidence_hash=None,
+        refresh_generation=refresh_generation,
+        parser_id="cninfo-pdf",
+        parser_version="cninfo-pdf-v1",
+        mapping_version="cninfo-annual-v1",
+        declared_security_id="SZ000001",
+        declared_period="2025-12-31",
+    )
+    verification = verify_official_fetch(fetch, SourcePolicy.cninfo())
+    if verification.status != "verified":
+        raise AssertionError(verification)
+    stored = raw_store.write_verified(
+        fetch, verification, producing_task_id=producing_task_id
+    )
+    return raw_store, fetch, stored, verification
 
 
 def forge_balance_semantics(
@@ -972,6 +1018,434 @@ class StateStoreTestCase(unittest.TestCase):
         self.assertNotIn("schema_migration", tables)
         self.assertTrue({"financial_fact", "feature_set", "feature_value"}.isdisjoint(tables))
         self.assertEqual(indexes, {"feature_set_latest_idx": "job"})
+
+    def configured_formal_store(
+        self,
+        *,
+        raw_bytes: bytes = b"%PDF-1.7 official bootstrap",
+        refresh_generation: str = "bootstrap-v1",
+        producing_task_id: str | None = None,
+        label: str = "default",
+    ) -> tuple[StateStore, FormalSnapshotStore, OfficialFetch, FormalStoredSnapshot, EvidenceVerification]:
+        raw_store, fetch, stored, verification = written_formal_snapshot(
+            Path(self.tempdir.name) / f"formal-raw-{label}",
+            raw_bytes=raw_bytes,
+            refresh_generation=refresh_generation,
+            producing_task_id=producing_task_id,
+        )
+        return (
+            StateStore(self.db_path, formal_snapshot_store=raw_store),
+            raw_store,
+            fetch,
+            stored,
+            verification,
+        )
+
+    def insert_formal_receipt_fixture(
+        self,
+        *,
+        db_path: Path | None = None,
+        task_id: str,
+        raw_store: FormalSnapshotStore,
+        fetch: OfficialFetch,
+        stored: FormalStoredSnapshot,
+        verification: EvidenceVerification,
+    ) -> tuple[str, dict[str, object]]:
+        validated = raw_store.validate_stored_snapshot(
+            fetch,
+            stored,
+            verification,
+            expected_producing_task_id=task_id,
+        )
+        snapshot_id = str(uuid.uuid4())
+        receipt = {
+            "task_id": task_id,
+            "snapshot_id": snapshot_id,
+            "manifest_sha256": validated.manifest_sha256,
+            "refresh_generation": validated.refresh_generation,
+            "recorded_at": utc_at(5),
+        }
+        with closing(sqlite3.connect(db_path or self.db_path)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                """INSERT INTO formal_source_snapshot
+                (id,source,dataset,request_json,request_fingerprint,content_sha256,
+                 manifest_sha256,content_path,manifest_path,original_url,published_at_utc,
+                 published_precision,source_updated_at_utc,captured_at_utc,effective_at_utc,
+                 effective_time_evidence_hash,parser_id,parser_version,mapping_version,
+                 refresh_generation,producing_task_id,verification_json,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    snapshot_id,
+                    validated.source,
+                    validated.dataset,
+                    validated.request_json,
+                    validated.request_fingerprint,
+                    validated.content_sha256,
+                    validated.manifest_sha256,
+                    validated.content_path,
+                    validated.manifest_path,
+                    validated.original_url,
+                    validated.published_at_utc,
+                    validated.published_precision,
+                    validated.source_updated_at_utc,
+                    validated.captured_at_utc,
+                    validated.effective_at_utc,
+                    validated.effective_time_evidence_hash,
+                    validated.parser_id,
+                    validated.parser_version,
+                    validated.mapping_version,
+                    validated.refresh_generation,
+                    validated.producing_task_id,
+                    validated.verification_json,
+                    utc_at(4),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO formal_task_snapshot_receipt
+                (task_id,snapshot_id,manifest_sha256,refresh_generation,recorded_at)
+                VALUES (?,?,?,?,?)""",
+                tuple(receipt.values()),
+            )
+            connection.commit()
+        return snapshot_id, receipt
+
+    def test_formal_snapshot_store_injection_is_optional_but_formal_apis_fail_closed(self) -> None:
+        self.assertIsNone(self.store.get_job("missing"))
+        for operation in (
+            lambda: self.store.put_formal_snapshot(None, None, None),
+            lambda: self.store.get_formal_snapshot("missing"),
+            lambda: self.store.get_formal_task_snapshot_receipt("missing"),
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(ValueError, "formal snapshot store.*configured"):
+                    operation()
+        with self.assertRaisesRegex(ValueError, "formal_snapshot_store"):
+            StateStore(self.db_path, formal_snapshot_store=object())
+
+    def test_put_formal_bootstrap_snapshot_returns_revalidated_ref_without_receipt(self) -> None:
+        store, _, fetch, stored, verification = self.configured_formal_store()
+
+        first = store.put_formal_snapshot(fetch, stored, verification)
+        replay = store.put_formal_snapshot(fetch, stored, verification)
+
+        self.assertIsInstance(first, OfficialSnapshotRef)
+        self.assertEqual(replay, first)
+        self.assertEqual(store.get_formal_snapshot(first.snapshot_id), first)
+        self.assertEqual(first.request_fingerprint, fetch.request.request_fingerprint)
+        self.assertEqual(first.content_sha256, fetch.content_sha256)
+        self.assertEqual(first.manifest_sha256, stored.manifest_sha256)
+        self.assertEqual(first.refresh_generation, "bootstrap-v1")
+        self.assertIsNone(first.producing_task_id)
+        self.assertEqual(first.verification_status, "verified")
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM formal_source_snapshot").fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT producing_task_id FROM formal_source_snapshot"
+                ).fetchone()[0],
+                None,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM formal_task_snapshot_receipt"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_formal_bootstrap_new_generation_shares_binary_but_keeps_distinct_lineage(self) -> None:
+        raw_root = Path(self.tempdir.name) / "formal-shared-binary"
+        raw_store, first_fetch, first_stored, first_verification = written_formal_snapshot(
+            raw_root, refresh_generation="generation-v1"
+        )
+        _, second_fetch, second_stored, second_verification = written_formal_snapshot(
+            raw_root, refresh_generation="generation-v2"
+        )
+        store = StateStore(self.db_path, formal_snapshot_store=raw_store)
+
+        first = store.put_formal_snapshot(
+            first_fetch, first_stored, first_verification
+        )
+        second = store.put_formal_snapshot(
+            second_fetch, second_stored, second_verification
+        )
+
+        self.assertNotEqual(first.snapshot_id, second.snapshot_id)
+        self.assertNotEqual(first.manifest_sha256, second.manifest_sha256)
+        self.assertEqual(first.content_sha256, second.content_sha256)
+        self.assertEqual(first.content_path, second.content_path)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM formal_source_snapshot").fetchone()[0],
+                2,
+            )
+
+    def test_formal_snapshot_manifest_and_lineage_conflicts_never_repair_rows(self) -> None:
+        store, _, fetch, stored, verification = self.configured_formal_store(
+            label="manifest-conflict"
+        )
+        ref = store.put_formal_snapshot(fetch, stored, verification)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_source_snapshot SET original_url = ? WHERE id = ?",
+                ("https://static.cninfo.com.cn/tampered.pdf", ref.snapshot_id),
+            )
+            connection.commit()
+            before = connection.execute(
+                "SELECT * FROM formal_source_snapshot WHERE id = ?", (ref.snapshot_id,)
+            ).fetchone()
+
+        with self.assertRaisesRegex(ValueError, "formal_snapshot_manifest_conflict"):
+            store.put_formal_snapshot(fetch, stored, verification)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            after = connection.execute(
+                "SELECT * FROM formal_source_snapshot WHERE id = ?", (ref.snapshot_id,)
+            ).fetchone()
+        self.assertEqual(after, before)
+
+        lineage_path = Path(self.tempdir.name) / "lineage.sqlite3"
+        raw_root = Path(self.tempdir.name) / "lineage-raw"
+        raw_store, first_fetch, first_stored, first_verification = written_formal_snapshot(
+            raw_root, raw_bytes=b"first", refresh_generation="same-generation"
+        )
+        _, second_fetch, second_stored, second_verification = written_formal_snapshot(
+            raw_root, raw_bytes=b"second", refresh_generation="same-generation"
+        )
+        lineage_store = StateStore(lineage_path, formal_snapshot_store=raw_store)
+        lineage_store.initialize()
+        first_ref = lineage_store.put_formal_snapshot(
+            first_fetch, first_stored, first_verification
+        )
+        with self.assertRaisesRegex(ValueError, "formal_snapshot_lineage_conflict"):
+            lineage_store.put_formal_snapshot(
+                second_fetch, second_stored, second_verification
+            )
+        self.assertEqual(lineage_store.get_formal_snapshot(first_ref.snapshot_id), first_ref)
+        with closing(sqlite3.connect(lineage_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM formal_source_snapshot").fetchone()[0],
+                1,
+            )
+
+    def test_formal_bootstrap_rejections_leave_database_empty(self) -> None:
+        cases: list[tuple[str, OfficialFetch, FormalStoredSnapshot, EvidenceVerification, FormalSnapshotStore]] = []
+        raw_store, fetch, stored, verification = written_formal_snapshot(
+            Path(self.tempdir.name) / "formal-rejections-valid"
+        )
+        cases.append(
+            (
+                "rejected",
+                fetch,
+                stored,
+                replace(verification, status="rejected"),
+                raw_store,
+            )
+        )
+        producer_store, producer_fetch, producer_stored, producer_verification = written_formal_snapshot(
+            Path(self.tempdir.name) / "formal-rejections-producer",
+            producing_task_id="task-produced",
+        )
+        cases.append(
+            (
+                "producer",
+                producer_fetch,
+                producer_stored,
+                producer_verification,
+                producer_store,
+            )
+        )
+        cases.append(
+            (
+                "mismatch",
+                replace(fetch, refresh_generation="other-generation"),
+                stored,
+                verification,
+                raw_store,
+            )
+        )
+        for index, (label, candidate_fetch, candidate_stored, candidate_verification, candidate_raw_store) in enumerate(cases):
+            with self.subTest(label=label):
+                path = Path(self.tempdir.name) / f"formal-rejection-{index}.sqlite3"
+                store = StateStore(path, formal_snapshot_store=candidate_raw_store)
+                store.initialize()
+                with self.assertRaises(ValueError):
+                    store.put_formal_snapshot(
+                        candidate_fetch, candidate_stored, candidate_verification
+                    )
+                with closing(sqlite3.connect(path)) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM formal_source_snapshot"
+                        ).fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM formal_task_snapshot_receipt"
+                        ).fetchone()[0],
+                        0,
+                    )
+
+    def test_formal_snapshot_getter_rejects_malformed_ids_and_stored_tamper(self) -> None:
+        store, raw_store, fetch, stored, verification = self.configured_formal_store(
+            label="getter-inputs"
+        )
+        ref = store.put_formal_snapshot(fetch, stored, verification)
+        for invalid_id in ("", "   ", None, 7):
+            with self.subTest(invalid_id=invalid_id):
+                with self.assertRaises(ValueError):
+                    store.get_formal_snapshot(invalid_id)
+        self.assertIsNone(store.get_formal_snapshot("missing-snapshot"))
+
+        tamper_cases = (
+            ("request_json", '{"dataset":"annual_report"}'),
+            ("request_json", '{"dataset":"annual_report","extra":1}'),
+            ("request_fingerprint", "0" * 64),
+            ("verification_json", '{"content_sha256":"0"}'),
+            ("original_url", "https://static.cninfo.com.cn/tampered.pdf"),
+            ("created_at", "2026-09-04T08:00:00"),
+        )
+        for index, (column, value) in enumerate(tamper_cases):
+            with self.subTest(column=column, value=value):
+                path = Path(self.tempdir.name) / f"formal-db-tamper-{index}.sqlite3"
+                candidate = StateStore(path, formal_snapshot_store=raw_store)
+                candidate.initialize()
+                candidate_ref = candidate.put_formal_snapshot(fetch, stored, verification)
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute(
+                        f"UPDATE formal_source_snapshot SET {column} = ? WHERE id = ?",
+                        (value, candidate_ref.snapshot_id),
+                    )
+                    connection.commit()
+                with self.assertRaises(ValueError):
+                    candidate.get_formal_snapshot(candidate_ref.snapshot_id)
+
+        Path(ref.content_path).write_bytes(b"tampered raw bytes")
+        with self.assertRaises(ValueError):
+            store.get_formal_snapshot(ref.snapshot_id)
+
+        manifest_raw_store, manifest_fetch, manifest_stored, manifest_verification = written_formal_snapshot(
+            Path(self.tempdir.name) / "formal-raw-manifest-tamper"
+        )
+        manifest_store = StateStore(
+            Path(self.tempdir.name) / "formal-manifest-tamper.sqlite3",
+            formal_snapshot_store=manifest_raw_store,
+        )
+        manifest_store.initialize()
+        manifest_ref = manifest_store.put_formal_snapshot(
+            manifest_fetch, manifest_stored, manifest_verification
+        )
+        Path(manifest_ref.manifest_path).write_bytes(b"{}")
+        with self.assertRaises(ValueError):
+            manifest_store.get_formal_snapshot(manifest_ref.snapshot_id)
+
+    def test_formal_receipt_getter_revalidates_task_snapshot_lineage_and_survives_failure(self) -> None:
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "receipt-task", "receipt-generation", {"slot": 1}
+        )
+        store, raw_store, fetch, stored, verification = self.configured_formal_store(
+            refresh_generation="receipt-generation",
+            producing_task_id=task_id,
+            label="receipt-success",
+        )
+        snapshot_id, expected = self.insert_formal_receipt_fixture(
+            task_id=task_id,
+            raw_store=raw_store,
+            fetch=fetch,
+            stored=stored,
+            verification=verification,
+        )
+
+        self.assertEqual(store.get_formal_task_snapshot_receipt(task_id), expected)
+        self.assertEqual(store.get_formal_snapshot(snapshot_id).producing_task_id, task_id)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """UPDATE formal_collection_task
+                SET status='terminal_failed', error_json=? WHERE id=?""",
+                ('{"code":"parse_failed"}', task_id),
+            )
+            connection.commit()
+        self.assertEqual(store.get_formal_task_snapshot_receipt(task_id), expected)
+
+        for invalid_id in ("", None, 9):
+            with self.subTest(invalid_id=invalid_id):
+                with self.assertRaises(ValueError):
+                    store.get_formal_task_snapshot_receipt(invalid_id)
+        self.assertIsNone(store.get_formal_task_snapshot_receipt("missing-task"))
+
+    def test_formal_receipt_getter_rejects_every_cross_lineage_mismatch(self) -> None:
+        mutations = (
+            ("formal_task_snapshot_receipt", "manifest_sha256", "0" * 64),
+            ("formal_task_snapshot_receipt", "refresh_generation", "wrong-generation"),
+            ("formal_source_snapshot", "producing_task_id", None),
+            ("formal_collection_task", "refresh_generation", "wrong-generation"),
+            ("formal_task_snapshot_receipt", "recorded_at", "2026-09-04T08:00:00"),
+        )
+        for index, (table, column, value) in enumerate(mutations):
+            with self.subTest(table=table, column=column):
+                path = Path(self.tempdir.name) / f"receipt-mismatch-{index}.sqlite3"
+                task_store = StateStore(path)
+                task_store.initialize()
+                task_id = task_store.enqueue_formal_task(
+                    "formal_statement",
+                    f"receipt-mismatch-{index}",
+                    "receipt-generation",
+                    {},
+                )
+                raw_store, fetch, stored, verification = written_formal_snapshot(
+                    Path(self.tempdir.name) / f"receipt-mismatch-raw-{index}",
+                    refresh_generation="receipt-generation",
+                    producing_task_id=task_id,
+                )
+                configured = StateStore(path, formal_snapshot_store=raw_store)
+                snapshot_id, _ = self.insert_formal_receipt_fixture(
+                    db_path=path,
+                    task_id=task_id,
+                    raw_store=raw_store,
+                    fetch=fetch,
+                    stored=stored,
+                    verification=verification,
+                )
+                target_id = task_id if table != "formal_source_snapshot" else snapshot_id
+                id_column = "id" if table != "formal_task_snapshot_receipt" else "task_id"
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute("PRAGMA foreign_keys = OFF")
+                    connection.execute(
+                        f"UPDATE {table} SET {column} = ? WHERE {id_column} = ?",
+                        (value, target_id),
+                    )
+                    connection.commit()
+                with self.assertRaises(ValueError):
+                    configured.get_formal_task_snapshot_receipt(task_id)
+
+    def test_formal_snapshot_lookup_never_reads_legacy_source_snapshot(self) -> None:
+        store, _, fetch, stored, verification = self.configured_formal_store(
+            label="legacy-isolation"
+        )
+        legacy_id, _ = self.store.record_snapshot(
+            fetch.request.source,
+            fetch.request.dataset,
+            fetch.request.request_fingerprint,
+            fetch.content_sha256,
+            stored.content_path,
+            1,
+            fetch.captured_at_utc,
+        )
+
+        self.assertIsNone(store.get_formal_snapshot(legacy_id))
+        self.assertIsNone(store.get_formal_task_snapshot_receipt(legacy_id))
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM formal_source_snapshot").fetchone()[0],
+                0,
+            )
 
     def test_formal_task_contract_exact_replay_and_initial_public_row(self) -> None:
         self.assertEqual(

@@ -39,6 +39,17 @@ from ashare_pipeline.financial_schema import (
     balance_equation_blockers,
     raw_financial_slot_descriptor,
 )
+from ashare_pipeline.formal_evidence import (
+    EvidenceVerification,
+    OfficialFetch,
+    OfficialRequest,
+    OfficialSnapshotRef,
+)
+from ashare_pipeline.formal_snapshot_store import (
+    FormalSnapshotStore,
+    FormalStoredSnapshot,
+    ValidatedFormalSnapshot,
+)
 
 
 JOB_STATES = {"pending", "running", "succeeded", "retryable_failed", "terminal_failed"}
@@ -96,6 +107,12 @@ _FROZEN_CALENDAR_SNAPSHOT_KEYS = frozenset(
         "request",
         "request_fingerprint",
     }
+)
+_FORMAL_REQUEST_IDENTITY_KEYS = frozenset(
+    {"dataset", "exchange", "period_or_date", "security_id", "source"}
+)
+_FORMAL_VERIFICATION_KEYS = frozenset(
+    {"content_sha256", "effective_at_utc", "reasons", "status"}
 )
 
 FINANCIAL_FACT_COLUMNS = (
@@ -503,6 +520,61 @@ def _decode_canonical_mapping_json(value: str, field: str) -> dict[str, object]:
     if _json(decoded) != value:
         raise ValueError(f"stored formal task {field} JSON is not canonical")
     return decoded
+
+
+def _decode_canonical_formal_json(value: object, field: str) -> dict[str, object]:
+    if type(value) is not str:
+        raise ValueError(f"stored formal snapshot {field} JSON must be text")
+    try:
+        decoded = json.loads(
+            value,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"nonfinite JSON value: {constant}")
+            ),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"stored formal snapshot {field} JSON is invalid") from error
+    if not isinstance(decoded, dict):
+        raise ValueError(f"stored formal snapshot {field} JSON is not a mapping")
+    if _json(decoded) != value:
+        raise ValueError(f"stored formal snapshot {field} JSON is not canonical")
+    return decoded
+
+
+def _require_canonical_uuid(value: object, field: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"stored formal {field} must be a canonical UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError) as error:
+        raise ValueError(f"stored formal {field} must be a canonical UUID") from error
+    if str(parsed) != value:
+        raise ValueError(f"stored formal {field} must be a canonical UUID")
+    return value
+
+
+def _require_canonical_utc(value: object, field: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"stored formal {field} must be canonical UTC")
+    try:
+        normalized = _utc_iso(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"stored formal {field} must be canonical UTC") from error
+    if normalized != value or not value.endswith("+00:00"):
+        raise ValueError(f"stored formal {field} must be canonical UTC")
+    return value
+
+
+def _require_formal_sha256(value: object, field: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"stored formal {field} must be a lowercase SHA-256")
+    return value
 
 
 def _reconciliation_sha256(value: object, field: str) -> str:
@@ -1079,8 +1151,20 @@ def _validate_and_bind_reconciliation_issue(
 
 
 class StateStore:
-    def __init__(self, db_path: str | Path):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        formal_snapshot_store: FormalSnapshotStore | None = None,
+    ):
+        if formal_snapshot_store is not None and not isinstance(
+            formal_snapshot_store, FormalSnapshotStore
+        ):
+            raise ValueError(
+                "formal_snapshot_store must be a FormalSnapshotStore or None"
+            )
         self.db_path = Path(db_path)
+        self._formal_snapshot_store = formal_snapshot_store
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
@@ -1382,6 +1466,137 @@ class StateStore:
             (_utc_now(),),
         )
 
+    def _require_formal_snapshot_store(self) -> FormalSnapshotStore:
+        if self._formal_snapshot_store is None:
+            raise ValueError("formal snapshot store is not configured")
+        return self._formal_snapshot_store
+
+    def _formal_snapshot_row_to_ref(self, row: sqlite3.Row) -> OfficialSnapshotRef:
+        raw_store = self._require_formal_snapshot_store()
+        snapshot_id = _require_canonical_uuid(row["id"], "snapshot ID")
+        request_payload = _decode_canonical_formal_json(row["request_json"], "request")
+        if frozenset(request_payload) != _FORMAL_REQUEST_IDENTITY_KEYS:
+            raise ValueError("stored formal snapshot request identity keys mismatch")
+        verification_payload = _decode_canonical_formal_json(
+            row["verification_json"], "verification"
+        )
+        if frozenset(verification_payload) != _FORMAL_VERIFICATION_KEYS:
+            raise ValueError("stored formal snapshot verification keys mismatch")
+        reasons = verification_payload["reasons"]
+        if type(reasons) is not list or any(type(reason) is not str for reason in reasons):
+            raise ValueError("stored formal snapshot verification reasons are invalid")
+        if verification_payload["status"] != "verified":
+            raise ValueError("stored formal snapshot verification is not verified")
+
+        request_json = str(row["request_json"])
+        request_fingerprint = _require_formal_sha256(
+            row["request_fingerprint"], "request fingerprint"
+        )
+        if request_fingerprint != hashlib.sha256(request_json.encode("utf-8")).hexdigest():
+            raise ValueError("stored formal snapshot request fingerprint mismatch")
+        request = OfficialRequest(
+            source=request_payload["source"],
+            dataset=request_payload["dataset"],
+            security_id=request_payload["security_id"],
+            period_or_date=request_payload["period_or_date"],
+            exchange=request_payload["exchange"],
+        )
+        stored = FormalStoredSnapshot(
+            content_path=row["content_path"],
+            manifest_path=row["manifest_path"],
+            content_sha256=_require_formal_sha256(row["content_sha256"], "content hash"),
+            manifest_sha256=_require_formal_sha256(row["manifest_sha256"], "manifest hash"),
+        )
+        raw_bytes = raw_store.read_verified_raw(stored)
+        verification = EvidenceVerification(
+            status=verification_payload["status"],
+            content_sha256=verification_payload["content_sha256"],
+            reasons=tuple(reasons),
+            effective_at_utc=verification_payload["effective_at_utc"],
+        )
+        fetch = OfficialFetch(
+            request=request,
+            raw_bytes=raw_bytes,
+            original_url=row["original_url"],
+            published_at_utc=row["published_at_utc"],
+            published_precision=row["published_precision"],
+            source_updated_at_utc=row["source_updated_at_utc"],
+            captured_at_utc=row["captured_at_utc"],
+            effective_at_utc=row["effective_at_utc"],
+            effective_time_evidence_hash=row["effective_time_evidence_hash"],
+            refresh_generation=row["refresh_generation"],
+            parser_id=row["parser_id"],
+            parser_version=row["parser_version"],
+            mapping_version=row["mapping_version"],
+            declared_security_id=request.security_id,
+            declared_period=request.period_or_date,
+        )
+        validated = raw_store.validate_stored_snapshot(
+            fetch,
+            stored,
+            verification,
+            expected_producing_task_id=row["producing_task_id"],
+        )
+        if type(validated) is not ValidatedFormalSnapshot:
+            raise ValueError("formal snapshot validation returned an invalid projection")
+        for field in (
+            "source", "dataset", "request_json", "request_fingerprint",
+            "content_sha256", "manifest_sha256", "content_path", "manifest_path",
+            "original_url", "published_at_utc", "published_precision",
+            "source_updated_at_utc", "captured_at_utc", "effective_at_utc",
+            "effective_time_evidence_hash", "parser_id", "parser_version",
+            "mapping_version", "refresh_generation", "producing_task_id",
+            "verification_json",
+        ):
+            stored_value = row[field]
+            validated_value = getattr(validated, field)
+            if type(stored_value) is not type(validated_value) or stored_value != validated_value:
+                raise ValueError(f"stored formal snapshot {field} mismatch")
+        _require_canonical_utc(row["created_at"], "snapshot creation time")
+        return OfficialSnapshotRef(
+            snapshot_id=snapshot_id,
+            source=validated.source,
+            dataset=validated.dataset,
+            request_fingerprint=validated.request_fingerprint,
+            security_id=validated.security_id,
+            period_or_date=validated.period_or_date,
+            exchange=validated.exchange,
+            content_sha256=validated.content_sha256,
+            manifest_sha256=validated.manifest_sha256,
+            content_path=validated.content_path,
+            manifest_path=validated.manifest_path,
+            original_url=validated.original_url,
+            published_at_utc=validated.published_at_utc,
+            published_precision=validated.published_precision,
+            source_updated_at_utc=validated.source_updated_at_utc,
+            captured_at_utc=validated.captured_at_utc,
+            effective_at_utc=validated.effective_at_utc,
+            effective_time_evidence_hash=validated.effective_time_evidence_hash,
+            refresh_generation=validated.refresh_generation,
+            producing_task_id=validated.producing_task_id,
+            parser_id=validated.parser_id,
+            parser_version=validated.parser_version,
+            mapping_version=validated.mapping_version,
+            verification_status="verified",
+        )
+
+    @staticmethod
+    def _formal_ref_matches_projection(
+        ref: OfficialSnapshotRef, validated: ValidatedFormalSnapshot
+    ) -> bool:
+        return all(
+            getattr(ref, field) == getattr(validated, field)
+            for field in (
+                "source", "dataset", "request_fingerprint", "security_id",
+                "period_or_date", "exchange", "content_sha256", "manifest_sha256",
+                "content_path", "manifest_path", "original_url", "published_at_utc",
+                "published_precision", "source_updated_at_utc", "captured_at_utc",
+                "effective_at_utc", "effective_time_evidence_hash",
+                "refresh_generation", "producing_task_id", "parser_id",
+                "parser_version", "mapping_version",
+            )
+        )
+
     def start_run(self, mode: str, as_of_cn: str, params: dict) -> str:
         run_id = str(uuid.uuid4())
         with self._transaction() as connection:
@@ -1401,6 +1616,165 @@ class StateStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError("run does not exist or is already finished")
+
+    def put_formal_snapshot(
+        self,
+        fetch: OfficialFetch,
+        stored: FormalStoredSnapshot,
+        verification: EvidenceVerification,
+    ) -> OfficialSnapshotRef:
+        raw_store = self._require_formal_snapshot_store()
+        validated = raw_store.validate_stored_snapshot(
+            fetch,
+            stored,
+            verification,
+            expected_producing_task_id=None,
+        )
+        if type(validated) is not ValidatedFormalSnapshot:
+            raise ValueError("formal snapshot validation returned an invalid projection")
+        request_payload = _decode_canonical_formal_json(validated.request_json, "request")
+        if frozenset(request_payload) != _FORMAL_REQUEST_IDENTITY_KEYS:
+            raise ValueError("formal snapshot request identity keys mismatch")
+        if validated.request_fingerprint != hashlib.sha256(
+            validated.request_json.encode("utf-8")
+        ).hexdigest():
+            raise ValueError("formal snapshot request fingerprint mismatch")
+
+        with self._transaction(immediate=True) as connection:
+            existing = connection.execute(
+                "SELECT * FROM formal_source_snapshot WHERE manifest_sha256 = ?",
+                (validated.manifest_sha256,),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    ref = self._formal_snapshot_row_to_ref(existing)
+                    if not self._formal_ref_matches_projection(ref, validated):
+                        raise ValueError("immutable formal snapshot fields differ")
+                except ValueError as error:
+                    raise ValueError("formal_snapshot_manifest_conflict") from error
+                return ref
+
+            lineage = connection.execute(
+                """SELECT * FROM formal_source_snapshot
+                WHERE request_fingerprint = ? AND refresh_generation = ?
+                  AND producing_task_id IS NULL""",
+                (validated.request_fingerprint, validated.refresh_generation),
+            ).fetchone()
+            if lineage is not None:
+                self._formal_snapshot_row_to_ref(lineage)
+                raise ValueError("formal_snapshot_lineage_conflict")
+
+            snapshot_id = str(uuid.uuid4())
+            connection.execute(
+                """INSERT INTO formal_source_snapshot
+                (id,source,dataset,request_json,request_fingerprint,content_sha256,
+                 manifest_sha256,content_path,manifest_path,original_url,published_at_utc,
+                 published_precision,source_updated_at_utc,captured_at_utc,effective_at_utc,
+                 effective_time_evidence_hash,parser_id,parser_version,mapping_version,
+                 refresh_generation,producing_task_id,verification_json,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    snapshot_id,
+                    validated.source,
+                    validated.dataset,
+                    validated.request_json,
+                    validated.request_fingerprint,
+                    validated.content_sha256,
+                    validated.manifest_sha256,
+                    validated.content_path,
+                    validated.manifest_path,
+                    validated.original_url,
+                    validated.published_at_utc,
+                    validated.published_precision,
+                    validated.source_updated_at_utc,
+                    validated.captured_at_utc,
+                    validated.effective_at_utc,
+                    validated.effective_time_evidence_hash,
+                    validated.parser_id,
+                    validated.parser_version,
+                    validated.mapping_version,
+                    validated.refresh_generation,
+                    validated.producing_task_id,
+                    validated.verification_json,
+                    _utc_now(),
+                ),
+            )
+            inserted = connection.execute(
+                "SELECT * FROM formal_source_snapshot WHERE id = ?", (snapshot_id,)
+            ).fetchone()
+            if inserted is None:
+                raise ValueError("formal snapshot insert was not visible")
+            return self._formal_snapshot_row_to_ref(inserted)
+
+    def get_formal_snapshot(self, snapshot_id: str) -> OfficialSnapshotRef | None:
+        self._require_formal_snapshot_store()
+        if type(snapshot_id) is not str or not snapshot_id.strip():
+            raise ValueError("snapshot_id must be a nonempty string")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM formal_source_snapshot WHERE id = ?", (snapshot_id,)
+            ).fetchone()
+            return self._formal_snapshot_row_to_ref(row) if row is not None else None
+
+    def get_formal_task_snapshot_receipt(
+        self, task_id: str
+    ) -> dict[str, object] | None:
+        self._require_formal_snapshot_store()
+        if type(task_id) is not str or not task_id.strip():
+            raise ValueError("task_id must be a nonempty string")
+        with closing(self._connect()) as connection:
+            receipt = connection.execute(
+                "SELECT * FROM formal_task_snapshot_receipt WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if receipt is None:
+                return None
+            task = connection.execute(
+                "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise ValueError("formal snapshot receipt task is missing")
+            prerequisites = [
+                str(row["prerequisite_task_id"])
+                for row in connection.execute(
+                    """SELECT prerequisite_task_id
+                    FROM formal_collection_task_dependency
+                    WHERE task_id = ? ORDER BY prerequisite_task_id""",
+                    (task_id,),
+                )
+            ]
+            task_public = self._formal_task_public(task, prerequisites)
+            snapshot = connection.execute(
+                "SELECT * FROM formal_source_snapshot WHERE id = ?",
+                (receipt["snapshot_id"],),
+            ).fetchone()
+            if snapshot is None:
+                raise ValueError("formal snapshot receipt snapshot is missing")
+            ref = self._formal_snapshot_row_to_ref(snapshot)
+            if receipt["task_id"] != task_id or ref.producing_task_id != task_id:
+                raise ValueError("formal snapshot receipt producer mismatch")
+            manifest_sha256 = _require_formal_sha256(
+                receipt["manifest_sha256"], "receipt manifest hash"
+            )
+            if manifest_sha256 != ref.manifest_sha256:
+                raise ValueError("formal snapshot receipt manifest mismatch")
+            refresh_generation = receipt["refresh_generation"]
+            if (
+                type(refresh_generation) is not str
+                or not refresh_generation
+                or refresh_generation != ref.refresh_generation
+                or refresh_generation != task_public["refresh_generation"]
+            ):
+                raise ValueError("formal snapshot receipt refresh generation mismatch")
+            return {
+                "task_id": task_id,
+                "snapshot_id": ref.snapshot_id,
+                "manifest_sha256": manifest_sha256,
+                "refresh_generation": refresh_generation,
+                "recorded_at": _require_canonical_utc(
+                    receipt["recorded_at"], "receipt time"
+                ),
+            }
 
     def enqueue_formal_task(
         self,
