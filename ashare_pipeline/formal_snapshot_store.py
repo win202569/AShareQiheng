@@ -23,6 +23,36 @@ class FormalStoredSnapshot:
     manifest_sha256: str
 
 
+@dataclass(frozen=True)
+class ValidatedFormalSnapshot:
+    """Canonical manifest metadata safe for persistence after strict raw inspection."""
+
+    source: str
+    dataset: str
+    request_json: str
+    request_fingerprint: str
+    security_id: str | None
+    period_or_date: str | None
+    exchange: str | None
+    content_sha256: str
+    manifest_sha256: str
+    content_path: str
+    manifest_path: str
+    original_url: str
+    published_at_utc: str
+    published_precision: str
+    source_updated_at_utc: str | None
+    captured_at_utc: str
+    effective_at_utc: str
+    effective_time_evidence_hash: str | None
+    refresh_generation: str
+    producing_task_id: str | None
+    parser_id: str
+    parser_version: str
+    mapping_version: str
+    verification_json: str
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -125,6 +155,148 @@ class FormalSnapshotStore:
         if _sha256_bytes(raw_bytes) != stored.content_sha256:
             raise ValueError("content hash verification failed")
         return raw_bytes
+
+    def validate_stored_snapshot(
+        self,
+        fetch: OfficialFetch,
+        stored: FormalStoredSnapshot,
+        verification: EvidenceVerification,
+        *,
+        expected_producing_task_id: str | None,
+    ) -> ValidatedFormalSnapshot:
+        """Inspect exact fetch, verification, manifest, paths, and raw bytes.
+
+        The returned frozen projection is populated from the re-read canonical manifest and
+        is suitable for a persistence boundary; no caller-supplied path or metadata is
+        returned until every immutable linkage has been checked.
+        """
+        self._validate_inspection_inputs(
+            fetch, stored, verification, expected_producing_task_id
+        )
+        content_sha256 = fetch.content_sha256
+        self._require_sha256(content_sha256, "fetch content hash")
+        self._require_sha256(verification.content_sha256, "verification content hash")
+        self._require_sha256(stored.content_sha256, "stored content hash")
+        self._require_sha256(stored.manifest_sha256, "stored manifest hash")
+        if fetch.effective_time_evidence_hash is not None:
+            self._require_sha256(
+                fetch.effective_time_evidence_hash, "effective_time_evidence_hash"
+            )
+        if verification.content_sha256 != content_sha256:
+            raise ValueError("verification content_sha256 does not match fetch content_sha256")
+        if stored.content_sha256 != content_sha256:
+            raise ValueError("stored content_sha256 does not match fetch content_sha256")
+
+        if Path(stored.manifest_path).name != f"{stored.manifest_sha256}.manifest.json":
+            raise ValueError("manifest hash does not match manifest path")
+        if Path(stored.content_path).name != f"{stored.content_sha256}.bin":
+            raise ValueError("content hash does not match content path")
+        manifest_path = self._path_inside_root(stored.manifest_path)
+        content_path = self._path_inside_root(stored.content_path)
+
+        envelope = self._read_manifest(manifest_path, stored.manifest_sha256)
+        manifest_hash = envelope.get("manifest_sha256")
+        self._require_sha256(manifest_hash, "manifest envelope hash")
+        manifest_content_hash = envelope.get("content_sha256")
+        self._require_sha256(manifest_content_hash, "manifest content_sha256")
+        manifest_verification = envelope.get("verification")
+        if not isinstance(manifest_verification, dict):
+            raise ValueError("invalid manifest verification")
+        self._require_sha256(
+            manifest_verification.get("content_sha256"),
+            "manifest verification content_sha256",
+        )
+
+        request = envelope.get("request")
+        if not isinstance(request, dict):
+            raise ValueError("invalid manifest request")
+        source = self._safe_path_component(request.get("source"), "source")
+        dataset = self._safe_path_component(request.get("dataset"), "dataset")
+        expected_directory = self.root / "data" / "raw" / "formal" / source / dataset
+        if manifest_path.parent != expected_directory:
+            raise ValueError("manifest path does not match manifest lineage")
+        if content_path.parent != manifest_path.parent:
+            raise ValueError("content and manifest paths must be sibling files")
+
+        expected_payload = self._manifest_payload(
+            fetch, verification, expected_producing_task_id, content_sha256
+        )
+        payload = {key: value for key, value in envelope.items() if key != "manifest_sha256"}
+        self._require_exact_manifest_payload(payload, expected_payload)
+
+        try:
+            raw_bytes = content_path.read_bytes()
+        except OSError as error:
+            raise ValueError(f"unable to read stored content: {content_path}") from error
+        if _sha256_bytes(raw_bytes) != content_sha256:
+            raise ValueError("content hash verification failed")
+        if raw_bytes != fetch.raw_bytes:
+            raise ValueError("stored raw bytes do not match fetch raw bytes")
+
+        request_json_bytes = _canonical_json_bytes(request)
+        verification_json_bytes = _canonical_json_bytes(manifest_verification)
+        return ValidatedFormalSnapshot(
+            source=source,
+            dataset=dataset,
+            request_json=request_json_bytes.decode("utf-8"),
+            request_fingerprint=_sha256_bytes(request_json_bytes),
+            security_id=request["security_id"],
+            period_or_date=request["period_or_date"],
+            exchange=request["exchange"],
+            content_sha256=manifest_content_hash,
+            manifest_sha256=manifest_hash,
+            content_path=str(content_path),
+            manifest_path=str(manifest_path),
+            original_url=payload["original_url"],
+            published_at_utc=payload["published_at_utc"],
+            published_precision=payload["published_precision"],
+            source_updated_at_utc=payload["source_updated_at_utc"],
+            captured_at_utc=payload["captured_at_utc"],
+            effective_at_utc=payload["effective_at_utc"],
+            effective_time_evidence_hash=payload["effective_time_evidence_hash"],
+            refresh_generation=payload["refresh_generation"],
+            producing_task_id=payload["producing_task_id"],
+            parser_id=payload["parser_id"],
+            parser_version=payload["parser_version"],
+            mapping_version=payload["mapping_version"],
+            verification_json=verification_json_bytes.decode("utf-8"),
+        )
+
+    @staticmethod
+    def _validate_inspection_inputs(
+        fetch: object,
+        stored: object,
+        verification: object,
+        expected_producing_task_id: object,
+    ) -> None:
+        if type(fetch) is not OfficialFetch:
+            raise ValueError("fetch must have exact type OfficialFetch")
+        if type(stored) is not FormalStoredSnapshot:
+            raise ValueError("stored must have exact type FormalStoredSnapshot")
+        if type(verification) is not EvidenceVerification:
+            raise ValueError("verification must have exact type EvidenceVerification")
+        if type(fetch.request) is not OfficialRequest:
+            raise ValueError("fetch request must have exact type OfficialRequest")
+        if type(fetch.raw_bytes) is not bytes:
+            raise ValueError("fetch raw_bytes must have exact type bytes")
+        if verification.status != "verified":
+            raise ValueError("verification must be verified")
+        if expected_producing_task_id is not None and (
+            type(expected_producing_task_id) is not str or not expected_producing_task_id
+        ):
+            raise ValueError("expected producing_task_id must be a nonempty string or None")
+        if type(stored.content_path) is not str or type(stored.manifest_path) is not str:
+            raise ValueError("stored snapshot paths must have exact type str")
+
+    @staticmethod
+    def _require_exact_manifest_payload(
+        payload: dict[str, object], expected: dict[str, object]
+    ) -> None:
+        if payload.keys() != expected.keys():
+            raise ValueError("manifest payload fields do not exactly match expected fields")
+        for field, expected_value in expected.items():
+            if _canonical_json_bytes(payload[field]) != _canonical_json_bytes(expected_value):
+                raise ValueError(f"manifest {field} does not match fetch or verification")
 
     def _validate_write_inputs(
         self,
@@ -291,9 +463,20 @@ class FormalSnapshotStore:
         return value
 
     def _path_inside_root(self, value: str) -> Path:
-        path = Path(value).resolve()
-        self._require_target_within_root(path)
-        return path
+        if not isinstance(value, str) or not value:
+            raise ValueError("formal snapshot path must be a nonempty string")
+        supplied = Path(value)
+        if not supplied.is_absolute():
+            raise ValueError("formal snapshot path must be absolute")
+        normalized = Path(os.path.abspath(value))
+        if os.path.normcase(str(supplied)) != os.path.normcase(str(normalized)):
+            raise ValueError("formal snapshot path must be normalized")
+        try:
+            resolved = supplied.resolve(strict=True)
+        except OSError as error:
+            raise ValueError(f"unable to resolve formal snapshot path: {supplied}") from error
+        self._require_target_within_root(resolved)
+        return resolved
 
     def _require_target_within_root(self, target: Path) -> None:
         try:
@@ -302,4 +485,4 @@ class FormalSnapshotStore:
             raise ValueError("formal snapshot path must stay inside the store root") from error
 
 
-__all__ = ["FormalSnapshotStore", "FormalStoredSnapshot"]
+__all__ = ["FormalSnapshotStore", "FormalStoredSnapshot", "ValidatedFormalSnapshot"]
