@@ -77,9 +77,82 @@ class FormalSnapshotStoreTests(unittest.TestCase):
             stored = store.write_verified(fetch, verified(fetch), producing_task_id=None)
             envelope = json.loads(Path(stored.manifest_path).read_text(encoding="utf-8"))
             envelope["producing_task_id"] = "tampered-task"
-            Path(stored.manifest_path).write_text(json.dumps(envelope), encoding="utf-8")
+            Path(stored.manifest_path).write_text(
+                json.dumps(envelope, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+            )
 
             with self.assertRaisesRegex(ValueError, "manifest hash"):
+                store.read_verified_raw(stored)
+
+    def test_existing_content_symlink_outside_store_is_rejected(self):
+        """Following an existing hash-path symlink would accept outside-root bytes."""
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside_root:
+            store = FormalSnapshotStore(root)
+            fetch = verified_fetch()
+            target = (
+                Path(root)
+                / "data"
+                / "raw"
+                / "formal"
+                / "cninfo"
+                / "annual_report"
+                / f"{fetch.content_sha256}.bin"
+            )
+            target.parent.mkdir(parents=True)
+            outside_content = Path(outside_root) / "outside.bin"
+            outside_content.write_bytes(fetch.raw_bytes)
+            try:
+                target.symlink_to(outside_content)
+            except OSError as error:
+                self.skipTest(f"file symlinks unavailable in this test environment: {error}")
+
+            with self.assertRaisesRegex(ValueError, "stay inside"):
+                store.write_verified(fetch, verified(fetch), producing_task_id=None)
+
+    def test_existing_manifest_symlink_outside_store_is_rejected(self):
+        """Following an existing lineage-manifest symlink would accept outside provenance."""
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside_root:
+            store = FormalSnapshotStore(root)
+            fetch = verified_fetch()
+            stored = store.write_verified(fetch, verified(fetch), producing_task_id=None)
+            target = Path(stored.manifest_path)
+            outside_manifest = Path(outside_root) / target.name
+            outside_manifest.write_bytes(target.read_bytes())
+            target.unlink()
+            try:
+                target.symlink_to(outside_manifest)
+            except OSError as error:
+                self.skipTest(f"file symlinks unavailable in this test environment: {error}")
+
+            with self.assertRaisesRegex(ValueError, "stay inside"):
+                store.write_verified(fetch, verified(fetch), producing_task_id=None)
+
+    def test_pretty_printed_manifest_bytes_are_rejected(self):
+        """Re-canonicalizing instead of checking stored bytes would hide byte-level tampering."""
+        with tempfile.TemporaryDirectory() as root:
+            store = FormalSnapshotStore(root)
+            fetch = verified_fetch()
+            stored = store.write_verified(fetch, verified(fetch), producing_task_id=None)
+            manifest_path = Path(stored.manifest_path)
+            envelope = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_path.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                store.read_verified_raw(stored)
+
+    def test_duplicate_manifest_keys_are_rejected(self):
+        """A JSON parser that silently keeps the last duplicate key would hide tampering."""
+        with tempfile.TemporaryDirectory() as root:
+            store = FormalSnapshotStore(root)
+            fetch = verified_fetch()
+            stored = store.write_verified(fetch, verified(fetch), producing_task_id=None)
+            manifest_path = Path(stored.manifest_path)
+            original = manifest_path.read_bytes()
+            marker = b'"producing_task_id":null,'
+            self.assertIn(marker, original)
+            manifest_path.write_bytes(original.replace(marker, marker + marker, 1))
+
+            with self.assertRaisesRegex(ValueError, "duplicate"):
                 store.read_verified_raw(stored)
 
     def test_same_bytes_in_new_generation_reuses_bin_but_keeps_two_manifests(self):

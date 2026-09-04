@@ -33,6 +33,19 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+class _DuplicateManifestKeyError(ValueError):
+    pass
+
+
+def _unique_manifest_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateManifestKeyError(key)
+        result[key] = value
+    return result
+
+
 class FormalSnapshotStore:
     """Persist verified official fetches without decoding or re-encoding their bytes."""
 
@@ -173,6 +186,7 @@ class FormalSnapshotStore:
         }
 
     def _write_content(self, target: Path, raw_bytes: bytes, content_sha256: str) -> None:
+        self._require_target_within_root(target)
         if target.exists():
             try:
                 existing = target.read_bytes()
@@ -188,6 +202,7 @@ class FormalSnapshotStore:
         )
 
     def _write_manifest(self, target: Path, envelope: dict[str, object], manifest_sha256: str) -> None:
+        self._require_target_within_root(target)
         encoded = _canonical_json_bytes(envelope)
         if target.exists():
             existing = self._read_manifest(target, manifest_sha256)
@@ -232,12 +247,18 @@ class FormalSnapshotStore:
             raise ValueError("content hash verification failed before replacement")
 
     def _read_manifest(self, path: Path, expected_sha256: str) -> dict[str, object]:
+        self._require_target_within_root(path)
         try:
-            envelope = json.loads(path.read_text(encoding="utf-8"))
+            raw_bytes = path.read_bytes()
+            envelope = json.loads(raw_bytes.decode("utf-8"), object_pairs_hook=_unique_manifest_object)
+        except _DuplicateManifestKeyError as error:
+            raise ValueError("duplicate manifest key") from error
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError(f"invalid manifest: {path}") from error
         if not isinstance(envelope, dict):
             raise ValueError("invalid manifest envelope")
+        if raw_bytes != _canonical_json_bytes(envelope):
+            raise ValueError("manifest envelope is not canonical")
         manifest_sha256 = envelope.get("manifest_sha256")
         if manifest_sha256 != expected_sha256:
             raise ValueError("manifest hash does not match envelope")
