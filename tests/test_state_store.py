@@ -1045,6 +1045,7 @@ class StateStoreTestCase(unittest.TestCase):
         self,
         *,
         db_path: Path | None = None,
+        include_receipt: bool = True,
         task_id: str,
         raw_store: FormalSnapshotStore,
         fetch: OfficialFetch,
@@ -1101,12 +1102,13 @@ class StateStoreTestCase(unittest.TestCase):
                     utc_at(4),
                 ),
             )
-            connection.execute(
-                """INSERT INTO formal_task_snapshot_receipt
-                (task_id,snapshot_id,manifest_sha256,refresh_generation,recorded_at)
-                VALUES (?,?,?,?,?)""",
-                tuple(receipt.values()),
-            )
+            if include_receipt:
+                connection.execute(
+                    """INSERT INTO formal_task_snapshot_receipt
+                    (task_id,snapshot_id,manifest_sha256,refresh_generation,recorded_at)
+                    VALUES (?,?,?,?,?)""",
+                    tuple(receipt.values()),
+                )
             connection.commit()
         return snapshot_id, receipt
 
@@ -1420,6 +1422,83 @@ class StateStoreTestCase(unittest.TestCase):
                     connection.commit()
                 with self.assertRaises(ValueError):
                     configured.get_formal_task_snapshot_receipt(task_id)
+
+    def test_formal_receipt_getter_rejects_deleted_receipt_orphan(self) -> None:
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "receipt-orphan", "receipt-generation", {}
+        )
+        store, raw_store, fetch, stored, verification = self.configured_formal_store(
+            refresh_generation="receipt-generation",
+            producing_task_id=task_id,
+            label="receipt-orphan",
+        )
+        snapshot_id, _ = self.insert_formal_receipt_fixture(
+            task_id=task_id,
+            raw_store=raw_store,
+            fetch=fetch,
+            stored=stored,
+            verification=verification,
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "DELETE FROM formal_task_snapshot_receipt WHERE task_id = ?",
+                (task_id,),
+            )
+            connection.commit()
+
+        self.assertEqual(store.get_formal_snapshot(snapshot_id).producing_task_id, task_id)
+        with self.assertRaisesRegex(ValueError, "receipt.*producer|producer.*receipt"):
+            store.get_formal_task_snapshot_receipt(task_id)
+
+        empty_task = self.store.enqueue_formal_task(
+            "formal_statement", "genuine-no-receipt", "receipt-generation", {}
+        )
+        self.assertIsNone(store.get_formal_task_snapshot_receipt(empty_task))
+
+    def test_formal_receipt_getter_rejects_extra_producer_snapshot(self) -> None:
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "receipt-extra", "receipt-generation", {}
+        )
+        raw_root = Path(self.tempdir.name) / "receipt-extra-raw"
+        raw_store, fetch, stored, verification = written_formal_snapshot(
+            raw_root,
+            refresh_generation="receipt-generation",
+            producing_task_id=task_id,
+        )
+        store = StateStore(self.db_path, formal_snapshot_store=raw_store)
+        _, expected = self.insert_formal_receipt_fixture(
+            task_id=task_id,
+            raw_store=raw_store,
+            fetch=fetch,
+            stored=stored,
+            verification=verification,
+        )
+        _, extra_fetch, extra_stored, extra_verification = written_formal_snapshot(
+            raw_root,
+            raw_bytes=b"extra producer row",
+            refresh_generation="extra-generation",
+            producing_task_id=task_id,
+        )
+        extra_snapshot_id, _ = self.insert_formal_receipt_fixture(
+            include_receipt=False,
+            task_id=task_id,
+            raw_store=raw_store,
+            fetch=extra_fetch,
+            stored=extra_stored,
+            verification=extra_verification,
+        )
+
+        with self.assertRaisesRegex(ValueError, "receipt.*producer|producer.*receipt"):
+            store.get_formal_task_snapshot_receipt(task_id)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    """SELECT id FROM formal_source_snapshot
+                    WHERE producing_task_id = ? ORDER BY id""",
+                    (task_id,),
+                ).fetchall(),
+                sorted([(expected["snapshot_id"],), (extra_snapshot_id,)]),
+            )
 
     def test_formal_snapshot_lookup_never_reads_legacy_source_snapshot(self) -> None:
         store, _, fetch, stored, verification = self.configured_formal_store(

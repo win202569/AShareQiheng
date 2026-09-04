@@ -1727,8 +1727,20 @@ class StateStore:
                 "SELECT * FROM formal_task_snapshot_receipt WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
+            producer_snapshot_ids = [
+                str(row["id"])
+                for row in connection.execute(
+                    """SELECT id FROM formal_source_snapshot
+                    WHERE producing_task_id = ? ORDER BY id""",
+                    (task_id,),
+                )
+            ]
             if receipt is None:
+                if producer_snapshot_ids:
+                    raise ValueError("formal snapshot producer has no exact receipt")
                 return None
+            if producer_snapshot_ids != [receipt["snapshot_id"]]:
+                raise ValueError("formal snapshot receipt producer set mismatch")
             task = connection.execute(
                 "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
             ).fetchone()
