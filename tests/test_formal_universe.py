@@ -1,4 +1,7 @@
 from dataclasses import replace
+import hashlib
+import json
+from collections.abc import Mapping
 import unittest
 
 from ashare_pipeline.formal_evidence import OfficialSnapshotRef
@@ -14,6 +17,20 @@ from ashare_pipeline.formal_universe import (
 
 
 FORMAL_FREEZE_AT_CN = "2026-08-31T15:00:00+08:00"
+
+
+def canonical_hash(value: object) -> str:
+    def plain(item: object) -> object:
+        if isinstance(item, Mapping):
+            return {key: plain(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [plain(child) for child in item]
+        return item
+
+    payload = json.dumps(
+        plain(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def snapshot_ref(exchange: str) -> OfficialSnapshotRef:
@@ -154,8 +171,8 @@ class FormalUniverseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SH/SZ/BJ"):
             build_universe_snapshot(extractions[:2])
 
-    def test_frozen_input_constructor_rejects_bare_members_and_tampered_hash_graph(self):
-        with self.assertRaisesRegex(ValueError, "three verified SH/SZ/BJ sources"):
+    def test_frozen_input_public_constructor_rejects_bare_members(self):
+        with self.assertRaisesRegex(ValueError, "FormalUniverseIngestor"):
             FormalFrozenUniverseInput(
                 as_of_utc=FORMAL_FREEZE_AT_CN,
                 registry_manifest_hash="m" * 64,
@@ -166,32 +183,81 @@ class FormalUniverseTests(unittest.TestCase):
                 frozen_input_hash="f" * 64,
             )
 
-        frozen = FormalUniverseIngestor().build(
+    def test_public_constructor_rejects_a_self_consistent_fabricated_source_graph(self):
+        legitimate = FormalUniverseIngestor().build(
             FORMAL_FREEZE_AT_CN,
             "m" * 64,
             verified_listing_documents("SH", "SZ", "BJ"),
         )
-        for field in ("universe_hash", "source_audit_hash", "frozen_input_hash"):
-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
-                replace(frozen, **{field: "0" * 64})
-
-        first_source = frozen.sources[0]
-        bad_audit = replace(first_source.extraction.audit, audit_hash="0" * 64)
-        bad_source = replace(
-            first_source,
-            extraction=replace(first_source.extraction, audit=bad_audit),
+        first = legitimate.sources[0]
+        forged_audit_fields = {
+            "accepted_members_hash": first.extraction.audit.accepted_members_hash,
+            "accepted_ordinary_a_count": first.extraction.audit.accepted_ordinary_a_count,
+            "exchange": first.extraction.audit.exchange,
+            "excluded_by_security_type": first.extraction.audit.excluded_by_security_type,
+            "excluded_rows_hash": "9" * 64,
+            "parsed_rows_hash": "8" * 64,
+            "parser_id": first.extraction.audit.parser_id,
+            "parser_version": first.extraction.audit.parser_version,
+            "source_content_sha256": first.extraction.audit.source_content_sha256,
+            "source_row_count": first.extraction.audit.source_row_count,
+        }
+        forged_audit = replace(
+            first.extraction.audit,
+            **forged_audit_fields,
+            audit_hash=canonical_hash(forged_audit_fields),
         )
-        with self.assertRaisesRegex(ValueError, "audit_hash"):
-            replace(frozen, sources=(bad_source, *frozen.sources[1:]))
+        forged_first = replace(
+            first,
+            extraction=replace(first.extraction, audit=forged_audit),
+        )
+        forged_sources = (forged_first, *legitimate.sources[1:])
+        member_payloads = [{
+            "exchange": member.exchange,
+            "listing_status": member.listing_status,
+            "raw_row": member.raw_row,
+            "raw_row_hash": member.raw_row_hash,
+            "security_id": member.security_id,
+            "security_type": member.security_type,
+        } for member in legitimate.members]
+        source_audits = [{
+            "exchange": source.exchange,
+            "audit_hash": source.extraction.audit.audit_hash,
+        } for source in forged_sources]
+        forged_universe_hash = canonical_hash({
+            "members": member_payloads,
+            "source_audits": source_audits,
+        })
+        source_manifest = [{
+            "audit_hash": source.extraction.audit.audit_hash,
+            "content_sha256": source.snapshot.content_sha256,
+            "exchange": source.exchange,
+            "manifest_sha256": source.snapshot.manifest_sha256,
+            "parser_id": source.snapshot.parser_id,
+            "parser_version": source.snapshot.parser_version,
+        } for source in forged_sources]
+        forged_source_audit_hash = canonical_hash(source_manifest)
+        forged_frozen_input_hash = canonical_hash({
+            "as_of_utc": legitimate.as_of_utc,
+            "registry_manifest_hash": legitimate.registry_manifest_hash,
+            "sources": [{
+                "audit_hash": item["audit_hash"],
+                "exchange": item["exchange"],
+                "manifest_sha256": item["manifest_sha256"],
+            } for item in source_manifest],
+            "universe_hash": forged_universe_hash,
+        })
 
-        malformed_source = replace(first_source, extraction=None)
-        with self.assertRaises(Exception) as caught:
-            replace(frozen, sources=(malformed_source, *frozen.sources[1:]))
-        self.assertIsInstance(caught.exception, ValueError)
-        self.assertIn("extraction", str(caught.exception))
-
-        with self.assertRaisesRegex(ValueError, "members must exactly match"):
-            replace(frozen, members=frozen.members[1:])
+        with self.assertRaisesRegex(ValueError, "FormalUniverseIngestor"):
+            FormalFrozenUniverseInput(
+                as_of_utc=legitimate.as_of_utc,
+                registry_manifest_hash=legitimate.registry_manifest_hash,
+                members=legitimate.members,
+                sources=forged_sources,
+                universe_hash=forged_universe_hash,
+                source_audit_hash=forged_source_audit_hash,
+                frozen_input_hash=forged_frozen_input_hash,
+            )
 
     def test_member_constructor_rejects_noncanonical_or_non_ordinary_identity(self):
         frozen = FormalUniverseIngestor().build(

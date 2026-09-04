@@ -157,7 +157,7 @@ class FormalUniverseSourceDocument:
     parsed_rows: tuple[Mapping[str, object], ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class FormalFrozenUniverseInput:
     as_of_utc: str
     registry_manifest_hash: str
@@ -167,8 +167,20 @@ class FormalFrozenUniverseInput:
     source_audit_hash: str
     frozen_input_hash: str
 
-    def __post_init__(self) -> None:
-        _validate_frozen_universe_input(self)
+    def __init__(
+        self,
+        *,
+        as_of_utc: str,
+        registry_manifest_hash: str,
+        members: tuple[FormalUniverseMember, ...],
+        sources: tuple[FormalUniverseSourceEvidence, ...],
+        universe_hash: str,
+        source_audit_hash: str,
+        frozen_input_hash: str,
+    ) -> None:
+        raise ValueError(
+            "FormalFrozenUniverseInput must be constructed by FormalUniverseIngestor"
+        )
 
 
 def classify_universe_status(
@@ -408,6 +420,28 @@ def _validate_frozen_universe_input(frozen: FormalFrozenUniverseInput) -> None:
         raise ValueError("formal frozen universe frozen_input_hash mismatch")
 
 
+def _create_frozen_universe_input(
+    *,
+    as_of_utc: str,
+    registry_manifest_hash: str,
+    members: tuple[FormalUniverseMember, ...],
+    sources: tuple[FormalUniverseSourceEvidence, ...],
+    universe_hash: str,
+    source_audit_hash: str,
+    frozen_input_hash: str,
+) -> FormalFrozenUniverseInput:
+    frozen = object.__new__(FormalFrozenUniverseInput)
+    object.__setattr__(frozen, "as_of_utc", as_of_utc)
+    object.__setattr__(frozen, "registry_manifest_hash", registry_manifest_hash)
+    object.__setattr__(frozen, "members", members)
+    object.__setattr__(frozen, "sources", sources)
+    object.__setattr__(frozen, "universe_hash", universe_hash)
+    object.__setattr__(frozen, "source_audit_hash", source_audit_hash)
+    object.__setattr__(frozen, "frozen_input_hash", frozen_input_hash)
+    _validate_frozen_universe_input(frozen)
+    return frozen
+
+
 class FormalUniverseIngestor:
     def build(
         self,
@@ -444,7 +478,7 @@ class FormalUniverseIngestor:
         frozen_input_hash = _frozen_input_hash(
             as_of_utc, registry_manifest_hash, universe_hash, source_manifest
         )
-        return FormalFrozenUniverseInput(
+        return _create_frozen_universe_input(
             as_of_utc=as_of_utc,
             registry_manifest_hash=registry_manifest_hash,
             members=members,
