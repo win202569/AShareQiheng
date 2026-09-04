@@ -52,12 +52,14 @@ from ashare_pipeline.formal_snapshot_store import (
 )
 from ashare_pipeline.formal_universe import (
     FormalFrozenUniverseInput,
+    FormalUniverseDecision,
     FormalUniverseExtraction,
     FormalUniverseMember,
     FormalUniverseSourceAudit,
     FormalUniverseSourceEvidence,
     _create_frozen_universe_input,
     _validate_frozen_universe_input,
+    canonical_security_id,
 )
 
 
@@ -155,6 +157,12 @@ _FORMAL_UNIVERSE_MEMBER_KEYS = frozenset(
         "security_id",
         "security_type",
     }
+)
+_FORMAL_UNIVERSE_FINALIZER_PAYLOAD_KEYS = frozenset(
+    {"as_of_utc", "registry_manifest_hash", "refresh_generation", "source_task_ids"}
+)
+_FORMAL_UNIVERSE_FINALIZER_RESULT_KEYS = frozenset(
+    {"universe_snapshot_id", "frozen_input_hash", "universe_hash", "registry_manifest_hash"}
 )
 
 FINANCIAL_FACT_COLUMNS = (
@@ -737,6 +745,55 @@ def _formal_universe_initial_status_evidence_hash(
             payload, "formal universe initial status evidence"
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _require_formal_universe_status_values(
+    *,
+    security_id: object,
+    status: object,
+    reasons: object,
+    veto_flags: object,
+    evidence_hash: object,
+    frozen_input_hash: str,
+) -> tuple[str, str, tuple[str, ...], tuple[str, ...], str]:
+    if type(security_id) is not str:
+        raise ValueError("formal universe status security ID is invalid")
+    try:
+        canonical = canonical_security_id(security_id)
+    except (TypeError, ValueError) as error:
+        raise ValueError("formal universe status security ID is invalid") from error
+    if canonical != security_id:
+        raise ValueError("formal universe status security ID is not canonical")
+    if type(status) is not str or status not in _FORMAL_UNIVERSE_STATUSES:
+        raise ValueError("formal universe status is not recognized")
+    if type(reasons) is not tuple or any(
+        type(reason) is not str or not reason for reason in reasons
+    ):
+        raise ValueError("formal universe status reasons must be canonical strings")
+    if type(veto_flags) is not tuple or any(
+        type(flag) is not str or not flag for flag in veto_flags
+    ):
+        raise ValueError("formal universe status veto flags must be canonical strings")
+    if tuple(sorted(reasons)) != reasons or len(set(reasons)) != len(reasons):
+        raise ValueError("formal universe status reasons must be sorted and unique")
+    if tuple(sorted(veto_flags)) != veto_flags or len(set(veto_flags)) != len(veto_flags):
+        raise ValueError("formal universe status veto flags must be sorted and unique")
+    if status in {"out_of_scope", "pending_evidence"} and not reasons:
+        raise ValueError(f"{status} requires at least one reason")
+    if status == "pool_vetoed" and not veto_flags:
+        raise ValueError("pool_vetoed requires at least one veto flag")
+    if status == "formal_scored" and veto_flags:
+        raise ValueError("formal_scored cannot carry veto flags")
+    digest = _require_formal_sha256(evidence_hash, "universe status evidence hash")
+    if (
+        status == "pending_evidence"
+        and reasons == ("formal_collection_pending",)
+        and not veto_flags
+        and digest
+        != _formal_universe_initial_status_evidence_hash(frozen_input_hash, security_id)
+    ):
+        raise ValueError("stored formal universe initial status evidence hash mismatch")
+    return security_id, status, reasons, veto_flags, digest
 
 
 def _require_canonical_uuid(value: object, field: str) -> str:
@@ -2496,32 +2553,20 @@ class StateStore:
         ):
             raise ValueError("stored formal universe must have exactly one status per member")
         for row in status_rows:
-            reasons = _decode_canonical_formal_array(row["reasons_json"], "reasons")
-            veto_flags = _decode_canonical_formal_array(
+            reasons_list = _decode_canonical_formal_array(row["reasons_json"], "reasons")
+            veto_flags_list = _decode_canonical_formal_array(
                 row["veto_flags_json"], "veto flags"
             )
-            if (
-                row["snapshot_id"] != snapshot_id
-                or row["status"] not in _FORMAL_UNIVERSE_STATUSES
-                or any(type(reason) is not str or not reason for reason in reasons)
-                or any(type(flag) is not str or not flag for flag in veto_flags)
-            ):
+            if row["snapshot_id"] != snapshot_id:
                 raise ValueError("stored formal universe status fields are invalid")
-            evidence_hash = _require_formal_sha256(
-                row["evidence_hash"], "universe status evidence hash"
+            _require_formal_universe_status_values(
+                security_id=row["security_id"],
+                status=row["status"],
+                reasons=tuple(reasons_list),
+                veto_flags=tuple(veto_flags_list),
+                evidence_hash=row["evidence_hash"],
+                frozen_input_hash=header["frozen_input_hash"],
             )
-            if (
-                row["status"] == "pending_evidence"
-                and reasons == ["formal_collection_pending"]
-                and veto_flags == []
-                and evidence_hash
-                != _formal_universe_initial_status_evidence_hash(
-                    header["frozen_input_hash"], row["security_id"]
-                )
-            ):
-                raise ValueError(
-                    "stored formal universe initial status evidence hash mismatch"
-                )
             _require_canonical_utc(row["updated_at"], "universe status update time")
 
         frozen = _create_frozen_universe_input(
@@ -2698,6 +2743,217 @@ class StateStore:
                 return []
             _, sources = self._formal_universe_from_connection(connection, row)
             return sources
+
+    def replace_formal_universe_statuses(
+        self,
+        universe_snapshot_id: str,
+        decisions: Sequence[FormalUniverseDecision],
+    ) -> None:
+        self._require_formal_snapshot_store()
+        snapshot_id = _require_canonical_uuid(
+            universe_snapshot_id, "universe snapshot ID"
+        )
+        if isinstance(decisions, (str, bytes)):
+            raise ValueError("formal universe decisions must be a sequence")
+        try:
+            materialized = tuple(decisions)
+        except TypeError as error:
+            raise ValueError("formal universe decisions must be a sequence") from error
+
+        with self._transaction(immediate=True) as connection:
+            header = connection.execute(
+                "SELECT * FROM formal_universe_snapshot WHERE id = ?", (snapshot_id,)
+            ).fetchone()
+            if header is None:
+                raise ValueError("formal universe snapshot does not exist")
+            frozen, _ = self._formal_universe_from_connection(connection, header)
+            expected_ids = tuple(member.security_id for member in frozen.members)
+            validated: dict[str, tuple[str, tuple[str, ...], tuple[str, ...], str]] = {}
+            for decision in materialized:
+                if type(decision) is not FormalUniverseDecision:
+                    raise ValueError(
+                        "formal universe decisions must have exact type FormalUniverseDecision"
+                    )
+                security_id, status, reasons, veto_flags, evidence_hash = (
+                    _require_formal_universe_status_values(
+                        security_id=decision.security_id,
+                        status=decision.status,
+                        reasons=decision.reasons,
+                        veto_flags=decision.veto_flags,
+                        evidence_hash=decision.evidence_hash,
+                        frozen_input_hash=frozen.frozen_input_hash,
+                    )
+                )
+                if security_id in validated:
+                    raise ValueError("duplicate formal universe decision security ID")
+                validated[security_id] = (status, reasons, veto_flags, evidence_hash)
+            if tuple(sorted(validated)) != expected_ids:
+                raise ValueError(
+                    "formal universe decisions must exactly cover existing members"
+                )
+
+            updated_at = _utc_iso(_utc_now())
+            for security_id in expected_ids:
+                status, reasons, veto_flags, evidence_hash = validated[security_id]
+                cursor = connection.execute(
+                    """UPDATE formal_universe_status
+                    SET status=?,reasons_json=?,veto_flags_json=?,evidence_hash=?,updated_at=?
+                    WHERE snapshot_id=? AND security_id=?""",
+                    (
+                        status,
+                        _json(list(reasons)),
+                        _json(list(veto_flags)),
+                        evidence_hash,
+                        updated_at,
+                        snapshot_id,
+                        security_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("formal universe status replacement lost coverage")
+            refreshed = connection.execute(
+                "SELECT * FROM formal_universe_snapshot WHERE id = ?", (snapshot_id,)
+            ).fetchone()
+            if refreshed is None:
+                raise ValueError("formal universe snapshot disappeared")
+            self._formal_universe_from_connection(connection, refreshed)
+
+    def list_formal_universe_statuses(
+        self, universe_snapshot_id: str
+    ) -> list[dict[str, object]]:
+        self._require_formal_snapshot_store()
+        snapshot_id = _require_canonical_uuid(
+            universe_snapshot_id, "universe snapshot ID"
+        )
+        with self._transaction() as connection:
+            header = connection.execute(
+                "SELECT * FROM formal_universe_snapshot WHERE id = ?", (snapshot_id,)
+            ).fetchone()
+            if header is None:
+                return []
+            self._formal_universe_from_connection(connection, header)
+            result: list[dict[str, object]] = []
+            for row in connection.execute(
+                """SELECT * FROM formal_universe_status
+                WHERE snapshot_id=? ORDER BY security_id""",
+                (snapshot_id,),
+            ):
+                public = dict(row)
+                public.pop("reasons_json")
+                public.pop("veto_flags_json")
+                public["reasons"] = tuple(
+                    _decode_canonical_formal_array(row["reasons_json"], "reasons")
+                )
+                public["veto_flags"] = tuple(
+                    _decode_canonical_formal_array(row["veto_flags_json"], "veto flags")
+                )
+                result.append(public)
+            return result
+
+    def _require_formal_universe_finalizer_proof(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        task: Mapping[str, object],
+        result: object,
+    ) -> dict[str, object]:
+        _require_canonical_uuid(row["id"], "finalizer task ID")
+        if task["kind"] != "formal_universe_finalize":
+            raise ValueError("formal universe proof requires a finalizer task")
+        payload = task["payload"]
+        if type(payload) is not dict or frozenset(payload) != _FORMAL_UNIVERSE_FINALIZER_PAYLOAD_KEYS:
+            raise ValueError("formal universe finalizer payload keys mismatch")
+        if type(result) is not dict or frozenset(result) != _FORMAL_UNIVERSE_FINALIZER_RESULT_KEYS:
+            raise ValueError("formal universe finalizer result keys mismatch")
+        generation = task["refresh_generation"]
+        if type(generation) is not str or not generation or payload["refresh_generation"] != generation:
+            raise ValueError("formal universe finalizer generation mismatch")
+        snapshot_id = _require_canonical_uuid(
+            result["universe_snapshot_id"], "universe snapshot ID"
+        )
+        header_row = connection.execute(
+            "SELECT * FROM formal_universe_snapshot WHERE id = ?", (snapshot_id,)
+        ).fetchone()
+        if header_row is None:
+            raise ValueError("formal universe finalizer target is missing")
+        frozen, _ = self._formal_universe_from_connection(connection, header_row)
+        header = dict(header_row)
+
+        source_by_exchange = {source.exchange: source for source in frozen.sources}
+        expected_source_ids: list[str] = []
+        for exchange in ("BJ", "SH", "SZ"):
+            source = source_by_exchange.get(exchange)
+            if source is None:
+                raise ValueError("formal universe finalizer source graph is incomplete")
+            expected_source_ids.append(
+                _require_canonical_uuid(
+                    source.snapshot.producing_task_id,
+                    f"{exchange} universe source task ID",
+                )
+            )
+        payload_source_ids = payload["source_task_ids"]
+        if type(payload_source_ids) is not list:
+            raise ValueError("formal universe finalizer source task IDs must be a list")
+        canonical_payload_source_ids = [
+            _require_canonical_uuid(value, "finalizer source task ID")
+            for value in payload_source_ids
+        ]
+        if canonical_payload_source_ids != expected_source_ids:
+            raise ValueError("formal universe finalizer source task order or identity mismatch")
+        prerequisite_ids = task["prerequisite_task_ids"]
+        if (
+            type(prerequisite_ids) is not list
+            or len(prerequisite_ids) != 3
+            or sorted(prerequisite_ids) != sorted(expected_source_ids)
+        ):
+            raise ValueError("formal universe finalizer prerequisite set mismatch")
+        if self._formal_task_snapshot_receipt_from_connection(connection, row["id"]) is not None:
+            raise ValueError("formal universe finalizer cannot own a source receipt")
+
+        if (
+            payload["as_of_utc"] != frozen.as_of_utc
+            or payload["registry_manifest_hash"] != frozen.registry_manifest_hash
+        ):
+            raise ValueError("formal universe finalizer payload header mismatch")
+        expected_result = {
+            "universe_snapshot_id": snapshot_id,
+            "frozen_input_hash": frozen.frozen_input_hash,
+            "universe_hash": frozen.universe_hash,
+            "registry_manifest_hash": frozen.registry_manifest_hash,
+        }
+        for field in ("frozen_input_hash", "universe_hash", "registry_manifest_hash"):
+            _require_formal_sha256(result[field], f"finalizer result {field}")
+        if result != expected_result:
+            raise ValueError("formal universe finalizer result does not match target header")
+        return header
+
+    def get_formal_universe_snapshot_from_task(
+        self, finalizer_task_id: str
+    ) -> dict[str, object] | None:
+        self._require_formal_snapshot_store()
+        task_id = _require_canonical_uuid(finalizer_task_id, "finalizer task ID")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            prerequisites = [
+                str(item["prerequisite_task_id"])
+                for item in connection.execute(
+                    """SELECT prerequisite_task_id
+                    FROM formal_collection_task_dependency
+                    WHERE task_id=? ORDER BY prerequisite_task_id""",
+                    (task_id,),
+                )
+            ]
+            task = self._formal_task_public(row, prerequisites)
+            if task["kind"] != "formal_universe_finalize":
+                raise ValueError("formal universe task lookup requires a finalizer")
+            self._require_formal_verified_task_state(row, task)
+            return self._require_formal_universe_finalizer_proof(
+                connection, row, task, task["result"]
+            )
 
     def enqueue_formal_task(
         self,
@@ -3036,8 +3292,11 @@ class StateStore:
                     "formal task is not held by the current unexpired lease owner"
                 )
             if task["kind"] == "formal_universe_finalize":
-                raise ValueError(
-                    "formal universe finalizer requires verified universe proof"
+                self._require_formal_universe_finalizer_proof(
+                    connection,
+                    row,
+                    task,
+                    _decode_canonical_mapping_json(result_json, "result"),
                 )
 
             source_task = task["kind"] in _FORMAL_SOURCE_FETCH_KINDS

@@ -41,6 +41,7 @@ from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore, FormalSto
 from ashare_pipeline.formal_universe import (
     FormalFrozenUniverseInput,
     FormalUniverseIngestor,
+    FormalUniverseDecision,
     FormalUniverseSourceDocument,
     extract_formal_universe_members,
 )
@@ -7432,6 +7433,345 @@ class StateStoreTestCase(unittest.TestCase):
             legacy,
             [("akshare", "stock_list", "legacy-request", "legacy-payload")],
         )
+
+    def test_formal_universe_statuses_replace_complete_typed_ledger_and_list_canonically(self) -> None:
+        store, frozen, _ = self.task_backed_frozen_universe(label="status-ledger")
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+        initial = store.list_formal_universe_statuses(snapshot_id)
+        self.assertEqual(
+            [row["security_id"] for row in initial],
+            ["BJ430001", "SH600000", "SZ000001"],
+        )
+        expected_initial_hash = hashlib.sha256(json.dumps(
+            {
+                "frozen_input_hash": frozen.frozen_input_hash,
+                "reasons": ["formal_collection_pending"],
+                "security_id": "BJ430001",
+                "status": "pending_evidence",
+                "veto_flags": [],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+        self.assertEqual(initial[0]["evidence_hash"], expected_initial_hash)
+        self.assertEqual(initial[0]["reasons"], ("formal_collection_pending",))
+        self.assertEqual(initial[0]["veto_flags"], ())
+
+        decisions = (
+            FormalUniverseDecision(
+                "BJ430001", "out_of_scope", ("not_ordinary_a",), (), "1" * 64
+            ),
+            FormalUniverseDecision(
+                "SH600000", "pending_evidence", ("missing_report",), ("ST",), "2" * 64
+            ),
+            FormalUniverseDecision(
+                "SZ000001", "pool_vetoed", ("risk_rule",), ("ST",), "3" * 64
+            ),
+        )
+        store.replace_formal_universe_statuses(snapshot_id, decisions)
+        listed = store.list_formal_universe_statuses(snapshot_id)
+        self.assertEqual(
+            [
+                (
+                    row["security_id"], row["status"], row["reasons"],
+                    row["veto_flags"], row["evidence_hash"],
+                )
+                for row in listed
+            ],
+            [
+                ("BJ430001", "out_of_scope", ("not_ordinary_a",), (), "1" * 64),
+                ("SH600000", "pending_evidence", ("missing_report",), ("ST",), "2" * 64),
+                ("SZ000001", "pool_vetoed", ("risk_rule",), ("ST",), "3" * 64),
+            ],
+        )
+        self.assertEqual(len({row["updated_at"] for row in listed}), 1)
+
+        rescored = list(decisions)
+        rescored[2] = FormalUniverseDecision(
+            "SZ000001", "formal_scored", (), (), "4" * 64
+        )
+        store.replace_formal_universe_statuses(snapshot_id, rescored)
+        self.assertEqual(
+            store.list_formal_universe_statuses(snapshot_id)[2]["status"],
+            "formal_scored",
+        )
+
+    def test_formal_universe_status_replacement_rejects_invalid_or_incomplete_input_without_mutation(self) -> None:
+        store, frozen, _ = self.task_backed_frozen_universe(label="status-invalid")
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+        before = store.list_formal_universe_statuses(snapshot_id)
+        valid = [
+            FormalUniverseDecision(member.security_id, "formal_scored", (), (), "a" * 64)
+            for member in frozen.members
+        ]
+
+        class DecisionSubclass(FormalUniverseDecision):
+            pass
+
+        invalid_sets = (
+            [dict(security_id=item.security_id) for item in valid],
+            [DecisionSubclass(**valid[0].__dict__), *valid[1:]],
+            [replace(valid[0], security_id="bj430001"), *valid[1:]],
+            [replace(valid[0], status="unknown"), *valid[1:]],
+            [replace(valid[0], evidence_hash="A" * 64), *valid[1:]],
+            [replace(valid[0], reasons=("z", "a")), *valid[1:]],
+            [replace(valid[0], reasons=("a", "a")), *valid[1:]],
+            [replace(valid[0], veto_flags=("ST", "RISK")), *valid[1:]],
+            [replace(valid[0], status="pending_evidence", reasons=()), *valid[1:]],
+            [replace(valid[0], status="pool_vetoed", veto_flags=()), *valid[1:]],
+            [replace(valid[0], veto_flags=("ST",)), *valid[1:]],
+            valid[:-1],
+            [valid[0], valid[0], valid[2]],
+            [replace(valid[0], security_id="SH600001"), *valid[1:]],
+            [*valid, FormalUniverseDecision("SH600001", "formal_scored", (), (), "b" * 64)],
+            [
+                FormalUniverseDecision(
+                    frozen.members[0].security_id,
+                    "pending_evidence",
+                    ("formal_collection_pending",),
+                    (),
+                    "b" * 64,
+                ),
+                *valid[1:],
+            ],
+        )
+        for decisions in invalid_sets:
+            with self.subTest(decisions=decisions):
+                with self.assertRaises(ValueError):
+                    store.replace_formal_universe_statuses(snapshot_id, decisions)
+                self.assertEqual(store.list_formal_universe_statuses(snapshot_id), before)
+
+    def test_formal_universe_status_replacement_rolls_back_late_failure_and_revalidates_graph(self) -> None:
+        store, frozen, _ = self.task_backed_frozen_universe(label="status-rollback")
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+        before = store.list_formal_universe_statuses(snapshot_id)
+        decisions = tuple(
+            FormalUniverseDecision(member.security_id, "formal_scored", (), (), "c" * 64)
+            for member in frozen.members
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """CREATE TRIGGER fail_late_status_update BEFORE UPDATE ON formal_universe_status
+                WHEN OLD.snapshot_id='%s' AND OLD.security_id='SZ000001'
+                BEGIN SELECT RAISE(ABORT, 'late status failure'); END""" % snapshot_id
+            )
+            connection.commit()
+        with self.assertRaises(sqlite3.IntegrityError):
+            store.replace_formal_universe_statuses(snapshot_id, decisions)
+        self.assertEqual(store.list_formal_universe_statuses(snapshot_id), before)
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("DROP TRIGGER fail_late_status_update")
+            connection.execute(
+                "DELETE FROM formal_universe_status WHERE snapshot_id=? AND security_id='BJ430001'",
+                (snapshot_id,),
+            )
+            connection.commit()
+        with self.assertRaises(ValueError):
+            store.list_formal_universe_statuses(snapshot_id)
+        with self.assertRaises(ValueError):
+            store.replace_formal_universe_statuses(snapshot_id, decisions)
+
+    def test_formal_universe_finalizer_completion_and_getter_require_exact_bound_proof(self) -> None:
+        store, frozen, source_task_ids = self.task_backed_frozen_universe(
+            label="finalizer-valid"
+        )
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+        generation = "universe-finalizer-generation-v1"
+        ordered_sources = [source_task_ids[exchange] for exchange in ("BJ", "SH", "SZ")]
+        finalizer_id = store.enqueue_formal_task(
+            "formal_universe_finalize",
+            "formal-universe-finalize:valid",
+            generation,
+            {
+                "as_of_utc": frozen.as_of_utc,
+                "registry_manifest_hash": frozen.registry_manifest_hash,
+                "refresh_generation": generation,
+                "source_task_ids": ordered_sources,
+            },
+            ordered_sources,
+        )
+        leased = store.lease_next_formal_task(
+            ("formal_universe_finalize",), "worker-finalizer", 300
+        )
+        self.assertEqual(leased["id"], finalizer_id)
+        result = {
+            "universe_snapshot_id": snapshot_id,
+            "frozen_input_hash": frozen.frozen_input_hash,
+            "universe_hash": frozen.universe_hash,
+            "registry_manifest_hash": frozen.registry_manifest_hash,
+        }
+        store.complete_formal_task(finalizer_id, "worker-finalizer", result)
+        self.assertEqual(store.get_formal_task(finalizer_id)["status"], "verified")
+        self.assertEqual(
+            store.get_formal_universe_snapshot_from_task(finalizer_id),
+            store.get_formal_universe_snapshot_by_input_hash(frozen.frozen_input_hash),
+        )
+        self.assertIsNone(store.get_formal_universe_snapshot_from_task(str(uuid.uuid4())))
+
+    def test_formal_universe_finalizer_rejects_result_tampering_without_mutation(self) -> None:
+        store, frozen, source_task_ids = self.task_backed_frozen_universe(
+            label="finalizer-result-reject"
+        )
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+        generation = "universe-finalizer-result-generation"
+        ordered_sources = [source_task_ids[exchange] for exchange in ("BJ", "SH", "SZ")]
+        finalizer_id = store.enqueue_formal_task(
+            "formal_universe_finalize",
+            "formal-universe-finalize:result-reject",
+            generation,
+            {
+                "as_of_utc": frozen.as_of_utc,
+                "registry_manifest_hash": frozen.registry_manifest_hash,
+                "refresh_generation": generation,
+                "source_task_ids": ordered_sources,
+            },
+            ordered_sources,
+        )
+        store.lease_next_formal_task(
+            ("formal_universe_finalize",), "worker-finalizer", 300
+        )
+        valid = {
+            "universe_snapshot_id": snapshot_id,
+            "frozen_input_hash": frozen.frozen_input_hash,
+            "universe_hash": frozen.universe_hash,
+            "registry_manifest_hash": frozen.registry_manifest_hash,
+        }
+        invalid = (
+            {key: value for key, value in valid.items() if key != "universe_hash"},
+            {**valid, "extra": "field"},
+            {**valid, "universe_snapshot_id": str(uuid.uuid4())},
+            {**valid, "frozen_input_hash": "0" * 64},
+            {**valid, "universe_hash": "0" * 64},
+            {**valid, "registry_manifest_hash": "0" * 64},
+        )
+        before = store.get_formal_task(finalizer_id)
+        for result in invalid:
+            with self.subTest(result=result):
+                with self.assertRaises(ValueError):
+                    store.complete_formal_task(finalizer_id, "worker-finalizer", result)
+                self.assertEqual(store.get_formal_task(finalizer_id), before)
+
+    def test_formal_universe_finalizer_rejects_payload_dependency_and_graph_tampering(self) -> None:
+        cases = ("payload-order", "payload-generation", "dependency", "source", "member", "status")
+        for index, case in enumerate(cases):
+            with self.subTest(case=case):
+                path = Path(self.tempdir.name) / f"finalizer-tamper-{index}.sqlite3"
+                store, frozen, source_task_ids = self.task_backed_frozen_universe(
+                    label=f"finalizer-tamper-{index}", db_path=path
+                )
+                snapshot_id = store.put_formal_universe_snapshot(frozen)
+                generation = f"finalizer-tamper-generation-{index}"
+                ordered_sources = [source_task_ids[e] for e in ("BJ", "SH", "SZ")]
+                finalizer_id = store.enqueue_formal_task(
+                    "formal_universe_finalize",
+                    f"formal-universe-finalize:tamper:{index}",
+                    generation,
+                    {
+                        "as_of_utc": frozen.as_of_utc,
+                        "registry_manifest_hash": frozen.registry_manifest_hash,
+                        "refresh_generation": generation,
+                        "source_task_ids": ordered_sources,
+                    },
+                    ordered_sources,
+                )
+                store.lease_next_formal_task(
+                    ("formal_universe_finalize",), "worker-finalizer", 300
+                )
+                before = store.get_formal_task(finalizer_id)
+                with closing(sqlite3.connect(path)) as connection:
+                    if case.startswith("payload"):
+                        payload = dict(before["payload"])
+                        if case == "payload-order":
+                            payload["source_task_ids"] = list(reversed(ordered_sources))
+                        else:
+                            payload["refresh_generation"] = "wrong-generation"
+                        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                        connection.execute(
+                            "UPDATE formal_collection_task SET payload_json=?,payload_sha256=? WHERE id=?",
+                            (payload_json, hashlib.sha256(payload_json.encode()).hexdigest(), finalizer_id),
+                        )
+                    elif case == "dependency":
+                        connection.execute(
+                            "DELETE FROM formal_collection_task_dependency WHERE task_id=? AND prerequisite_task_id=?",
+                            (finalizer_id, ordered_sources[0]),
+                        )
+                    elif case == "source":
+                        connection.execute(
+                            "UPDATE formal_universe_source SET source_content_sha256=? WHERE universe_snapshot_id=? AND exchange='BJ'",
+                            ("0" * 64, snapshot_id),
+                        )
+                    elif case == "member":
+                        connection.execute(
+                            "UPDATE formal_universe_member SET code6='999999' WHERE snapshot_id=? AND security_id='BJ430001'",
+                            (snapshot_id,),
+                        )
+                    else:
+                        connection.execute(
+                            "DELETE FROM formal_universe_status WHERE snapshot_id=? AND security_id='BJ430001'",
+                            (snapshot_id,),
+                        )
+                    connection.commit()
+                result = {
+                    "universe_snapshot_id": snapshot_id,
+                    "frozen_input_hash": frozen.frozen_input_hash,
+                    "universe_hash": frozen.universe_hash,
+                    "registry_manifest_hash": frozen.registry_manifest_hash,
+                }
+                with self.assertRaises(ValueError):
+                    store.complete_formal_task(finalizer_id, "worker-finalizer", result)
+                with closing(sqlite3.connect(path)) as connection:
+                    row = connection.execute(
+                        "SELECT status,result_json,lease_worker FROM formal_collection_task WHERE id=?",
+                        (finalizer_id,),
+                    ).fetchone()
+                self.assertEqual(row, ("leased", None, "worker-finalizer"))
+
+    def test_formal_universe_finalizer_getter_rejects_impossible_verified_state(self) -> None:
+        store, frozen, source_task_ids = self.task_backed_frozen_universe(
+            label="finalizer-getter-state"
+        )
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+        generation = "universe-finalizer-getter-generation"
+        ordered_sources = [source_task_ids[e] for e in ("BJ", "SH", "SZ")]
+        finalizer_id = store.enqueue_formal_task(
+            "formal_universe_finalize",
+            "formal-universe-finalize:getter-state",
+            generation,
+            {
+                "as_of_utc": frozen.as_of_utc,
+                "registry_manifest_hash": frozen.registry_manifest_hash,
+                "refresh_generation": generation,
+                "source_task_ids": ordered_sources,
+            },
+            ordered_sources,
+        )
+        store.lease_next_formal_task(
+            ("formal_universe_finalize",), "worker-finalizer", 300
+        )
+        result = {
+            "universe_snapshot_id": snapshot_id,
+            "frozen_input_hash": frozen.frozen_input_hash,
+            "universe_hash": frozen.universe_hash,
+            "registry_manifest_hash": frozen.registry_manifest_hash,
+        }
+        store.complete_formal_task(finalizer_id, "worker-finalizer", result)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET lease_worker='ghost-worker' WHERE id=?",
+                (finalizer_id,),
+            )
+            connection.commit()
+        with self.assertRaises(ValueError):
+            store.get_formal_universe_snapshot_from_task(finalizer_id)
+
+        wrong_kind = store.enqueue_formal_task(
+            "formal_feature_build", "not-a-finalizer", "generation-v1", {}
+        )
+        with self.assertRaises(ValueError):
+            store.get_formal_universe_snapshot_from_task(wrong_kind)
 
 
 if __name__ == "__main__":
