@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import math
 import sqlite3
 import tempfile
@@ -971,6 +972,387 @@ class StateStoreTestCase(unittest.TestCase):
         self.assertNotIn("schema_migration", tables)
         self.assertTrue({"financial_fact", "feature_set", "feature_value"}.isdisjoint(tables))
         self.assertEqual(indexes, {"feature_set_latest_idx": "job"})
+
+    def test_formal_task_contract_exact_replay_and_initial_public_row(self) -> None:
+        self.assertEqual(
+            getattr(state_store_module, "FORMAL_TASK_STATES", None),
+            {
+                "pending",
+                "leased",
+                "verified",
+                "retryable_failed",
+                "terminal_failed",
+                "superseded",
+            },
+        )
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement",
+            "statement-v1",
+            "generation-v1",
+            {"security_id": "SH600001", "labels": ["年报", "审计"]},
+        )
+
+        replayed_id = self.store.enqueue_formal_task(
+            "formal_statement",
+            "statement-v1",
+            "generation-v1",
+            {"labels": ["年报", "审计"], "security_id": "SH600001"},
+        )
+        row = self.store.get_formal_task(task_id)
+
+        self.assertEqual(replayed_id, task_id)
+        self.assertEqual(row["id"], task_id)
+        self.assertEqual(row["kind"], "formal_statement")
+        self.assertEqual(row["idempotency_key"], "statement-v1")
+        self.assertEqual(row["refresh_generation"], "generation-v1")
+        self.assertEqual(
+            row["payload"],
+            {"labels": ["年报", "审计"], "security_id": "SH600001"},
+        )
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["prerequisite_task_ids"], [])
+        for field in (
+            "lease_worker",
+            "lease_expires_at",
+            "next_retry_at",
+            "result",
+            "error",
+        ):
+            self.assertIsNone(row[field])
+        self.assertIsNotNone(row["created_at"])
+        self.assertIsNotNone(row["updated_at"])
+        self.assertEqual(
+            row["payload_sha256"],
+            hashlib.sha256(
+                '{"labels":["年报","审计"],"security_id":"SH600001"}'.encode("utf-8")
+            ).hexdigest(),
+        )
+        self.assertIsNone(self.store.get_formal_task("missing-task"))
+
+    def test_formal_task_replay_ignores_prerequisite_order_and_getter_sorts(self) -> None:
+        first = self.store.enqueue_formal_task(
+            "formal_context", "context-first", "generation-v1", {"slot": 1}
+        )
+        second = self.store.enqueue_formal_task(
+            "formal_context", "context-second", "generation-v1", {"slot": 2}
+        )
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement",
+            "statement-with-deps",
+            "generation-v1",
+            {"security_id": "SH600001"},
+            prerequisite_task_ids=(second, first),
+        )
+
+        replayed_id = self.store.enqueue_formal_task(
+            "formal_statement",
+            "statement-with-deps",
+            "generation-v1",
+            {"security_id": "SH600001"},
+            prerequisite_task_ids=(first, second),
+        )
+
+        self.assertEqual(replayed_id, task_id)
+        self.assertEqual(
+            self.store.get_formal_task(task_id)["prerequisite_task_ids"],
+            sorted((first, second)),
+        )
+
+    def test_formal_task_idempotency_conflicts_roll_back_without_mutation(self) -> None:
+        prerequisite = self.store.enqueue_formal_task(
+            "formal_context", "context-v1", "generation-v1", {"slot": 1}
+        )
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement",
+            "statement-v1",
+            "generation-v1",
+            {"security_id": "SH600001"},
+            prerequisite_task_ids=(prerequisite,),
+        )
+        original = self.store.get_formal_task(task_id)
+        conflicts = (
+            ("other_kind", "generation-v1", {"security_id": "SH600001"}, (prerequisite,)),
+            ("formal_statement", "generation-v2", {"security_id": "SH600001"}, (prerequisite,)),
+            ("formal_statement", "generation-v1", {"security_id": "SZ000002"}, (prerequisite,)),
+            ("formal_statement", "generation-v1", {"security_id": "SH600001"}, ()),
+        )
+
+        for kind, generation, payload, prerequisites in conflicts:
+            with self.subTest(kind=kind, generation=generation, payload=payload, prerequisites=prerequisites):
+                with self.assertRaisesRegex(ValueError, "idempotency_payload_conflict"):
+                    self.store.enqueue_formal_task(
+                        kind,
+                        "statement-v1",
+                        generation,
+                        payload,
+                        prerequisite_task_ids=prerequisites,
+                    )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM formal_collection_task").fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM formal_collection_task_dependency"
+                ).fetchone()[0],
+                1,
+            )
+        self.assertEqual(self.store.get_formal_task(task_id), original)
+
+    def test_formal_task_snapshots_caller_payload_and_rejects_invalid_inputs(self) -> None:
+        payload = {"security_id": "SH600001", "nested": {"period": "2026-06-30"}}
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "snapshot-v1", "generation-v1", payload
+        )
+        payload["security_id"] = "SZ000002"
+        payload["nested"]["period"] = "2099-12-31"
+        self.assertEqual(
+            self.store.get_formal_task(task_id)["payload"],
+            {"nested": {"period": "2026-06-30"}, "security_id": "SH600001"},
+        )
+
+        invalid_identifiers = (
+            ("", "key", "generation"),
+            ("kind", "", "generation"),
+            ("kind", "key", ""),
+            ("   ", "key", "generation"),
+        )
+        for kind, key, generation in invalid_identifiers:
+            with self.subTest(kind=kind, key=key, generation=generation):
+                with self.assertRaises(ValueError):
+                    self.store.enqueue_formal_task(kind, key, generation, {})
+        for payload_value in (
+            [],
+            {"value": math.nan},
+            {"value": math.inf},
+            {"value": -math.inf},
+            {1: "coerced-key"},
+            {"nested": {1: "coerced-key"}},
+        ):
+            with self.subTest(payload=payload_value):
+                with self.assertRaises((TypeError, ValueError)):
+                    self.store.enqueue_formal_task(
+                        "formal_statement", "invalid-payload", "generation-v1", payload_value
+                    )
+
+    def test_formal_task_rejects_missing_duplicate_self_and_cyclic_prerequisites(self) -> None:
+        parent = self.store.enqueue_formal_task(
+            "formal_context", "parent-v1", "generation-v1", {"slot": 1}
+        )
+        with self.assertRaisesRegex(ValueError, "missing prerequisite"):
+            self.store.enqueue_formal_task(
+                "formal_statement",
+                "missing-dependency",
+                "generation-v1",
+                {},
+                prerequisite_task_ids=("missing-task",),
+            )
+        with self.assertRaisesRegex(ValueError, "duplicate prerequisite"):
+            self.store.enqueue_formal_task(
+                "formal_statement",
+                "duplicate-dependency",
+                "generation-v1",
+                {},
+                prerequisite_task_ids=(parent, parent),
+            )
+        with patch.object(state_store_module.uuid, "uuid4", return_value="self-task"):
+            with self.assertRaisesRegex(ValueError, "self"):
+                self.store.enqueue_formal_task(
+                    "formal_statement",
+                    "self-dependency",
+                    "generation-v1",
+                    {},
+                    prerequisite_task_ids=("self-task",),
+                )
+
+        child = self.store.enqueue_formal_task(
+            "formal_context",
+            "child-v1",
+            "generation-v1",
+            {"slot": 2},
+            prerequisite_task_ids=(parent,),
+        )
+        with patch.object(state_store_module.uuid, "uuid4", return_value=parent):
+            with self.assertRaisesRegex(ValueError, "cycle"):
+                self.store.enqueue_formal_task(
+                    "formal_context",
+                    "cycle-v1",
+                    "generation-v1",
+                    {"slot": 3},
+                    prerequisite_task_ids=(child,),
+                )
+
+    def test_get_formal_task_rejects_payload_hash_and_noncanonical_json_tampering(self) -> None:
+        task_id = self.store.enqueue_formal_task(
+            "formal_statement", "tamper-v1", "generation-v1", {"a": 1, "b": 2}
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET payload_sha256 = ? WHERE id = ?",
+                ("0" * 64, task_id),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(ValueError, "payload hash"):
+            self.store.get_formal_task(task_id)
+
+        canonical = '{"a":1,"b":2}'
+        canonical_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET payload_json = ?, payload_sha256 = ? WHERE id = ?",
+                ('{"b":2, "a":1}', canonical_hash, task_id),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(ValueError, "canonical"):
+            self.store.get_formal_task(task_id)
+
+    def test_resolve_formal_task_dependencies_cascades_terminal_and_superseded(self) -> None:
+        terminal_parent = self.store.enqueue_formal_task(
+            "formal_context", "terminal-parent", "generation-v1", {}
+        )
+        child = self.store.enqueue_formal_task(
+            "formal_statement",
+            "terminal-child",
+            "generation-v1",
+            {},
+            prerequisite_task_ids=(terminal_parent,),
+        )
+        grandchild = self.store.enqueue_formal_task(
+            "formal_feature",
+            "terminal-grandchild",
+            "generation-v1",
+            {},
+            prerequisite_task_ids=(child,),
+        )
+        superseded_parent = self.store.enqueue_formal_task(
+            "formal_context", "superseded-parent", "generation-v1", {}
+        )
+        superseded_child = self.store.enqueue_formal_task(
+            "formal_statement",
+            "superseded-child",
+            "generation-v1",
+            {},
+            prerequisite_task_ids=(superseded_parent,),
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET status = 'terminal_failed' WHERE id = ?",
+                (terminal_parent,),
+            )
+            connection.execute(
+                "UPDATE formal_collection_task SET status = 'superseded' WHERE id = ?",
+                (superseded_parent,),
+            )
+            connection.commit()
+
+        self.assertEqual(self.store.resolve_formal_task_dependencies(), 3)
+        self.assertEqual(self.store.get_formal_task(child)["status"], "terminal_failed")
+        self.assertEqual(self.store.get_formal_task(grandchild)["status"], "terminal_failed")
+        superseded_row = self.store.get_formal_task(superseded_child)
+        self.assertEqual(superseded_row["status"], "terminal_failed")
+        self.assertEqual(
+            superseded_row["error"],
+            {
+                "blocking_prerequisite_task_ids": [superseded_parent],
+                "code": "prerequisite_terminal_failed",
+            },
+        )
+        self.assertEqual(self.store.resolve_formal_task_dependencies(), 0)
+
+    def test_resolve_formal_task_dependencies_sorts_blockers_and_clears_retry_state(self) -> None:
+        first = self.store.enqueue_formal_task(
+            "formal_context", "blocking-first", "generation-v1", {}
+        )
+        second = self.store.enqueue_formal_task(
+            "formal_context", "blocking-second", "generation-v1", {}
+        )
+        child = self.store.enqueue_formal_task(
+            "formal_statement",
+            "retryable-child",
+            "generation-v1",
+            {},
+            prerequisite_task_ids=(second, first),
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET status = 'terminal_failed' WHERE id = ?",
+                (first,),
+            )
+            connection.execute(
+                "UPDATE formal_collection_task SET status = 'superseded' WHERE id = ?",
+                (second,),
+            )
+            connection.execute(
+                """UPDATE formal_collection_task
+                SET status = 'retryable_failed', next_retry_at = ?,
+                    result_json = ?, error_json = ? WHERE id = ?""",
+                (utc_at(20), '{"stale":true}', '{"code":"retry"}', child),
+            )
+            connection.commit()
+
+        self.assertEqual(self.store.resolve_formal_task_dependencies(), 1)
+        row = self.store.get_formal_task(child)
+        self.assertEqual(row["status"], "terminal_failed")
+        self.assertEqual(
+            row["error"],
+            {
+                "blocking_prerequisite_task_ids": sorted((first, second)),
+                "code": "prerequisite_terminal_failed",
+            },
+        )
+        self.assertIsNone(row["result"])
+        self.assertIsNone(row["next_retry_at"])
+        self.assertIsNone(row["lease_worker"])
+        self.assertIsNone(row["lease_expires_at"])
+
+    def test_resolve_formal_task_dependencies_does_not_rewrite_leased_child(self) -> None:
+        parent = self.store.enqueue_formal_task(
+            "formal_context", "leased-parent", "generation-v1", {}
+        )
+        child = self.store.enqueue_formal_task(
+            "formal_statement",
+            "leased-child",
+            "generation-v1",
+            {},
+            prerequisite_task_ids=(parent,),
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_collection_task SET status = 'terminal_failed' WHERE id = ?",
+                (parent,),
+            )
+            connection.execute(
+                """UPDATE formal_collection_task SET status = 'leased', lease_worker = ?,
+                lease_expires_at = ?, error_json = ? WHERE id = ?""",
+                ("worker-a", utc_at(30), '{"code":"keep"}', child),
+            )
+            before = connection.execute(
+                "SELECT * FROM formal_collection_task WHERE id = ?", (child,)
+            ).fetchone()
+            connection.commit()
+
+        self.assertEqual(self.store.resolve_formal_task_dependencies(), 0)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            after = connection.execute(
+                "SELECT * FROM formal_collection_task WHERE id = ?", (child,)
+            ).fetchone()
+        self.assertEqual(after, before)
+
+    def test_formal_task_operations_leave_legacy_queue_contract_untouched(self) -> None:
+        legacy_id = self.store.enqueue_job("legacy", "legacy-v1", {"value": 1})
+        formal_id = self.store.enqueue_formal_task(
+            "formal_context", "formal-v1", "generation-v1", {"value": 2}
+        )
+
+        self.assertEqual(self.store.get_job(legacy_id)["status"], "pending")
+        self.assertEqual(self.store.get_job(legacy_id)["payload"], {"value": 1})
+        self.assertEqual(self.store.get_formal_task(formal_id)["status"], "pending")
+        self.assertEqual(
+            state_store_module.JOB_STATES,
+            {"pending", "running", "succeeded", "retryable_failed", "terminal_failed"},
+        )
 
     def test_v3_foreign_keys_reject_missing_snapshot_and_feature_set(self) -> None:
         with closing(sqlite3.connect(self.db_path)) as connection:

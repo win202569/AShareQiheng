@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -40,6 +42,14 @@ from ashare_pipeline.financial_schema import (
 
 
 JOB_STATES = {"pending", "running", "succeeded", "retryable_failed", "terminal_failed"}
+FORMAL_TASK_STATES = {
+    "pending",
+    "leased",
+    "verified",
+    "retryable_failed",
+    "terminal_failed",
+    "superseded",
+}
 SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
 SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
 RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
@@ -444,6 +454,55 @@ def _json(value: object) -> str:
         sort_keys=True,
         allow_nan=False,
     )
+
+
+def _validate_json_object_keys(value: object) -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise ValueError("JSON object keys must be strings")
+            _validate_json_object_keys(nested)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            _validate_json_object_keys(nested)
+
+
+def _canonical_mapping_json(value: Mapping[str, object], field: str) -> str:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field} must be a mapping")
+    try:
+        snapshot = copy.deepcopy(dict(value))
+        _validate_json_object_keys(snapshot)
+        return _json(snapshot)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field} must be a finite JSON mapping") from error
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _decode_canonical_mapping_json(value: str, field: str) -> dict[str, object]:
+    try:
+        decoded = json.loads(
+            value,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"nonfinite JSON value: {constant}")
+            ),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"stored formal task {field} JSON is invalid") from error
+    if not isinstance(decoded, dict):
+        raise ValueError(f"stored formal task {field} JSON is not a mapping")
+    if _json(decoded) != value:
+        raise ValueError(f"stored formal task {field} JSON is not canonical")
+    return decoded
 
 
 def _reconciliation_sha256(value: object, field: str) -> str:
@@ -1342,6 +1401,193 @@ class StateStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError("run does not exist or is already finished")
+
+    def enqueue_formal_task(
+        self,
+        kind: str,
+        idempotency_key: str,
+        refresh_generation: str,
+        payload: Mapping[str, object],
+        prerequisite_task_ids: Iterable[str] = (),
+    ) -> str:
+        for value, field in (
+            (kind, "kind"),
+            (idempotency_key, "idempotency_key"),
+            (refresh_generation, "refresh_generation"),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field} must be a nonempty string")
+        payload_json = _canonical_mapping_json(payload, "payload")
+        payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        if isinstance(prerequisite_task_ids, (str, bytes)):
+            raise ValueError("prerequisite task IDs must be an iterable of strings")
+        try:
+            requested_prerequisites = tuple(prerequisite_task_ids)
+        except TypeError as error:
+            raise ValueError("prerequisite task IDs must be iterable") from error
+        for prerequisite_id in requested_prerequisites:
+            if not isinstance(prerequisite_id, str) or not prerequisite_id.strip():
+                raise ValueError("prerequisite task IDs must be nonempty strings")
+        if len(set(requested_prerequisites)) != len(requested_prerequisites):
+            raise ValueError("duplicate prerequisite task ID")
+        prerequisites = tuple(sorted(requested_prerequisites))
+        task_id = str(uuid.uuid4())
+        now = _utc_now()
+
+        with self._transaction(immediate=True) as connection:
+            existing = connection.execute(
+                """SELECT id,kind,refresh_generation,payload_json,payload_sha256
+                FROM formal_collection_task WHERE idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                existing_prerequisites = tuple(
+                    row["prerequisite_task_id"]
+                    for row in connection.execute(
+                        """SELECT prerequisite_task_id
+                        FROM formal_collection_task_dependency
+                        WHERE task_id = ? ORDER BY prerequisite_task_id""",
+                        (existing["id"],),
+                    )
+                )
+                if (
+                    existing["kind"] != kind
+                    or existing["refresh_generation"] != refresh_generation
+                    or existing["payload_json"] != payload_json
+                    or existing["payload_sha256"] != payload_sha256
+                    or existing_prerequisites != prerequisites
+                ):
+                    raise ValueError("idempotency_payload_conflict")
+                return str(existing["id"])
+
+            if task_id in prerequisites:
+                raise ValueError("formal task cannot depend on itself")
+            if prerequisites:
+                marks = ",".join("?" for _ in prerequisites)
+                found = {
+                    str(row["id"])
+                    for row in connection.execute(
+                        f"SELECT id FROM formal_collection_task WHERE id IN ({marks})",
+                        prerequisites,
+                    )
+                }
+                missing = sorted(set(prerequisites) - found)
+                if missing:
+                    raise ValueError(f"missing prerequisite task IDs: {missing}")
+                for prerequisite_id in prerequisites:
+                    cycle = connection.execute(
+                        """WITH RECURSIVE prerequisite_chain(id) AS (
+                            SELECT ?
+                            UNION
+                            SELECT dependency.prerequisite_task_id
+                            FROM formal_collection_task_dependency AS dependency
+                            JOIN prerequisite_chain
+                              ON dependency.task_id = prerequisite_chain.id
+                        )
+                        SELECT 1 FROM prerequisite_chain WHERE id = ? LIMIT 1""",
+                        (prerequisite_id, task_id),
+                    ).fetchone()
+                    if cycle is not None:
+                        raise ValueError("formal task dependency cycle")
+
+            connection.execute(
+                """INSERT INTO formal_collection_task
+                (id,kind,idempotency_key,refresh_generation,payload_json,payload_sha256,
+                 status,lease_worker,lease_expires_at,next_retry_at,result_json,error_json,
+                 created_at,updated_at)
+                VALUES (?,?,?,?,?,?,'pending',NULL,NULL,NULL,NULL,NULL,?,?)""",
+                (
+                    task_id,
+                    kind,
+                    idempotency_key,
+                    refresh_generation,
+                    payload_json,
+                    payload_sha256,
+                    now,
+                    now,
+                ),
+            )
+            for prerequisite_id in prerequisites:
+                connection.execute(
+                    """INSERT INTO formal_collection_task_dependency
+                    (task_id,prerequisite_task_id,created_at) VALUES (?,?,?)""",
+                    (task_id, prerequisite_id, now),
+                )
+        return task_id
+
+    def get_formal_task(self, task_id: str) -> dict[str, object] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            prerequisites = [
+                str(item["prerequisite_task_id"])
+                for item in connection.execute(
+                    """SELECT prerequisite_task_id
+                    FROM formal_collection_task_dependency
+                    WHERE task_id = ? ORDER BY prerequisite_task_id""",
+                    (task_id,),
+                )
+            ]
+            return self._formal_task_public(row, prerequisites)
+
+    def resolve_formal_task_dependencies(self) -> int:
+        changed = 0
+        with self._transaction(immediate=True) as connection:
+            while True:
+                candidates = connection.execute(
+                    """SELECT task.id
+                    FROM formal_collection_task AS task
+                    WHERE task.status IN ('pending','retryable_failed')
+                      AND EXISTS (
+                        SELECT 1
+                        FROM formal_collection_task_dependency AS dependency
+                        JOIN formal_collection_task AS prerequisite
+                          ON prerequisite.id = dependency.prerequisite_task_id
+                        WHERE dependency.task_id = task.id
+                          AND prerequisite.status IN ('terminal_failed','superseded')
+                      )
+                    ORDER BY task.id"""
+                ).fetchall()
+                if not candidates:
+                    break
+                iteration_changed = 0
+                for candidate in candidates:
+                    task_id = str(candidate["id"])
+                    blockers = [
+                        str(row["prerequisite_task_id"])
+                        for row in connection.execute(
+                            """SELECT dependency.prerequisite_task_id
+                            FROM formal_collection_task_dependency AS dependency
+                            JOIN formal_collection_task AS prerequisite
+                              ON prerequisite.id = dependency.prerequisite_task_id
+                            WHERE dependency.task_id = ?
+                              AND prerequisite.status IN ('terminal_failed','superseded')
+                            ORDER BY dependency.prerequisite_task_id""",
+                            (task_id,),
+                        )
+                    ]
+                    error_json = _json(
+                        {
+                            "blocking_prerequisite_task_ids": blockers,
+                            "code": "prerequisite_terminal_failed",
+                        }
+                    )
+                    cursor = connection.execute(
+                        """UPDATE formal_collection_task
+                        SET status = 'terminal_failed', lease_worker = NULL,
+                            lease_expires_at = NULL, next_retry_at = NULL,
+                            result_json = NULL, error_json = ?, updated_at = ?
+                        WHERE id = ? AND status IN ('pending','retryable_failed')""",
+                        (error_json, _utc_now(), task_id),
+                    )
+                    iteration_changed += cursor.rowcount
+                if iteration_changed == 0:
+                    break
+                changed += iteration_changed
+        return changed
 
     def enqueue_job(self, kind: str, idempotency_key: str, payload: dict) -> str:
         job_id = str(uuid.uuid4())
@@ -2597,6 +2843,35 @@ class StateStore:
         ):
             result[public_name] = json.loads(result.pop(stored_name))
         return result
+
+    @staticmethod
+    def _formal_task_public(
+        row: sqlite3.Row, prerequisite_task_ids: Sequence[str]
+    ) -> dict[str, object]:
+        payload_json = str(row["payload_json"])
+        payload = _decode_canonical_mapping_json(payload_json, "payload")
+        payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        if row["payload_sha256"] != payload_sha256:
+            raise ValueError("stored formal task payload hash mismatch")
+        result_json = row["result_json"]
+        error_json = row["error_json"]
+        public = dict(row)
+        public.pop("payload_json")
+        public.pop("result_json")
+        public.pop("error_json")
+        public["payload"] = payload
+        public["result"] = (
+            _decode_canonical_mapping_json(str(result_json), "result")
+            if result_json is not None
+            else None
+        )
+        public["error"] = (
+            _decode_canonical_mapping_json(str(error_json), "error")
+            if error_json is not None
+            else None
+        )
+        public["prerequisite_task_ids"] = sorted(prerequisite_task_ids)
+        return public
 
     @staticmethod
     def _job_public(row: sqlite3.Row) -> dict:
