@@ -17,6 +17,7 @@ import re
 from types import MappingProxyType
 from typing import Literal, Protocol
 import uuid
+import weakref
 
 from .formal_evidence import (
     EvidenceVerification,
@@ -58,7 +59,6 @@ _CONFIG_KEYS = frozenset(
     }
 )
 _SELECTOR_KEYS = frozenset({"context_kind", "scope_key", "exchange", "as_of_rule"})
-_REGISTRY_CONSTRUCTION_TOKEN = object()
 
 
 class FormalSourceError(RuntimeError):
@@ -511,110 +511,223 @@ def _selector_from_wire(value: object) -> CalendarSelector | None:
     )
 
 
-@dataclass(frozen=True, init=False)
-class SignedSourceRegistry:
-    """A canonical, verifier-approved source registry with no default configs."""
+def _make_signed_source_registry_type() -> type[object]:
+    """Build the trusted registry type with its construction state in a closure.
 
-    canonical_json: bytes
-    registry_hash: str
-    signature: str
-    key_id: str
-    configs: tuple[SourceAdapterConfig, ...]
+    A source registry is an executable authorization boundary: merely copying
+    its public dataclass fields must not make an object trusted.  The weak
+    identity map below is deliberately unreachable as a module attribute and
+    additionally seals every public field that an adapter may consume.
+    """
 
-    def __init__(
-        self,
-        canonical_json: bytes,
-        registry_hash: str,
-        signature: str,
-        key_id: str,
-        configs: tuple[SourceAdapterConfig, ...],
-        *,
-        _verified_token: object | None = None,
-    ) -> None:
-        if _verified_token is not _REGISTRY_CONSTRUCTION_TOKEN:
-            raise ValueError("SignedSourceRegistry must be loaded with from_signed_bytes")
-        object.__setattr__(self, "canonical_json", canonical_json)
-        object.__setattr__(self, "registry_hash", registry_hash)
-        object.__setattr__(self, "signature", signature)
-        object.__setattr__(self, "key_id", key_id)
-        object.__setattr__(self, "configs", configs)
+    registry_fields = (
+        "canonical_json",
+        "registry_hash",
+        "signature",
+        "key_id",
+    )
+    config_fields = (
+        "source",
+        "dataset",
+        "endpoint_url",
+        "http_method",
+        "parser_id",
+        "parser_version",
+        "mapping_version",
+        "request_template",
+        "timeout_seconds",
+        "retry_base_seconds",
+        "retry_max_attempts",
+        "challenge_cooldown_seconds",
+        "registry_hash",
+        "exchange_scope",
+        "calendar_selector",
+        "bootstrap_calendar",
+    )
 
-    @classmethod
-    def from_signed_bytes(
-        cls,
-        registry_bytes: bytes,
-        signature: str,
-        key_id: str,
-        verifier: RegistrySignatureVerifier,
-    ) -> "SignedSourceRegistry":
-        signature_text, key_text = _verify_signature(
-            registry_bytes, signature, key_id, verifier, label="source registry"
-        )
-        wire = _load_canonical_object(registry_bytes, label="source registry")
-        if set(wire) != {"configs", "registry_role", "schema_version"}:
-            raise ValueError("source registry has unknown or missing keys")
-        if wire["registry_role"] != "source":
-            raise ValueError("source registry role must be source")
-        if wire["schema_version"] != "formal-source-registry-v1":
-            raise ValueError("source registry schema_version is invalid")
-        if type(wire["configs"]) is not list:
-            raise ValueError("source registry configs must be a list")
-        registry_hash = hashlib.sha256(registry_bytes).hexdigest()
-        configs: list[SourceAdapterConfig] = []
-        identities: set[tuple[str, str, str | None]] = set()
-        for item in wire["configs"]:
-            if type(item) is not dict or set(item) != _CONFIG_KEYS:
-                raise ValueError("source registry config has unknown or missing keys")
-            config = SourceAdapterConfig(
-                source=item["source"],
-                dataset=item["dataset"],
-                endpoint_url=item["endpoint_url"],
-                http_method=item["http_method"],
-                parser_id=item["parser_id"],
-                parser_version=item["parser_version"],
-                mapping_version=item["mapping_version"],
-                request_template=item["request_template"],
-                timeout_seconds=item["timeout_seconds"],
-                retry_base_seconds=item["retry_base_seconds"],
-                retry_max_attempts=item["retry_max_attempts"],
-                challenge_cooldown_seconds=item["challenge_cooldown_seconds"],
-                registry_hash=registry_hash,
-                exchange_scope=item["exchange_scope"],
-                calendar_selector=_selector_from_wire(item["calendar_selector"]),
-                bootstrap_calendar=item["bootstrap_calendar"],
+    @dataclass(frozen=True)
+    class _RegistryRecord:
+        reference: weakref.ReferenceType[object]
+        registry_fingerprint: tuple[object, ...]
+        configs: tuple[SourceAdapterConfig, ...]
+        configs_fingerprint: tuple[object, ...]
+
+    verified_registries: dict[int, _RegistryRecord] = {}
+
+    def value_fingerprint(value: object) -> object:
+        """Preserve type, order, and nesting so mutation is never normalized away."""
+
+        if type(value) is CalendarSelector:
+            return (
+                "CalendarSelector",
+                value.context_kind,
+                value.scope_key,
+                value.exchange,
+                value.as_of_rule,
             )
-            identity = (config.source, config.dataset, config.exchange_scope)
-            if identity in identities:
-                raise ValueError("source registry has duplicate config identity")
-            identities.add(identity)
-            configs.append(config)
-        return cls(
-            registry_bytes,
-            registry_hash,
-            signature_text,
-            key_text,
-            tuple(configs),
-            _verified_token=_REGISTRY_CONSTRUCTION_TOKEN,
+        if isinstance(value, Mapping):
+            return (
+                "Mapping",
+                type(value).__module__,
+                type(value).__qualname__,
+                tuple(
+                    (value_fingerprint(key), value_fingerprint(item))
+                    for key, item in value.items()
+                ),
+            )
+        if type(value) is tuple or type(value) is list:
+            return (type(value).__name__, tuple(value_fingerprint(item) for item in value))
+        if type(value) in {str, int, float, bool, bytes, type(None)}:
+            return (type(value).__name__, value)
+        return ("unexpected", type(value).__module__, type(value).__qualname__, id(value))
+
+    def config_fingerprint(config: object) -> tuple[object, ...]:
+        if type(config) is not SourceAdapterConfig:
+            return ("invalid-config", type(config).__module__, type(config).__qualname__)
+        return tuple(
+            (field, value_fingerprint(getattr(config, field, object()))) for field in config_fields
         )
 
-    def select(self, request: OfficialRequest) -> SourceAdapterConfig:
-        _, exchange = _validate_request(request)
-        matching = [
-            config
-            for config in self.configs
-            if config.source == request.source and config.dataset == request.dataset
-        ]
-        if exchange is None:
-            matching = [config for config in matching if config.exchange_scope is None]
-        else:
+    def registry_fingerprint(registry: object) -> tuple[object, ...]:
+        return tuple(
+            (field, value_fingerprint(getattr(registry, field, object()))) for field in registry_fields
+        )
+
+    def configs_fingerprint(configs: object) -> tuple[object, ...]:
+        if type(configs) is not tuple:
+            return ("invalid-configs", type(configs).__module__, type(configs).__qualname__)
+        return tuple(config_fingerprint(config) for config in configs)
+
+    def remember_verified(registry: object) -> None:
+        identity = id(registry)
+
+        def discard(reference: weakref.ReferenceType[object], *, identity: int = identity) -> None:
+            record = verified_registries.get(identity)
+            if record is not None and record.reference is reference:
+                verified_registries.pop(identity, None)
+
+        reference = weakref.ref(registry, discard)
+        configs = getattr(registry, "configs")
+        assert type(configs) is tuple
+        verified_registries[identity] = _RegistryRecord(
+            reference,
+            registry_fingerprint(registry),
+            configs,
+            configs_fingerprint(configs),
+        )
+
+    def is_verified(registry: object) -> bool:
+        record = verified_registries.get(id(registry))
+        return (
+            record is not None
+            and record.reference() is registry
+            and getattr(registry, "configs", None) is record.configs
+            and registry_fingerprint(registry) == record.registry_fingerprint
+            and configs_fingerprint(getattr(registry, "configs", None)) == record.configs_fingerprint
+        )
+
+    @dataclass(frozen=True, init=False)
+    class SignedSourceRegistry:
+        """A canonical, verifier-approved source registry with no default configs."""
+
+        canonical_json: bytes
+        registry_hash: str
+        signature: str
+        key_id: str
+        configs: tuple[SourceAdapterConfig, ...]
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise ValueError("SignedSourceRegistry must be loaded with from_signed_bytes")
+
+        def _require_verified(self) -> None:
+            if not is_verified(self):
+                raise ValueError("signed source registry was not verified by from_signed_bytes")
+
+        @classmethod
+        def from_signed_bytes(
+            cls,
+            registry_bytes: bytes,
+            signature: str,
+            key_id: str,
+            verifier: RegistrySignatureVerifier,
+        ) -> "SignedSourceRegistry":
+            if cls is not SignedSourceRegistry:
+                raise ValueError("SignedSourceRegistry must have exact type")
+            signature_text, key_text = _verify_signature(
+                registry_bytes, signature, key_id, verifier, label="source registry"
+            )
+            wire = _load_canonical_object(registry_bytes, label="source registry")
+            if set(wire) != {"configs", "registry_role", "schema_version"}:
+                raise ValueError("source registry has unknown or missing keys")
+            if wire["registry_role"] != "source":
+                raise ValueError("source registry role must be source")
+            if wire["schema_version"] != "formal-source-registry-v1":
+                raise ValueError("source registry schema_version is invalid")
+            if type(wire["configs"]) is not list:
+                raise ValueError("source registry configs must be a list")
+            registry_hash = hashlib.sha256(registry_bytes).hexdigest()
+            configs: list[SourceAdapterConfig] = []
+            identities: set[tuple[str, str, str | None]] = set()
+            for item in wire["configs"]:
+                if type(item) is not dict or set(item) != _CONFIG_KEYS:
+                    raise ValueError("source registry config has unknown or missing keys")
+                config = SourceAdapterConfig(
+                    source=item["source"],
+                    dataset=item["dataset"],
+                    endpoint_url=item["endpoint_url"],
+                    http_method=item["http_method"],
+                    parser_id=item["parser_id"],
+                    parser_version=item["parser_version"],
+                    mapping_version=item["mapping_version"],
+                    request_template=item["request_template"],
+                    timeout_seconds=item["timeout_seconds"],
+                    retry_base_seconds=item["retry_base_seconds"],
+                    retry_max_attempts=item["retry_max_attempts"],
+                    challenge_cooldown_seconds=item["challenge_cooldown_seconds"],
+                    registry_hash=registry_hash,
+                    exchange_scope=item["exchange_scope"],
+                    calendar_selector=_selector_from_wire(item["calendar_selector"]),
+                    bootstrap_calendar=item["bootstrap_calendar"],
+                )
+                identity = (config.source, config.dataset, config.exchange_scope)
+                if identity in identities:
+                    raise ValueError("source registry has duplicate config identity")
+                identities.add(identity)
+                configs.append(config)
+            registry = object.__new__(SignedSourceRegistry)
+            object.__setattr__(registry, "canonical_json", registry_bytes)
+            object.__setattr__(registry, "registry_hash", registry_hash)
+            object.__setattr__(registry, "signature", signature_text)
+            object.__setattr__(registry, "key_id", key_text)
+            object.__setattr__(registry, "configs", tuple(configs))
+            remember_verified(registry)
+            return registry
+
+        def select(self, request: OfficialRequest) -> SourceAdapterConfig:
+            SignedSourceRegistry._require_verified(self)
+            _, exchange = _validate_request(request)
             matching = [
                 config
-                for config in matching
-                if config.exchange_scope is None or config.exchange_scope == exchange
+                for config in self.configs
+                if config.source == request.source and config.dataset == request.dataset
             ]
-        if len(matching) != 1:
-            raise FormalTerminalSourceError("signed source config is absent or ambiguous")
-        return matching[0]
+            if exchange is None:
+                matching = [config for config in matching if config.exchange_scope is None]
+            else:
+                matching = [
+                    config
+                    for config in matching
+                    if config.exchange_scope is None or config.exchange_scope == exchange
+                ]
+            if len(matching) != 1:
+                raise FormalTerminalSourceError("signed source config is absent or ambiguous")
+            return matching[0]
+
+    return SignedSourceRegistry
+
+
+SignedSourceRegistry = _make_signed_source_registry_type()
+del _make_signed_source_registry_type
 
 
 def _validate_request(request: object) -> tuple[OfficialRequest, str | None]:
@@ -744,6 +857,7 @@ class FormalOfficialSourceAdapter:
     ) -> None:
         if type(registry) is not SignedSourceRegistry:
             raise ValueError("registry must have exact type SignedSourceRegistry")
+        SignedSourceRegistry._require_verified(registry)
         if not callable(getattr(transport, "send", None)):
             raise ValueError("transport must implement send")
         if not isinstance(policies, Mapping) or not isinstance(parsers, Mapping):
@@ -766,6 +880,12 @@ class FormalOfficialSourceAdapter:
         for config in registry.configs:
             self._registered_policy(config)
             self._registered_parser(config)
+
+    def _require_registry_provenance(self) -> None:
+        try:
+            SignedSourceRegistry._require_verified(self.registry)
+        except ValueError as error:
+            raise FormalTerminalSourceError("signed source registry is not verified") from error
 
     def _registered_policy(self, config: SourceAdapterConfig) -> SourcePolicy:
         policy = self._policies.get(config.source)
@@ -835,12 +955,14 @@ class FormalOfficialSourceAdapter:
         refresh_generation: str,
         calendar_binding: VerifiedCalendarBinding | None,
     ) -> tuple[OfficialRequest, SourceAdapterConfig, SourcePolicy, OfficialDocumentParser, str | None, VerifiedCalendarBinding | None, TransportRequest]:
+        self._require_registry_provenance()
         request, resolved_exchange = _validate_request(request)
         try:
             _require_trimmed_text(refresh_generation, "refresh_generation")
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
-        config = self.registry.select(request)
+        config = SignedSourceRegistry.select(self.registry, request)
+        self._require_registry_provenance()
         if config.bootstrap_calendar and (
             request.exchange is not None or request.security_id is not None
         ):

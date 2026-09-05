@@ -3,6 +3,7 @@ import json
 import unittest
 from dataclasses import replace
 
+import ashare_pipeline.formal_sources as formal_sources_module
 from ashare_pipeline.formal_evidence import (
     OfficialRequest,
     OfficialSnapshotRef,
@@ -234,6 +235,69 @@ class FormalSourceTests(unittest.TestCase):
     def test_signed_registry_cannot_be_constructed_without_its_signature_loader(self):
         with self.assertRaisesRegex(ValueError, "from_signed_bytes"):
             SignedSourceRegistry(b"{}", "0" * 64, "signature", "fixture-key", ())
+
+    def test_registry_provenance_blocks_forgery_and_config_mutation_before_network(self):
+        for name in ("_REGISTRY_CONSTRUCTION_TOKEN", "_make_signed_source_registry_type"):
+            with self.subTest(module_capability=name):
+                self.assertFalse(hasattr(formal_sources_module, name))
+        document = timestamp_document()
+        registry = SignedSourceRegistry.from_signed_bytes(
+            registry_bytes([config()]), "fixture-signature", "fixture-key", AcceptingVerifier()
+        )
+        forged = object.__new__(SignedSourceRegistry)
+        for field in ("canonical_json", "registry_hash", "signature", "key_id", "configs"):
+            object.__setattr__(forged, field, getattr(registry, field))
+        object.__setattr__(forged, "_require_verified", lambda: None)
+        object.__setattr__(forged, "select", lambda _request: registry.configs[0])
+        forged_transport = FakeTransport(response())
+        forged_parser = FixtureParser(document)
+        with self.assertRaisesRegex(ValueError, "verified"):
+            FormalOfficialSourceAdapter(
+                transport=forged_transport,
+                registry=forged,
+                policies={"cninfo": SourcePolicy.cninfo()},
+                parsers={"fixture-parser": forged_parser},
+                effective_time_resolver=FixtureResolver(),
+                source_registry_hash=registry.registry_hash,
+                registry_manifest_hash="f" * 64,
+            )
+        self.assertEqual(forged_transport.requests, [])
+        self.assertEqual(forged_parser.calls, [])
+
+        request = OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31")
+        mutations = (
+            ("endpoint_url", "https://www.cninfo.com.cn/fixture/mutated.json"),
+            (
+                "request_template",
+                {"query": {"fixed": "yes"}, "headers": {"accept": "application/json"}, "body": None},
+            ),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                signed = SignedSourceRegistry.from_signed_bytes(
+                    registry_bytes([config()]),
+                    "fixture-signature",
+                    "fixture-key",
+                    AcceptingVerifier(),
+                )
+                transport = FakeTransport(response())
+                parser = FixtureParser(document)
+                adapter = FormalOfficialSourceAdapter(
+                    transport=transport,
+                    registry=signed,
+                    policies={"cninfo": SourcePolicy.cninfo()},
+                    parsers={"fixture-parser": parser},
+                    effective_time_resolver=FixtureResolver(),
+                    source_registry_hash=signed.registry_hash,
+                    registry_manifest_hash="f" * 64,
+                )
+                object.__setattr__(signed.configs[0], field, value)
+                with self.assertRaisesRegex(FormalTerminalSourceError, "registry.*verified"):
+                    adapter.fetch_verified(
+                        request, refresh_generation="generation", calendar_binding=None
+                    )
+                self.assertEqual(transport.requests, [])
+                self.assertEqual(parser.calls, [])
 
     def test_adapter_requires_the_loaded_root_source_registry_hash(self):
         registry = SignedSourceRegistry.from_signed_bytes(

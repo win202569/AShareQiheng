@@ -33,96 +33,6 @@ _ROLE_FIELDS = {
     "event": "event_registry_hash",
 }
 _ROOT_KEYS = frozenset({"schema_version", "purpose", "approval_id", *_ROLE_FIELDS.values()})
-_MANIFEST_FINGERPRINT_FIELDS = (
-    "manifest_hash",
-    "purpose",
-    "approval_id",
-    "canonical_json",
-    "signature",
-    "key_id",
-    "source_registry_hash",
-    "mapping_registry_hash",
-    "feature_registry_hash",
-    "scoring_registry_hash",
-    "industry_registry_hash",
-    "cyclic_registry_hash",
-    "redline_registry_hash",
-    "status_registry_hash",
-    "event_registry_hash",
-)
-_BLOB_FINGERPRINT_FIELDS = (
-    "registry_role",
-    "registry_hash",
-    "canonical_json",
-    "signature",
-    "key_id",
-    "approval_id",
-    "declared_registry_manifest_hash",
-    "binding_signature",
-    "binding_key_id",
-)
-
-
-@dataclass(frozen=True)
-class _VerifiedManifestRecord:
-    reference: weakref.ReferenceType[object]
-    fingerprint: tuple[tuple[type[object], object], ...]
-
-
-@dataclass(frozen=True)
-class _VerifiedBundleRecord:
-    reference: weakref.ReferenceType[object]
-    manifest: object
-    manifest_fingerprint: tuple[tuple[type[object], object], ...]
-    blobs: object
-    blobs_fingerprint: tuple[tuple[object, ...], ...]
-
-
-_VERIFIED_MANIFESTS: dict[int, _VerifiedManifestRecord] = {}
-_VERIFIED_BUNDLES: dict[int, _VerifiedBundleRecord] = {}
-
-
-def _fingerprint_fields(
-    value: object, field_names: tuple[str, ...]
-) -> tuple[tuple[type[object], object], ...] | None:
-    fields: list[tuple[type[object], object]] = []
-    try:
-        for name in field_names:
-            item = getattr(value, name)
-            fields.append((type(item), item))
-    except AttributeError:
-        return None
-    return tuple(fields)
-
-
-def _manifest_fingerprint(
-    manifest: object,
-) -> tuple[tuple[type[object], object], ...] | None:
-    return _fingerprint_fields(manifest, _MANIFEST_FINGERPRINT_FIELDS)
-
-
-def _remember_verified_manifest(manifest: object) -> None:
-    fingerprint = _manifest_fingerprint(manifest)
-    if fingerprint is None:
-        raise RuntimeError("verified registry manifest fields are incomplete")
-    identity = id(manifest)
-
-    def forget(reference: weakref.ReferenceType[object]) -> None:
-        record = _VERIFIED_MANIFESTS.get(identity)
-        if record is not None and record.reference is reference:
-            _VERIFIED_MANIFESTS.pop(identity, None)
-
-    reference = weakref.ref(manifest, forget)
-    _VERIFIED_MANIFESTS[identity] = _VerifiedManifestRecord(reference, fingerprint)
-
-
-def _has_verified_manifest(manifest: object) -> bool:
-    record = _VERIFIED_MANIFESTS.get(id(manifest))
-    return (
-        record is not None
-        and record.reference() is manifest
-        and _manifest_fingerprint(manifest) == record.fingerprint
-    )
 
 
 class _DuplicateJsonKey(ValueError):
@@ -212,128 +122,15 @@ def _verify_signature(
     return signature_text, key_text
 
 
-@dataclass(frozen=True, init=False)
-class FormalRegistryManifest:
-    manifest_hash: str
-    purpose: Literal["test", "official"]
-    approval_id: str | None
-    canonical_json: bytes
-    signature: str
-    key_id: str
-    source_registry_hash: str
-    mapping_registry_hash: str
-    feature_registry_hash: str
-    scoring_registry_hash: str
-    industry_registry_hash: str
-    cyclic_registry_hash: str
-    redline_registry_hash: str
-    status_registry_hash: str
-    event_registry_hash: str
-
-    def __init__(self, *_args: object, **_kwargs: object) -> None:
-        raise ValueError("FormalRegistryManifest must be loaded with from_signed_bytes")
-
-    def _require_verified(self) -> None:
-        if not _has_verified_manifest(self):
-            raise ValueError("registry manifest was not verified by from_signed_bytes")
-
-    def require_official(self) -> None:
-        self._require_verified()
-        if self.purpose != "official" or self.approval_id is None:
-            raise ValueError("official registry manifest approval is required")
-        _require_trimmed_text(self.approval_id, "official approval_id")
-
-    def assert_member_hashes(self, **hashes: str) -> None:
-        self._require_verified()
-        expected_names = set(_ROLE_FIELDS.values())
-        if set(hashes) != expected_names:
-            raise ValueError("registry manifest member hashes must name exactly every role field")
-        for field, expected in hashes.items():
-            _require_hash(expected, field)
-            if getattr(self, field) != expected:
-                raise ValueError(f"registry manifest member hash mismatch for {field}")
-
-    @classmethod
-    def from_signed_bytes(
-        cls,
-        canonical_json: bytes,
-        signature: str,
-        key_id: str,
-        verifier: RegistrySignatureVerifier,
-    ) -> "FormalRegistryManifest":
-        signature_text, key_text = _verify_signature(
-            canonical_json, signature, key_id, verifier, label="registry manifest"
-        )
-        wire = _load_canonical_object(canonical_json, label="registry manifest")
-        if set(wire) != _ROOT_KEYS:
-            raise ValueError("registry manifest has unknown or missing keys")
-        if wire["schema_version"] != "formal-registry-manifest-v1":
-            raise ValueError("registry manifest schema_version is invalid")
-        purpose = wire["purpose"]
-        if purpose not in {"test", "official"}:
-            raise ValueError("registry manifest purpose is invalid")
-        approval_id = wire["approval_id"]
-        if purpose == "official":
-            _require_trimmed_text(approval_id, "official approval_id")
-        elif approval_id is not None:
-            raise ValueError("test registry manifest approval_id must be null")
-        fields = {field: _require_hash(wire[field], field) for field in _ROLE_FIELDS.values()}
-        if len(set(fields.values())) != len(_ROLE_FIELDS):
-            raise ValueError("registry manifest member hashes must be unique")
-        return _construct_verified_manifest(
-            manifest_hash=hashlib.sha256(canonical_json).hexdigest(),
-            purpose=purpose,
-            approval_id=approval_id,
-            canonical_json=canonical_json,
-            signature=signature_text,
-            key_id=key_text,
-            **fields,
-        )
-
-
-def _construct_verified_manifest(
-    *,
-    manifest_hash: str,
-    purpose: Literal["test", "official"],
-    approval_id: str | None,
-    canonical_json: bytes,
-    signature: str,
-    key_id: str,
-    source_registry_hash: str,
-    mapping_registry_hash: str,
-    feature_registry_hash: str,
-    scoring_registry_hash: str,
-    industry_registry_hash: str,
-    cyclic_registry_hash: str,
-    redline_registry_hash: str,
-    status_registry_hash: str,
-    event_registry_hash: str,
-) -> FormalRegistryManifest:
-    manifest = object.__new__(FormalRegistryManifest)
-    for name, value in (
-        ("manifest_hash", manifest_hash),
-        ("purpose", purpose),
-        ("approval_id", approval_id),
-        ("canonical_json", canonical_json),
-        ("signature", signature),
-        ("key_id", key_id),
-        ("source_registry_hash", source_registry_hash),
-        ("mapping_registry_hash", mapping_registry_hash),
-        ("feature_registry_hash", feature_registry_hash),
-        ("scoring_registry_hash", scoring_registry_hash),
-        ("industry_registry_hash", industry_registry_hash),
-        ("cyclic_registry_hash", cyclic_registry_hash),
-        ("redline_registry_hash", redline_registry_hash),
-        ("status_registry_hash", status_registry_hash),
-        ("event_registry_hash", event_registry_hash),
-    ):
-        object.__setattr__(manifest, name, value)
-    _remember_verified_manifest(manifest)
-    return manifest
-
-
 @dataclass(frozen=True)
 class VerifiedRegistryBlob:
+    """An untrusted raw child envelope read from a repository.
+
+    It stays publicly constructible because persistence adapters and test
+    fixtures model raw storage with it.  The loader deliberately re-verifies
+    every field before a blob is present in a trusted bundle.
+    """
+
     registry_role: str
     registry_hash: str
     canonical_json: bytes
@@ -345,253 +142,461 @@ class VerifiedRegistryBlob:
     binding_key_id: str
 
 
-def _blob_fingerprint(
-    blob: object,
-) -> tuple[tuple[type[object], object], ...] | None:
-    if type(blob) is not VerifiedRegistryBlob:
-        return None
-    return _fingerprint_fields(blob, _BLOB_FINGERPRINT_FIELDS)
+def _make_trusted_registry_types() -> tuple[type[object], type[object], type[object]]:
+    """Create trusted types with all minting/sealing state closure-private.
 
+    Public fields remain inspectable for auditability, but neither copying a
+    legitimate object nor invoking a module helper can grant its verified
+    construction provenance.  Identity records also seal fields against
+    ``object.__setattr__`` after signature validation.
+    """
 
-def _blobs_fingerprint(blobs: object) -> tuple[tuple[object, ...], ...] | None:
-    if not isinstance(blobs, Mapping):
-        return None
-    try:
-        roles = tuple(sorted(blobs))
-    except TypeError:
-        return None
-    fields: list[tuple[object, ...]] = []
-    for role in roles:
-        if type(role) is not str:
+    manifest_fields = (
+        "manifest_hash",
+        "purpose",
+        "approval_id",
+        "canonical_json",
+        "signature",
+        "key_id",
+        "source_registry_hash",
+        "mapping_registry_hash",
+        "feature_registry_hash",
+        "scoring_registry_hash",
+        "industry_registry_hash",
+        "cyclic_registry_hash",
+        "redline_registry_hash",
+        "status_registry_hash",
+        "event_registry_hash",
+    )
+    blob_fields = (
+        "registry_role",
+        "registry_hash",
+        "canonical_json",
+        "signature",
+        "key_id",
+        "approval_id",
+        "declared_registry_manifest_hash",
+        "binding_signature",
+        "binding_key_id",
+    )
+
+    @dataclass(frozen=True)
+    class _VerifiedManifestRecord:
+        reference: weakref.ReferenceType[object]
+        fingerprint: tuple[tuple[type[object], object], ...]
+
+    @dataclass(frozen=True)
+    class _VerifiedBundleRecord:
+        reference: weakref.ReferenceType[object]
+        manifest: object
+        manifest_fingerprint: tuple[tuple[type[object], object], ...]
+        blobs: object
+        blobs_fingerprint: tuple[tuple[object, ...], ...]
+
+    verified_manifests: dict[int, _VerifiedManifestRecord] = {}
+    verified_bundles: dict[int, _VerifiedBundleRecord] = {}
+
+    def fingerprint_fields(
+        value: object, field_names: tuple[str, ...]
+    ) -> tuple[tuple[type[object], object], ...] | None:
+        fields: list[tuple[type[object], object]] = []
+        try:
+            for name in field_names:
+                item = getattr(value, name)
+                fields.append((type(item), item))
+        except AttributeError:
+            return None
+        return tuple(fields)
+
+    def manifest_fingerprint(
+        manifest: object,
+    ) -> tuple[tuple[type[object], object], ...] | None:
+        return fingerprint_fields(manifest, manifest_fields)
+
+    def remember_verified_manifest(manifest: object) -> None:
+        fingerprint = manifest_fingerprint(manifest)
+        if fingerprint is None:
+            raise RuntimeError("verified registry manifest fields are incomplete")
+        identity = id(manifest)
+
+        def forget(reference: weakref.ReferenceType[object]) -> None:
+            record = verified_manifests.get(identity)
+            if record is not None and record.reference is reference:
+                verified_manifests.pop(identity, None)
+
+        reference = weakref.ref(manifest, forget)
+        verified_manifests[identity] = _VerifiedManifestRecord(reference, fingerprint)
+
+    def has_verified_manifest(manifest: object) -> bool:
+        record = verified_manifests.get(id(manifest))
+        return (
+            record is not None
+            and record.reference() is manifest
+            and manifest_fingerprint(manifest) == record.fingerprint
+        )
+
+    @dataclass(frozen=True, init=False)
+    class FormalRegistryManifest:
+        manifest_hash: str
+        purpose: Literal["test", "official"]
+        approval_id: str | None
+        canonical_json: bytes
+        signature: str
+        key_id: str
+        source_registry_hash: str
+        mapping_registry_hash: str
+        feature_registry_hash: str
+        scoring_registry_hash: str
+        industry_registry_hash: str
+        cyclic_registry_hash: str
+        redline_registry_hash: str
+        status_registry_hash: str
+        event_registry_hash: str
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise ValueError("FormalRegistryManifest must be loaded with from_signed_bytes")
+
+        def _require_verified(self) -> None:
+            if not has_verified_manifest(self):
+                raise ValueError("registry manifest was not verified by from_signed_bytes")
+
+        def require_official(self) -> None:
+            self._require_verified()
+            if self.purpose != "official" or self.approval_id is None:
+                raise ValueError("official registry manifest approval is required")
+            _require_trimmed_text(self.approval_id, "official approval_id")
+
+        def assert_member_hashes(self, **hashes: str) -> None:
+            self._require_verified()
+            expected_names = set(_ROLE_FIELDS.values())
+            if set(hashes) != expected_names:
+                raise ValueError("registry manifest member hashes must name exactly every role field")
+            for field, expected in hashes.items():
+                _require_hash(expected, field)
+                if getattr(self, field) != expected:
+                    raise ValueError(f"registry manifest member hash mismatch for {field}")
+
+        @classmethod
+        def from_signed_bytes(
+            cls,
+            canonical_json: bytes,
+            signature: str,
+            key_id: str,
+            verifier: RegistrySignatureVerifier,
+        ) -> "FormalRegistryManifest":
+            if cls is not FormalRegistryManifest:
+                raise ValueError("FormalRegistryManifest must have exact type")
+            signature_text, key_text = _verify_signature(
+                canonical_json, signature, key_id, verifier, label="registry manifest"
+            )
+            wire = _load_canonical_object(canonical_json, label="registry manifest")
+            if set(wire) != _ROOT_KEYS:
+                raise ValueError("registry manifest has unknown or missing keys")
+            if wire["schema_version"] != "formal-registry-manifest-v1":
+                raise ValueError("registry manifest schema_version is invalid")
+            purpose = wire["purpose"]
+            if purpose not in {"test", "official"}:
+                raise ValueError("registry manifest purpose is invalid")
+            approval_id = wire["approval_id"]
+            if purpose == "official":
+                _require_trimmed_text(approval_id, "official approval_id")
+            elif approval_id is not None:
+                raise ValueError("test registry manifest approval_id must be null")
+            fields = {field: _require_hash(wire[field], field) for field in _ROLE_FIELDS.values()}
+            if len(set(fields.values())) != len(_ROLE_FIELDS):
+                raise ValueError("registry manifest member hashes must be unique")
+            return construct_verified_manifest(
+                manifest_hash=hashlib.sha256(canonical_json).hexdigest(),
+                purpose=purpose,
+                approval_id=approval_id,
+                canonical_json=canonical_json,
+                signature=signature_text,
+                key_id=key_text,
+                **fields,
+            )
+
+    def construct_verified_manifest(
+        *,
+        manifest_hash: str,
+        purpose: Literal["test", "official"],
+        approval_id: str | None,
+        canonical_json: bytes,
+        signature: str,
+        key_id: str,
+        source_registry_hash: str,
+        mapping_registry_hash: str,
+        feature_registry_hash: str,
+        scoring_registry_hash: str,
+        industry_registry_hash: str,
+        cyclic_registry_hash: str,
+        redline_registry_hash: str,
+        status_registry_hash: str,
+        event_registry_hash: str,
+    ) -> FormalRegistryManifest:
+        manifest = object.__new__(FormalRegistryManifest)
+        for name, value in (
+            ("manifest_hash", manifest_hash),
+            ("purpose", purpose),
+            ("approval_id", approval_id),
+            ("canonical_json", canonical_json),
+            ("signature", signature),
+            ("key_id", key_id),
+            ("source_registry_hash", source_registry_hash),
+            ("mapping_registry_hash", mapping_registry_hash),
+            ("feature_registry_hash", feature_registry_hash),
+            ("scoring_registry_hash", scoring_registry_hash),
+            ("industry_registry_hash", industry_registry_hash),
+            ("cyclic_registry_hash", cyclic_registry_hash),
+            ("redline_registry_hash", redline_registry_hash),
+            ("status_registry_hash", status_registry_hash),
+            ("event_registry_hash", event_registry_hash),
+        ):
+            object.__setattr__(manifest, name, value)
+        remember_verified_manifest(manifest)
+        return manifest
+
+    def blob_fingerprint(
+        blob: object,
+    ) -> tuple[tuple[type[object], object], ...] | None:
+        if type(blob) is not VerifiedRegistryBlob:
+            return None
+        return fingerprint_fields(blob, blob_fields)
+
+    def blobs_fingerprint(blobs: object) -> tuple[tuple[object, ...], ...] | None:
+        if not isinstance(blobs, Mapping):
             return None
         try:
-            fingerprint = _blob_fingerprint(blobs[role])
-        except (KeyError, TypeError):
+            roles = tuple(sorted(blobs))
+        except TypeError:
             return None
-        if fingerprint is None:
-            return None
-        fields.append((role, fingerprint))
-    return tuple(fields)
+        fields: list[tuple[object, ...]] = []
+        for role in roles:
+            if type(role) is not str:
+                return None
+            try:
+                fingerprint = blob_fingerprint(blobs[role])
+            except (KeyError, TypeError):
+                return None
+            if fingerprint is None:
+                return None
+            fields.append((role, fingerprint))
+        return tuple(fields)
 
+    def remember_verified_bundle(bundle: object) -> None:
+        try:
+            manifest = bundle.manifest
+            blobs = bundle.blobs
+        except AttributeError as error:
+            raise RuntimeError("verified registry bundle fields are incomplete") from error
+        sealed_manifest = manifest_fingerprint(manifest)
+        sealed_blobs = blobs_fingerprint(blobs)
+        if sealed_manifest is None or sealed_blobs is None:
+            raise RuntimeError("verified registry bundle fields are invalid")
+        identity = id(bundle)
 
-def _remember_verified_bundle(bundle: object) -> None:
-    try:
-        manifest = bundle.manifest
-        blobs = bundle.blobs
-    except AttributeError as error:
-        raise RuntimeError("verified registry bundle fields are incomplete") from error
-    manifest_fingerprint = _manifest_fingerprint(manifest)
-    blobs_fingerprint = _blobs_fingerprint(blobs)
-    if manifest_fingerprint is None or blobs_fingerprint is None:
-        raise RuntimeError("verified registry bundle fields are invalid")
-    identity = id(bundle)
+        def forget(reference: weakref.ReferenceType[object]) -> None:
+            record = verified_bundles.get(identity)
+            if record is not None and record.reference is reference:
+                verified_bundles.pop(identity, None)
 
-    def forget(reference: weakref.ReferenceType[object]) -> None:
-        record = _VERIFIED_BUNDLES.get(identity)
-        if record is not None and record.reference is reference:
-            _VERIFIED_BUNDLES.pop(identity, None)
+        reference = weakref.ref(bundle, forget)
+        verified_bundles[identity] = _VerifiedBundleRecord(
+            reference,
+            manifest,
+            sealed_manifest,
+            blobs,
+            sealed_blobs,
+        )
 
-    reference = weakref.ref(bundle, forget)
-    _VERIFIED_BUNDLES[identity] = _VerifiedBundleRecord(
-        reference,
-        manifest,
-        manifest_fingerprint,
-        blobs,
-        blobs_fingerprint,
-    )
+    def has_verified_bundle(bundle: object) -> bool:
+        record = verified_bundles.get(id(bundle))
+        if record is None or record.reference() is not bundle:
+            return False
+        try:
+            manifest = bundle.manifest
+            blobs = bundle.blobs
+        except AttributeError:
+            return False
+        return (
+            manifest is record.manifest
+            and has_verified_manifest(manifest)
+            and manifest_fingerprint(manifest) == record.manifest_fingerprint
+            and blobs is record.blobs
+            and blobs_fingerprint(blobs) == record.blobs_fingerprint
+        )
 
+    @dataclass(frozen=True, init=False)
+    class VerifiedRegistryBundle:
+        manifest: FormalRegistryManifest
+        blobs: Mapping[str, VerifiedRegistryBlob]
 
-def _has_verified_bundle(bundle: object) -> bool:
-    record = _VERIFIED_BUNDLES.get(id(bundle))
-    if record is None or record.reference() is not bundle:
-        return False
-    try:
-        manifest = bundle.manifest
-        blobs = bundle.blobs
-    except AttributeError:
-        return False
-    return (
-        manifest is record.manifest
-        and _has_verified_manifest(manifest)
-        and _manifest_fingerprint(manifest) == record.manifest_fingerprint
-        and blobs is record.blobs
-        and _blobs_fingerprint(blobs) == record.blobs_fingerprint
-    )
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise ValueError("VerifiedRegistryBundle must be constructed by the registry bundle loader")
 
+        def _require_verified(self) -> None:
+            if not has_verified_bundle(self):
+                raise ValueError("registry bundle was not verified by FormalRegistryBundleLoader")
 
-@dataclass(frozen=True, init=False)
-class VerifiedRegistryBundle:
-    manifest: FormalRegistryManifest
-    blobs: Mapping[str, VerifiedRegistryBlob]
+        def require_official(self) -> None:
+            self._require_verified()
+            if type(self.manifest) is not FormalRegistryManifest:
+                raise ValueError("registry bundle manifest is invalid")
+            self.manifest.require_official()
+            assert self.manifest.approval_id is not None
+            if set(self.blobs) != set(_ROLE_FIELDS):
+                raise ValueError("registry bundle does not contain every role")
+            for role, blob in self.blobs.items():
+                if type(blob) is not VerifiedRegistryBlob or blob.registry_role != role:
+                    raise ValueError("registry bundle role is invalid")
+                if blob.approval_id != self.manifest.approval_id:
+                    raise ValueError("registry blob approval does not match official manifest")
 
-    def __init__(self, *_args: object, **_kwargs: object) -> None:
-        raise ValueError("VerifiedRegistryBundle must be constructed by the registry bundle loader")
-
-    def _require_verified(self) -> None:
-        if not _has_verified_bundle(self):
-            raise ValueError("registry bundle was not verified by FormalRegistryBundleLoader")
-
-    def require_official(self) -> None:
-        self._require_verified()
-        if type(self.manifest) is not FormalRegistryManifest:
-            raise ValueError("registry bundle manifest is invalid")
-        self.manifest.require_official()
-        assert self.manifest.approval_id is not None
-        if set(self.blobs) != set(_ROLE_FIELDS):
-            raise ValueError("registry bundle does not contain every role")
-        for role, blob in self.blobs.items():
+        def blob(self, role: str) -> VerifiedRegistryBlob:
+            self._require_verified()
+            if type(role) is not str or role not in _ROLE_FIELDS:
+                raise ValueError("registry role is unknown")
+            blob = self.blobs.get(role)
             if type(blob) is not VerifiedRegistryBlob or blob.registry_role != role:
-                raise ValueError("registry bundle role is invalid")
-            if blob.approval_id != self.manifest.approval_id:
-                raise ValueError("registry blob approval does not match official manifest")
+                raise ValueError("registry bundle role is missing or invalid")
+            return blob
 
-    def blob(self, role: str) -> VerifiedRegistryBlob:
-        self._require_verified()
-        if type(role) is not str or role not in _ROLE_FIELDS:
-            raise ValueError("registry role is unknown")
-        blob = self.blobs.get(role)
-        if type(blob) is not VerifiedRegistryBlob or blob.registry_role != role:
-            raise ValueError("registry bundle role is missing or invalid")
-        return blob
+    def construct_verified_bundle(
+        manifest: FormalRegistryManifest, blobs: Mapping[str, VerifiedRegistryBlob]
+    ) -> VerifiedRegistryBundle:
+        bundle = object.__new__(VerifiedRegistryBundle)
+        object.__setattr__(bundle, "manifest", manifest)
+        object.__setattr__(bundle, "blobs", blobs)
+        remember_verified_bundle(bundle)
+        return bundle
+
+    class FormalRegistryBundleLoader:
+        """Reconstruct a hash-pinned bundle from raw signed repository envelopes."""
+
+        def __init__(self, repository: object, verifier: RegistrySignatureVerifier) -> None:
+            if not callable(getattr(repository, "get_formal_registry_manifest", None)):
+                raise ValueError("registry repository must provide get_formal_registry_manifest")
+            if not callable(getattr(repository, "get_formal_registry_blob", None)):
+                raise ValueError("registry repository must provide get_formal_registry_blob")
+            if not callable(getattr(verifier, "verify", None)):
+                raise ValueError("registry signature verifier is invalid")
+            self._repository = repository
+            self._verifier = verifier
+
+        def _read_manifest(self, manifest_hash: str) -> FormalRegistryManifest:
+            try:
+                stored = self._repository.get_formal_registry_manifest(manifest_hash)
+            except Exception as error:
+                raise ValueError("registry manifest repository read failed") from error
+            if type(stored) is not FormalRegistryManifest:
+                raise ValueError("registry manifest is unknown or invalid")
+            manifest = FormalRegistryManifest.from_signed_bytes(
+                stored.canonical_json, stored.signature, stored.key_id, self._verifier
+            )
+            if manifest.manifest_hash != manifest_hash:
+                raise ValueError("registry manifest hash does not match requested root")
+            return manifest
+
+        def _read_blob(
+            self,
+            *,
+            expected_role: str,
+            expected_hash: str,
+            manifest: FormalRegistryManifest,
+        ) -> VerifiedRegistryBlob:
+            try:
+                stored = self._repository.get_formal_registry_blob(expected_hash)
+            except Exception as error:
+                raise ValueError("registry blob repository read failed") from error
+            if type(stored) is not VerifiedRegistryBlob:
+                raise ValueError(f"registry blob is unknown for role {expected_role}")
+            signature, key_id = _verify_signature(
+                stored.canonical_json,
+                stored.signature,
+                stored.key_id,
+                self._verifier,
+                label=f"registry blob {expected_role}",
+            )
+            registry_hash = hashlib.sha256(stored.canonical_json).hexdigest()
+            if registry_hash != expected_hash or stored.registry_hash != expected_hash:
+                raise ValueError(f"registry blob hash mismatch for role {expected_role}")
+            if stored.registry_role != expected_role:
+                raise ValueError(f"registry blob role mismatch for role {expected_role}")
+            wire = _load_canonical_object(stored.canonical_json, label=f"registry blob {expected_role}")
+            if wire.get("registry_role") != expected_role:
+                raise ValueError(f"registry blob declared role mismatch for role {expected_role}")
+            if expected_role == "source":
+                source = SignedSourceRegistry.from_signed_bytes(
+                    stored.canonical_json, signature, key_id, self._verifier
+                )
+                if source.registry_hash != expected_hash:
+                    raise ValueError("source registry hash mismatch")
+            declared_root = _require_hash(
+                stored.declared_registry_manifest_hash,
+                f"registry blob declared root for role {expected_role}",
+            )
+            if declared_root != manifest.manifest_hash:
+                raise ValueError(f"registry blob declared root mismatch for role {expected_role}")
+            binding_bytes = _canonical_json_bytes(
+                {
+                    "child_sha256": registry_hash,
+                    "registry_manifest_hash": manifest.manifest_hash,
+                    "registry_role": expected_role,
+                }
+            )
+            binding_signature, binding_key_id = _verify_signature(
+                binding_bytes,
+                stored.binding_signature,
+                stored.binding_key_id,
+                self._verifier,
+                label=f"registry blob binding {expected_role}",
+            )
+            approval_id = stored.approval_id
+            if manifest.purpose == "official":
+                if approval_id != manifest.approval_id:
+                    raise ValueError(f"registry blob approval mismatch for role {expected_role}")
+            elif approval_id is not None:
+                raise ValueError(f"test registry blob approval must be null for role {expected_role}")
+            return VerifiedRegistryBlob(
+                registry_role=expected_role,
+                registry_hash=registry_hash,
+                canonical_json=stored.canonical_json,
+                signature=signature,
+                key_id=key_id,
+                approval_id=approval_id,
+                declared_registry_manifest_hash=declared_root,
+                binding_signature=binding_signature,
+                binding_key_id=binding_key_id,
+            )
+
+        def load(self, manifest_hash: str) -> VerifiedRegistryBundle:
+            _require_hash(manifest_hash, "manifest_hash")
+            manifest = self._read_manifest(manifest_hash)
+            expected = {field: getattr(manifest, field) for field in _ROLE_FIELDS.values()}
+            manifest.assert_member_hashes(**expected)
+            blobs: dict[str, VerifiedRegistryBlob] = {}
+            for role, field in _ROLE_FIELDS.items():
+                blobs[role] = self._read_blob(
+                    expected_role=role,
+                    expected_hash=expected[field],
+                    manifest=manifest,
+                )
+            if set(blobs) != set(_ROLE_FIELDS):
+                raise ValueError("registry bundle has missing or duplicate roles")
+            return construct_verified_bundle(manifest, MappingProxyType(blobs))
+
+    return FormalRegistryManifest, VerifiedRegistryBundle, FormalRegistryBundleLoader
 
 
-def _construct_verified_bundle(
-    manifest: FormalRegistryManifest, blobs: Mapping[str, VerifiedRegistryBlob]
-) -> VerifiedRegistryBundle:
-    bundle = object.__new__(VerifiedRegistryBundle)
-    object.__setattr__(bundle, "manifest", manifest)
-    object.__setattr__(bundle, "blobs", blobs)
-    _remember_verified_bundle(bundle)
-    return bundle
+FormalRegistryManifest, VerifiedRegistryBundle, FormalRegistryBundleLoader = (
+    _make_trusted_registry_types()
+)
+del _make_trusted_registry_types
 
 
 class FormalRegistryBundleRepository(Protocol):
     def get_formal_registry_manifest(self, manifest_hash: str) -> FormalRegistryManifest | None: ...
 
     def get_formal_registry_blob(self, registry_hash: str) -> VerifiedRegistryBlob | None: ...
-
-
-class FormalRegistryBundleLoader:
-    """Reconstruct a hash-pinned bundle from raw signed repository envelopes."""
-
-    def __init__(
-        self, repository: FormalRegistryBundleRepository, verifier: RegistrySignatureVerifier
-    ) -> None:
-        if not callable(getattr(repository, "get_formal_registry_manifest", None)):
-            raise ValueError("registry repository must provide get_formal_registry_manifest")
-        if not callable(getattr(repository, "get_formal_registry_blob", None)):
-            raise ValueError("registry repository must provide get_formal_registry_blob")
-        if not callable(getattr(verifier, "verify", None)):
-            raise ValueError("registry signature verifier is invalid")
-        self._repository = repository
-        self._verifier = verifier
-
-    def _read_manifest(self, manifest_hash: str) -> FormalRegistryManifest:
-        try:
-            stored = self._repository.get_formal_registry_manifest(manifest_hash)
-        except Exception as error:
-            raise ValueError("registry manifest repository read failed") from error
-        if type(stored) is not FormalRegistryManifest:
-            raise ValueError("registry manifest is unknown or invalid")
-        manifest = FormalRegistryManifest.from_signed_bytes(
-            stored.canonical_json, stored.signature, stored.key_id, self._verifier
-        )
-        if manifest.manifest_hash != manifest_hash:
-            raise ValueError("registry manifest hash does not match requested root")
-        return manifest
-
-    def _read_blob(
-        self,
-        *,
-        expected_role: str,
-        expected_hash: str,
-        manifest: FormalRegistryManifest,
-    ) -> VerifiedRegistryBlob:
-        try:
-            stored = self._repository.get_formal_registry_blob(expected_hash)
-        except Exception as error:
-            raise ValueError("registry blob repository read failed") from error
-        if type(stored) is not VerifiedRegistryBlob:
-            raise ValueError(f"registry blob is unknown for role {expected_role}")
-        signature, key_id = _verify_signature(
-            stored.canonical_json,
-            stored.signature,
-            stored.key_id,
-            self._verifier,
-            label=f"registry blob {expected_role}",
-        )
-        registry_hash = hashlib.sha256(stored.canonical_json).hexdigest()
-        if registry_hash != expected_hash or stored.registry_hash != expected_hash:
-            raise ValueError(f"registry blob hash mismatch for role {expected_role}")
-        if stored.registry_role != expected_role:
-            raise ValueError(f"registry blob role mismatch for role {expected_role}")
-        wire = _load_canonical_object(stored.canonical_json, label=f"registry blob {expected_role}")
-        if wire.get("registry_role") != expected_role:
-            raise ValueError(f"registry blob declared role mismatch for role {expected_role}")
-        if expected_role == "source":
-            source = SignedSourceRegistry.from_signed_bytes(
-                stored.canonical_json, signature, key_id, self._verifier
-            )
-            if source.registry_hash != expected_hash:
-                raise ValueError("source registry hash mismatch")
-        try:
-            declared_root = _require_hash(
-                stored.declared_registry_manifest_hash,
-                f"registry blob declared root for role {expected_role}",
-            )
-        except ValueError as error:
-            raise ValueError(str(error)) from error
-        if declared_root != manifest.manifest_hash:
-            raise ValueError(f"registry blob declared root mismatch for role {expected_role}")
-        binding_bytes = _canonical_json_bytes(
-            {
-                "child_sha256": registry_hash,
-                "registry_manifest_hash": manifest.manifest_hash,
-                "registry_role": expected_role,
-            }
-        )
-        binding_signature, binding_key_id = _verify_signature(
-            binding_bytes,
-            stored.binding_signature,
-            stored.binding_key_id,
-            self._verifier,
-            label=f"registry blob binding {expected_role}",
-        )
-        approval_id = stored.approval_id
-        if manifest.purpose == "official":
-            if approval_id != manifest.approval_id:
-                raise ValueError(f"registry blob approval mismatch for role {expected_role}")
-        elif approval_id is not None:
-            raise ValueError(f"test registry blob approval must be null for role {expected_role}")
-        return VerifiedRegistryBlob(
-            registry_role=expected_role,
-            registry_hash=registry_hash,
-            canonical_json=stored.canonical_json,
-            signature=signature,
-            key_id=key_id,
-            approval_id=approval_id,
-            declared_registry_manifest_hash=declared_root,
-            binding_signature=binding_signature,
-            binding_key_id=binding_key_id,
-        )
-
-    def load(self, manifest_hash: str) -> VerifiedRegistryBundle:
-        _require_hash(manifest_hash, "manifest_hash")
-        manifest = self._read_manifest(manifest_hash)
-        expected = {
-            field: getattr(manifest, field) for field in _ROLE_FIELDS.values()
-        }
-        manifest.assert_member_hashes(**expected)
-        blobs: dict[str, VerifiedRegistryBlob] = {}
-        for role, field in _ROLE_FIELDS.items():
-            blobs[role] = self._read_blob(
-                expected_role=role,
-                expected_hash=expected[field],
-                manifest=manifest,
-            )
-        if set(blobs) != set(_ROLE_FIELDS):
-            raise ValueError("registry bundle has missing or duplicate roles")
-        return _construct_verified_bundle(manifest, MappingProxyType(blobs))
 
 
 __all__ = [

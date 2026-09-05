@@ -3,6 +3,7 @@ import json
 import unittest
 from dataclasses import replace
 
+import ashare_pipeline.formal_registry_manifest as registry_manifest_module
 from ashare_pipeline.formal_registry_manifest import (
     FormalRegistryBundleLoader,
     FormalRegistryManifest,
@@ -368,6 +369,46 @@ class FormalRegistryManifestTests(unittest.TestCase):
             FormalRegistryManifest(_verified_token=object())
         with self.assertRaisesRegex(ValueError, "loader"):
             VerifiedRegistryBundle(manifest, {}, _verified_token=object())
+
+    def test_trusted_manifest_and_bundle_factories_are_not_module_capabilities(self):
+        for name in (
+            "_construct_verified_manifest",
+            "_remember_verified_manifest",
+            "_has_verified_manifest",
+            "_construct_verified_bundle",
+            "_remember_verified_bundle",
+            "_has_verified_bundle",
+            "_VERIFIED_MANIFESTS",
+            "_VERIFIED_BUNDLES",
+            "_make_trusted_registry_types",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(registry_manifest_module, name))
+
+        _, manifest, _ = fixture_repository()
+        forged = object.__new__(FormalRegistryManifest)
+        for field in (
+            "manifest_hash",
+            "purpose",
+            "approval_id",
+            "canonical_json",
+            "signature",
+            "key_id",
+            "source_registry_hash",
+            "mapping_registry_hash",
+            "feature_registry_hash",
+            "scoring_registry_hash",
+            "industry_registry_hash",
+            "cyclic_registry_hash",
+            "redline_registry_hash",
+            "status_registry_hash",
+            "event_registry_hash",
+        ):
+            object.__setattr__(forged, field, getattr(manifest, field))
+        with self.assertRaisesRegex(ValueError, "verified"):
+            forged.assert_member_hashes(
+                **{f"{role}_registry_hash": getattr(forged, f"{role}_registry_hash") for role in ROLES}
+            )
 
     def test_manifest_provenance_rejects_object_setattr_mutation(self):
         _, manifest, _ = fixture_repository()
