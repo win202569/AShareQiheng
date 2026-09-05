@@ -215,6 +215,37 @@ def response(raw=b'{"fixture":true}', status=200, url="https://www.cninfo.com.cn
     return TransportResponse(**value)
 
 
+def snapshot_ref(request, raw, document, **changes):
+    value = {
+        "snapshot_id": "snapshot",
+        "source": request.source,
+        "dataset": request.dataset,
+        "request_fingerprint": request.request_fingerprint,
+        "security_id": request.security_id,
+        "period_or_date": request.period_or_date,
+        "exchange": request.exchange,
+        "content_sha256": hashlib.sha256(raw).hexdigest(),
+        "manifest_sha256": "a" * 64,
+        "content_path": "unused.bin",
+        "manifest_path": "unused.manifest.json",
+        "original_url": "https://www.cninfo.com.cn/fixture/annual.json",
+        "published_at_utc": document.published_at_utc,
+        "published_precision": document.published_precision,
+        "source_updated_at_utc": document.source_updated_at_utc,
+        "captured_at_utc": "2026-09-04T00:00:00+00:00",
+        "effective_at_utc": document.published_at_utc,
+        "effective_time_evidence_hash": None,
+        "refresh_generation": "generation",
+        "producing_task_id": None,
+        "parser_id": "fixture-parser",
+        "parser_version": "fixture-v1",
+        "mapping_version": "fixture-map-v1",
+        "verification_status": "verified",
+    }
+    value.update(changes)
+    return OfficialSnapshotRef(**value)
+
+
 class FormalSourceTests(unittest.TestCase):
     def make_adapter(self, configs, document, *, transport=None, resolver=None):
         registry = SignedSourceRegistry.from_signed_bytes(
@@ -311,6 +342,30 @@ class FormalSourceTests(unittest.TestCase):
         self.assertEqual(parsed.parser_id, "fixture-parser")
         self.assertEqual(parsed.rows[0]["amount"], 1)
         self.assertEqual(verification.status, "verified")
+
+    def test_verified_document_rows_reject_custom_leaf_or_key_objects(self):
+        class SelfCopyingObject:
+            def __deepcopy__(self, memo):
+                return self
+
+        cases = (
+            {"amount": SelfCopyingObject()},
+            {SelfCopyingObject(): 1},
+        )
+        for row in cases:
+            with self.subTest(row=row):
+                adapter, transport, _ = self.make_adapter(
+                    [config()], timestamp_document(rows=(row,))
+                )
+
+                with self.assertRaises(FormalTerminalSourceError):
+                    adapter.fetch_verified(
+                        OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31"),
+                        refresh_generation="generation",
+                        calendar_binding=None,
+                    )
+
+                self.assertEqual(len(transport.requests), 1)
 
     def test_request_exchange_and_document_precision_require_exact_strings(self):
         class PretendString:
@@ -1195,6 +1250,102 @@ class FormalSourceTests(unittest.TestCase):
         self.assertIsNot(parsed, document)
         self.assertEqual(parsed.rows, document.rows)
         self.assertEqual(transport.requests, [])
+
+    def test_replay_rejects_spoofed_snapshot_ref_values_before_parser(self):
+        class PretendString:
+            def __init__(self, value):
+                self.value = value
+
+            def __hash__(self):
+                return hash(self.value)
+
+            def __eq__(self, other):
+                return type(other) is str and other == self.value
+
+            def __ne__(self, other):
+                return not self.__eq__(other)
+
+        raw = b"snapshot-ref-spoof"
+        document = timestamp_document()
+        request = OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31")
+        adapter, transport, parser = self.make_adapter([config()], document)
+        valid = snapshot_ref(request, raw, document)
+        for field, forged_value in (
+            ("published_precision", PretendString("timestamp")),
+            ("verification_status", PretendString("verified")),
+            ("request_fingerprint", PretendString(request.request_fingerprint)),
+            ("mapping_version", PretendString("fixture-map-v1")),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(FormalTerminalSourceError):
+                    adapter.parse_verified_snapshot(
+                        replace(valid, **{field: forged_value}), raw, calendar_binding=None
+                    )
+                self.assertEqual(parser.calls, [])
+                self.assertEqual(transport.requests, [])
+
+        with self.assertRaises(FormalTerminalSourceError):
+            adapter.parse_verified_snapshot(
+                replace(valid, effective_time_evidence_hash="e" * 64),
+                raw,
+                calendar_binding=None,
+            )
+        self.assertEqual(parser.calls, [])
+        self.assertEqual(transport.requests, [])
+
+        date_document = timestamp_document(
+            declared_security_id="SZ000001",
+            published_at_utc="2026-08-20T00:00:00+00:00",
+            published_precision="date_only",
+        )
+        date_request = OfficialRequest("cninfo", "annual_report", "SZ000001", "2025-12-31", "SZ")
+        date_adapter, date_transport, date_parser = self.make_adapter(
+            [
+                config(
+                    calendar_selector={
+                        "context_kind": "trading_calendar",
+                        "scope_key": "disclosure",
+                        "exchange": "SZ",
+                        "as_of_rule": "visible_at_freeze",
+                    },
+                    exchange_scope="SZ",
+                )
+            ],
+            date_document,
+            resolver=FixtureResolver(),
+        )
+        date_ref = snapshot_ref(
+            date_request,
+            raw,
+            date_document,
+            manifest_sha256="b" * 64,
+            effective_at_utc="2026-08-21T15:00:00+08:00",
+            effective_time_evidence_hash="c" * 64,
+        )
+        with self.assertRaises(FormalTerminalSourceError):
+            date_adapter.parse_verified_snapshot(
+                replace(date_ref, effective_time_evidence_hash=PretendString("c" * 64)),
+                raw,
+                calendar_binding=binding(),
+            )
+        self.assertEqual(date_parser.calls, [])
+        self.assertEqual(date_transport.requests, [])
+        with self.assertRaises(FormalTerminalSourceError):
+            date_adapter.parse_verified_snapshot(
+                replace(date_ref, manifest_sha256=PretendString("b" * 64)),
+                raw,
+                calendar_binding=binding(),
+            )
+        self.assertEqual(date_parser.calls, [])
+        self.assertEqual(date_transport.requests, [])
+        with self.assertRaises(FormalTerminalSourceError):
+            date_adapter.parse_verified_snapshot(
+                replace(date_ref, effective_time_evidence_hash=None),
+                raw,
+                calendar_binding=binding(),
+            )
+        self.assertEqual(date_parser.calls, [])
+        self.assertEqual(date_transport.requests, [])
 
     def test_date_only_replay_rechecks_binding_effective_time_and_all_signed_lineage(self):
         selector = {

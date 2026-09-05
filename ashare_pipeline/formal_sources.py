@@ -8,7 +8,6 @@ injected document parser for every collection attempt.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -448,20 +447,24 @@ class SourceAdapterConfig:
 
 
 def _freeze_document_value(value: object) -> object:
-    """Detach parser-owned row data while preserving ordinary mapping access."""
+    """Freeze only exact JSON-shaped parser row values into detached containers."""
 
     if isinstance(value, Mapping):
-        copied: dict[object, object] = {}
+        copied: dict[str, object] = {}
         for key, item in value.items():
-            copied[deepcopy(key)] = _freeze_document_value(item)
+            if type(key) is not str:
+                raise ValueError("parser document row mapping keys must be exact strings")
+            if key in copied:
+                raise ValueError("parser document row mapping has duplicate keys")
+            copied[key] = _freeze_document_value(item)
         return MappingProxyType(copied)
     if type(value) in {tuple, list}:
         return tuple(_freeze_document_value(item) for item in value)
-    if type(value) in {set, frozenset}:
-        return frozenset(_freeze_document_value(item) for item in value)
-    if type(value) is bytearray:
-        return bytes(value)
-    return deepcopy(value)
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    raise ValueError("parser document row contains an unsupported value")
 
 
 @dataclass(frozen=True)
@@ -1001,32 +1004,153 @@ def _copy_calendar_binding(binding: VerifiedCalendarBinding) -> VerifiedCalendar
     )
 
 
+def _require_snapshot_path(value: object, label: str) -> str:
+    path = _require_trimmed_text(value, label)
+    if _has_forbidden_raw_control(path, whitespace=False):
+        raise ValueError(f"{label} contains forbidden control characters")
+    return path
+
+
+def _require_optional_aware_timestamp(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    return _require_aware_timestamp(value, label)
+
+
 def _copy_snapshot_ref(snapshot_ref: OfficialSnapshotRef) -> OfficialSnapshotRef:
+    """Validate and detach every replay reference value before policy or parser callbacks."""
+
+    if type(snapshot_ref) is not OfficialSnapshotRef:
+        raise ValueError("snapshot_ref must have exact type OfficialSnapshotRef")
+    (
+        raw_snapshot_id,
+        raw_source,
+        raw_dataset,
+        raw_request_fingerprint,
+        raw_security_id,
+        raw_period_or_date,
+        raw_exchange,
+        raw_content_sha256,
+        raw_manifest_sha256,
+        raw_content_path,
+        raw_manifest_path,
+        raw_original_url,
+        raw_published_at_utc,
+        raw_published_precision,
+        raw_source_updated_at_utc,
+        raw_captured_at_utc,
+        raw_effective_at_utc,
+        raw_effective_time_evidence_hash,
+        raw_refresh_generation,
+        raw_producing_task_id,
+        raw_parser_id,
+        raw_parser_version,
+        raw_mapping_version,
+        raw_verification_status,
+    ) = (
+        snapshot_ref.snapshot_id,
+        snapshot_ref.source,
+        snapshot_ref.dataset,
+        snapshot_ref.request_fingerprint,
+        snapshot_ref.security_id,
+        snapshot_ref.period_or_date,
+        snapshot_ref.exchange,
+        snapshot_ref.content_sha256,
+        snapshot_ref.manifest_sha256,
+        snapshot_ref.content_path,
+        snapshot_ref.manifest_path,
+        snapshot_ref.original_url,
+        snapshot_ref.published_at_utc,
+        snapshot_ref.published_precision,
+        snapshot_ref.source_updated_at_utc,
+        snapshot_ref.captured_at_utc,
+        snapshot_ref.effective_at_utc,
+        snapshot_ref.effective_time_evidence_hash,
+        snapshot_ref.refresh_generation,
+        snapshot_ref.producing_task_id,
+        snapshot_ref.parser_id,
+        snapshot_ref.parser_version,
+        snapshot_ref.mapping_version,
+        snapshot_ref.verification_status,
+    )
+    snapshot_id = _require_trimmed_text(raw_snapshot_id, "snapshot snapshot_id")
+    source = _require_source(raw_source, "snapshot source")
+    dataset = _require_trimmed_text(raw_dataset, "snapshot dataset", identifier=True)
+    request_fingerprint = _require_sha256(raw_request_fingerprint, "snapshot request_fingerprint")
+    security_id: str | None = None
+    if raw_security_id is not None:
+        if type(raw_security_id) is not str or _SECURITY_ID.fullmatch(raw_security_id) is None:
+            raise ValueError("snapshot security_id must be canonical or null")
+        security_id = raw_security_id
+    period_or_date: str | None = None
+    if raw_period_or_date is not None:
+        period_or_date = _require_trimmed_text(raw_period_or_date, "snapshot period_or_date")
+    exchange: Literal["SH", "SZ", "BJ"] | None = None
+    if raw_exchange is not None:
+        exchange = _require_exchange(raw_exchange, "snapshot exchange")
+    content_sha256 = _require_sha256(raw_content_sha256, "snapshot content_sha256")
+    manifest_sha256 = _require_sha256(raw_manifest_sha256, "snapshot manifest_sha256")
+    content_path = _require_snapshot_path(raw_content_path, "snapshot content_path")
+    manifest_path = _require_snapshot_path(raw_manifest_path, "snapshot manifest_path")
+    original_url = _require_trimmed_text(raw_original_url, "snapshot original_url")
+    _https_host(original_url, "snapshot original_url")
+    if type(raw_published_precision) is not str or raw_published_precision not in {
+        "timestamp",
+        "date_only",
+    }:
+        raise ValueError("snapshot published_precision is invalid")
+    published_precision: Literal["timestamp", "date_only"] = raw_published_precision
+    if published_precision == "timestamp":
+        published_at_utc = _require_aware_timestamp(raw_published_at_utc, "snapshot published_at_utc")
+    else:
+        published_at_utc = _require_date_only_anchor(raw_published_at_utc)
+    source_updated_at_utc = _require_optional_aware_timestamp(
+        raw_source_updated_at_utc, "snapshot source_updated_at_utc"
+    )
+    captured_at_utc = _require_aware_timestamp(raw_captured_at_utc, "snapshot captured_at_utc")
+    effective_at_utc = _require_aware_timestamp(raw_effective_at_utc, "snapshot effective_at_utc")
+    if published_precision == "timestamp":
+        if raw_effective_time_evidence_hash is not None:
+            raise ValueError("timestamp snapshot cannot carry a calendar evidence hash")
+        effective_time_evidence_hash: str | None = None
+    else:
+        effective_time_evidence_hash = _require_sha256(
+            raw_effective_time_evidence_hash, "snapshot effective_time_evidence_hash"
+        )
+    refresh_generation = _require_trimmed_text(raw_refresh_generation, "snapshot refresh_generation")
+    producing_task_id: str | None = None
+    if raw_producing_task_id is not None:
+        producing_task_id = _require_trimmed_text(raw_producing_task_id, "snapshot producing_task_id")
+    parser_id = _require_trimmed_text(raw_parser_id, "snapshot parser_id", identifier=True)
+    parser_version = _require_trimmed_text(raw_parser_version, "snapshot parser_version", identifier=True)
+    mapping_version = _require_trimmed_text(raw_mapping_version, "snapshot mapping_version", identifier=True)
+    if type(raw_verification_status) is not str or raw_verification_status != "verified":
+        raise ValueError("snapshot verification_status must be verified")
     return OfficialSnapshotRef(
-        snapshot_id=snapshot_ref.snapshot_id,
-        source=snapshot_ref.source,
-        dataset=snapshot_ref.dataset,
-        request_fingerprint=snapshot_ref.request_fingerprint,
-        security_id=snapshot_ref.security_id,
-        period_or_date=snapshot_ref.period_or_date,
-        exchange=snapshot_ref.exchange,
-        content_sha256=snapshot_ref.content_sha256,
-        manifest_sha256=snapshot_ref.manifest_sha256,
-        content_path=snapshot_ref.content_path,
-        manifest_path=snapshot_ref.manifest_path,
-        original_url=snapshot_ref.original_url,
-        published_at_utc=snapshot_ref.published_at_utc,
-        published_precision=snapshot_ref.published_precision,
-        source_updated_at_utc=snapshot_ref.source_updated_at_utc,
-        captured_at_utc=snapshot_ref.captured_at_utc,
-        effective_at_utc=snapshot_ref.effective_at_utc,
-        effective_time_evidence_hash=snapshot_ref.effective_time_evidence_hash,
-        refresh_generation=snapshot_ref.refresh_generation,
-        producing_task_id=snapshot_ref.producing_task_id,
-        parser_id=snapshot_ref.parser_id,
-        parser_version=snapshot_ref.parser_version,
-        mapping_version=snapshot_ref.mapping_version,
-        verification_status=snapshot_ref.verification_status,
+        snapshot_id=snapshot_id,
+        source=source,
+        dataset=dataset,
+        request_fingerprint=request_fingerprint,
+        security_id=security_id,
+        period_or_date=period_or_date,
+        exchange=exchange,
+        content_sha256=content_sha256,
+        manifest_sha256=manifest_sha256,
+        content_path=content_path,
+        manifest_path=manifest_path,
+        original_url=original_url,
+        published_at_utc=published_at_utc,
+        published_precision=published_precision,
+        source_updated_at_utc=source_updated_at_utc,
+        captured_at_utc=captured_at_utc,
+        effective_at_utc=effective_at_utc,
+        effective_time_evidence_hash=effective_time_evidence_hash,
+        refresh_generation=refresh_generation,
+        producing_task_id=producing_task_id,
+        parser_id=parser_id,
+        parser_version=parser_version,
+        mapping_version=mapping_version,
+        verification_status="verified",
     )
 
 
@@ -1467,10 +1591,8 @@ class FormalOfficialSourceAdapter:
             raise FormalTerminalSourceError("snapshot_ref must have exact type OfficialSnapshotRef")
         if type(raw_bytes) is not bytes:
             raise FormalTerminalSourceError("snapshot raw_bytes must be bytes")
-        trusted_ref = _copy_snapshot_ref(snapshot_ref)
         try:
-            _require_sha256(trusted_ref.content_sha256, "snapshot content_sha256")
-            _require_sha256(trusted_ref.manifest_sha256, "snapshot manifest_sha256")
+            trusted_ref = _copy_snapshot_ref(snapshot_ref)
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
         if hashlib.sha256(raw_bytes).hexdigest() != trusted_ref.content_sha256:
