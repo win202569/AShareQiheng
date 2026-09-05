@@ -1907,6 +1907,24 @@ class StateStore:
             quarters = [self._formal_quarter_from_connection(connection, self._formal_quarter_wire(row)) for row in rows]
             return tuple(sorted(quarters, key=lambda quarter: _json(quarter.to_dict())))
 
+    def put_formal_context_facts(self, normalization) -> None:
+        """Append a sealed semantic normalization through verified V6 lineage."""
+        from .formal_context_repository import _put_context_facts
+        with self._transaction(immediate=True) as connection:
+            _put_context_facts(self, connection, normalization)
+
+    def list_formal_context_facts(self, *, registry_manifest_hash: str,
+            context_kind: str | None = None, scope_key: str | None = None,
+            security_id: str | None = None, as_of_utc: str | None = None,
+            source_snapshot_id: str | None = None):
+        """Revalidate every stored Context record before returning detached facts."""
+        from .formal_context_repository import _list_context_facts
+        with self._transaction() as connection:
+            return _list_context_facts(self, connection,
+                registry_manifest_hash=registry_manifest_hash, context_kind=context_kind,
+                scope_key=scope_key, security_id=security_id, as_of_utc=as_of_utc,
+                source_snapshot_id=source_snapshot_id)
+
     def _require_registry_verifier(self):
         verifier = self._registry_signature_verifier
         if verifier is None or not callable(getattr(verifier, "verify", None)):
