@@ -96,6 +96,48 @@ class InterruptedItemsRow(Mapping[str, object]):
         return stream()
 
 
+class TuplePairSubclass(tuple):
+    def __len__(self) -> int:
+        raise AssertionError("fixture tuple subclass must not use __len__")
+
+    def __getitem__(self, index: object) -> object:
+        raise AssertionError("fixture tuple subclass must not use __getitem__")
+
+    def __iter__(self):
+        return tuple.__iter__(self)
+
+
+class ListPairSubclass(list):
+    def __len__(self) -> int:
+        raise AssertionError("fixture list subclass must not use __len__")
+
+    def __getitem__(self, index: object) -> object:
+        raise AssertionError("fixture list subclass must not use __getitem__")
+
+    def __iter__(self):
+        return list.__iter__(self)
+
+
+class ProbeRow(Mapping[str, object]):
+    """Records whether an untrusted row stream has been consumed."""
+
+    def __init__(self, seen: list[str]) -> None:
+        self._seen = seen
+
+    def __getitem__(self, key: str) -> object:
+        return {"ITEM": "OPERATING_PROFIT", "VALUE": "1"}[key]
+
+    def __iter__(self):
+        return iter(("ITEM", "VALUE"))
+
+    def __len__(self) -> int:
+        return 2
+
+    def items(self):
+        self._seen.append("items_called")
+        return (("ITEM", "OPERATING_PROFIT"), ("VALUE", "1"))
+
+
 def mapping(**changes: object) -> dict[str, object]:
     value: dict[str, object] = {
         "mapping_id": "operating_profit",
@@ -330,6 +372,58 @@ class FormalFinancialSchemaTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             extract(registry=registry)
+
+    def test_mapping_registry_select_requires_exact_query_values(self) -> None:
+        query: dict[str, object] = {
+            "source": "cninfo",
+            "dataset": "annual_report",
+            "parser_id": "fixture-parser",
+            "parser_version": "fixture-v1",
+            "mapping_version": "fixture-map-v1",
+            "exchange": "BJ",
+        }
+        for field in query:
+            with self.subTest(field=field):
+                hostile_query = dict(query)
+                hostile_query[field] = EqualitySpoof()
+                with self.assertRaises(ValueError):
+                    signed_registry().select(**hostile_query)  # type: ignore[arg-type]
+
+    def test_unverified_registry_fails_before_document_rows_are_consumed(self) -> None:
+        trusted = signed_registry()
+        forged = object.__new__(SignedFinancialMappingRegistry)
+        for field in ("canonical_json", "registry_hash", "signature", "key_id", "mappings", "bindings"):
+            object.__setattr__(forged, field, getattr(trusted, field))
+        seen: list[str] = []
+        document = fixture_document(rows=(ProbeRow(seen),))
+
+        with self.assertRaises(ValueError):
+            extract(document=document, snapshot=fixture_snapshot(document), registry=forged)
+
+        self.assertEqual(seen, [])
+
+    def test_all_hard_document_checks_precede_document_row_consumption(self) -> None:
+        cases = (
+            ("invalid_created_at", {}, {}, "not-a-timestamp"),
+            ("identity", {}, {"security_id": "BJ430002"}, "2026-09-04T00:00:00+00:00"),
+            ("parser_lineage", {}, {"parser_id": "other-parser"}, "2026-09-04T00:00:00+00:00"),
+            ("bootstrap", {"bootstrap_calendar": True}, {}, "2026-09-04T00:00:00+00:00"),
+        )
+        for label, document_changes, snapshot_changes, created_at_utc in cases:
+            with self.subTest(label=label):
+                seen: list[str] = []
+                document = fixture_document(rows=(ProbeRow(seen),), **document_changes)
+                snapshot = fixture_snapshot(document, **snapshot_changes)
+
+                with self.assertRaises(ValueError):
+                    extract(
+                        document=document,
+                        snapshot=snapshot,
+                        registry=signed_registry(),
+                        created_at_utc=created_at_utc,
+                    )
+
+                self.assertEqual(seen, [])
 
     def test_extracts_bj_duration_fact_with_verified_snapshot_lineage_and_raw_hash(self) -> None:
         document = fixture_document(rows=({"ITEM": "OPERATING_PROFIT", "VALUE": "120.0"},))
@@ -600,6 +694,36 @@ class FormalFinancialSchemaTests(unittest.TestCase):
         )
         self.assertEqual(duplicate.details["row_indices"], (0,))
         self.assertNotIn("required_source_field_missing", tuple(issue.code for issue in result.issues))
+
+    def test_mapping_item_pair_subclasses_remain_exact_duplicate_occurrences(self) -> None:
+        pair_rows = {
+            "tuple_subclass": (
+                TuplePairSubclass(("ITEM", "OPERATING_PROFIT")),
+                TuplePairSubclass(("VALUE", "2")),
+            ),
+            "list_subclass": (
+                ListPairSubclass(["ITEM", "OPERATING_PROFIT"]),
+                ListPairSubclass(["VALUE", "2"]),
+            ),
+        }
+        for label, pairs in pair_rows.items():
+            with self.subTest(label=label):
+                document = fixture_document(
+                    rows=(
+                        {"ITEM": "OPERATING_PROFIT", "VALUE": "1"},
+                        DuplicateKeyRow(pairs),
+                    )
+                )
+
+                result = extract(document=document, snapshot=fixture_snapshot(document))
+
+                self.assertEqual(result.facts, ())
+                self.assertEqual(
+                    tuple(issue.code for issue in result.issues),
+                    ("duplicate_source_field",),
+                )
+                duplicate = result.issues[0]
+                self.assertEqual(duplicate.details["row_indices"], (0, 1))
 
     def test_date_only_lineage_requires_utc_anchor_evidence_and_later_effective_time(self) -> None:
         document = fixture_document(

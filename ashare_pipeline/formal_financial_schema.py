@@ -552,6 +552,16 @@ def _make_signed_financial_mapping_registry_type() -> type[object]:
         exchange: str,
     ) -> tuple[FormalFactMapping, ...]:
         record = require_verified(registry)
+        source = _require_text(source, "mapping selection source", identifier=True)
+        dataset = _require_text(dataset, "mapping selection dataset", identifier=True)
+        parser_id = _require_text(parser_id, "mapping selection parser_id", identifier=True)
+        parser_version = _require_text(
+            parser_version, "mapping selection parser_version", identifier=True
+        )
+        mapping_version = _require_text(
+            mapping_version, "mapping selection mapping_version", identifier=True
+        )
+        exchange = _require_exchange(exchange, "mapping selection exchange")
         canonical = record.canonical_json
         assert type(canonical) is bytes
         _, parsed_mappings, parsed_bindings = _parse_registry_bytes(canonical)
@@ -1126,7 +1136,7 @@ class _DocumentLineage:
     published_precision: str
     source_updated_at_utc: str | None
     accounting_basis: str
-    rows: tuple["_RowSnapshot", ...]
+    raw_rows: tuple[object, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1317,17 +1327,31 @@ def _snapshot_row(index: int, row: object) -> _RowSnapshot:
     try:
         # Consume the whole finite item stream.  A malformed parser row must
         # not be allowed to hide a later (or previously seen) exact ITEM that
-        # conflicts with a signed mapping.  Only ordinary tuple/list pair
-        # snapshots and exact strings are observed; no parser-owned object is
-        # retained from an invalid row.
+        # conflicts with a signed mapping.  Tuple/list subtypes are read
+        # through their built-in storage accessors, so overridden pair methods
+        # cannot alter the snapshot.  Only exact strings are retained from an
+        # invalid row.
         for pair in row.items():
-            if type(pair) is not tuple and type(pair) is not list:
+            try:
+                if isinstance(pair, tuple):
+                    pair_length = tuple.__len__(pair)
+                    if pair_length >= 2:
+                        key = tuple.__getitem__(pair, 0)
+                        value = tuple.__getitem__(pair, 1)
+                elif isinstance(pair, list):
+                    pair_length = list.__len__(pair)
+                    if pair_length >= 2:
+                        key = list.__getitem__(pair, 0)
+                        value = list.__getitem__(pair, 1)
+                else:
+                    valid_shape = False
+                    continue
+            except Exception:
                 valid_shape = False
                 continue
-            if len(pair) < 2:
+            if pair_length < 2:
                 valid_shape = False
                 continue
-            key, value = pair[0], pair[1]
             if (
                 type(key) is str
                 and key == "ITEM"
@@ -1337,7 +1361,7 @@ def _snapshot_row(index: int, row: object) -> _RowSnapshot:
                 and _CONTROL.search(value) is None
             ):
                 candidate_items.append(value)
-            if len(pair) != 2 or type(key) is not str or key in copied:
+            if pair_length != 2 or type(key) is not str or key in copied:
                 valid_shape = False
                 continue
             copied[key] = value
@@ -1422,7 +1446,6 @@ def _document_lineage(document: object) -> _DocumentLineage:
     )
     if type(raw_rows) is not tuple:
         raise ValueError("document rows must be an exact tuple")
-    rows = tuple(_snapshot_row(index, row) for index, row in enumerate(raw_rows))
     accounting_basis = _require_text(
         raw_accounting_basis, "document accounting_basis", controls=True
     )
@@ -1435,7 +1458,7 @@ def _document_lineage(document: object) -> _DocumentLineage:
         published_precision=precision,
         source_updated_at_utc=source_updated,
         accounting_basis=accounting_basis,
-        rows=rows,
+        raw_rows=raw_rows,
     )
 
 
@@ -1482,6 +1505,17 @@ def extract_formal_financial_facts(
     if type(registry) is not SignedFinancialMappingRegistry:
         raise ValueError("registry must have exact type SignedFinancialMappingRegistry")
     snapshot = _snapshot_lineage(snapshot_ref)
+    # Verify the signed registry and select its exact binding before an
+    # untrusted document row is consumed.  Snapshot identity supplies the
+    # selection values; document identity is hard-checked immediately below.
+    selected_mappings = registry.select(
+        source=snapshot.source,
+        dataset=snapshot.dataset,
+        parser_id=snapshot.parser_id,
+        parser_version=snapshot.parser_version,
+        mapping_version=snapshot.mapping_version,
+        exchange=snapshot.security_id[:2],
+    )
     parsed_document = _document_lineage(document)
     created = _require_utc_timestamp(created_at_utc, "formal fact created_at_utc")
     if (
@@ -1502,16 +1536,6 @@ def extract_formal_financial_facts(
         or parsed_document.source_updated_at_utc != snapshot.source_updated_at_utc
     ):
         raise ValueError("document and snapshot publication lineage disagree")
-    # SignedFinancialMappingRegistry.select first validates its closure seal and
-    # then reconstructs mapping values from its signed canonical bytes.
-    selected_mappings = registry.select(
-        source=snapshot.source,
-        dataset=snapshot.dataset,
-        parser_id=snapshot.parser_id,
-        parser_version=snapshot.parser_version,
-        mapping_version=snapshot.mapping_version,
-        exchange=parsed_document.security_id[:2],
-    )
     period_kind = _period_kind_for(parsed_document.period)
     applicable = tuple(
         item
@@ -1538,7 +1562,10 @@ def extract_formal_financial_facts(
     matches: dict[str, list[_RowSnapshot]] = {field: [] for field in by_field}
     invalid_matches: dict[str, list[_RowSnapshot]] = {field: [] for field in by_field}
     issues: list[FormalFactIssue] = []
-    for row in parsed_document.rows:
+    rows = tuple(
+        _snapshot_row(index, row) for index, row in enumerate(parsed_document.raw_rows)
+    )
+    for row in rows:
         if not row.valid_shape:
             issues.append(
                 _new_issue(
