@@ -8,6 +8,7 @@ injected document parser for every collection attempt.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -363,11 +364,11 @@ class CalendarSelector:
     as_of_rule: Literal["visible_at_freeze"]
 
     def __post_init__(self) -> None:
-        if self.context_kind != "trading_calendar":
+        if type(self.context_kind) is not str or self.context_kind != "trading_calendar":
             raise ValueError("calendar selector context_kind must be trading_calendar")
         _require_trimmed_text(self.scope_key, "calendar selector scope_key", identifier=True)
         _require_exchange(self.exchange, "calendar selector exchange")
-        if self.as_of_rule != "visible_at_freeze":
+        if type(self.as_of_rule) is not str or self.as_of_rule != "visible_at_freeze":
             raise ValueError("calendar selector as_of_rule must be visible_at_freeze")
 
     @property
@@ -407,7 +408,7 @@ class SourceAdapterConfig:
         _require_source(self.source)
         _require_trimmed_text(self.dataset, "dataset", identifier=True)
         _https_host(self.endpoint_url, "endpoint_url")
-        if self.http_method not in {"GET", "POST"}:
+        if type(self.http_method) is not str or self.http_method not in {"GET", "POST"}:
             raise ValueError("http_method must be GET or POST")
         _require_trimmed_text(self.parser_id, "parser_id", identifier=True)
         _require_trimmed_text(self.parser_version, "parser_version", identifier=True)
@@ -446,6 +447,23 @@ class SourceAdapterConfig:
         object.__setattr__(self, "request_template", _freeze_template(self.request_template))
 
 
+def _freeze_document_value(value: object) -> object:
+    """Detach parser-owned row data while preserving ordinary mapping access."""
+
+    if isinstance(value, Mapping):
+        copied: dict[object, object] = {}
+        for key, item in value.items():
+            copied[deepcopy(key)] = _freeze_document_value(item)
+        return MappingProxyType(copied)
+    if type(value) in {tuple, list}:
+        return tuple(_freeze_document_value(item) for item in value)
+    if type(value) in {set, frozenset}:
+        return frozenset(_freeze_document_value(item) for item in value)
+    if type(value) is bytearray:
+        return bytes(value)
+    return deepcopy(value)
+
+
 @dataclass(frozen=True)
 class ParsedOfficialDocument:
     parser_id: str
@@ -467,7 +485,10 @@ class ParsedOfficialDocument:
                 raise ValueError("document declared_security_id must be canonical or null")
         if self.declared_period is not None:
             _require_trimmed_text(self.declared_period, "document declared_period")
-        if self.published_precision not in {"timestamp", "date_only"}:
+        if type(self.published_precision) is not str or self.published_precision not in {
+            "timestamp",
+            "date_only",
+        }:
             raise ValueError("document published_precision is invalid")
         if self.published_precision == "timestamp":
             _require_aware_timestamp(self.published_at_utc, "document published_at_utc")
@@ -486,6 +507,39 @@ class OfficialDocumentParser(Protocol):
     def parse(
         self, raw_bytes: bytes, *, request: OfficialRequest, config: SourceAdapterConfig
     ) -> ParsedOfficialDocument: ...
+
+
+def _copy_verified_document(document: object) -> ParsedOfficialDocument:
+    if type(document) is not ParsedOfficialDocument:
+        raise FormalTerminalSourceError("parser must return exact ParsedOfficialDocument")
+    try:
+        parser_id = document.parser_id
+        parser_version = document.parser_version
+        declared_security_id = document.declared_security_id
+        declared_period = document.declared_period
+        published_at_utc = document.published_at_utc
+        published_precision = document.published_precision
+        source_updated_at_utc = document.source_updated_at_utc
+        rows = document.rows
+        accounting_basis = document.accounting_basis
+        bootstrap_calendar = document.bootstrap_calendar
+        if type(rows) is not tuple or any(not isinstance(row, Mapping) for row in rows):
+            raise ValueError("parser document rows are invalid")
+        frozen_rows = tuple(_freeze_document_value(row) for row in rows)
+        return ParsedOfficialDocument(
+            parser_id=parser_id,
+            parser_version=parser_version,
+            declared_security_id=declared_security_id,
+            declared_period=declared_period,
+            published_at_utc=published_at_utc,
+            published_precision=published_precision,
+            source_updated_at_utc=source_updated_at_utc,
+            rows=frozen_rows,
+            accounting_basis=accounting_basis,
+            bootstrap_calendar=bootstrap_calendar,
+        )
+    except Exception as error:
+        raise FormalTerminalSourceError("parser document cannot be detached") from error
 
 
 def _require_date_only_anchor(value: object) -> str:
@@ -789,11 +843,15 @@ def _validate_request(request: object) -> tuple[OfficialRequest, str | None]:
             _require_trimmed_text(request.period_or_date, "request period_or_date")
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
-    if request.exchange is not None and request.exchange not in _EXCHANGES:
-        raise FormalTerminalSourceError("request exchange must be SH, SZ, BJ, or null")
-    if request.exchange is not None and security_exchange is not None and request.exchange != security_exchange:
+    exchange: str | None = None
+    if request.exchange is not None:
+        try:
+            exchange = _require_exchange(request.exchange, "request exchange")
+        except ValueError as error:
+            raise FormalTerminalSourceError(str(error)) from error
+    if exchange is not None and security_exchange is not None and exchange != security_exchange:
         raise FormalTerminalSourceError("request security_id and exchange disagree")
-    return request, request.exchange or security_exchange
+    return request, exchange or security_exchange
 
 
 def _substitute_text(value: str, values: Mapping[str, str | None], *, percent_encode: bool) -> str:
@@ -1265,8 +1323,7 @@ class FormalOfficialSourceAdapter:
         calendar_binding: VerifiedCalendarBinding | None,
         effective_time_resolver: EffectiveTimeResolver,
     ) -> tuple[ParsedOfficialDocument, str, str | None]:
-        if type(document) is not ParsedOfficialDocument:
-            raise FormalTerminalSourceError("parser must return exact ParsedOfficialDocument")
+        document = _copy_verified_document(document)
         if document.parser_id != config.parser_id or document.parser_version != config.parser_version:
             raise FormalTerminalSourceError("parser document identity does not match signed config")
         if document.declared_security_id != request.security_id:

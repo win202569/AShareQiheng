@@ -41,6 +41,31 @@ class RaisingVerifier:
         raise RuntimeError("verifier unavailable")
 
 
+class BlobRoleMutatingVerifier(AcceptingVerifier):
+    """Rewrites one raw envelope immediately after its child signature check."""
+
+    def __init__(self, blob, child_bytes):
+        self.blob = blob
+        self.child_bytes = child_bytes
+        self.mutated = False
+
+    def verify(self, payload, *, signature, key_id):
+        accepted = super().verify(payload, signature=signature, key_id=key_id)
+        if accepted and not self.mutated and payload == self.child_bytes:
+            object.__setattr__(self.blob, "registry_role", "source")
+            self.mutated = True
+        return accepted
+
+
+class CountingVerifier(AcceptingVerifier):
+    def __init__(self):
+        self.calls = 0
+
+    def verify(self, payload, *, signature, key_id):
+        self.calls += 1
+        return super().verify(payload, signature=signature, key_id=key_id)
+
+
 class SignatureMapVerifier:
     """A fixture verifier that proves exactly which canonical bytes were signed."""
 
@@ -200,6 +225,29 @@ class FormalRegistryManifestTests(unittest.TestCase):
         repository.blobs[source.registry_hash] = replace(source, signature="tampered")
         with self.assertRaisesRegex(ValueError, "signature"):
             FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(manifest.manifest_hash)
+
+    def test_loader_snapshots_raw_blob_before_verifier_can_mutate_its_envelope(self):
+        repository, manifest, blobs = fixture_repository()
+        source = replace(blobs[manifest.source_registry_hash], registry_role="mapping")
+        repository.blobs[source.registry_hash] = source
+        verifier = BlobRoleMutatingVerifier(source, source.canonical_json)
+
+        with self.assertRaisesRegex(ValueError, "role"):
+            FormalRegistryBundleLoader(repository, verifier).load(manifest.manifest_hash)
+        self.assertTrue(verifier.mutated)
+
+    def test_loader_rejects_mutable_raw_bytes_before_signature_verification(self):
+        repository, manifest, blobs = fixture_repository()
+        source = replace(
+            blobs[manifest.source_registry_hash],
+            canonical_json=bytearray(blobs[manifest.source_registry_hash].canonical_json),
+        )
+        repository.blobs[source.registry_hash] = source
+        verifier = CountingVerifier()
+
+        with self.assertRaises(ValueError):
+            FormalRegistryBundleLoader(repository, verifier).load(manifest.manifest_hash)
+        self.assertEqual(verifier.calls, 1)
 
     def test_scoring_hash_swap_and_role_swap_are_rejected_before_runtime_use(self):
         repository, manifest, blobs = fixture_repository()

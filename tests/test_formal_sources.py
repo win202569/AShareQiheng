@@ -18,6 +18,7 @@ from ashare_pipeline.formal_sources import (
     FormalTerminalSourceError,
     ParsedOfficialDocument,
     SignedSourceRegistry,
+    SourceAdapterConfig,
     TransportResponse,
 )
 
@@ -253,8 +254,119 @@ class FormalSourceTests(unittest.TestCase):
         self.assertEqual(fetch.original_url, "https://www.cninfo.com.cn/fixture/annual.json")
         self.assertEqual(transport.requests[0].url, "https://www.cninfo.com.cn/fixture/annual.json?period=2025-12-31&symbol=BJ430001")
         self.assertEqual(parser.calls[0][0], raw)
-        self.assertIs(parsed, document)
+        self.assertIsNot(parsed, document)
+        self.assertEqual(parsed.rows, document.rows)
         self.assertEqual(verification.status, "verified")
+
+    def test_verified_document_rows_are_detached_and_recursively_immutable(self):
+        parser_rows = (
+            {
+                "amount": 1,
+                "details": {"history": ["CNY", {"currency": "CNY"}]},
+            },
+        )
+        document = timestamp_document()
+        object.__setattr__(document, "rows", parser_rows)
+        adapter, _, _ = self.make_adapter([config()], document)
+
+        _, verification, parsed = adapter.fetch_verified(
+            OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31"),
+            refresh_generation="generation",
+            calendar_binding=None,
+        )
+
+        self.assertIsNot(parsed, document)
+        self.assertEqual(parsed.rows[0].get("amount"), 1)
+        self.assertEqual(parsed.rows[0]["details"]["history"][1]["currency"], "CNY")
+        with self.assertRaises(TypeError):
+            parsed.rows[0]["amount"] = 2
+        with self.assertRaises(AttributeError):
+            parsed.rows[0]["details"]["history"].append("USD")
+        with self.assertRaises(TypeError):
+            parsed.rows[0]["details"]["history"][1]["currency"] = "USD"
+        parser_rows[0]["details"]["history"][1]["currency"] = "USD"
+        self.assertEqual(parsed.rows[0]["details"]["history"][1]["currency"], "CNY")
+        self.assertEqual(verification.status, "verified")
+
+    def test_verified_document_copy_snapshots_metadata_before_row_callbacks(self):
+        document = timestamp_document()
+
+        class MetadataMutatingRow(dict):
+            def items(self):
+                object.__setattr__(document, "parser_id", "rewritten-parser")
+                return super().items()
+
+        object.__setattr__(document, "rows", (MetadataMutatingRow({"amount": 1}),))
+        adapter, _, _ = self.make_adapter([config()], document)
+
+        try:
+            _, verification, parsed = adapter.fetch_verified(
+                OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31"),
+                refresh_generation="generation",
+                calendar_binding=None,
+            )
+        except FormalTerminalSourceError as error:
+            self.fail(f"row callbacks must not rewrite verified document metadata: {error}")
+
+        self.assertEqual(parsed.parser_id, "fixture-parser")
+        self.assertEqual(parsed.rows[0]["amount"], 1)
+        self.assertEqual(verification.status, "verified")
+
+    def test_request_exchange_and_document_precision_require_exact_strings(self):
+        class PretendString:
+            def __init__(self, value):
+                self.value = value
+
+            def __hash__(self):
+                return hash(self.value)
+
+            def __eq__(self, other):
+                return type(other) is str and other == self.value
+
+            def __ne__(self, other):
+                return not self.__eq__(other)
+
+        with self.assertRaisesRegex(ValueError, "published_precision"):
+            timestamp_document(published_precision=PretendString("timestamp"))
+
+        document = timestamp_document(declared_security_id="SH600000")
+        adapter, transport, _ = self.make_adapter([config()], document)
+        with self.assertRaisesRegex(FormalTerminalSourceError, "request exchange"):
+            adapter.fetch_verified(
+                OfficialRequest(
+                    "cninfo",
+                    "annual_report",
+                    "SH600000",
+                    "2025-12-31",
+                    PretendString("SH"),
+                ),
+                refresh_generation="generation",
+                calendar_binding=None,
+            )
+        self.assertEqual(transport.requests, [])
+
+    def test_immediate_source_config_enums_require_exact_strings(self):
+        class PretendString:
+            def __init__(self, value):
+                self.value = value
+
+            def __hash__(self):
+                return hash(self.value)
+
+            def __eq__(self, other):
+                return type(other) is str and other == self.value
+
+            def __ne__(self, other):
+                return not self.__eq__(other)
+
+        with self.assertRaisesRegex(ValueError, "context_kind"):
+            CalendarSelector(PretendString("trading_calendar"), "disclosure", "SZ", "visible_at_freeze")
+        with self.assertRaisesRegex(ValueError, "as_of_rule"):
+            CalendarSelector("trading_calendar", "disclosure", "SZ", PretendString("visible_at_freeze"))
+        direct_config = config(http_method=PretendString("GET"))
+        direct_config["registry_hash"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "http_method"):
+            SourceAdapterConfig(**direct_config)
 
     def test_registry_verification_and_preflight_errors_never_call_transport(self):
         bytes_ = registry_bytes([config()])
@@ -504,7 +616,9 @@ class FormalSourceTests(unittest.TestCase):
             verification_status="verified",
         )
 
-        self.assertIs(adapter.parse_verified_snapshot(ref, raw, calendar_binding=None), document)
+        parsed = adapter.parse_verified_snapshot(ref, raw, calendar_binding=None)
+        self.assertIsNot(parsed, document)
+        self.assertEqual(parsed.rows, document.rows)
         self.assertEqual(registry.configs[0].mapping_version, "fixture-map-v1")
         self.assertEqual(parser.calls[0][2].mapping_version, "unsigned-map")
         self.assertEqual(transport.requests, [])
@@ -1078,7 +1192,8 @@ class FormalSourceTests(unittest.TestCase):
 
         parsed = adapter.parse_verified_snapshot(ref, raw, calendar_binding=None)
 
-        self.assertIs(parsed, document)
+        self.assertIsNot(parsed, document)
+        self.assertEqual(parsed.rows, document.rows)
         self.assertEqual(transport.requests, [])
 
     def test_date_only_replay_rechecks_binding_effective_time_and_all_signed_lineage(self):
@@ -1127,7 +1242,9 @@ class FormalSourceTests(unittest.TestCase):
             verification_status="verified",
         )
 
-        self.assertIs(adapter.parse_verified_snapshot(ref, raw, calendar_binding=binding()), document)
+        parsed = adapter.parse_verified_snapshot(ref, raw, calendar_binding=binding())
+        self.assertIsNot(parsed, document)
+        self.assertEqual(parsed.rows, document.rows)
         self.assertEqual(transport.requests, [])
         tampered = (
             (replace(ref, source="sse"), binding()),

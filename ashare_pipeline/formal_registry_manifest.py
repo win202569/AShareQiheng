@@ -181,6 +181,135 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
     )
 
     @dataclass(frozen=True)
+    class _RawManifestEnvelope:
+        manifest_hash: str
+        purpose: str
+        approval_id: str | None
+        canonical_json: bytes
+        signature: str
+        key_id: str
+        source_registry_hash: str
+        mapping_registry_hash: str
+        feature_registry_hash: str
+        scoring_registry_hash: str
+        industry_registry_hash: str
+        cyclic_registry_hash: str
+        redline_registry_hash: str
+        status_registry_hash: str
+        event_registry_hash: str
+
+    @dataclass(frozen=True)
+    class _RawBlobEnvelope:
+        registry_role: str
+        registry_hash: str
+        canonical_json: bytes
+        signature: str
+        key_id: str
+        approval_id: str | None
+        declared_registry_manifest_hash: str
+        binding_signature: str
+        binding_key_id: str
+
+    def require_optional_trimmed_text(value: object, label: str) -> str | None:
+        if value is None:
+            return None
+        return _require_trimmed_text(value, label)
+
+    def snapshot_manifest_envelope(stored: object) -> _RawManifestEnvelope:
+        if type(stored) is not FormalRegistryManifest:
+            raise ValueError("registry manifest is unknown or invalid")
+        try:
+            manifest_hash = stored.manifest_hash
+            purpose = stored.purpose
+            approval_id = stored.approval_id
+            canonical_json = stored.canonical_json
+            signature = stored.signature
+            key_id = stored.key_id
+            source_registry_hash = stored.source_registry_hash
+            mapping_registry_hash = stored.mapping_registry_hash
+            feature_registry_hash = stored.feature_registry_hash
+            scoring_registry_hash = stored.scoring_registry_hash
+            industry_registry_hash = stored.industry_registry_hash
+            cyclic_registry_hash = stored.cyclic_registry_hash
+            redline_registry_hash = stored.redline_registry_hash
+            status_registry_hash = stored.status_registry_hash
+            event_registry_hash = stored.event_registry_hash
+        except AttributeError as error:
+            raise ValueError("registry manifest is unknown or invalid") from error
+        if type(canonical_json) is not bytes:
+            raise ValueError("registry manifest canonical_json must be immutable bytes")
+        try:
+            return _RawManifestEnvelope(
+                _require_hash(manifest_hash, "stored manifest_hash"),
+                _require_trimmed_text(purpose, "stored manifest purpose"),
+                require_optional_trimmed_text(approval_id, "stored manifest approval_id"),
+                canonical_json,
+                _require_trimmed_text(signature, "stored manifest signature"),
+                _require_trimmed_text(key_id, "stored manifest key_id", identifier=True),
+                _require_hash(source_registry_hash, "stored source_registry_hash"),
+                _require_hash(mapping_registry_hash, "stored mapping_registry_hash"),
+                _require_hash(feature_registry_hash, "stored feature_registry_hash"),
+                _require_hash(scoring_registry_hash, "stored scoring_registry_hash"),
+                _require_hash(industry_registry_hash, "stored industry_registry_hash"),
+                _require_hash(cyclic_registry_hash, "stored cyclic_registry_hash"),
+                _require_hash(redline_registry_hash, "stored redline_registry_hash"),
+                _require_hash(status_registry_hash, "stored status_registry_hash"),
+                _require_hash(event_registry_hash, "stored event_registry_hash"),
+            )
+        except ValueError as error:
+            raise ValueError(f"registry manifest envelope is invalid: {error}") from error
+
+    def snapshot_blob_envelope(stored: object, *, expected_role: str) -> _RawBlobEnvelope:
+        if type(stored) is not VerifiedRegistryBlob:
+            raise ValueError(f"registry blob is unknown for role {expected_role}")
+        try:
+            registry_role = stored.registry_role
+            registry_hash = stored.registry_hash
+            canonical_json = stored.canonical_json
+            signature = stored.signature
+            key_id = stored.key_id
+            approval_id = stored.approval_id
+            declared_registry_manifest_hash = stored.declared_registry_manifest_hash
+            binding_signature = stored.binding_signature
+            binding_key_id = stored.binding_key_id
+        except AttributeError as error:
+            raise ValueError(f"registry blob is unknown for role {expected_role}") from error
+        if type(canonical_json) is not bytes:
+            raise ValueError(
+                f"registry blob canonical_json for role {expected_role} must be immutable bytes"
+            )
+        try:
+            return _RawBlobEnvelope(
+                _require_trimmed_text(registry_role, f"registry blob role for {expected_role}"),
+                _require_hash(registry_hash, f"registry blob stored hash for role {expected_role}"),
+                canonical_json,
+                _require_trimmed_text(signature, f"registry blob signature for role {expected_role}"),
+                _require_trimmed_text(
+                    key_id, f"registry blob key_id for role {expected_role}", identifier=True
+                ),
+                require_optional_trimmed_text(
+                    approval_id, f"registry blob approval for role {expected_role}"
+                ),
+                _require_hash(
+                    declared_registry_manifest_hash,
+                    f"registry blob declared root for role {expected_role}",
+                ),
+                _require_trimmed_text(
+                    binding_signature,
+                    f"registry blob binding signature for role {expected_role}",
+                ),
+                _require_trimmed_text(
+                    binding_key_id,
+                    f"registry blob binding key_id for role {expected_role}",
+                    identifier=True,
+                ),
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"registry blob envelope is invalid for role {expected_role}: {error}"
+            ) from error
+
+    @dataclass(frozen=True)
     class _VerifiedManifestRecord:
         reference: weakref.ReferenceType[object]
         fingerprint: tuple[tuple[type[object], object], ...]
@@ -490,10 +619,12 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
                 stored = self._repository.get_formal_registry_manifest(manifest_hash)
             except Exception as error:
                 raise ValueError("registry manifest repository read failed") from error
-            if type(stored) is not FormalRegistryManifest:
-                raise ValueError("registry manifest is unknown or invalid")
+            envelope = snapshot_manifest_envelope(stored)
+            stored_manifest_hash = _require_hash(envelope.manifest_hash, "stored manifest_hash")
+            if stored_manifest_hash != manifest_hash:
+                raise ValueError("registry manifest hash does not match requested root")
             manifest = FormalRegistryManifest.from_signed_bytes(
-                stored.canonical_json, stored.signature, stored.key_id, self._verifier
+                envelope.canonical_json, envelope.signature, envelope.key_id, self._verifier
             )
             if manifest.manifest_hash != manifest_hash:
                 raise ValueError("registry manifest hash does not match requested root")
@@ -510,31 +641,33 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
                 stored = self._repository.get_formal_registry_blob(expected_hash)
             except Exception as error:
                 raise ValueError("registry blob repository read failed") from error
-            if type(stored) is not VerifiedRegistryBlob:
-                raise ValueError(f"registry blob is unknown for role {expected_role}")
+            envelope = snapshot_blob_envelope(stored, expected_role=expected_role)
             signature, key_id = _verify_signature(
-                stored.canonical_json,
-                stored.signature,
-                stored.key_id,
+                envelope.canonical_json,
+                envelope.signature,
+                envelope.key_id,
                 self._verifier,
                 label=f"registry blob {expected_role}",
             )
-            registry_hash = hashlib.sha256(stored.canonical_json).hexdigest()
-            if registry_hash != expected_hash or stored.registry_hash != expected_hash:
+            registry_hash = hashlib.sha256(envelope.canonical_json).hexdigest()
+            stored_registry_hash = _require_hash(
+                envelope.registry_hash, f"registry blob stored hash for role {expected_role}"
+            )
+            if registry_hash != expected_hash or stored_registry_hash != expected_hash:
                 raise ValueError(f"registry blob hash mismatch for role {expected_role}")
-            if stored.registry_role != expected_role:
+            if type(envelope.registry_role) is not str or envelope.registry_role != expected_role:
                 raise ValueError(f"registry blob role mismatch for role {expected_role}")
-            wire = _load_canonical_object(stored.canonical_json, label=f"registry blob {expected_role}")
+            wire = _load_canonical_object(envelope.canonical_json, label=f"registry blob {expected_role}")
             if wire.get("registry_role") != expected_role:
                 raise ValueError(f"registry blob declared role mismatch for role {expected_role}")
             if expected_role == "source":
                 source = SignedSourceRegistry.from_signed_bytes(
-                    stored.canonical_json, signature, key_id, self._verifier
+                    envelope.canonical_json, signature, key_id, self._verifier
                 )
                 if source.registry_hash != expected_hash:
                     raise ValueError("source registry hash mismatch")
             declared_root = _require_hash(
-                stored.declared_registry_manifest_hash,
+                envelope.declared_registry_manifest_hash,
                 f"registry blob declared root for role {expected_role}",
             )
             if declared_root != manifest.manifest_hash:
@@ -548,12 +681,12 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
             )
             binding_signature, binding_key_id = _verify_signature(
                 binding_bytes,
-                stored.binding_signature,
-                stored.binding_key_id,
+                envelope.binding_signature,
+                envelope.binding_key_id,
                 self._verifier,
                 label=f"registry blob binding {expected_role}",
             )
-            approval_id = stored.approval_id
+            approval_id = envelope.approval_id
             if manifest.purpose == "official":
                 root_approval = _require_trimmed_text(
                     manifest.approval_id, "official manifest approval_id"
@@ -568,7 +701,7 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
             return VerifiedRegistryBlob(
                 registry_role=expected_role,
                 registry_hash=registry_hash,
-                canonical_json=stored.canonical_json,
+                canonical_json=envelope.canonical_json,
                 signature=signature,
                 key_id=key_id,
                 approval_id=approval_id,
