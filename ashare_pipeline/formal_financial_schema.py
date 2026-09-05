@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import re
+import struct
 from types import MappingProxyType
 from typing import Literal
 import uuid
@@ -890,30 +891,60 @@ def _normalize_fact_values(
 def _make_formal_financial_fact_type() -> type[object]:
     """Create the fact type with closure-private verified-object sealing."""
 
-    records: dict[int, tuple[weakref.ReferenceType[object], tuple[object, ...]]] = {}
+    FactFingerprint = tuple[tuple[str, object], ...]
+    records: dict[int, tuple[weakref.ReferenceType[object], FactFingerprint]] = {}
 
     def forget(identity: int) -> None:
         records.pop(identity, None)
 
-    def fingerprint(fact: object) -> tuple[object, ...] | None:
+    def values_and_fingerprint(fact: object) -> tuple[tuple[object, ...], FactFingerprint] | None:
         if type(fact) is not FormalFinancialFact:
             return None
         try:
-            return tuple(getattr(fact, field) for field in _FACT_FIELDS)
+            values = tuple(getattr(fact, field) for field in _FACT_FIELDS)
         except AttributeError:
             return None
+        fingerprints: list[tuple[str, object]] = []
+        for value in values:
+            if type(value) is str:
+                fingerprints.append(("str", value))
+            elif type(value) is float:
+                fingerprints.append(("float", struct.pack(">d", value)))
+            elif value is None:
+                fingerprints.append(("none", None))
+            else:
+                # Valid formal facts have only exact str, float, or null fields.
+                # Preserve any hostile replacement's exact type without invoking
+                # its equality or serialization methods.
+                fingerprints.append(("other", type(value)))
+        return values, tuple(fingerprints)
 
     def require_seal(fact: object) -> tuple[object, ...]:
         identity = id(fact)
         record = records.get(identity)
-        current = fingerprint(fact)
-        if record is None or current is None or record[0]() is not fact or record[1] != current:
+        current = values_and_fingerprint(fact)
+        if record is None or current is None or record[0]() is not fact or record[1] != current[1]:
             raise ValueError("formal financial fact was not constructed by a validated factory or was mutated")
-        values = dict(zip(_FACT_FIELDS, current, strict=True))
+        values = dict(zip(_FACT_FIELDS, current[0], strict=True))
         # Revalidate as defense in depth; this also rejects any impossible field mutation.
-        if _normalize_fact_values(values, require_id=True) != values:
+        normalized = _normalize_fact_values(values, require_id=True)
+        normalized_fingerprint = tuple(
+            (
+                "str",
+                normalized[field],
+            )
+            if type(normalized[field]) is str
+            else (
+                "float",
+                struct.pack(">d", normalized[field]),
+            )
+            if type(normalized[field]) is float
+            else ("none", None)
+            for field in _FACT_FIELDS
+        )
+        if normalized_fingerprint != current[1]:
             raise ValueError("formal financial fact no longer has a valid canonical identity")
-        return current
+        return current[0]
 
     def construct(values: Mapping[str, object], *, require_id: bool) -> "FormalFinancialFact":
         normalized = _normalize_fact_values(values, require_id=require_id)
@@ -921,10 +952,11 @@ def _make_formal_financial_fact_type() -> type[object]:
         for field in _FACT_FIELDS:
             object.__setattr__(fact, field, normalized[field])
         identity = id(fact)
-        record = tuple(normalized[field] for field in _FACT_FIELDS)
+        sealed = values_and_fingerprint(fact)
+        assert sealed is not None
         records[identity] = (
             weakref.ref(fact, lambda _reference, identity=identity: forget(identity)),
-            record,
+            sealed[1],
         )
         return fact
 

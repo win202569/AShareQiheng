@@ -509,6 +509,15 @@ class FormalFinancialSchemaTests(unittest.TestCase):
             forged.to_dict()
         self.assertFalse(hasattr(formal_financial_schema, "_make_formal_financial_fact_type"))
 
+    def test_fact_seal_rejects_type_equivalent_numeric_mutation(self) -> None:
+        fact = extract().facts[0]
+        self.assertIs(type(fact.value), float)
+
+        object.__setattr__(fact, "value", int(fact.value))
+
+        with self.assertRaises(ValueError):
+            fact.to_dict()
+
     def test_extraction_rejects_nonexact_snapshot_and_document_boundary_values(self) -> None:
         document = fixture_document()
         snapshot = fixture_snapshot(document)
