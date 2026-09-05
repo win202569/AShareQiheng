@@ -50,6 +50,7 @@ from ashare_pipeline.formal_snapshot_store import (
     FormalStoredSnapshot,
     ValidatedFormalSnapshot,
 )
+from ashare_pipeline.formal_time import formal_version_sort_key, is_visible_at
 from ashare_pipeline.formal_universe import (
     FormalFrozenUniverseInput,
     FormalUniverseDecision,
@@ -164,6 +165,29 @@ _FORMAL_UNIVERSE_FINALIZER_PAYLOAD_KEYS = frozenset(
 _FORMAL_UNIVERSE_FINALIZER_RESULT_KEYS = frozenset(
     {"universe_snapshot_id", "frozen_input_hash", "universe_hash", "registry_manifest_hash"}
 )
+
+
+@dataclass(frozen=True)
+class _FormalSnapshotVersion:
+    """Adapt the immutable formal reference to the shared version-order protocol."""
+
+    ref: OfficialSnapshotRef
+
+    @property
+    def published_at_utc(self) -> str:
+        return self.ref.published_at_utc
+
+    @property
+    def source_updated_at_utc(self) -> str | None:
+        return self.ref.source_updated_at_utc
+
+    @property
+    def captured_at_utc(self) -> str:
+        return self.ref.captured_at_utc
+
+    @property
+    def content_hash(self) -> str:
+        return self.ref.content_sha256
 
 FINANCIAL_FACT_COLUMNS = (
     "id",
@@ -1730,6 +1754,275 @@ class StateStore:
         if self._formal_snapshot_store is None:
             raise ValueError("formal snapshot store is not configured")
         return self._formal_snapshot_store
+
+    def _configured_formal_snapshot_store_for_repository(self) -> FormalSnapshotStore:
+        """Expose the one configured formal raw boundary to the sibling repository.
+
+        This deliberately returns the already-injected instance.  A repository must not
+        infer a raw root or construct a second store, because that would lose the trusted
+        date-only calendar resolver carried by the configured instance.
+        """
+        return self._require_formal_snapshot_store()
+
+    @staticmethod
+    def _require_formal_repository_identifier(value: object, field: str) -> str:
+        if type(value) is not str or not value or value != value.strip():
+            raise ValueError(f"{field} must be an already-trimmed nonempty string")
+        return value
+
+    def _formal_repository_request_identity(
+        self, request: object
+    ) -> tuple[OfficialRequest, str, str]:
+        """Return the canonical request JSON/fingerprint for a strict lookup request."""
+        raw_store = self._require_formal_snapshot_store()
+        if type(request) is not OfficialRequest:
+            raise ValueError("request must have exact type OfficialRequest")
+        try:
+            raw_store._validate_request_values(request)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("formal repository request is invalid") from error
+        request_json_bytes = request.canonical_json_bytes()
+        if type(request_json_bytes) is not bytes:
+            raise ValueError("formal repository request JSON is invalid")
+        try:
+            request_json = request_json_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("formal repository request JSON is invalid") from error
+        payload = _decode_canonical_formal_json(request_json, "formal repository request")
+        if frozenset(payload) != _FORMAL_REQUEST_IDENTITY_KEYS or payload != {
+            "source": request.source,
+            "dataset": request.dataset,
+            "security_id": request.security_id,
+            "period_or_date": request.period_or_date,
+            "exchange": request.exchange,
+        }:
+            raise ValueError("formal repository request identity is invalid")
+        return request, request_json, hashlib.sha256(request_json_bytes).hexdigest()
+
+    @staticmethod
+    def _require_formal_repository_as_of(value: object) -> str:
+        if type(value) is not str:
+            raise ValueError("as_of_utc must be a canonical timezone-aware timestamp")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(
+                "as_of_utc must be a canonical timezone-aware timestamp"
+            ) from error
+        if (
+            parsed.tzinfo is None
+            or parsed.utcoffset() is None
+            or parsed.isoformat() != value
+        ):
+            raise ValueError("as_of_utc must be a canonical timezone-aware timestamp")
+        return value
+
+    @staticmethod
+    def _formal_ref_matches_repository_request(
+        ref: OfficialSnapshotRef,
+        request: OfficialRequest,
+        request_fingerprint: str,
+    ) -> bool:
+        return (
+            ref.source == request.source
+            and ref.dataset == request.dataset
+            and ref.security_id == request.security_id
+            and ref.period_or_date == request.period_or_date
+            and ref.exchange == request.exchange
+            and ref.request_fingerprint == request_fingerprint
+        )
+
+    def _require_formal_snapshot_receipt_lineage(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        ref: OfficialSnapshotRef,
+    ) -> None:
+        """Verify the source-row/receipt/task graph for one revalidated reference."""
+        if row["id"] != ref.snapshot_id or row["manifest_sha256"] != ref.manifest_sha256:
+            raise ValueError("formal snapshot row identity mismatch")
+        receipt_rows = connection.execute(
+            "SELECT * FROM formal_task_snapshot_receipt WHERE snapshot_id = ?",
+            (ref.snapshot_id,),
+        ).fetchall()
+        producer_task_id = ref.producing_task_id
+        if producer_task_id is None:
+            if receipt_rows:
+                raise ValueError("formal bootstrap snapshot must not have a receipt")
+            return
+
+        task_id = _require_canonical_uuid(
+            producer_task_id, "snapshot producing task ID"
+        )
+        if len(receipt_rows) != 1:
+            raise ValueError("formal task-produced snapshot requires exactly one receipt")
+        receipt = receipt_rows[0]
+        if (
+            _require_canonical_uuid(receipt["task_id"], "receipt task ID") != task_id
+            or _require_canonical_uuid(receipt["snapshot_id"], "receipt snapshot ID")
+            != ref.snapshot_id
+            or _require_formal_sha256(
+                receipt["manifest_sha256"], "receipt manifest hash"
+            )
+            != ref.manifest_sha256
+        ):
+            raise ValueError("formal snapshot receipt linkage mismatch")
+        receipt_generation = receipt["refresh_generation"]
+        if (
+            type(receipt_generation) is not str
+            or not receipt_generation
+            or receipt_generation != ref.refresh_generation
+        ):
+            raise ValueError("formal snapshot receipt generation mismatch")
+        _require_canonical_utc(receipt["recorded_at"], "receipt time")
+
+        producer_rows = connection.execute(
+            """SELECT id FROM formal_source_snapshot
+            WHERE producing_task_id = ? ORDER BY id""",
+            (task_id,),
+        ).fetchall()
+        if [str(item["id"]) for item in producer_rows] != [ref.snapshot_id]:
+            raise ValueError("formal snapshot producer set mismatch")
+        task_row = connection.execute(
+            "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task_row is None or task_row["id"] != task_id:
+            raise ValueError("formal snapshot receipt task is missing")
+        prerequisites = [
+            str(item["prerequisite_task_id"])
+            for item in connection.execute(
+                """SELECT prerequisite_task_id
+                FROM formal_collection_task_dependency
+                WHERE task_id = ? ORDER BY prerequisite_task_id""",
+                (task_id,),
+            )
+        ]
+        task = self._formal_task_public(task_row, prerequisites)
+        if task["kind"] not in _FORMAL_SOURCE_FETCH_KINDS:
+            raise ValueError("formal snapshot receipt task is not a source task")
+        if task["refresh_generation"] != ref.refresh_generation:
+            raise ValueError("formal snapshot task generation mismatch")
+
+    def _formal_verified_snapshot_ref_from_connection(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> OfficialSnapshotRef:
+        ref = self._formal_snapshot_row_to_ref(row)
+        self._require_formal_snapshot_receipt_lineage(connection, row, ref)
+        return ref
+
+    def _formal_repository_candidates_from_connection(
+        self, connection: sqlite3.Connection, request_fingerprint: str
+    ) -> list[OfficialSnapshotRef]:
+        """Revalidate the fingerprint superset before any lookup-specific filtering."""
+        rows = connection.execute(
+            """SELECT * FROM formal_source_snapshot
+            WHERE request_fingerprint = ? ORDER BY manifest_sha256""",
+            (request_fingerprint,),
+        ).fetchall()
+        return [
+            self._formal_verified_snapshot_ref_from_connection(connection, row)
+            for row in rows
+        ]
+
+    def _find_formal_snapshot_exact_verified(
+        self,
+        request: OfficialRequest,
+        *,
+        parser_id: str,
+        parser_version: str,
+        mapping_version: str,
+        content_sha256: str,
+        manifest_sha256: str,
+    ) -> OfficialSnapshotRef | None:
+        request, _request_json, request_fingerprint = self._formal_repository_request_identity(
+            request
+        )
+        parser_id = self._require_formal_repository_identifier(parser_id, "parser_id")
+        parser_version = self._require_formal_repository_identifier(
+            parser_version, "parser_version"
+        )
+        mapping_version = self._require_formal_repository_identifier(
+            mapping_version, "mapping_version"
+        )
+        content_sha256 = _require_formal_sha256(content_sha256, "content hash")
+        manifest_sha256 = _require_formal_sha256(manifest_sha256, "manifest hash")
+        with self._transaction() as connection:
+            candidates = self._formal_repository_candidates_from_connection(
+                connection, request_fingerprint
+            )
+            matches = [
+                ref
+                for ref in candidates
+                if self._formal_ref_matches_repository_request(
+                    ref, request, request_fingerprint
+                )
+                and ref.parser_id == parser_id
+                and ref.parser_version == parser_version
+                and ref.mapping_version == mapping_version
+                and ref.content_sha256 == content_sha256
+                and ref.manifest_sha256 == manifest_sha256
+            ]
+            if len(matches) > 1:
+                raise ValueError("formal exact snapshot lookup is ambiguous")
+            return matches[0] if matches else None
+
+    def _find_formal_snapshot_visible_verified(
+        self,
+        request: OfficialRequest,
+        *,
+        parser_id: str,
+        parser_version: str,
+        mapping_version: str,
+        as_of_utc: str,
+    ) -> OfficialSnapshotRef | None:
+        request, _request_json, request_fingerprint = self._formal_repository_request_identity(
+            request
+        )
+        parser_id = self._require_formal_repository_identifier(parser_id, "parser_id")
+        parser_version = self._require_formal_repository_identifier(
+            parser_version, "parser_version"
+        )
+        mapping_version = self._require_formal_repository_identifier(
+            mapping_version, "mapping_version"
+        )
+        as_of_utc = self._require_formal_repository_as_of(as_of_utc)
+        with self._transaction() as connection:
+            candidates = self._formal_repository_candidates_from_connection(
+                connection, request_fingerprint
+            )
+            visible = [
+                ref
+                for ref in candidates
+                if self._formal_ref_matches_repository_request(
+                    ref, request, request_fingerprint
+                )
+                and ref.parser_id == parser_id
+                and ref.parser_version == parser_version
+                and ref.mapping_version == mapping_version
+                and is_visible_at(ref.effective_at_utc, as_of_utc)
+            ]
+            if not visible:
+                return None
+            return min(
+                visible,
+                key=lambda ref: (
+                    formal_version_sort_key(_FormalSnapshotVersion(ref)),
+                    ref.manifest_sha256,
+                ),
+            )
+
+    def _get_formal_snapshot_verified_by_manifest(
+        self, manifest_sha256: str
+    ) -> OfficialSnapshotRef | None:
+        manifest_sha256 = _require_formal_sha256(manifest_sha256, "manifest hash")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM formal_source_snapshot WHERE manifest_sha256 = ?",
+                (manifest_sha256,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._formal_verified_snapshot_ref_from_connection(connection, row)
 
     def _formal_snapshot_row_to_ref(self, row: sqlite3.Row) -> OfficialSnapshotRef:
         raw_store = self._require_formal_snapshot_store()
