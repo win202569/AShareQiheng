@@ -288,7 +288,8 @@ def _formula_to_dict(node: object, ancestors: set[int]) -> dict[str, object]:
             raise ValueError("formula op is invalid")
         if node.op == "fact":
             if (
-                node.left is not None or node.right is not None or node.items != ()
+                node.left is not None or node.right is not None
+                or type(node.items) is not tuple or node.items
                 or node.intervals is not None
             ):
                 raise ValueError("fact formula has invalid children")
@@ -300,7 +301,7 @@ def _formula_to_dict(node: object, ancestors: set[int]) -> dict[str, object]:
         if node.fact_key is not None or node.period_key is not None:
             raise ValueError("non-fact formula cannot contain fact fields")
         if node.op in {"add", "subtract", "divide", "cagr"}:
-            if node.items != ():
+            if type(node.items) is not tuple or node.items:
                 raise ValueError("binary formula cannot contain items")
             left = _formula_to_dict(node.left, ancestors)
             right = _formula_to_dict(node.right, ancestors)
@@ -733,7 +734,7 @@ def _make_evidence_type() -> type[object]:
             raise ValueError("formal evidence was not safely constructed or was mutated")
         return current
 
-    @dataclass(frozen=True, slots=True, weakref_slot=True)
+    @dataclass(frozen=True, slots=True, weakref_slot=True, init=False)
     class FormalEvidenceRef:
         formal_fact_id: str
         source_snapshot_id: str
@@ -746,7 +747,40 @@ def _make_evidence_type() -> type[object]:
         effective_at_utc: str
         mapping_version: str
 
-        def __post_init__(self) -> None:
+        def __init__(
+            self,
+            formal_fact_id: str,
+            source_snapshot_id: str,
+            source_content_sha256: str,
+            source_refresh_generation: str,
+            source_field: str,
+            raw_value_sha256: str,
+            published_at_utc: str,
+            published_precision: Literal["timestamp", "date_only"],
+            effective_at_utc: str,
+            mapping_version: str,
+        ) -> None:
+            if records.get(id(self)) is not None or any(
+                hasattr(self, field) for field in fields
+            ):
+                raise ValueError("formal evidence initialization may run only once")
+            for field, value in zip(
+                fields,
+                (
+                    formal_fact_id,
+                    source_snapshot_id,
+                    source_content_sha256,
+                    source_refresh_generation,
+                    source_field,
+                    raw_value_sha256,
+                    published_at_utc,
+                    published_precision,
+                    effective_at_utc,
+                    mapping_version,
+                ),
+                strict=True,
+            ):
+                object.__setattr__(self, field, value)
             remember(self)
 
         @classmethod
@@ -857,7 +891,7 @@ def _make_feature_value_type() -> type[object]:
             raise ValueError("formal feature value was not safely constructed or was mutated")
         return current
 
-    @dataclass(frozen=True, slots=True, weakref_slot=True)
+    @dataclass(frozen=True, slots=True, weakref_slot=True, init=False)
     class FormalFeatureValue:
         slot_id: str
         value: float | None
@@ -867,20 +901,42 @@ def _make_feature_value_type() -> type[object]:
         evidence: tuple[FormalEvidenceRef, ...]
         missing_reason: str | None
 
-        def __post_init__(self) -> None:
-            if type(self.value) is bool:
+        def __init__(
+            self,
+            slot_id: str,
+            value: float | None,
+            unit: str,
+            status: Literal["derived", "missing", "blocked", "not_applicable"],
+            formula_version: str,
+            evidence: tuple[FormalEvidenceRef, ...],
+            missing_reason: str | None,
+        ) -> None:
+            fields = (
+                "slot_id", "value", "unit", "status", "formula_version", "evidence",
+                "missing_reason",
+            )
+            if records.get(id(self)) is not None or any(
+                hasattr(self, field) for field in fields
+            ):
+                raise ValueError("formal feature value initialization may run only once")
+            if type(value) is bool:
                 raise ValueError("feature value must be finite numeric or null")
-            if type(self.value) is int:
+            if type(value) is int:
                 try:
-                    normalized = float(self.value)
+                    value = float(value)
                 except OverflowError as error:
                     raise ValueError("feature value must be finite") from error
-                object.__setattr__(self, "value", normalized)
-            if type(self.value) is float:
-                if not math.isfinite(self.value):
+            if type(value) is float:
+                if not math.isfinite(value):
                     raise ValueError("feature value must be finite")
-                if self.value == 0.0:
-                    object.__setattr__(self, "value", 0.0)
+                if value == 0.0:
+                    value = 0.0
+            for field, supplied in zip(
+                fields,
+                (slot_id, value, unit, status, formula_version, evidence, missing_reason),
+                strict=True,
+            ):
+                object.__setattr__(self, field, supplied)
             remember(self)
 
         @classmethod
@@ -1019,7 +1075,7 @@ def _make_bundle_type() -> type[object]:
             raise ValueError("formal feature bundle was not safely constructed or was mutated")
         return current
 
-    @dataclass(frozen=True, slots=True, weakref_slot=True)
+    @dataclass(frozen=True, slots=True, weakref_slot=True, init=False)
     class FormalFeatureBundle:
         schema_version: int
         contract_version: str
@@ -1034,7 +1090,50 @@ def _make_bundle_type() -> type[object]:
         comparable_quarter_keys: tuple[str, ...]
         blockers: tuple[str, ...]
 
-        def __post_init__(self) -> None:
+        def __init__(
+            self,
+            schema_version: int,
+            contract_version: str,
+            security_id: str,
+            as_of_utc: str,
+            template_id: str,
+            registry_manifest_hash: str,
+            feature_registry_hash: str,
+            input_hash: str,
+            values: tuple[FormalFeatureValue, ...],
+            history_endpoints: tuple[str, ...],
+            comparable_quarter_keys: tuple[str, ...],
+            blockers: tuple[str, ...],
+        ) -> None:
+            fields = (
+                "schema_version", "contract_version", "security_id", "as_of_utc",
+                "template_id", "registry_manifest_hash", "feature_registry_hash",
+                "input_hash", "values", "history_endpoints", "comparable_quarter_keys",
+                "blockers",
+            )
+            if records.get(id(self)) is not None or any(
+                hasattr(self, field) for field in fields
+            ):
+                raise ValueError("formal feature bundle initialization may run only once")
+            for field, value in zip(
+                fields,
+                (
+                    schema_version,
+                    contract_version,
+                    security_id,
+                    as_of_utc,
+                    template_id,
+                    registry_manifest_hash,
+                    feature_registry_hash,
+                    input_hash,
+                    values,
+                    history_endpoints,
+                    comparable_quarter_keys,
+                    blockers,
+                ),
+                strict=True,
+            ):
+                object.__setattr__(self, field, value)
             remember(self)
 
         @classmethod

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -65,6 +66,20 @@ def fixture_bundle(**changes: object) -> FormalFeatureBundle:
     }
     values.update(changes)
     return FormalFeatureBundle(**values)
+
+
+def create_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise OSError(result.stderr or result.stdout or "junction creation failed")
+    else:
+        os.symlink(target, link, target_is_directory=True)
 
 
 class FormalFeatureStoreTests(unittest.TestCase):
@@ -140,6 +155,28 @@ class FormalFeatureStoreTests(unittest.TestCase):
         self.assertEqual(bundle_path.read_bytes(), b"conflicting bundle")
         self.assertFalse(manifest_path.exists())
 
+    def test_competing_target_created_during_publication_is_never_overwritten(self) -> None:
+        bundle_path, manifest_path, _ = self.expected_paths()
+        real_link = os.link
+        raced = False
+
+        def competing_link(source: object, target: object, *args: object, **kwargs: object) -> None:
+            nonlocal raced
+            if not raced:
+                raced = True
+                bundle_path.write_bytes(b"competing writer")
+            real_link(source, target, *args, **kwargs)
+
+        with patch("ashare_pipeline.formal_feature_store.os.link", side_effect=competing_link):
+            with self.assertRaisesRegex(ValueError, "bundle conflict"):
+                self.store.write(self.bundle)
+
+        self.assertTrue(raced)
+        self.assertEqual(bundle_path.read_bytes(), b"competing writer")
+        self.assertFalse(manifest_path.exists())
+        self.assertEqual(list(bundle_path.parent.glob("*.part")), [])
+        self.assertEqual(list(bundle_path.parent.glob("*.lock")), [])
+
     def test_existing_manifest_conflict_never_overwrites_bytes(self) -> None:
         bundle_path, manifest_path, _ = self.expected_paths()
         bundle_path.parent.mkdir(parents=True)
@@ -196,12 +233,43 @@ class FormalFeatureStoreTests(unittest.TestCase):
             store = FormalFeatureBundleStore(root)
             failed_bundle = fixture_bundle(input_hash="8" * 64)
             directory = Path(root).resolve() / "data" / "formal" / "features"
-            with patch("ashare_pipeline.formal_feature_store.os.replace", side_effect=OSError("disk failure")):
+            with patch("ashare_pipeline.formal_feature_store.os.link", side_effect=OSError("disk failure")):
                 with self.assertRaisesRegex(ValueError, "write failed"):
                     store.write(failed_bundle)
             self.assertEqual(list(directory.glob("*.part")), [])
             self.assertEqual(list(directory.glob("*.lock")), [])
             self.assertEqual(list(directory.glob("*.json")), [])
+        self.assertFalse(lock_path.exists())
+
+    def test_directory_replacement_race_cannot_write_through_external_link(self) -> None:
+        bundle_path, _, lock_path = self.expected_paths()
+        directory = bundle_path.parent
+        displaced = directory.parent / "features.displaced"
+        external = self.root / "external-target"
+        external.mkdir()
+        real_open = os.open
+        raced = False
+
+        def replacing_open(
+            path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> int:
+            nonlocal raced
+            if not raced and str(path).endswith(".lock"):
+                raced = True
+                directory.rename(displaced)
+                create_directory_link(directory, external)
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with patch("ashare_pipeline.formal_feature_store.os.open", side_effect=replacing_open):
+            with self.assertRaises(ValueError):
+                self.store.write(self.bundle)
+
+        self.assertTrue(raced)
+        self.assertEqual(list(external.iterdir()), [])
+        self.assertEqual(list(displaced.glob("*.part")), [])
+        self.assertEqual(list(displaced.glob("*.lock")), [])
         self.assertFalse(lock_path.exists())
 
     def test_forged_or_mutated_receipt_and_wrong_store_root_are_rejected(self) -> None:

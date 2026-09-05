@@ -351,6 +351,15 @@ class FormalFeatureContractTests(unittest.TestCase):
             with self.subTest(wire=repr(wire)[:80]), self.assertRaises(ValueError):
                 FormulaNode.from_dict(wire)  # type: ignore[arg-type]
 
+    def test_registry_rejects_equality_spoofed_formula_items_mutation(self) -> None:
+        raw = feature_registry_bytes()
+        registry = load_registry(raw, registry_manifest(raw))
+        formula = registry.slots[0].formula
+        object.__setattr__(formula, "items", EqualitySpoof())
+
+        with self.assertRaises(ValueError):
+            _ = registry.release_eligible
+
     def test_evidence_copies_every_sealed_fact_lineage_field(self) -> None:
         fact = formal_fact()
         ref = FormalEvidenceRef.from_formal_fact(fact)
@@ -382,6 +391,19 @@ class FormalFeatureContractTests(unittest.TestCase):
             FormalEvidenceRef.from_formal_fact(fact)
         ref = evidence()
         object.__setattr__(ref, "source_field", "OTHER")
+        with self.assertRaises(ValueError):
+            ref.to_dict()
+
+    def test_evidence_cannot_reseal_after_refresh_generation_mutation(self) -> None:
+        ref = evidence()
+        original = ref.to_dict()
+        object.__setattr__(ref, "source_refresh_generation", "refresh-v2")
+
+        with self.assertRaises(AttributeError):
+            ref.__post_init__()
+        with self.assertRaises(ValueError):
+            FormalEvidenceRef.__init__(ref, **original)
+        self.assertEqual(ref.source_refresh_generation, "refresh-v2")
         with self.assertRaises(ValueError):
             ref.to_dict()
 
@@ -428,6 +450,27 @@ class FormalFeatureContractTests(unittest.TestCase):
         for supplied in ((refs[1], refs[0]), (refs[0], refs[0]), [refs[0]]):
             with self.subTest(supplied=supplied), self.assertRaises(ValueError):
                 feature_value(evidence=supplied)
+
+    def test_feature_value_cannot_reseal_after_mutation(self) -> None:
+        item = feature_value()
+        original = {
+            "slot_id": item.slot_id,
+            "value": item.value,
+            "unit": item.unit,
+            "status": item.status,
+            "formula_version": item.formula_version,
+            "evidence": item.evidence,
+            "missing_reason": item.missing_reason,
+        }
+        object.__setattr__(item, "slot_id", "general_nonfinancial.changed")
+
+        with self.assertRaises(AttributeError):
+            item.__post_init__()
+        with self.assertRaises(ValueError):
+            FormalFeatureValue.__init__(item, **original)
+        self.assertEqual(item.slot_id, "general_nonfinancial.changed")
+        with self.assertRaises(ValueError):
+            item.to_dict()
 
     def test_bundle_roundtrip_hash_and_exact_non_scoring_wire(self) -> None:
         bundle = feature_bundle()
@@ -477,6 +520,59 @@ class FormalFeatureContractTests(unittest.TestCase):
         for action in (bundle.to_dict, bundle.canonical_bytes, bundle.bundle_hash):
             with self.subTest(action=action.__name__), self.assertRaises(ValueError):
                 action()
+
+    def test_bundle_cannot_reseal_after_mutation(self) -> None:
+        bundle = feature_bundle()
+        original = {
+            "schema_version": bundle.schema_version,
+            "contract_version": bundle.contract_version,
+            "security_id": bundle.security_id,
+            "as_of_utc": bundle.as_of_utc,
+            "template_id": bundle.template_id,
+            "registry_manifest_hash": bundle.registry_manifest_hash,
+            "feature_registry_hash": bundle.feature_registry_hash,
+            "input_hash": bundle.input_hash,
+            "values": bundle.values,
+            "history_endpoints": bundle.history_endpoints,
+            "comparable_quarter_keys": bundle.comparable_quarter_keys,
+            "blockers": bundle.blockers,
+        }
+        object.__setattr__(bundle, "security_id", "SZ000001")
+
+        with self.assertRaises(AttributeError):
+            bundle.__post_init__()
+        with self.assertRaises(ValueError):
+            FormalFeatureBundle.__init__(bundle, **original)
+        self.assertEqual(bundle.security_id, "SZ000001")
+        with self.assertRaises(ValueError):
+            bundle.to_dict()
+
+    def test_populated_forged_bundle_cannot_run_initialization_or_seal_hook(self) -> None:
+        healthy = feature_bundle()
+        fields = {
+            "schema_version": healthy.schema_version,
+            "contract_version": healthy.contract_version,
+            "security_id": healthy.security_id,
+            "as_of_utc": healthy.as_of_utc,
+            "template_id": healthy.template_id,
+            "registry_manifest_hash": healthy.registry_manifest_hash,
+            "feature_registry_hash": healthy.feature_registry_hash,
+            "input_hash": healthy.input_hash,
+            "values": healthy.values,
+            "history_endpoints": healthy.history_endpoints,
+            "comparable_quarter_keys": healthy.comparable_quarter_keys,
+            "blockers": healthy.blockers,
+        }
+        forged = object.__new__(FormalFeatureBundle)
+        for name, value in fields.items():
+            object.__setattr__(forged, name, value)
+
+        with self.assertRaises(ValueError):
+            FormalFeatureBundle.__init__(forged, **fields)
+        with self.assertRaises(AttributeError):
+            forged.__post_init__()
+        with self.assertRaises(ValueError):
+            forged.to_dict()
 
 
 if __name__ == "__main__":
