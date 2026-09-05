@@ -226,6 +226,11 @@ def _verify_signature(
 def _https_host(value: object, label: str) -> str:
     if type(value) is not str or not value or value != value.strip():
         raise ValueError(f"{label} must be an absolute HTTPS URL")
+    if any(
+        ord(character) <= 0x20 or ord(character) == 0x7F or character.isspace()
+        for character in value
+    ):
+        raise ValueError(f"{label} contains forbidden whitespace or control characters")
     if not value[:8].lower() == "https://":
         raise ValueError(f"{label} must be an absolute HTTPS URL")
     remainder = value[8:]
@@ -277,6 +282,42 @@ def _validate_placeholders(value: object, label: str, *, nonempty: bool = False)
     return value
 
 
+def _has_forbidden_raw_control(value: str, *, whitespace: bool) -> bool:
+    return any(
+        ord(character) < 0x20
+        or ord(character) == 0x7F
+        or (whitespace and character.isspace())
+        for character in value
+    )
+
+
+def _validate_static_template_key(value: object, label: str, *, header: bool) -> str:
+    key = _validate_placeholders(value, label, nonempty=True)
+    if _PLACEHOLDER.search(key) is not None:
+        raise ValueError(f"{label} must be static and cannot contain placeholders")
+    if _has_forbidden_raw_control(key, whitespace=True):
+        raise ValueError(f"{label} contains forbidden whitespace or control characters")
+    if header and re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", key) is None:
+        raise ValueError(f"{label} must be a static HTTP field name")
+    return key
+
+
+def _validate_query_template_value(value: object, label: str) -> str:
+    item = _validate_placeholders(value, label)
+    if _has_forbidden_raw_control(item, whitespace=True):
+        raise ValueError(f"{label} contains forbidden whitespace or control characters")
+    if "&" in item or "#" in item:
+        raise ValueError(f"{label} contains an unsafe raw query delimiter")
+    return item
+
+
+def _validate_header_template_value(value: object, label: str) -> str:
+    item = _validate_placeholders(value, label)
+    if _has_forbidden_raw_control(item, whitespace=False):
+        raise ValueError(f"{label} contains forbidden control characters")
+    return item
+
+
 def _validate_body_template(value: object, label: str) -> None:
     if value is None:
         return
@@ -302,12 +343,12 @@ def _validate_request_template(value: object, method: object) -> Mapping[str, ob
     headers = value["headers"]
     if not isinstance(query, Mapping) or not isinstance(headers, Mapping):
         raise ValueError("request_template query and headers must be mappings")
-    for name, items in (("query", query), ("headers", headers)):
-        for key, item in items.items():
-            _validate_placeholders(key, f"request_template {name} key", nonempty=True)
-            _validate_placeholders(item, f"request_template {name} value")
-            if name == "headers" and ("\r" in key or "\n" in key or "\r" in item or "\n" in item):
-                raise ValueError("request_template header contains CR or LF")
+    for key, item in query.items():
+        _validate_static_template_key(key, "request_template query key", header=False)
+        _validate_query_template_value(item, "request_template query value")
+    for key, item in headers.items():
+        _validate_static_template_key(key, "request_template header key", header=True)
+        _validate_header_template_value(item, "request_template header value")
     _validate_body_template(value["body"], "request_template body")
     if method == "GET" and value["body"] is not None:
         raise ValueError("GET request_template body must be null")
@@ -395,6 +436,8 @@ class SourceAdapterConfig:
                 or self.exchange_scope is not None
             ):
                 raise ValueError("bootstrap calendar config must be an unbound trading_calendar")
+        elif self.dataset == "trading_calendar" and self.calendar_selector is None:
+            raise ValueError("non-bootstrap trading_calendar config requires calendar_selector")
         if self.calendar_selector is not None and self.exchange_scope is not None:
             if self.calendar_selector.exchange != self.exchange_scope:
                 raise ValueError("calendar selector exchange must match exchange_scope")
@@ -664,11 +707,19 @@ def _build_transport_request(
         url = config.endpoint_url + query_prefix + "&".join(query_pairs)
     else:
         url = config.endpoint_url
+    try:
+        _https_host(url, "constructed transport URL")
+    except ValueError as error:
+        raise FormalTerminalSourceError(str(error)) from error
     sent_headers = {
         key: _substitute_text(value, values, percent_encode=False) for key, value in headers.items()
     }
-    if any("\r" in key or "\n" in key or "\r" in value or "\n" in value for key, value in sent_headers.items()):
-        raise FormalTerminalSourceError("request template header contains CR or LF")
+    if any(
+        _has_forbidden_raw_control(key, whitespace=True)
+        or _has_forbidden_raw_control(value, whitespace=False)
+        for key, value in sent_headers.items()
+    ):
+        raise FormalTerminalSourceError("request template header contains forbidden control characters")
     body_value = _substitute_body(config.request_template["body"], values)
     body = None if body_value is None else _canonical_json_bytes(body_value)
     if config.http_method == "GET" and body is not None:
@@ -796,6 +847,14 @@ class FormalOfficialSourceAdapter:
             raise FormalTerminalSourceError(
                 "bootstrap calendar request must be a global request without an exchange"
             )
+        if config.dataset == "universe_listing" and (
+            request.security_id is not None
+            or config.exchange_scope is None
+            or request.exchange != config.exchange_scope
+        ):
+            raise FormalTerminalSourceError(
+                "universe_listing must be a global request for its signed exchange scope"
+            )
         if config.exchange_scope is not None and resolved_exchange is not None and config.exchange_scope != resolved_exchange:
             raise FormalTerminalSourceError("request exchange does not match signed config scope")
         try:
@@ -804,7 +863,10 @@ class FormalOfficialSourceAdapter:
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
         binding = self._resolve_calendar_binding(config, resolved_exchange, calendar_binding)
-        transport_request = _build_transport_request(config, request, resolved_exchange)
+        try:
+            transport_request = _build_transport_request(config, request, resolved_exchange)
+        except ValueError as error:
+            raise FormalTerminalSourceError(str(error)) from error
         return request, config, policy, parser, resolved_exchange, binding, transport_request
 
     @staticmethod
@@ -942,13 +1004,13 @@ class FormalOfficialSourceAdapter:
         except OSError as error:
             raise FormalRetryableSourceError("official transport failed") from error
         response = self._validate_response(response)
-        self._classify_response(response)
         try:
             host = _https_host(response.original_url, "transport response original_url")
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
         if host not in policy.allowed_hosts:
             raise FormalTerminalSourceError("transport response URL host is not allowlisted")
+        self._classify_response(response)
         try:
             document = parser.parse(response.raw_bytes, request=request, config=config)
         except FormalSourceError:
@@ -1024,11 +1086,11 @@ class FormalOfficialSourceAdapter:
         ):
             raise FormalTerminalSourceError("snapshot parser or mapping identity does not match signed config")
         try:
-            _https_host(snapshot_ref.original_url, "snapshot original_url")
+            snapshot_host = _https_host(snapshot_ref.original_url, "snapshot original_url")
             _require_aware_timestamp(snapshot_ref.captured_at_utc, "snapshot captured_at_utc")
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
-        if _https_host(snapshot_ref.original_url, "snapshot original_url") not in policy.allowed_hosts:
+        if snapshot_host not in policy.allowed_hosts:
             raise FormalTerminalSourceError("snapshot URL host is not allowlisted")
         try:
             document = parser.parse(raw_bytes, request=request, config=config)

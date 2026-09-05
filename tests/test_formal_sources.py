@@ -316,6 +316,100 @@ class FormalSourceTests(unittest.TestCase):
             )
         self.assertEqual(transport.requests, [])
 
+    def test_signed_templates_reject_dynamic_keys_controls_and_unbound_calendar_configs(self):
+        invalids = (
+            config(
+                request_template={"query": {"{security_id}": "value"}, "headers": {}, "body": None}
+            ),
+            config(
+                request_template={"query": {}, "headers": {"x-{security_id}": "value"}, "body": None}
+            ),
+            config(
+                request_template={"query": {"q": "raw&injected=true"}, "headers": {}, "body": None}
+            ),
+            config(
+                request_template={"query": {"q": "raw\r\nvalue"}, "headers": {}, "body": None}
+            ),
+            config(
+                request_template={"query": {}, "headers": {"x-safe": "raw\x7fvalue"}, "body": None}
+            ),
+            config(
+                dataset="trading_calendar",
+                request_template={"query": {}, "headers": {}, "body": None},
+            ),
+        )
+        for invalid in invalids:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    SignedSourceRegistry.from_signed_bytes(
+                        registry_bytes([invalid]),
+                        "fixture-signature",
+                        "fixture-key",
+                        AcceptingVerifier(),
+                    )
+
+    def test_url_controls_are_rejected_before_parser_or_snapshot_verification(self):
+        invalid_endpoint = config(
+            endpoint_url="https://www.cninfo.com.cn/fixture/annual\r\nredirect"
+        )
+        transport = FakeTransport(response())
+        with self.assertRaises(ValueError):
+            SignedSourceRegistry.from_signed_bytes(
+                registry_bytes([invalid_endpoint]),
+                "fixture-signature",
+                "fixture-key",
+                AcceptingVerifier(),
+            )
+        self.assertEqual(transport.requests, [])
+
+        raw = b"snapshot-raw"
+        document = timestamp_document()
+        adapter, response_transport, parser = self.make_adapter(
+            [config()], document,
+            transport=FakeTransport(
+                response(raw, url="https://www.cninfo.com.cn/fixture/annual\r\nredirect")
+            ),
+        )
+        request = OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31")
+        with self.assertRaises(FormalTerminalSourceError):
+            adapter.fetch_verified(
+                request, refresh_generation="generation", calendar_binding=None
+            )
+        self.assertEqual(len(response_transport.requests), 1)
+        self.assertEqual(parser.calls, [])
+
+        replay_adapter, replay_transport, replay_parser = self.make_adapter([config()], document)
+        ref = OfficialSnapshotRef(
+            snapshot_id="snapshot",
+            source=request.source,
+            dataset=request.dataset,
+            request_fingerprint=request.request_fingerprint,
+            security_id=request.security_id,
+            period_or_date=request.period_or_date,
+            exchange=request.exchange,
+            content_sha256=hashlib.sha256(raw).hexdigest(),
+            manifest_sha256="a" * 64,
+            content_path="unused.bin",
+            manifest_path="unused.manifest.json",
+            original_url="https://www.cninfo.com.cn/fixture/annual\x7fredirect",
+            published_at_utc=document.published_at_utc,
+            published_precision="timestamp",
+            source_updated_at_utc=document.source_updated_at_utc,
+            captured_at_utc="2026-09-04T00:00:00+00:00",
+            effective_at_utc=document.published_at_utc,
+            effective_time_evidence_hash=None,
+            refresh_generation="generation",
+            producing_task_id=None,
+            parser_id="fixture-parser",
+            parser_version="fixture-v1",
+            mapping_version="fixture-map-v1",
+            verification_status="verified",
+        )
+        with self.assertRaises(FormalTerminalSourceError):
+            replay_adapter.parse_verified_snapshot(ref, raw, calendar_binding=None)
+        self.assertEqual(replay_transport.requests, [])
+        self.assertEqual(replay_parser.calls, [])
+
     def test_status_challenge_and_timeout_are_classified_without_parsing(self):
         document = timestamp_document()
         cases = (
@@ -505,6 +599,23 @@ class FormalSourceTests(unittest.TestCase):
                 refresh_generation="generation",
                 calendar_binding=None,
             )
+
+    def test_universe_listing_rejects_non_global_identity_before_transport_or_parser(self):
+        listing = config(
+            dataset="universe_listing",
+            exchange_scope="BJ",
+            request_template={"query": {}, "headers": {}, "body": None},
+        )
+        document = timestamp_document(declared_security_id=None, declared_period=None)
+        adapter, transport, parser = self.make_adapter([listing], document)
+        with self.assertRaises(FormalTerminalSourceError):
+            adapter.fetch_verified(
+                OfficialRequest("cninfo", "universe_listing", "BJ430001", None, "BJ"),
+                refresh_generation="generation",
+                calendar_binding=None,
+            )
+        self.assertEqual(transport.requests, [])
+        self.assertEqual(parser.calls, [])
 
     def test_parser_identity_and_declared_publication_mismatches_fail_closed(self):
         request = OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31")

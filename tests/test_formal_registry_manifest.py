@@ -7,6 +7,7 @@ from ashare_pipeline.formal_registry_manifest import (
     FormalRegistryBundleLoader,
     FormalRegistryManifest,
     VerifiedRegistryBlob,
+    VerifiedRegistryBundle,
 )
 
 
@@ -93,6 +94,30 @@ def fixture_blob(role, raw, manifest_hash, *, registry_role=None, registry_hash=
     )
 
 
+def untrusted_manifest_envelope(manifest, **changes):
+    """Model raw repository fields without granting a verified root capability."""
+    envelope = object.__new__(FormalRegistryManifest)
+    for field in (
+        "manifest_hash",
+        "purpose",
+        "approval_id",
+        "canonical_json",
+        "signature",
+        "key_id",
+        "source_registry_hash",
+        "mapping_registry_hash",
+        "feature_registry_hash",
+        "scoring_registry_hash",
+        "industry_registry_hash",
+        "cyclic_registry_hash",
+        "redline_registry_hash",
+        "status_registry_hash",
+        "event_registry_hash",
+    ):
+        object.__setattr__(envelope, field, changes.get(field, getattr(manifest, field)))
+    return envelope
+
+
 def binding_bytes(child_sha256, registry_manifest_hash, registry_role):
     return canonical_bytes(
         {
@@ -165,7 +190,7 @@ class FormalRegistryManifestTests(unittest.TestCase):
 
     def test_loader_rejects_root_or_child_signature_tampering_after_storage(self):
         repository, manifest, blobs = fixture_repository()
-        repository.manifest = replace(manifest, signature="tampered")
+        repository.manifest = untrusted_manifest_envelope(manifest, signature="tampered")
         with self.assertRaisesRegex(ValueError, "signature"):
             FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(manifest.manifest_hash)
 
@@ -298,6 +323,91 @@ class FormalRegistryManifestTests(unittest.TestCase):
             FormalRegistryManifest.from_signed_bytes(
                 canonical_bytes(official), "fixture-signature", "fixture-key", AcceptingVerifier()
             )
+
+    def test_release_gates_reject_direct_or_fabricated_manifest_and_bundle_objects(self):
+        hashes = [f"{index:064x}" for index in range(1, 10)]
+        with self.assertRaisesRegex(ValueError, "from_signed_bytes"):
+            FormalRegistryManifest(
+                "a" * 64,
+                "official",
+                "release-1",
+                b"{}",
+                "signature",
+                "fixture-key",
+                *hashes,
+            )
+        fabricated_manifest = object.__new__(FormalRegistryManifest)
+        object.__setattr__(fabricated_manifest, "purpose", "official")
+        object.__setattr__(fabricated_manifest, "approval_id", "release-1")
+        with self.assertRaisesRegex(ValueError, "verified"):
+            fabricated_manifest.require_official()
+
+        repository, manifest, _ = fixture_repository()
+        with self.assertRaises(ValueError):
+            replace(manifest, signature="tampered")
+        with self.assertRaisesRegex(ValueError, "loader"):
+            VerifiedRegistryBundle(manifest, {})
+        fabricated_bundle = object.__new__(VerifiedRegistryBundle)
+        object.__setattr__(fabricated_bundle, "manifest", fabricated_manifest)
+        object.__setattr__(fabricated_bundle, "blobs", {})
+        with self.assertRaisesRegex(ValueError, "verified"):
+            fabricated_bundle.require_official()
+        with self.assertRaisesRegex(ValueError, "verified"):
+            fabricated_bundle.blob("source")
+
+    def test_verified_construction_capability_is_not_exposed_on_public_objects(self):
+        repository, manifest, _ = fixture_repository()
+        bundle = FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(
+            manifest.manifest_hash
+        )
+        with self.assertRaises(AttributeError):
+            getattr(manifest, "_verified_provenance")
+        with self.assertRaises(AttributeError):
+            getattr(bundle, "_verified_provenance")
+        with self.assertRaisesRegex(ValueError, "from_signed_bytes"):
+            FormalRegistryManifest(_verified_token=object())
+        with self.assertRaisesRegex(ValueError, "loader"):
+            VerifiedRegistryBundle(manifest, {}, _verified_token=object())
+
+    def test_manifest_provenance_rejects_object_setattr_mutation(self):
+        _, manifest, _ = fixture_repository()
+        object.__setattr__(manifest, "purpose", "official")
+        object.__setattr__(manifest, "approval_id", "release-1")
+        member_hashes = {
+            f"{role}_registry_hash": getattr(manifest, f"{role}_registry_hash")
+            for role in ROLES
+        }
+        with self.assertRaisesRegex(ValueError, "verified"):
+            manifest.require_official()
+        with self.assertRaisesRegex(ValueError, "verified"):
+            manifest.assert_member_hashes(**member_hashes)
+
+    def test_bundle_provenance_rejects_manifest_mapping_and_blob_mutation(self):
+        repository, manifest, _ = fixture_repository()
+        bundle = FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(
+            manifest.manifest_hash
+        )
+        _, replacement_manifest, _ = fixture_repository()
+        object.__setattr__(bundle, "manifest", replacement_manifest)
+        with self.assertRaisesRegex(ValueError, "verified"):
+            bundle.blob("source")
+
+        repository, manifest, _ = fixture_repository()
+        bundle = FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(
+            manifest.manifest_hash
+        )
+        object.__setattr__(bundle, "blobs", {})
+        with self.assertRaisesRegex(ValueError, "verified"):
+            bundle.blob("source")
+
+        repository, manifest, _ = fixture_repository()
+        bundle = FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(
+            manifest.manifest_hash
+        )
+        source = bundle.blob("source")
+        object.__setattr__(source, "binding_signature", "tampered")
+        with self.assertRaisesRegex(ValueError, "verified"):
+            bundle.blob("source")
 
 
 if __name__ == "__main__":
