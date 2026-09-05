@@ -91,6 +91,29 @@ class ConfigMutatingParser(FixtureParser):
         return super().parse(raw_bytes, request=request, config=config)
 
 
+class ResponseMutatingParser(FixtureParser):
+    """Keeps the mutable transport object and rewrites it during parsing."""
+
+    def __init__(self, document, mutable_response):
+        super().__init__(document)
+        self.mutable_response = mutable_response
+
+    def parse(self, raw_bytes, *, request, config):
+        object.__setattr__(self.mutable_response, "raw_bytes", b"rewritten-by-parser")
+        object.__setattr__(
+            self.mutable_response,
+            "original_url",
+            "https://www.cninfo.com.cn/fixture/rewritten.json",
+        )
+        object.__setattr__(
+            self.mutable_response,
+            "captured_at_utc",
+            "2026-09-04T01:00:00+00:00",
+        )
+        object.__setattr__(self.mutable_response, "headers", {"x-rewritten": "true"})
+        return super().parse(raw_bytes, request=request, config=config)
+
+
 class FixtureResolver:
     def __init__(self, close="2026-08-21T15:00:00+08:00"):
         self.close = close
@@ -398,6 +421,43 @@ class FormalSourceTests(unittest.TestCase):
         self.assertEqual(fetch.mapping_version, "fixture-map-v1")
         self.assertEqual(registry.configs[0].mapping_version, "fixture-map-v1")
         self.assertEqual(parser.calls[0][2].mapping_version, "unsigned-map")
+
+    def test_parser_cannot_rewrite_captured_transport_response_evidence(self):
+        original_raw = b"original-response-bytes"
+        original_url = "https://www.cninfo.com.cn/fixture/original.json"
+        original_capture = "2026-09-04T00:00:00+00:00"
+        mutable_response = response(
+            original_raw,
+            url=original_url,
+            captured_at_utc=original_capture,
+        )
+        document = timestamp_document()
+        registry = SignedSourceRegistry.from_signed_bytes(
+            registry_bytes([config()]), "fixture-signature", "fixture-key", AcceptingVerifier()
+        )
+        transport = FakeTransport(mutable_response)
+        parser = ResponseMutatingParser(document, mutable_response)
+        adapter = FormalOfficialSourceAdapter(
+            transport=transport,
+            registry=registry,
+            policies={"cninfo": SourcePolicy.cninfo()},
+            parsers={"fixture-parser": parser},
+            effective_time_resolver=FixtureResolver(),
+            source_registry_hash=registry.registry_hash,
+            registry_manifest_hash="f" * 64,
+        )
+
+        fetch, verification, _ = adapter.fetch_verified(
+            OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31"),
+            refresh_generation="generation",
+            calendar_binding=None,
+        )
+
+        self.assertEqual(parser.calls[0][0], original_raw)
+        self.assertEqual(fetch.raw_bytes, original_raw)
+        self.assertEqual(fetch.original_url, original_url)
+        self.assertEqual(fetch.captured_at_utc, original_capture)
+        self.assertEqual(verification.status, "verified")
 
     def test_parser_config_mutation_cannot_reject_or_rewrite_replay_identity(self):
         raw = b"replay-config-mutation"

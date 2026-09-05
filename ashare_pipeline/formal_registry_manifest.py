@@ -235,7 +235,17 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
             and manifest_fingerprint(manifest) == record.fingerprint
         )
 
-    @dataclass(frozen=True, init=False)
+    def require_manifest_seal(manifest: object) -> None:
+        if type(manifest) is not FormalRegistryManifest or not has_verified_manifest(manifest):
+            raise ValueError("registry manifest was not verified by from_signed_bytes")
+
+    def require_official_manifest(manifest: object) -> None:
+        require_manifest_seal(manifest)
+        if manifest.purpose != "official" or manifest.approval_id is None:
+            raise ValueError("official registry manifest approval is required")
+        _require_trimmed_text(manifest.approval_id, "official approval_id")
+
+    @dataclass(frozen=True, init=False, slots=True, weakref_slot=True)
     class FormalRegistryManifest:
         manifest_hash: str
         purpose: Literal["test", "official"]
@@ -256,18 +266,11 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             raise ValueError("FormalRegistryManifest must be loaded with from_signed_bytes")
 
-        def _require_verified(self) -> None:
-            if not has_verified_manifest(self):
-                raise ValueError("registry manifest was not verified by from_signed_bytes")
-
         def require_official(self) -> None:
-            self._require_verified()
-            if self.purpose != "official" or self.approval_id is None:
-                raise ValueError("official registry manifest approval is required")
-            _require_trimmed_text(self.approval_id, "official approval_id")
+            require_official_manifest(self)
 
         def assert_member_hashes(self, **hashes: str) -> None:
-            self._require_verified()
+            require_manifest_seal(self)
             expected_names = set(_ROLE_FIELDS.values())
             if set(hashes) != expected_names:
                 raise ValueError("registry manifest member hashes must name exactly every role field")
@@ -425,7 +428,11 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
             and blobs_fingerprint(blobs) == record.blobs_fingerprint
         )
 
-    @dataclass(frozen=True, init=False)
+    def require_bundle_seal(bundle: object) -> None:
+        if type(bundle) is not VerifiedRegistryBundle or not has_verified_bundle(bundle):
+            raise ValueError("registry bundle was not verified by FormalRegistryBundleLoader")
+
+    @dataclass(frozen=True, init=False, slots=True, weakref_slot=True)
     class VerifiedRegistryBundle:
         manifest: FormalRegistryManifest
         blobs: Mapping[str, VerifiedRegistryBlob]
@@ -433,15 +440,11 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             raise ValueError("VerifiedRegistryBundle must be constructed by the registry bundle loader")
 
-        def _require_verified(self) -> None:
-            if not has_verified_bundle(self):
-                raise ValueError("registry bundle was not verified by FormalRegistryBundleLoader")
-
         def require_official(self) -> None:
-            self._require_verified()
+            require_bundle_seal(self)
             if type(self.manifest) is not FormalRegistryManifest:
                 raise ValueError("registry bundle manifest is invalid")
-            self.manifest.require_official()
+            require_official_manifest(self.manifest)
             assert self.manifest.approval_id is not None
             if set(self.blobs) != set(_ROLE_FIELDS):
                 raise ValueError("registry bundle does not contain every role")
@@ -452,7 +455,7 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
                     raise ValueError("registry blob approval does not match official manifest")
 
         def blob(self, role: str) -> VerifiedRegistryBlob:
-            self._require_verified()
+            require_bundle_seal(self)
             if type(role) is not str or role not in _ROLE_FIELDS:
                 raise ValueError("registry role is unknown")
             blob = self.blobs.get(role)
@@ -552,7 +555,13 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
             )
             approval_id = stored.approval_id
             if manifest.purpose == "official":
-                if approval_id != manifest.approval_id:
+                root_approval = _require_trimmed_text(
+                    manifest.approval_id, "official manifest approval_id"
+                )
+                child_approval = _require_trimmed_text(
+                    approval_id, f"registry blob approval for role {expected_role}"
+                )
+                if child_approval != root_approval:
                     raise ValueError(f"registry blob approval mismatch for role {expected_role}")
             elif approval_id is not None:
                 raise ValueError(f"test registry blob approval must be null for role {expected_role}")

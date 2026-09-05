@@ -285,6 +285,39 @@ class FormalRegistryManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "signature"):
             FormalRegistryBundleLoader(repository, RaisingVerifier()).load(manifest.manifest_hash)
 
+    def test_official_child_approval_requires_an_exact_trimmed_string(self):
+        repository, manifest, blobs = fixture_repository()
+        root = json.loads(manifest.canonical_json)
+        root["purpose"] = "official"
+        root["approval_id"] = "release-1"
+        official = FormalRegistryManifest.from_signed_bytes(
+            canonical_bytes(root), "fixture-signature", "fixture-key", AcceptingVerifier()
+        )
+
+        class AlwaysEqualApproval:
+            def __eq__(self, _other):
+                return True
+
+            def __ne__(self, _other):
+                return False
+
+        official_blobs = {
+            registry_hash: replace(
+                blob,
+                approval_id="release-1",
+                declared_registry_manifest_hash=official.manifest_hash,
+            )
+            for registry_hash, blob in blobs.items()
+        }
+        source_hash = official.source_registry_hash
+        official_blobs[source_hash] = replace(
+            official_blobs[source_hash], approval_id=AlwaysEqualApproval()
+        )
+        repository = InMemoryRepository(official, official_blobs)
+
+        with self.assertRaisesRegex(ValueError, "approval"):
+            FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(official.manifest_hash)
+
     def test_outer_binding_signature_covers_canonical_root_child_and_role_bytes(self):
         repository, manifest, blobs, verifier = strict_binding_fixture()
         FormalRegistryBundleLoader(repository, verifier).load(manifest.manifest_hash)
@@ -422,6 +455,38 @@ class FormalRegistryManifestTests(unittest.TestCase):
             manifest.require_official()
         with self.assertRaisesRegex(ValueError, "verified"):
             manifest.assert_member_hashes(**member_hashes)
+
+    def test_instance_guard_injection_cannot_bypass_manifest_or_bundle_seals(self):
+        repository, manifest, _ = fixture_repository()
+        try:
+            object.__setattr__(manifest, "_require_verified", lambda: None)
+        except AttributeError:
+            pass
+        object.__setattr__(manifest, "purpose", "official")
+        object.__setattr__(manifest, "approval_id", "release-1")
+        member_hashes = {
+            f"{role}_registry_hash": getattr(manifest, f"{role}_registry_hash")
+            for role in ROLES
+        }
+        with self.assertRaisesRegex(ValueError, "verified"):
+            manifest.require_official()
+        with self.assertRaisesRegex(ValueError, "verified"):
+            manifest.assert_member_hashes(**member_hashes)
+
+        repository, manifest, _ = fixture_repository()
+        bundle = FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(
+            manifest.manifest_hash
+        )
+        source = bundle.blob("source")
+        try:
+            object.__setattr__(bundle, "_require_verified", lambda: None)
+        except AttributeError:
+            pass
+        object.__setattr__(bundle, "blobs", {"source": source})
+        with self.assertRaisesRegex(ValueError, "verified"):
+            bundle.blob("source")
+        with self.assertRaisesRegex(ValueError, "verified"):
+            bundle.require_official()
 
     def test_bundle_provenance_rejects_manifest_mapping_and_blob_mutation(self):
         repository, manifest, _ = fixture_repository()

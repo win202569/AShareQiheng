@@ -1206,20 +1206,36 @@ class FormalOfficialSourceAdapter:
         )
 
     @staticmethod
-    def _validate_response(response: object) -> TransportResponse:
+    def _snapshot_response(response: object) -> TransportResponse:
         if type(response) is not TransportResponse:
             raise FormalTerminalSourceError("transport response must have exact type TransportResponse")
-        if type(response.status_code) is not int:
+        status_code = response.status_code
+        original_url = response.original_url
+        headers = response.headers
+        raw_bytes = response.raw_bytes
+        captured_at_utc = response.captured_at_utc
+        if type(status_code) is not int:
             raise FormalTerminalSourceError("transport response status_code is invalid")
-        if not isinstance(response.headers, Mapping):
+        if not isinstance(headers, Mapping):
             raise FormalTerminalSourceError("transport response headers are invalid")
-        if type(response.raw_bytes) is not bytes:
+        if type(raw_bytes) is not bytes:
             raise FormalTerminalSourceError("transport response raw_bytes are invalid")
         try:
-            _require_aware_timestamp(response.captured_at_utc, "transport response captured_at_utc")
+            _https_host(original_url, "transport response original_url")
+            _require_aware_timestamp(captured_at_utc, "transport response captured_at_utc")
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
-        return response
+        try:
+            immutable_headers = MappingProxyType(dict(headers.items()))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise FormalTerminalSourceError("transport response headers are invalid") from error
+        return TransportResponse(
+            status_code=status_code,
+            original_url=original_url,
+            headers=immutable_headers,
+            raw_bytes=raw_bytes,
+            captured_at_utc=captured_at_utc,
+        )
 
     @staticmethod
     def _is_challenge(response: TransportResponse) -> bool:
@@ -1334,7 +1350,7 @@ class FormalOfficialSourceAdapter:
             raise
         except OSError as error:
             raise FormalRetryableSourceError("official transport failed") from error
-        response = FormalOfficialSourceAdapter._validate_response(response)
+        response = FormalOfficialSourceAdapter._snapshot_response(response)
         try:
             host = _https_host(response.original_url, "transport response original_url")
         except ValueError as error:
