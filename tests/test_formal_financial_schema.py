@@ -45,6 +45,13 @@ class RaisingVerifier:
         raise RuntimeError("fixture verifier unavailable")
 
 
+class EqualitySpoof:
+    """A hostile replacement that claims equality with every original field."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+
 def mapping(**changes: object) -> dict[str, object]:
     value: dict[str, object] = {
         "mapping_id": "operating_profit",
@@ -273,6 +280,13 @@ class FormalFinancialSchemaTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             extract(registry=registry)
 
+    def test_mapping_registry_rejects_equality_spoofed_public_mutation(self) -> None:
+        registry = signed_registry()
+        object.__setattr__(registry.mappings[0], "source_field", EqualitySpoof())
+
+        with self.assertRaises(ValueError):
+            extract(registry=registry)
+
     def test_extracts_bj_duration_fact_with_verified_snapshot_lineage_and_raw_hash(self) -> None:
         document = fixture_document(rows=({"ITEM": "OPERATING_PROFIT", "VALUE": "120.0"},))
         result = extract(document=document, snapshot=fixture_snapshot(document))
@@ -398,6 +412,38 @@ class FormalFinancialSchemaTests(unittest.TestCase):
                 self.assertEqual(result.facts, ())
                 self.assertEqual(result.issues[0].code, "nonnumeric_value")
 
+        arabic_indic = fixture_document(rows=({"ITEM": "OPERATING_PROFIT", "VALUE": "١٢"},))
+        arabic_result = extract(document=arabic_indic, snapshot=fixture_snapshot(arabic_indic))
+        self.assertEqual(arabic_result.facts, ())
+        self.assertEqual(arabic_result.issues[0].code, "nonnumeric_value")
+
+    def test_malformed_duplicate_mapped_item_blocks_a_valid_numeric_fact(self) -> None:
+        document = fixture_document(
+            rows=(
+                {"ITEM": "OPERATING_PROFIT", "VALUE": "120.0"},
+                {"ITEM": "OPERATING_PROFIT", "VALUE": {"nested": 1}},
+            )
+        )
+        result = extract(document=document, snapshot=fixture_snapshot(document))
+
+        self.assertEqual(result.facts, ())
+        self.assertIn("duplicate_source_field", tuple(issue.code for issue in result.issues))
+        self.assertIn("invalid_row_shape", tuple(issue.code for issue in result.issues))
+
+    def test_malformed_duplicate_row_indices_preserve_source_order(self) -> None:
+        document = fixture_document(
+            rows=(
+                {"ITEM": "OPERATING_PROFIT", "VALUE": {"nested": 1}},
+                {"ITEM": "OPERATING_PROFIT", "VALUE": "120.0"},
+            )
+        )
+
+        result = extract(document=document, snapshot=fixture_snapshot(document))
+
+        duplicate = next(issue for issue in result.issues if issue.code == "duplicate_source_field")
+        self.assertEqual(result.facts, ())
+        self.assertEqual(duplicate.details["row_indices"], (0, 1))
+
     def test_date_only_lineage_requires_utc_anchor_evidence_and_later_effective_time(self) -> None:
         document = fixture_document(
             published_at_utc="2026-03-20T00:00:00+00:00",
@@ -490,6 +536,21 @@ class FormalFinancialSchemaTests(unittest.TestCase):
         self.assertNotIn("VALUE", unknown.details)
         with self.assertRaises(TypeError):
             unknown.details["tampered"] = True
+        serialized = unknown.to_dict()
+        self.assertEqual(
+            canonical_json_bytes(serialized),
+            canonical_bytes(
+                {
+                    "code": "unknown_source_field",
+                    "details": {"row_index": 0, "source_field": "UNMAPPED"},
+                    "mapping_id": None,
+                    "source_field": "UNMAPPED",
+                }
+            ),
+        )
+        assert isinstance(serialized["details"], dict)
+        serialized["details"]["row_index"] = 99
+        self.assertEqual(unknown.details["row_index"], 0)
         raw_row["ITEM"] = "ALTERED"
         self.assertEqual(unknown.source_field, "UNMAPPED")
 

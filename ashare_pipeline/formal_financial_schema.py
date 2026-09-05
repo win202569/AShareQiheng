@@ -34,7 +34,7 @@ _EXCHANGES = frozenset({"SH", "SZ", "BJ"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _DATE_ONLY_ANCHOR = re.compile(r"^\d{4}-\d{2}-\d{2}T00:00:00\+00:00$")
-_DECIMAL = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+_DECIMAL = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 _REGISTRY_KEYS = frozenset(
@@ -243,11 +243,11 @@ def _require_canonical_uuid(value: object, label: str) -> str:
     return text
 
 
-def _mapping_fingerprint(mapping: object) -> tuple[object, ...] | None:
+def _mapping_fingerprint(mapping: object) -> tuple[str, ...] | None:
     if type(mapping) is not FormalFactMapping:
         return None
     try:
-        return (
+        fields = (
             mapping.mapping_id,
             mapping.statement,
             mapping.metric_key,
@@ -257,6 +257,9 @@ def _mapping_fingerprint(mapping: object) -> tuple[object, ...] | None:
             mapping.period_kind,
             mapping.accounting_basis,
         )
+        if any(type(field) is not str for field in fields):
+            return None
+        return fields
     except AttributeError:
         return None
 
@@ -265,15 +268,22 @@ def _binding_fingerprint(binding: object) -> tuple[object, ...] | None:
     if type(binding) is not _FormalFactBinding:
         return None
     try:
-        return (
+        fields = (
             binding.source,
             binding.dataset,
             binding.parser_id,
             binding.parser_version,
             binding.mapping_version,
             binding.exchange_scope,
-            binding.mapping_ids,
         )
+        mapping_ids = binding.mapping_ids
+        if (
+            any(type(field) is not str for field in fields)
+            or type(mapping_ids) is not tuple
+            or any(type(mapping_id) is not str for mapping_id in mapping_ids)
+        ):
+            return None
+        return (*fields, mapping_ids)
     except AttributeError:
         return None
 
@@ -448,41 +458,87 @@ def _verify_registry_signature(
 def _make_signed_financial_mapping_registry_type() -> type[object]:
     """Create a registry class whose trusted construction record is closure-private."""
 
-    records: dict[int, tuple[weakref.ReferenceType[object], tuple[object, ...]]] = {}
+    @dataclass(frozen=True)
+    class _RegistrySeal:
+        canonical_json: bytes
+        registry_hash: str
+        signature: str
+        key_id: str
+        mappings: tuple[FormalFactMapping, ...]
+        bindings: tuple[_FormalFactBinding, ...]
+        mapping_fingerprints: tuple[tuple[str, ...], ...]
+        binding_fingerprints: tuple[tuple[object, ...], ...]
+
+    records: dict[int, tuple[weakref.ReferenceType[object], _RegistrySeal]] = {}
 
     def forget(identity: int) -> None:
         records.pop(identity, None)
 
-    def fingerprint(registry: object) -> tuple[object, ...] | None:
+    def fingerprint(registry: object) -> _RegistrySeal | None:
         if type(registry) is not SignedFinancialMappingRegistry:
             return None
         try:
+            canonical_json = registry.canonical_json
+            registry_hash = registry.registry_hash
+            signature = registry.signature
+            key_id = registry.key_id
             mappings = registry.mappings
             bindings = registry.bindings
-            mapping_fingerprints = tuple(_mapping_fingerprint(item) for item in mappings)
-            binding_fingerprints = tuple(_binding_fingerprint(item) for item in bindings)
-            if None in mapping_fingerprints or None in binding_fingerprints:
+            if (
+                type(canonical_json) is not bytes
+                or type(registry_hash) is not str
+                or type(signature) is not str
+                or type(key_id) is not str
+                or type(mappings) is not tuple
+                or type(bindings) is not tuple
+            ):
                 return None
-            return (
-                registry.canonical_json,
-                registry.registry_hash,
-                registry.signature,
-                registry.key_id,
+            mapping_fingerprints: list[tuple[str, ...]] = []
+            for item in mappings:
+                item_fingerprint = _mapping_fingerprint(item)
+                if item_fingerprint is None:
+                    return None
+                mapping_fingerprints.append(item_fingerprint)
+            binding_fingerprints: list[tuple[object, ...]] = []
+            for item in bindings:
+                item_fingerprint = _binding_fingerprint(item)
+                if item_fingerprint is None:
+                    return None
+                binding_fingerprints.append(item_fingerprint)
+            return _RegistrySeal(
+                canonical_json,
+                registry_hash,
+                signature,
+                key_id,
                 mappings,
                 bindings,
-                mapping_fingerprints,
-                binding_fingerprints,
+                tuple(mapping_fingerprints),
+                tuple(binding_fingerprints),
             )
         except (AttributeError, TypeError):
             return None
 
-    def require_verified(registry: object) -> tuple[object, ...]:
+    def require_verified(registry: object) -> _RegistrySeal:
         identity = id(registry)
         record = records.get(identity)
         current = fingerprint(registry)
-        if record is None or current is None or record[0]() is not registry or record[1] != current:
+        if record is None or current is None or record[0]() is not registry:
             raise ValueError("signed financial mapping registry was not verified or was mutated")
-        return record[1]
+        sealed = record[1]
+        # Exact primitive checks are intentional: a hostile object can claim
+        # equality with a signed field but cannot cross this type boundary.
+        if (
+            current.canonical_json != sealed.canonical_json
+            or current.registry_hash != sealed.registry_hash
+            or current.signature != sealed.signature
+            or current.key_id != sealed.key_id
+            or current.mappings is not sealed.mappings
+            or current.bindings is not sealed.bindings
+            or current.mapping_fingerprints != sealed.mapping_fingerprints
+            or current.binding_fingerprints != sealed.binding_fingerprints
+        ):
+            raise ValueError("signed financial mapping registry was not verified or was mutated")
+        return sealed
 
     def mapping_snapshots(
         registry: object,
@@ -495,7 +551,7 @@ def _make_signed_financial_mapping_registry_type() -> type[object]:
         exchange: str,
     ) -> tuple[FormalFactMapping, ...]:
         record = require_verified(registry)
-        canonical = record[0]
+        canonical = record.canonical_json
         assert type(canonical) is bytes
         _, parsed_mappings, parsed_bindings = _parse_registry_bytes(canonical)
         matching = [
@@ -649,6 +705,29 @@ class FormalFactIssue:
         if not isinstance(frozen, Mapping):
             raise ValueError("fact issue details must be a mapping")
         object.__setattr__(self, "details", frozen)
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a detached JSON-native record safe for canonical serialization."""
+
+        code = _require_text(self.code, "fact issue code", identifier=True)
+        mapping_id = _require_optional_text(
+            self.mapping_id, "fact issue mapping_id", identifier=True
+        )
+        source_field = _require_optional_text(
+            self.source_field, "fact issue source_field", controls=True
+        )
+        frozen = _freeze_json(self.details, label="fact issue details")
+        if not isinstance(frozen, Mapping):
+            raise ValueError("fact issue details must be a mapping")
+        return {
+            "code": code,
+            "mapping_id": mapping_id,
+            "source_field": source_field,
+            "details": _thaw_json(frozen),
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_dict())
 
 
 def _period_kind_for(period_end: str) -> str:
@@ -1131,16 +1210,24 @@ def _snapshot_row(index: int, row: object) -> _RowSnapshot:
         if type(key) is not str or key in copied:
             return _RowSnapshot(index, False, None, _UNSAFE_RAW)
         copied[key] = value
+    raw_item = copied.get("ITEM")
+    item: str | None = None
+    if (
+        type(raw_item) is str
+        and bool(raw_item)
+        and raw_item == raw_item.strip()
+        and _CONTROL.search(raw_item) is None
+    ):
+        item = raw_item
     if set(copied) != {"ITEM", "VALUE"}:
-        return _RowSnapshot(index, False, None, _UNSAFE_RAW)
-    item = copied["ITEM"]
-    if type(item) is not str or not item or item != item.strip() or _CONTROL.search(item) is not None:
+        return _RowSnapshot(index, False, item, _UNSAFE_RAW)
+    if item is None:
         return _RowSnapshot(index, False, None, _UNSAFE_RAW)
     raw_value = copied["VALUE"]
     # A row's VALUE must itself be a raw JSON scalar.  Non-finite floats retain
     # their shape here and become deterministic nonnumeric issues downstream.
     if raw_value is not None and type(raw_value) not in {bool, int, float, str}:
-        return _RowSnapshot(index, False, None, _UNSAFE_RAW)
+        return _RowSnapshot(index, False, item, _UNSAFE_RAW)
     return _RowSnapshot(index, True, item, raw_value)
 
 
@@ -1308,10 +1395,20 @@ def extract_formal_financial_facts(
         )
     by_field = {item.source_field: item for item in applicable}
     matches: dict[str, list[_RowSnapshot]] = {field: [] for field in by_field}
+    invalid_matches: dict[str, list[_RowSnapshot]] = {field: [] for field in by_field}
     issues: list[FormalFactIssue] = []
     for row in parsed_document.rows:
         if not row.valid_shape:
-            issues.append(_new_issue("invalid_row_shape", None, None, {"row_index": row.index}))
+            issues.append(
+                _new_issue(
+                    "invalid_row_shape",
+                    None,
+                    row.item,
+                    {"row_index": row.index, **({"source_field": row.item} if row.item else {})},
+                )
+            )
+            if row.item is not None and row.item in by_field:
+                invalid_matches[row.item].append(row)
             continue
         assert row.item is not None
         if row.item not in by_field:
@@ -1328,6 +1425,7 @@ def extract_formal_financial_facts(
     facts: list[FormalFinancialFact] = []
     for mapped in sorted(applicable, key=lambda item: (item.mapping_id, item.source_field)):
         field_rows = matches[mapped.source_field]
+        malformed_rows = invalid_matches[mapped.source_field]
         if not field_rows:
             issues.append(
                 _new_issue(
@@ -1338,7 +1436,7 @@ def extract_formal_financial_facts(
                 )
             )
             continue
-        if len(field_rows) != 1:
+        if len(field_rows) + len(malformed_rows) != 1:
             issues.append(
                 _new_issue(
                     "duplicate_source_field",
@@ -1346,7 +1444,9 @@ def extract_formal_financial_facts(
                     mapped.source_field,
                     {
                         "mapping_id": mapped.mapping_id,
-                        "row_indices": tuple(item.index for item in field_rows),
+                        "row_indices": tuple(
+                            sorted(item.index for item in (*field_rows, *malformed_rows))
+                        ),
                         "source_field": mapped.source_field,
                     },
                 )
