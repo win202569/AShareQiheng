@@ -316,9 +316,15 @@ class FormalFeatureStoreTests(unittest.TestCase):
             with patch(
                 "ashare_pipeline.formal_feature_store.os.mkdir",
                 side_effect=replacing_mkdir,
-            ):
-                with self.assertRaises(ValueError):
-                    store.write(self.bundle)
+            ) as mocked_mkdir:
+                supported_dir_fd = set(os.supports_dir_fd)
+                supported_dir_fd.add(mocked_mkdir)
+                with patch(
+                    "ashare_pipeline.formal_feature_store.os.supports_dir_fd",
+                    supported_dir_fd,
+                ):
+                    with self.assertRaises(ValueError):
+                        store.write(self.bundle)
 
             self.assertTrue(raced)
             self.assertEqual(list(external.iterdir()), [])
