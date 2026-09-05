@@ -1911,13 +1911,11 @@ class StateStore:
         return ref
 
     def _formal_repository_candidates_from_connection(
-        self, connection: sqlite3.Connection, request_fingerprint: str
+        self, connection: sqlite3.Connection
     ) -> list[OfficialSnapshotRef]:
-        """Revalidate the fingerprint superset before any lookup-specific filtering."""
+        """Revalidate every snapshot before applying caller-owned lookup identity."""
         rows = connection.execute(
-            """SELECT * FROM formal_source_snapshot
-            WHERE request_fingerprint = ? ORDER BY manifest_sha256""",
-            (request_fingerprint,),
+            "SELECT * FROM formal_source_snapshot ORDER BY manifest_sha256"
         ).fetchall()
         return [
             self._formal_verified_snapshot_ref_from_connection(connection, row)
@@ -1947,9 +1945,7 @@ class StateStore:
         content_sha256 = _require_formal_sha256(content_sha256, "content hash")
         manifest_sha256 = _require_formal_sha256(manifest_sha256, "manifest hash")
         with self._transaction() as connection:
-            candidates = self._formal_repository_candidates_from_connection(
-                connection, request_fingerprint
-            )
+            candidates = self._formal_repository_candidates_from_connection(connection)
             matches = [
                 ref
                 for ref in candidates
@@ -1987,9 +1983,7 @@ class StateStore:
         )
         as_of_utc = self._require_formal_repository_as_of(as_of_utc)
         with self._transaction() as connection:
-            candidates = self._formal_repository_candidates_from_connection(
-                connection, request_fingerprint
-            )
+            candidates = self._formal_repository_candidates_from_connection(connection)
             visible = [
                 ref
                 for ref in candidates

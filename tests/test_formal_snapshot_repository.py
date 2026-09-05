@@ -698,6 +698,71 @@ class FormalSnapshotRepositoryTests(unittest.TestCase):
                 manifest_sha256=historical_ref.manifest_sha256,
             )
 
+    def test_exact_lookup_does_not_fallback_when_newer_row_fingerprint_is_tampered(self) -> None:
+        """A mutable row fingerprint must not exclude corrupt newer evidence from validation."""
+        older = cninfo_fetch(
+            raw_bytes=b"older exact candidate", refresh_generation="exact-history-v1"
+        )
+        older_ref = self.repository.persist_verified(
+            older, verified(older), producing_task_id=None, worker_id=None
+        )
+        newer = cninfo_fetch(
+            raw_bytes=b"newer exact candidate",
+            refresh_generation="exact-history-v2",
+            published_at_utc="2026-08-21T08:00:00+00:00",
+        )
+        newer_ref = self.repository.persist_verified(
+            newer, verified(newer), producing_task_id=None, worker_id=None
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_source_snapshot SET request_fingerprint = ? WHERE id = ?",
+                ("0" * 64, newer_ref.snapshot_id),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "request fingerprint"):
+            self.repository.find_exact_verified(
+                older.request,
+                parser_id=older.parser_id,
+                parser_version=older.parser_version,
+                mapping_version=older.mapping_version,
+                content_sha256=older.content_sha256,
+                manifest_sha256=older_ref.manifest_sha256,
+            )
+
+    def test_visible_lookup_does_not_fallback_when_newer_row_fingerprint_is_tampered(self) -> None:
+        """Point-in-time selection must validate a corrupt newest row before choosing history."""
+        older = cninfo_fetch(
+            raw_bytes=b"older visible candidate", refresh_generation="visible-history-v1"
+        )
+        self.repository.persist_verified(
+            older, verified(older), producing_task_id=None, worker_id=None
+        )
+        newer = cninfo_fetch(
+            raw_bytes=b"newer visible candidate",
+            refresh_generation="visible-history-v2",
+            published_at_utc="2026-08-21T08:00:00+00:00",
+        )
+        newer_ref = self.repository.persist_verified(
+            newer, verified(newer), producing_task_id=None, worker_id=None
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE formal_source_snapshot SET request_fingerprint = ? WHERE id = ?",
+                ("0" * 64, newer_ref.snapshot_id),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ValueError, "request fingerprint"):
+            self.repository.find_visible_verified(
+                older.request,
+                parser_id=older.parser_id,
+                parser_version=older.parser_version,
+                mapping_version=older.mapping_version,
+                as_of_utc="2026-08-31T07:00:00+00:00",
+            )
+
     def test_task_producer_requires_one_receipt_and_one_source_row(self) -> None:
         """A task-produced ref cannot survive a missing receipt, generation drift, or extra row."""
         task_id, fetch, ref = self.persist_leased_snapshot(
