@@ -22,6 +22,16 @@ from ashare_pipeline.formal_feature_store import (
 )
 
 
+PROJECT_TEST_TEMP_ROOT = (
+    Path(__file__).resolve().parents[1] / ".tmp" / "formal-feature-store-tests"
+)
+
+
+def project_temporary_directory() -> tempfile.TemporaryDirectory[str]:
+    PROJECT_TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(dir=PROJECT_TEST_TEMP_ROOT)
+
+
 def canonical_bytes(value: object) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -84,7 +94,7 @@ def create_directory_link(link: Path, target: Path) -> None:
 
 class FormalFeatureStoreTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory()
+        self.tempdir = project_temporary_directory()
         self.root = Path(self.tempdir.name)
         self.store = FormalFeatureBundleStore(self.root)
         self.bundle = fixture_bundle()
@@ -102,6 +112,7 @@ class FormalFeatureStoreTests(unittest.TestCase):
         )
 
     def test_write_and_verified_read_use_exact_content_addressed_files(self) -> None:
+        self.assertEqual(self.root.parent, PROJECT_TEST_TEMP_ROOT)
         saved = self.store.write(self.bundle)
         bundle_path, manifest_path, _ = self.expected_paths()
 
@@ -136,7 +147,7 @@ class FormalFeatureStoreTests(unittest.TestCase):
 
     def test_read_rejects_tampered_bundle_or_manifest(self) -> None:
         for target in ("bundle", "manifest"):
-            with self.subTest(target=target), tempfile.TemporaryDirectory() as root:
+            with self.subTest(target=target), project_temporary_directory() as root:
                 store = FormalFeatureBundleStore(root)
                 saved = store.write(self.bundle)
                 path = Path(saved.bundle_path if target == "bundle" else saved.manifest_path)
@@ -197,7 +208,7 @@ class FormalFeatureStoreTests(unittest.TestCase):
         self.assertTrue(manifest_path.exists())
         self.assertEqual(self.store.read_verified(saved), self.bundle)
 
-        with tempfile.TemporaryDirectory() as root:
+        with project_temporary_directory() as root:
             store = FormalFeatureBundleStore(root)
             other = fixture_bundle(input_hash="7" * 64)
             directory = Path(root).resolve() / "data" / "formal" / "features"
@@ -229,7 +240,7 @@ class FormalFeatureStoreTests(unittest.TestCase):
         self.assertEqual(self.store.read_verified(saved), self.bundle)
         self.assertEqual(orphan.read_bytes(), b"untrusted partial")
 
-        with tempfile.TemporaryDirectory() as root:
+        with project_temporary_directory() as root:
             store = FormalFeatureBundleStore(root)
             failed_bundle = fixture_bundle(input_hash="8" * 64)
             directory = Path(root).resolve() / "data" / "formal" / "features"
@@ -273,7 +284,7 @@ class FormalFeatureStoreTests(unittest.TestCase):
         self.assertFalse(lock_path.exists())
 
     def test_missing_directory_creation_is_bound_to_verified_parent(self) -> None:
-        with tempfile.TemporaryDirectory() as sandbox:
+        with project_temporary_directory() as sandbox:
             sandbox_path = Path(sandbox)
             root = sandbox_path / "store-root"
             displaced = sandbox_path / "store-root.displaced"
@@ -329,7 +340,7 @@ class FormalFeatureStoreTests(unittest.TestCase):
             self.store.read_verified(saved)
 
         healthy = self.store.write(self.bundle)
-        with tempfile.TemporaryDirectory() as other_root:
+        with project_temporary_directory() as other_root:
             with self.assertRaises(ValueError):
                 FormalFeatureBundleStore(other_root).read_verified(healthy)
 
