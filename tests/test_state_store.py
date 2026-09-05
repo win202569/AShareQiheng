@@ -722,7 +722,7 @@ class StateStoreTestCase(unittest.TestCase):
                 )
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,), (5,)],
+                [(2,), (3,), (4,), (5,), (6,)],
             )
             tables = {
                 row[0]
@@ -802,7 +802,7 @@ class StateStoreTestCase(unittest.TestCase):
                 connection.execute(
                     "SELECT version FROM schema_migration ORDER BY version"
                 ).fetchall(),
-                [(2,), (3,), (4,), (5,)],
+                [(2,), (3,), (4,), (5,), (6,)],
             )
             self.assertEqual(
                 connection.execute("SELECT * FROM source_snapshot").fetchall(),
@@ -851,7 +851,7 @@ class StateStoreTestCase(unittest.TestCase):
         with closing(sqlite3.connect(self.db_path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,), (5,)],
+                [(2,), (3,), (4,), (5,), (6,)],
             )
             counts = dict(
                 connection.execute(
@@ -960,7 +960,7 @@ class StateStoreTestCase(unittest.TestCase):
         with closing(sqlite3.connect(legacy_path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,), (5,)],
+                [(2,), (3,), (4,), (5,), (6,)],
             )
 
     def test_initialize_migrates_complete_v3_database_to_v5_preserving_issues(self) -> None:
@@ -987,7 +987,7 @@ class StateStoreTestCase(unittest.TestCase):
                 connection.execute(
                     "SELECT version FROM schema_migration ORDER BY version"
                 ).fetchall(),
-                [(2,), (3,), (4,), (5,)],
+                [(2,), (3,), (4,), (5,), (6,)],
             )
             self.assertEqual(
                 connection.execute("SELECT * FROM quality_issue").fetchall(),
@@ -8071,6 +8071,525 @@ class StateStoreTestCase(unittest.TestCase):
                     ).fetchall()
                 self.assertEqual(task_after, task_before)
                 self.assertEqual(statuses_after, statuses_before)
+
+
+class FormalV6PersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1])
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.db_path = self.root / "state.sqlite"
+        self.store = StateStore(self.db_path)
+        self.store.initialize()
+
+    def test_v6_migration_all_continuous_entrances_and_reopen(self):
+        for last in (2, 3, 4, 5, 6):
+            with self.subTest(last=last):
+                path = self.root / f"migration-{last}.sqlite"
+                with closing(sqlite3.connect(path)) as connection:
+                    StateStore._create_v2_schema(connection)
+                    connection.execute(state_store_module._MIGRATION_TABLE_DDL)
+                    connection.execute("INSERT INTO schema_migration VALUES (2, ?)", (utc_at(0),))
+                    for version in range(3, last + 1):
+                        getattr(StateStore, f"_apply_v{version}_migration")(connection)
+                    before = connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall()
+                    connection.commit()
+                store = StateStore(path)
+                store.initialize()
+                store.initialize()
+                with closing(sqlite3.connect(path)) as connection:
+                    after = connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall()
+                    tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                self.assertEqual([r[0] for r in after], [2, 3, 4, 5, 6])
+                self.assertEqual(after[:len(before)], before)
+                self.assertTrue({"formal_financial_fact", "formal_quarter_fact", "formal_feature_set", "formal_feature_value", "formal_context_fact", "formal_registry_manifest", "formal_registry_blob", "formal_source_circuit"} <= tables)
+
+    def test_v6_migration_rejects_partial_tampered_and_premature_objects(self):
+        for kind, names in (("table", tuple(state_store_module._V6_TABLE_DDL)), ("index", tuple(state_store_module._V6_INDEX_DDL))):
+            for name in names:
+                with self.subTest(kind=kind, name=name):
+                    path = self.root / f"tamper-{name}.sqlite"
+                    store = StateStore(path)
+                    store.initialize()
+                    with closing(sqlite3.connect(path)) as connection:
+                        before = connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall()
+                        connection.execute(f"DROP {kind} {name}")
+                        if kind == "table":
+                            connection.execute(f"CREATE TABLE {name}(wrong TEXT)")
+                        else:
+                            connection.execute(f"CREATE INDEX {name} ON formal_financial_fact(id)")
+                        connection.commit()
+                    with self.assertRaises(RuntimeError):
+                        store.initialize()
+                    with closing(sqlite3.connect(path)) as connection:
+                        self.assertEqual(connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall(), before)
+        path = self.root / "premature.sqlite"
+        store = StateStore(path)
+        store.initialize()
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("DELETE FROM schema_migration WHERE version=6")
+            connection.commit()
+        with self.assertRaises(RuntimeError):
+            store.initialize()
+
+    def install_fact(self, *, report_period="2025-12-31", generation="bootstrap-v1", source_overrides=None, **changes):
+        from tests.test_formal_feature_contract import formal_fact
+        raw_store, fetch, stored, verification = written_formal_snapshot(self.root, refresh_generation=generation)
+        if report_period != "2025-12-31" or source_overrides:
+            fetch = replace(fetch, request=replace(fetch.request, period_or_date=report_period), declared_period=report_period, **(source_overrides or {}))
+            verification = verify_official_fetch(fetch, SourcePolicy.cninfo())
+            stored = raw_store.write_verified(fetch, verification, producing_task_id=None)
+        self.store = StateStore(self.db_path, formal_snapshot_store=raw_store)
+        ref = self.store.put_formal_snapshot(fetch, stored, verification)
+        values = dict(security_id=ref.security_id, source_snapshot_id=ref.snapshot_id,
+            period_end=report_period, period_start=report_period[:4] + "-01-01",
+            period_kind={"03-31": "Q1", "06-30": "H1", "09-30": "Q3", "12-31": "FY"}[report_period[5:]],
+            source_content_sha256=ref.content_sha256, source_refresh_generation=ref.refresh_generation,
+            source_producing_task_id=ref.producing_task_id, parser_id=ref.parser_id,
+            parser_version=ref.parser_version, mapping_version=ref.mapping_version,
+            source_updated_at_utc=ref.source_updated_at_utc, captured_at_utc=ref.captured_at_utc)
+        values.update(changes)
+        return formal_fact(**values)
+
+    def test_formal_facts_replay_preserves_first_created_time_and_lists_detached(self):
+        from ashare_pipeline.formal_financial_schema import FormalFinancialFact
+        fact = self.install_fact()
+        self.store.insert_formal_financial_facts((fact,))
+        wire = fact.to_dict()
+        wire["created_at_utc"] = "2026-09-05T00:00:00+00:00"
+        later = FormalFinancialFact.from_dict(wire)
+        self.store.insert_formal_financial_facts((later,))
+        result = self.store.list_formal_financial_facts(security_id="SZ000001")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].to_dict(), fact.to_dict())
+        self.assertIsNot(result[0], fact)
+
+    def test_formal_facts_lineage_mismatch_rolls_back_whole_batch(self):
+        from tests.test_formal_feature_contract import formal_fact
+        good = self.install_fact()
+        changes = {"security_id": "SH600001", "period_end": "2024-12-31",
+            "source_content_sha256": "f" * 64, "source_refresh_generation": "other",
+            "source_producing_task_id": "other", "parser_id": "other", "parser_version": "other",
+            "mapping_version": "other", "source_updated_at_utc": "2026-03-20T09:00:00+00:00",
+            "captured_at_utc": "2026-09-04T09:00:00+00:00"}
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                wire = good.to_dict()
+                wire.pop("id")
+                wire[field] = value
+                if field == "period_end":
+                    wire["period_start"] = "2024-01-01"
+                bad = formal_fact(**wire)
+                with self.assertRaises(ValueError):
+                    self.store.insert_formal_financial_facts((good, bad))
+                self.assertEqual(self.store.list_formal_financial_facts(), ())
+
+    def test_formal_fact_publication_lineage_and_legacy_ids_are_rejected(self):
+        from ashare_pipeline.formal_financial_schema import FormalFinancialFact
+        good = self.install_fact()
+        alternatives = (
+            {"published_at_utc": "2026-03-21T08:00:00+00:00", "effective_at_utc": "2026-03-21T08:00:00+00:00"},
+            {"published_precision": "date_only", "published_at_utc": "2026-03-19T16:00:00+00:00", "effective_at_utc": "2026-03-20T01:30:00+00:00", "effective_time_evidence_hash": "e" * 64},
+            {"source_snapshot_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+        )
+        for changes in alternatives:
+            wire = good.to_dict()
+            wire.pop("id")
+            wire.update(changes)
+            with self.assertRaises(ValueError):
+                self.store.insert_formal_financial_facts((FormalFinancialFact.create(**wire),))
+        self.assertEqual(self.store.list_formal_financial_facts(), ())
+
+    def test_formal_fact_reads_revalidate_raw_files_rows_and_seals(self):
+        from ashare_pipeline.formal_financial_schema import FormalFinancialFact
+        good = self.install_fact()
+        self.store.insert_formal_financial_facts((good,))
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            row = connection.execute("SELECT content_path FROM formal_source_snapshot WHERE id=?", (good.source_snapshot_id,)).fetchone()
+        path = Path(row[0])
+        if not path.is_absolute():
+            path = self.root / path
+        original = path.read_bytes()
+        path.write_bytes(original + b"tamper")
+        with self.assertRaises(ValueError):
+            self.store.list_formal_financial_facts()
+        with self.assertRaises(ValueError):
+            self.store.insert_formal_financial_facts((good,))
+        path.write_bytes(original)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("UPDATE formal_financial_fact SET value=99")
+            connection.commit()
+        with self.assertRaises(ValueError):
+            self.store.list_formal_financial_facts()
+        forged = object.__new__(FormalFinancialFact)
+        with self.assertRaises(ValueError):
+            self.store.insert_formal_financial_facts((forged,))
+
+    def test_quarter_rederivation_rejects_canonical_wrong_arithmetic(self):
+        from ashare_pipeline.formal_financial_features import derive_comparable_quarters, FormalQuarterFact
+        fact = self.install_fact(statement="balance", nature="instant", period_start=None)
+        self.store.insert_formal_financial_facts((fact,))
+        quarter = derive_comparable_quarters((fact,)).facts[0]
+        self.store.insert_formal_quarter_facts((quarter,))
+        self.assertEqual(self.store.list_formal_quarter_facts()[0].to_dict(), quarter.to_dict())
+        wire = quarter.to_dict()
+        wire["value"] = 999.0
+        identity = {k: v for k, v in wire.items() if k not in {"id", "evidence"}}
+        identity["schema_version"] = "formal-quarter-fact-v1"
+        wire["id"] = hashlib.sha256(state_store_module._json(identity).encode()).hexdigest()
+        with self.assertRaises(ValueError):
+            self.store.insert_formal_quarter_facts((FormalQuarterFact.from_dict(wire),))
+        self.assertEqual(len(self.store.list_formal_quarter_facts()), 1)
+
+    def test_quarter_cumulative_arithmetic_and_historical_lineage_coexist(self):
+        from ashare_pipeline.formal_financial_features import derive_comparable_quarters, FormalQuarterFact
+        q1 = self.install_fact(report_period="2025-03-31", value=40.0)
+        h1 = self.install_fact(report_period="2025-06-30", value=100.0)
+        self.store.insert_formal_financial_facts((q1, h1))
+        quarters = derive_comparable_quarters((h1, q1)).facts
+        q2 = next(q for q in quarters if q.quarter_key == "2025Q2")
+        self.assertEqual(q2.value, 60.0)
+        self.store.insert_formal_quarter_facts((q2,))
+        revised = self.install_fact(report_period="2025-06-30", value=120.0, generation="revision-v2")
+        self.store.insert_formal_financial_facts((revised,))
+        q2_new = next(q for q in derive_comparable_quarters((q1, revised)).facts if q.quarter_key == "2025Q2")
+        self.store.insert_formal_quarter_facts((q2_new, q2))
+        self.assertEqual(sorted(q.value for q in self.store.list_formal_quarter_facts()), [60.0, 80.0])
+        wire = q2.to_dict()
+        wire["evidence"][0]["source_content_sha256"] = "f" * 64
+        with self.assertRaises(ValueError):
+            self.store.insert_formal_quarter_facts((FormalQuarterFact.from_dict(wire),))
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("UPDATE formal_quarter_fact SET component_fact_ids_json='[]' WHERE id=?", (q2.id,))
+            connection.commit()
+        with self.assertRaises(ValueError):
+            self.store.list_formal_quarter_facts()
+
+    def test_fact_receipt_and_task_corruption_reject_replay_and_listing(self):
+        from tests.test_formal_feature_contract import formal_fact
+        task_id, fetch, stored, verification = self.install_leased_source()
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(1)):
+            ref = self.store.put_formal_snapshot_for_leased_task(fetch, stored, verification, task_id=task_id, worker_id="worker")
+        fact = formal_fact(security_id=ref.security_id, source_snapshot_id=ref.snapshot_id,
+            source_content_sha256=ref.content_sha256, source_refresh_generation=ref.refresh_generation,
+            source_producing_task_id=task_id, parser_id=ref.parser_id, parser_version=ref.parser_version,
+            mapping_version=ref.mapping_version, source_updated_at_utc=ref.source_updated_at_utc, captured_at_utc=ref.captured_at_utc)
+        self.store.insert_formal_financial_facts((fact,))
+        for statement, args, restore, restore_args in (
+            ("UPDATE formal_task_snapshot_receipt SET refresh_generation='wrong' WHERE task_id=?", (task_id,), "UPDATE formal_task_snapshot_receipt SET refresh_generation=? WHERE task_id=?", (ref.refresh_generation, task_id)),
+            ("UPDATE formal_collection_task SET kind='wrong' WHERE id=?", (task_id,), "UPDATE formal_collection_task SET kind='formal_statement' WHERE id=?", (task_id,)),
+        ):
+            with closing(sqlite3.connect(self.db_path)) as connection:
+                connection.execute(statement, args)
+                connection.commit()
+            with self.assertRaises(ValueError):
+                self.store.list_formal_financial_facts()
+            with self.assertRaises(ValueError):
+                self.store.insert_formal_financial_facts((fact,))
+            with closing(sqlite3.connect(self.db_path)) as connection:
+                connection.execute(restore, restore_args)
+                connection.commit()
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("DELETE FROM formal_task_snapshot_receipt WHERE task_id=?", (task_id,))
+            connection.commit()
+        with self.assertRaises(ValueError):
+            self.store.list_formal_financial_facts()
+
+    def test_registry_persistence_verifies_all_children_and_survives_restart(self):
+        from tests.test_formal_registry_manifest import strict_binding_fixture
+        _, root, blobs, verifier = strict_binding_fixture()
+        store = StateStore(self.db_path, registry_signature_verifier=verifier)
+        with self.assertRaises(ValueError):
+            store.put_formal_registry_manifest(root)
+        for blob in blobs.values():
+            store.put_formal_registry_blob(blob)
+        store.put_formal_registry_manifest(root)
+        reopened = StateStore(self.db_path, registry_signature_verifier=verifier)
+        self.assertEqual(reopened.get_formal_registry_manifest(root.manifest_hash), root)
+        for key, blob in blobs.items():
+            self.assertEqual(reopened.get_formal_registry_blob(key), blob)
+        bad = replace(next(iter(blobs.values())), binding_signature="invalid")
+        with self.assertRaises(ValueError):
+            reopened.put_formal_registry_blob(bad)
+        with self.assertRaises(ValueError):
+            self.store.get_formal_registry_manifest(root.manifest_hash)
+
+    def test_registry_all_roles_reject_raw_hash_role_signature_binding_tamper(self):
+        from tests.test_formal_registry_manifest import strict_binding_fixture
+        _, root, blobs, verifier = strict_binding_fixture()
+        store = StateStore(self.db_path, registry_signature_verifier=verifier)
+        for blob in blobs.values():
+            for field, value in (("registry_hash", "f" * 64), ("registry_role", "wrong"),
+                ("signature", "wrong"), ("key_id", "wrong"), ("canonical_json", blob.canonical_json + b" "),
+                ("declared_registry_manifest_hash", "f" * 64), ("binding_signature", "wrong"), ("binding_key_id", "wrong")):
+                with self.subTest(role=blob.registry_role, field=field):
+                    with self.assertRaises(ValueError):
+                        store.put_formal_registry_blob(replace(blob, **{field: value}))
+            store.put_formal_registry_blob(blob)
+        store.put_formal_registry_manifest(root)
+        for blob in blobs.values():
+            with closing(sqlite3.connect(self.db_path)) as connection:
+                connection.execute("UPDATE formal_registry_blob SET binding_signature='wrong' WHERE registry_hash=?", (blob.registry_hash,))
+                connection.commit()
+            with self.assertRaises(ValueError):
+                store.get_formal_registry_blob(blob.registry_hash)
+            with self.assertRaises(ValueError):
+                store.put_formal_registry_manifest(root)
+            with closing(sqlite3.connect(self.db_path)) as connection:
+                connection.execute("UPDATE formal_registry_blob SET binding_signature=? WHERE registry_hash=?", (blob.binding_signature, blob.registry_hash))
+                connection.commit()
+
+    def test_registry_root_forgery_column_tamper_and_binding_reuse_conflict(self):
+        from tests.test_formal_registry_manifest import fixture_repository, AcceptingVerifier, untrusted_manifest_envelope
+        _, root, blobs = fixture_repository()
+        store = StateStore(self.db_path, registry_signature_verifier=AcceptingVerifier())
+        for blob in blobs.values():
+            store.put_formal_registry_blob(blob)
+        with self.assertRaises(ValueError):
+            store.put_formal_registry_manifest(untrusted_manifest_envelope(root))
+        store.put_formal_registry_manifest(root)
+        with self.assertRaises(ValueError):
+            store.put_formal_registry_blob(replace(next(iter(blobs.values())), declared_registry_manifest_hash="f" * 64))
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("UPDATE formal_registry_manifest SET scoring_registry_hash=?", ("f" * 64,))
+            connection.commit()
+        with self.assertRaises(ValueError):
+            store.get_formal_registry_manifest(root.manifest_hash)
+
+    def install_registry_and_bundle(self, *, facts=(), wrong_source_binding=False):
+        from tests.test_formal_feature_contract import canonical_bytes, feature_registry_bytes, slot_wire, TEMPLATES
+        from ashare_pipeline.formal_registry_manifest import FormalRegistryManifest, VerifiedRegistryBlob
+        from ashare_pipeline.formal_feature_contract import load_signed_feature_registry
+        from ashare_pipeline.formal_feature_store import FormalFeatureBundleStore
+        from ashare_pipeline.formal_financial_features import build_formal_feature_bundle
+        class DigestVerifier:
+            def verify(self, raw, *, signature, key_id):
+                return key_id == "fixture-key" and signature == hashlib.sha256(raw).hexdigest()
+        verifier = DigestVerifier()
+        roles = ("source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event")
+        raw = {role: canonical_bytes({"registry_role": role, "schema_version": "fixture-v1"}) for role in roles}
+        raw["source"] = canonical_bytes({"registry_role": "source", "schema_version": "formal-source-registry-v1", "configs": []})
+        raw["feature"] = feature_registry_bytes(
+            source_registry_hash="f" * 64 if wrong_source_binding else hashlib.sha256(raw["source"]).hexdigest(),
+            mapping_registry_hash=hashlib.sha256(raw["mapping"]).hexdigest(),
+            slots=sorted([slot_wire(t, unit="CNY", formula={"op": "fact", "fact_key": "revenue", "period_key": "FY2025"}) for t in TEMPLATES], key=lambda s: s["slot_id"]))
+        hashes = {f"{role}_registry_hash": hashlib.sha256(value).hexdigest() for role, value in raw.items()}
+        root_bytes = canonical_bytes({"schema_version": "formal-registry-manifest-v1", "purpose": "official", "approval_id": "test-approval", **hashes})
+        root = FormalRegistryManifest.from_signed_bytes(root_bytes, hashlib.sha256(root_bytes).hexdigest(), "fixture-key", verifier)
+        feature_store = FormalFeatureBundleStore(self.root)
+        self.store = StateStore(self.db_path, formal_snapshot_store=self.store._formal_snapshot_store,
+            registry_signature_verifier=verifier, formal_feature_bundle_store=feature_store)
+        for role, value in raw.items():
+            child_hash = hashes[f"{role}_registry_hash"]
+            binding = canonical_bytes({"child_sha256": child_hash, "registry_manifest_hash": root.manifest_hash, "registry_role": role})
+            self.store.put_formal_registry_blob(VerifiedRegistryBlob(registry_hash=child_hash, registry_role=role, canonical_json=value,
+                signature=child_hash, key_id="fixture-key", approval_id="test-approval", declared_registry_manifest_hash=root.manifest_hash,
+                binding_signature=hashlib.sha256(binding).hexdigest(), binding_key_id="fixture-key"))
+        self.store.put_formal_registry_manifest(root)
+        registry = load_signed_feature_registry(raw["feature"], hashes["feature_registry_hash"], "fixture-key", verifier, registry_manifest=root)
+        if wrong_source_binding:
+            from ashare_pipeline.formal_feature_contract import FormalFeatureBundle, FormalFeatureValue
+            bundle = FormalFeatureBundle(schema_version=1, contract_version="formal-features-v1", security_id="SZ000001",
+                as_of_utc="2026-08-31T07:00:00+00:00", template_id="general_nonfinancial", registry_manifest_hash=root.manifest_hash,
+                feature_registry_hash=hashes["feature_registry_hash"], input_hash="a" * 64, history_endpoints=(), comparable_quarter_keys=(), blockers=(),
+                values=(FormalFeatureValue(slot_id="general_nonfinancial.growth", value=None, unit="CNY", status="missing", formula_version="formula-v1", evidence=(), missing_reason="missing"),))
+        else:
+            bundle = build_formal_feature_bundle(security_id="SZ000001", as_of_utc="2026-08-31T07:00:00+00:00", template_id="general_nonfinancial", facts=facts, issues=(), registry=registry, registry_manifest=root)
+        receipt = feature_store.write(bundle)
+        return bundle, receipt, feature_store
+
+    def test_bundle_live_receipt_and_append_only_metadata(self):
+        fact = self.install_fact()
+        self.store.insert_formal_financial_facts((fact,))
+        bundle, receipt, feature_store = self.install_registry_and_bundle(facts=(fact,))
+        self.assertEqual(self.store.put_formal_feature_bundle(bundle, receipt), (bundle.bundle_hash(), True))
+        row = self.store.get_formal_feature_bundle_row(bundle.input_hash)
+        self.assertIs(type(row), dict)
+        self.assertEqual(row["id"], bundle.bundle_hash())
+        self.assertEqual(row["values"][0]["value"], 100.0)
+        row["values"][0]["value"] = -999.0
+        self.assertEqual(self.store.get_formal_feature_bundle_row(bundle.input_hash)["values"][0]["value"], 100.0)
+        self.assertEqual(self.store.put_formal_feature_bundle(bundle, receipt), (bundle.bundle_hash(), False))
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("UPDATE formal_feature_value SET value=999")
+            connection.commit()
+        with self.assertRaises(ValueError):
+            self.store.put_formal_feature_bundle(bundle, receipt)
+
+    def test_bundle_missing_evidence_and_missing_live_store_fail_closed(self):
+        fact = self.install_fact()
+        bundle, receipt, _ = self.install_registry_and_bundle(facts=(fact,))
+        with self.assertRaises(ValueError):
+            self.store.put_formal_feature_bundle(bundle, receipt)
+        with self.assertRaises(ValueError):
+            StateStore(self.db_path).put_formal_feature_bundle(bundle, receipt)
+        self.assertIsNone(self.store.get_formal_feature_bundle_row(bundle.input_hash))
+
+    def test_bundle_rejects_feature_child_bound_to_wrong_source_role_hash(self):
+        bundle, receipt, _ = self.install_registry_and_bundle(wrong_source_binding=True)
+        with self.assertRaises(ValueError):
+            self.store.put_formal_feature_bundle(bundle, receipt)
+
+    def test_bundle_blocked_audit_input_hash_conflicts_and_receipt_tamper(self):
+        from ashare_pipeline.formal_feature_contract import FormalFeatureBundle
+        from ashare_pipeline.formal_feature_store import FormalStoredFeatureBundle
+        bundle, receipt, store = self.install_registry_and_bundle()
+        self.store.put_formal_feature_bundle(bundle, receipt)
+        wire = bundle.to_dict()
+        wire["blockers"] = sorted(wire["blockers"] + ["new_blocker"])
+        changed = FormalFeatureBundle.from_dict(wire)
+        changed_receipt = store.write(changed)
+        with self.assertRaises(ValueError):
+            self.store.put_formal_feature_bundle(changed, changed_receipt)
+        with self.assertRaises(ValueError):
+            self.store.put_formal_feature_bundle(bundle, changed_receipt)
+        with self.assertRaises(ValueError):
+            self.store.put_formal_feature_bundle(bundle, object.__new__(FormalStoredFeatureBundle))
+        original = Path(receipt.manifest_path).read_bytes()
+        Path(receipt.manifest_path).write_bytes(original + b" ")
+        with self.assertRaises(ValueError):
+            self.store.put_formal_feature_bundle(bundle, receipt)
+        Path(receipt.manifest_path).write_bytes(original)
+        self.assertEqual(self.store.get_formal_feature_bundle_row(bundle.input_hash)["bundle_hash"], bundle.bundle_hash())
+
+    def test_bundle_rejects_signed_slot_unit_formula_and_foreign_evidence(self):
+        from ashare_pipeline.formal_feature_contract import FormalFeatureBundle
+        fact = self.install_fact()
+        self.store.insert_formal_financial_facts((fact,))
+        bundle, _, store = self.install_registry_and_bundle(facts=(fact,))
+        changes = (
+            ("unit", "ratio"), ("formula_version", "wrong-v1"), ("slot_id", "general_nonfinancial.unknown"),
+        )
+        for key, value in changes:
+            wire = bundle.to_dict()
+            wire["values"][0][key] = value
+            changed = FormalFeatureBundle.from_dict(wire)
+            receipt = store.write(changed)
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.store.put_formal_feature_bundle(changed, receipt)
+        wire = bundle.to_dict()
+        wire["security_id"] = "SH600001"
+        changed = FormalFeatureBundle.from_dict(wire)
+        with self.assertRaises(ValueError):
+            self.store.put_formal_feature_bundle(changed, store.write(changed))
+        self.assertIsNone(self.store.get_formal_feature_bundle_row(bundle.input_hash))
+
+    def test_bundle_evidence_cutoff_excludes_source_update_but_allows_late_capture(self):
+        from ashare_pipeline.formal_feature_contract import FormalFeatureBundle
+        good = self.install_fact()
+        self.store.insert_formal_financial_facts((good,))
+        bundle, receipt, store = self.install_registry_and_bundle(facts=(good,))
+        self.store.put_formal_feature_bundle(bundle, receipt)
+        wire = bundle.to_dict()
+        wire["as_of_utc"] = "2026-03-20T07:00:00+00:00"
+        changed = FormalFeatureBundle.from_dict(wire)
+        with self.assertRaises(ValueError):
+            self.store.put_formal_feature_bundle(changed, store.write(changed))
+
+    def test_bundle_evidence_rejects_future_source_update(self):
+        from ashare_pipeline.formal_feature_contract import FormalFeatureBundle, FormalEvidenceRef
+        future = self.install_fact(source_overrides={"source_updated_at_utc": "2026-09-01T08:00:00+00:00"})
+        self.store.insert_formal_financial_facts((future,))
+        bundle, _, store = self.install_registry_and_bundle()
+        wire = bundle.to_dict()
+        wire["values"][0].update(status="derived", value=100.0, missing_reason=None, evidence=[FormalEvidenceRef.from_formal_fact(future).to_dict()])
+        forged = FormalFeatureBundle.from_dict(wire)
+        with self.assertRaises(ValueError):
+            self.store.put_formal_feature_bundle(forged, store.write(forged))
+
+    def test_source_circuit_invalid_shapes_tamper_and_task_isolation(self):
+        task_id = self.store.enqueue_formal_task(kind="custom.kind", idempotency_key="generic", refresh_generation="v1", payload={})
+        task = self.store.get_formal_task(task_id)
+        invalid = ({"failure_count": True}, {"failure_count": 0}, {"reason": {}}, {"reason": {"n": float("nan")}}, {"retry_after_utc": utc_at(-1)}, {"state": "half_open"}, {"opened_at_utc": "2026-08-31T00:00:00Z"})
+        base = dict(state="open", failure_count=1, reason={"timeout": True}, opened_at_utc=utc_at(0), retry_after_utc=utc_at(60))
+        for change in invalid:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.store.set_formal_source_circuit("cninfo", **{**base, **change})
+        self.store.set_formal_source_circuit("cninfo", **base)
+        self.assertEqual(self.store.get_formal_task(task_id), task)
+        self.assertEqual(self.store.lease_next_formal_task(("custom.kind",), "worker", 60, utc_at(0))["id"], task_id)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("UPDATE formal_source_circuit SET reason_json='{ \"timeout\": true }'")
+            connection.commit()
+        with self.assertRaises(ValueError):
+            self.store.get_formal_source_circuit("cninfo")
+
+    def test_task_listing_validates_filters_detaches_and_orders(self):
+        ids = []
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(0)):
+            for index in range(3):
+                ids.append(self.store.enqueue_formal_task(kind="custom.kind", idempotency_key=f"custom-{index}", refresh_generation="v1", payload={"nested": [1]}))
+        result = self.store.list_formal_tasks(kinds=["custom.kind"], statuses=["pending"])
+        self.assertEqual([row["id"] for row in result], sorted(ids))
+        result[0]["payload"]["nested"].append(2)
+        self.assertEqual(self.store.list_formal_tasks()[0]["payload"], {"nested": [1]})
+        for filters in ({"kinds": [" bad"]}, {"kinds": ["a\nb"]}, {"kinds": ["a\u0085b"]}, {"kinds": "custom.kind"}, {"statuses": ["unknown"]}, {"statuses": [True]}):
+            with self.subTest(filters=filters), self.assertRaises(ValueError):
+                self.store.list_formal_tasks(**filters)
+
+    def test_receipt_insert_tail_rolls_back_when_graph_validation_crosses_expiry(self):
+        task_id, fetch, stored, verification = self.install_leased_source()
+        with patch("ashare_pipeline.state_store._utc_now", side_effect=[utc_at(1), utc_at(2), utc_at(60)]):
+            with self.assertRaises(ValueError):
+                self.store.put_formal_snapshot_for_leased_task(fetch, stored, verification, task_id=task_id, worker_id="worker")
+        self.assertIsNone(self.store.get_formal_task_snapshot_receipt(task_id))
+
+    def install_leased_source(self):
+        task_id = self.store.enqueue_formal_task(kind="formal_statement", idempotency_key="source", refresh_generation="task-v1", payload={})
+        self.store.lease_next_formal_task(("formal_statement",), "worker", 60, utc_at(0))
+        raw_store, fetch, stored, verification = written_formal_snapshot(self.root, refresh_generation="task-v1", producing_task_id=task_id)
+        self.store = StateStore(self.db_path, formal_snapshot_store=raw_store)
+        return task_id, fetch, stored, verification
+
+    def test_receipt_insert_and_replay_resample_lease_expiry(self):
+        task_id, fetch, stored, verification = self.install_leased_source()
+        with patch("ashare_pipeline.state_store._utc_now", side_effect=[utc_at(1), utc_at(60)]):
+            with self.assertRaises(ValueError):
+                self.store.put_formal_snapshot_for_leased_task(fetch, stored, verification, task_id=task_id, worker_id="worker")
+        self.assertIsNone(self.store.get_formal_task_snapshot_receipt(task_id))
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(1)):
+            self.store.put_formal_snapshot_for_leased_task(fetch, stored, verification, task_id=task_id, worker_id="worker")
+        with patch("ashare_pipeline.state_store._utc_now", side_effect=[utc_at(1), utc_at(60)]):
+            with self.assertRaises(ValueError):
+                self.store.put_formal_snapshot_for_leased_task(fetch, stored, verification, task_id=task_id, worker_id="worker")
+
+    def test_receipt_getter_rejects_non_source_producer(self):
+        task_id, fetch, stored, verification = self.install_leased_source()
+        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(1)):
+            self.store.put_formal_snapshot_for_leased_task(fetch, stored, verification, task_id=task_id, worker_id="worker")
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("UPDATE formal_collection_task SET kind='feature_build' WHERE id=?", (task_id,))
+            connection.commit()
+        with self.assertRaises(ValueError):
+            self.store.get_formal_task_snapshot_receipt(task_id)
+
+    def test_source_circuit_replay_is_noop_and_open_closed_rules(self):
+        self.assertIsNone(self.store.get_formal_source_circuit("cninfo"))
+        self.store.set_formal_source_circuit("cninfo", state="open", failure_count=2,
+            reason={"http": 503}, opened_at_utc=utc_at(0), retry_after_utc=utc_at(60))
+        before = self.store.get_formal_source_circuit("cninfo")
+        self.store.set_formal_source_circuit("cninfo", state="open", failure_count=2,
+            reason={"http": 503}, opened_at_utc=utc_at(0), retry_after_utc=utc_at(60))
+        self.assertEqual(self.store.get_formal_source_circuit("cninfo"), before)
+        with self.assertRaises(ValueError):
+            self.store.set_formal_source_circuit("cninfo", state="closed", failure_count=1,
+                reason={}, opened_at_utc=None, retry_after_utc=None)
+        self.assertIsNone(self.store.get_formal_source_circuit("sse"))
+        self.store.set_formal_source_circuit("cninfo", state="closed", failure_count=0,
+            reason={}, opened_at_utc=None, retry_after_utc=None)
+        self.assertEqual(self.store.get_formal_source_circuit("cninfo")["state"], "closed")
+
+    def test_task_listing_empty_filters_and_corrupt_missing_dependency(self):
+        parent = self.store.enqueue_formal_task(kind="feature_build", idempotency_key="parent", refresh_generation="g", payload={})
+        child = self.store.enqueue_formal_task(kind="feature_build", idempotency_key="child", refresh_generation="g", payload={}, prerequisite_task_ids=(parent,))
+        self.assertEqual(len(self.store.list_formal_tasks()), 2)
+        self.assertEqual(self.store.list_formal_tasks(kinds=[]), [])
+        self.assertEqual(self.store.list_formal_tasks(statuses=[]), [])
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("DELETE FROM formal_collection_task WHERE id=?", (parent,))
+            connection.commit()
+        self.assertIsNone(self.store.lease_next_formal_task(("feature_build",), "worker", 60, utc_at(0)))
+        self.assertEqual(self.store.get_formal_task(child)["status"], "pending")
 
 
 if __name__ == "__main__":

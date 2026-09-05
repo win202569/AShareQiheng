@@ -51,6 +51,15 @@ from ashare_pipeline.formal_snapshot_store import (
     ValidatedFormalSnapshot,
 )
 from ashare_pipeline.formal_time import formal_version_sort_key, is_visible_at
+from ashare_pipeline.formal_financial_schema import FormalFinancialFact
+from ashare_pipeline.formal_financial_features import FormalQuarterFact, derive_comparable_quarters
+from ashare_pipeline.formal_feature_contract import (
+    FormalFeatureBundle, FormalFeatureValue, FormalEvidenceRef, load_signed_feature_registry,
+)
+from ashare_pipeline.formal_feature_store import FormalFeatureBundleStore, FormalStoredFeatureBundle
+from ashare_pipeline.formal_registry_manifest import (
+    FormalRegistryManifest, FormalRegistryBundleLoader, VerifiedRegistryBlob,
+)
 from ashare_pipeline.formal_universe import (
     FormalFrozenUniverseInput,
     FormalUniverseDecision,
@@ -77,7 +86,7 @@ SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
 SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
 RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
 _OWNED_JOB_KINDS = frozenset({"deep_financial", "deep_statement", "feature_build"})
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _EVIDENCE_QUERY_BATCH_SIZE = 256
 _STATEMENT_DATASETS = ("balance_sheet", "profit_sheet", "cash_flow_sheet")
 _SHANGHAI = timezone(timedelta(hours=8))
@@ -495,6 +504,92 @@ _V5_INDEX_DDL = {
         formal_source_snapshot_exact_request_idx ON formal_source_snapshot(
             source,dataset,request_fingerprint,refresh_generation,created_at DESC
         )""",
+}
+
+
+_FORMAL_REGISTRY_ROLES = (
+    "source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event",
+)
+_FORMAL_ROOT_FIELDS = (
+    "manifest_hash", "purpose", "approval_id", "canonical_json", "signature", "key_id",
+    *(f"{role}_registry_hash" for role in _FORMAL_REGISTRY_ROLES),
+)
+_FORMAL_BLOB_FIELDS = (
+    "registry_hash", "registry_role", "canonical_json", "signature", "key_id", "approval_id",
+    "declared_registry_manifest_hash", "binding_signature", "binding_key_id",
+)
+_V6_TABLE_DDL = {
+    "formal_financial_fact": """CREATE TABLE formal_financial_fact (
+        id TEXT PRIMARY KEY, security_id TEXT NOT NULL, statement TEXT NOT NULL,
+        metric_key TEXT NOT NULL, period_start TEXT, period_end TEXT NOT NULL,
+        period_kind TEXT NOT NULL, value REAL NOT NULL, unit TEXT NOT NULL,
+        nature TEXT NOT NULL, accounting_basis TEXT NOT NULL,
+        published_at_utc TEXT NOT NULL, published_precision TEXT NOT NULL,
+        effective_at_utc TEXT NOT NULL, effective_time_evidence_hash TEXT,
+        source_updated_at_utc TEXT, captured_at_utc TEXT NOT NULL,
+        source_snapshot_id TEXT NOT NULL REFERENCES formal_source_snapshot(id),
+        source_content_sha256 TEXT NOT NULL, source_refresh_generation TEXT NOT NULL,
+        source_producing_task_id TEXT, source_field TEXT NOT NULL,
+        raw_value_sha256 TEXT NOT NULL, parser_id TEXT NOT NULL,
+        parser_version TEXT NOT NULL, mapping_version TEXT NOT NULL, created_at_utc TEXT NOT NULL
+    )""",
+    "formal_quarter_fact": """CREATE TABLE formal_quarter_fact (
+        id TEXT PRIMARY KEY, security_id TEXT NOT NULL, statement TEXT NOT NULL,
+        metric_key TEXT NOT NULL, quarter_end TEXT NOT NULL, quarter_key TEXT NOT NULL,
+        value REAL NOT NULL, unit TEXT NOT NULL, nature TEXT NOT NULL,
+        accounting_basis TEXT NOT NULL, mapping_version TEXT NOT NULL,
+        component_fact_ids_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+        derivation_version TEXT NOT NULL, created_at_utc TEXT NOT NULL
+    )""",
+    "formal_feature_set": """CREATE TABLE formal_feature_set (
+        id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, contract_version TEXT NOT NULL,
+        security_id TEXT NOT NULL, as_of_utc TEXT NOT NULL, template_id TEXT NOT NULL,
+        registry_manifest_hash TEXT NOT NULL, feature_registry_hash TEXT NOT NULL,
+        input_hash TEXT NOT NULL UNIQUE, history_endpoints_json TEXT NOT NULL,
+        comparable_quarter_keys_json TEXT NOT NULL, blockers_json TEXT NOT NULL,
+        bundle_hash TEXT NOT NULL, bundle_manifest_hash TEXT NOT NULL,
+        bundle_path TEXT NOT NULL, manifest_path TEXT NOT NULL, created_at_utc TEXT NOT NULL
+    )""",
+    "formal_feature_value": """CREATE TABLE formal_feature_value (
+        feature_set_id TEXT NOT NULL REFERENCES formal_feature_set(id), slot_id TEXT NOT NULL,
+        value REAL, unit TEXT NOT NULL, status TEXT NOT NULL, formula_version TEXT NOT NULL,
+        evidence_json TEXT NOT NULL, missing_reason TEXT,
+        PRIMARY KEY(feature_set_id, slot_id)
+    )""",
+    "formal_context_fact": """CREATE TABLE formal_context_fact (
+        id TEXT PRIMARY KEY, context_kind TEXT NOT NULL, scope_key TEXT NOT NULL,
+        security_id TEXT, as_of_utc TEXT NOT NULL, value_json TEXT NOT NULL,
+        no_coverage INTEGER NOT NULL, published_at_utc TEXT NOT NULL,
+        effective_at_utc TEXT NOT NULL, source_updated_at_utc TEXT, captured_at_utc TEXT NOT NULL,
+        refresh_generation TEXT NOT NULL, source_snapshot_id TEXT NOT NULL REFERENCES formal_source_snapshot(id),
+        source_content_sha256 TEXT NOT NULL, parser_id TEXT NOT NULL, parser_version TEXT NOT NULL,
+        mapping_version TEXT NOT NULL, registry_manifest_hash TEXT NOT NULL,
+        evidence_json TEXT NOT NULL, created_at_utc TEXT NOT NULL
+    )""",
+    "formal_registry_manifest": """CREATE TABLE formal_registry_manifest (
+        manifest_hash TEXT PRIMARY KEY, purpose TEXT NOT NULL, approval_id TEXT,
+        canonical_json BLOB NOT NULL, signature TEXT NOT NULL, key_id TEXT NOT NULL,
+        source_registry_hash TEXT NOT NULL, mapping_registry_hash TEXT NOT NULL,
+        feature_registry_hash TEXT NOT NULL, scoring_registry_hash TEXT NOT NULL,
+        industry_registry_hash TEXT NOT NULL, cyclic_registry_hash TEXT NOT NULL,
+        redline_registry_hash TEXT NOT NULL, status_registry_hash TEXT NOT NULL,
+        event_registry_hash TEXT NOT NULL, created_at_utc TEXT NOT NULL
+    )""",
+    "formal_registry_blob": """CREATE TABLE formal_registry_blob (
+        registry_hash TEXT PRIMARY KEY, registry_role TEXT NOT NULL, canonical_json BLOB NOT NULL,
+        signature TEXT NOT NULL, key_id TEXT NOT NULL, approval_id TEXT,
+        declared_registry_manifest_hash TEXT NOT NULL, binding_signature TEXT NOT NULL,
+        binding_key_id TEXT NOT NULL, created_at_utc TEXT NOT NULL
+    )""",
+    "formal_source_circuit": """CREATE TABLE formal_source_circuit (
+        source TEXT PRIMARY KEY, state TEXT NOT NULL, failure_count INTEGER NOT NULL,
+        reason_json TEXT NOT NULL, opened_at_utc TEXT, retry_after_utc TEXT, updated_at_utc TEXT NOT NULL
+    )""",
+}
+_V6_INDEX_DDL = {
+    "idx_formal_financial_fact_security": "CREATE INDEX idx_formal_financial_fact_security ON formal_financial_fact(security_id, period_end, statement, metric_key, id)",
+    "idx_formal_quarter_fact_security": "CREATE INDEX idx_formal_quarter_fact_security ON formal_quarter_fact(security_id, quarter_end, statement, metric_key, id)",
+    "idx_formal_feature_set_header": "CREATE INDEX idx_formal_feature_set_header ON formal_feature_set(security_id, as_of_utc, template_id, registry_manifest_hash, id)",
 }
 
 
@@ -1440,6 +1535,8 @@ class StateStore:
         db_path: str | Path,
         *,
         formal_snapshot_store: FormalSnapshotStore | None = None,
+        registry_signature_verifier: object | None = None,
+        formal_feature_bundle_store: FormalFeatureBundleStore | None = None,
     ):
         if formal_snapshot_store is not None and not isinstance(
             formal_snapshot_store, FormalSnapshotStore
@@ -1449,6 +1546,12 @@ class StateStore:
             )
         self.db_path = Path(db_path)
         self._formal_snapshot_store = formal_snapshot_store
+        if registry_signature_verifier is not None and not callable(getattr(registry_signature_verifier, "verify", None)):
+            raise ValueError("registry_signature_verifier must provide verify")
+        if formal_feature_bundle_store is not None and type(formal_feature_bundle_store) is not FormalFeatureBundleStore:
+            raise ValueError("formal_feature_bundle_store must have exact type")
+        self._registry_signature_verifier = registry_signature_verifier
+        self._formal_feature_bundle_store = formal_feature_bundle_store
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
@@ -1486,118 +1589,42 @@ class StateStore:
 
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+        with self._transaction(immediate=True) as connection:
             tables = self._user_tables(connection)
+            schemas = {
+                2: (_V2_TABLE_DDL, _V2_INDEX_DDL),
+                3: (_V3_TABLE_DDL, _V3_INDEX_DDL),
+                4: (_V4_TABLE_DDL, _V4_INDEX_DDL),
+                5: (_V5_TABLE_DDL, _V5_INDEX_DDL),
+                6: (_V6_TABLE_DDL, _V6_INDEX_DDL),
+            }
             if not tables:
                 self._create_v2_schema(connection)
                 connection.execute(_MIGRATION_TABLE_DDL)
-                connection.execute(
-                    "INSERT INTO schema_migration(version, applied_at) VALUES (2, ?)",
-                    (_utc_now(),),
-                )
-                self._apply_v3_migration(connection)
-                self._apply_v4_migration(connection)
-                self._apply_v5_migration(connection)
+                connection.execute("INSERT INTO schema_migration VALUES (2, ?)", (_utc_now(),))
+                versions = {2}
             elif "schema_migration" not in tables:
                 if tables != set(_V2_TABLE_DDL):
                     raise RuntimeError("database does not match the complete v2 schema")
                 self._assert_v2_schema(connection)
                 connection.execute(_MIGRATION_TABLE_DDL)
-                connection.execute(
-                    "INSERT INTO schema_migration(version, applied_at) VALUES (2, ?)",
-                    (_utc_now(),),
-                )
-                self._apply_v3_migration(connection)
-                self._apply_v4_migration(connection)
-                self._apply_v5_migration(connection)
+                connection.execute("INSERT INTO schema_migration VALUES (2, ?)", (_utc_now(),))
+                versions = {2}
             else:
-                self._assert_schema_ddl(
-                    connection,
-                    {"schema_migration": _MIGRATION_TABLE_DDL},
-                    {},
-                    "migration ledger",
-                )
-                versions = {
-                    int(row[0])
-                    for row in connection.execute("SELECT version FROM schema_migration")
-                }
-                if versions not in ({2}, {2, 3}, {2, 3, 4}, {2, 3, 4, 5}):
-                    raise RuntimeError(f"unsupported migration versions: {sorted(versions)}")
-                self._assert_v2_schema(connection)
-                if versions == {2}:
-                    later_tables = tables & (
-                        set(_V3_TABLE_DDL) | set(_V4_TABLE_DDL) | set(_V5_TABLE_DDL)
-                    )
-                    if later_tables:
-                        raise RuntimeError(
-                            "version-2 ledger has unexpected later tables: "
-                            f"{sorted(later_tables)}"
-                        )
-                    self._apply_v3_migration(connection)
-                    self._apply_v4_migration(connection)
-                    self._apply_v5_migration(connection)
-                elif versions == {2, 3}:
-                    self._assert_schema_ddl(
-                        connection,
-                        _V3_TABLE_DDL,
-                        _V3_INDEX_DDL,
-                        "v3 schema",
-                    )
-                    later_tables = tables & (set(_V4_TABLE_DDL) | set(_V5_TABLE_DDL))
-                    if later_tables:
-                        raise RuntimeError(
-                            "version-3 ledger has unexpected v4 tables: "
-                            f"{sorted(later_tables)}"
-                        )
-                    self._apply_v4_migration(connection)
-                    self._apply_v5_migration(connection)
-                elif versions == {2, 3, 4}:
-                    self._assert_schema_ddl(
-                        connection,
-                        _V3_TABLE_DDL,
-                        _V3_INDEX_DDL,
-                        "v3 schema",
-                    )
-                    self._assert_schema_ddl(
-                        connection,
-                        _V4_TABLE_DDL,
-                        _V4_INDEX_DDL,
-                        "v4 schema",
-                    )
-                    partial_v5_tables = tables & set(_V5_TABLE_DDL)
-                    if partial_v5_tables:
-                        raise RuntimeError(
-                            "version-4 ledger has unexpected v5 tables: "
-                            f"{sorted(partial_v5_tables)}"
-                        )
-                    self._apply_v5_migration(connection)
-                else:
-                    self._assert_schema_ddl(
-                        connection,
-                        _V3_TABLE_DDL,
-                        _V3_INDEX_DDL,
-                        "v3 schema",
-                    )
-                    self._assert_schema_ddl(
-                        connection,
-                        _V4_TABLE_DDL,
-                        _V4_INDEX_DDL,
-                        "v4 schema",
-                    )
-                    self._assert_schema_ddl(
-                        connection,
-                        _V5_TABLE_DDL,
-                        _V5_INDEX_DDL,
-                        "v5 schema",
-                    )
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+                self._assert_schema_ddl(connection, {"schema_migration": _MIGRATION_TABLE_DDL}, {}, "migration ledger")
+                versions = {row[0] for row in connection.execute("SELECT version FROM schema_migration")}
+                if any(type(v) is not int for v in versions) or versions not in (
+                    {2}, {2, 3}, {2, 3, 4}, {2, 3, 4, 5}, {2, 3, 4, 5, 6}
+                ):
+                    raise RuntimeError(f"unsupported migration versions: {sorted(versions, key=str)}")
+            objects = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
+            for version, (table_ddl, index_ddl) in schemas.items():
+                if version in versions:
+                    self._assert_schema_ddl(connection, table_ddl, index_ddl, f"v{version} schema")
+                elif objects & (set(table_ddl) | set(index_ddl)):
+                    raise RuntimeError(f"unexpected v{version} schema before its migration ledger")
+            for version in range(max(versions) + 1, 7):
+                getattr(self, f"_apply_v{version}_migration")(connection)
 
     @contextmanager
     def owned_job_transaction(
@@ -1749,6 +1776,501 @@ class StateStore:
             "INSERT INTO schema_migration(version, applied_at) VALUES (5, ?)",
             (_utc_now(),),
         )
+
+    @classmethod
+    def _apply_v6_migration(cls, connection: sqlite3.Connection) -> None:
+        for statement in (*_V6_TABLE_DDL.values(), *_V6_INDEX_DDL.values()):
+            connection.execute(statement)
+        cls._assert_schema_ddl(connection, _V6_TABLE_DDL, _V6_INDEX_DDL, "v6 schema")
+        connection.execute("INSERT INTO schema_migration VALUES (6, ?)", (_utc_now(),))
+
+    @staticmethod
+    def _formal_insert_row(connection, table: str, row: dict[str, object]) -> None:
+        # Only fixed internal table/column names enter this helper.
+        columns = tuple(row)
+        connection.execute(
+            f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+            tuple(row[k] for k in columns),
+        )
+
+    @staticmethod
+    def _formal_security_filter(value: object) -> str:
+        if type(value) is not str or canonical_security_id(value) != value:
+            raise ValueError("formal security ID must be canonical")
+        return value
+
+    def _formal_fact_from_connection(self, connection, row) -> FormalFinancialFact:
+        wire = dict(row)
+        fact = FormalFinancialFact.from_dict(wire)
+        wire = fact.to_dict()
+        source = connection.execute("SELECT * FROM formal_source_snapshot WHERE id=?", (wire["source_snapshot_id"],)).fetchone()
+        if source is None:
+            raise ValueError("formal fact source snapshot is missing")
+        ref = self._formal_verified_snapshot_ref_from_connection(connection, source)
+        expected = {
+            "security_id": ref.security_id, "period_end": ref.period_or_date,
+            "source_snapshot_id": ref.snapshot_id, "source_content_sha256": ref.content_sha256,
+            "source_refresh_generation": ref.refresh_generation, "source_producing_task_id": ref.producing_task_id,
+            "parser_id": ref.parser_id, "parser_version": ref.parser_version, "mapping_version": ref.mapping_version,
+            "published_at_utc": ref.published_at_utc, "published_precision": ref.published_precision,
+            "effective_at_utc": ref.effective_at_utc, "effective_time_evidence_hash": ref.effective_time_evidence_hash,
+            "source_updated_at_utc": ref.source_updated_at_utc, "captured_at_utc": ref.captured_at_utc,
+        }
+        if any(type(wire[k]) is not type(v) or wire[k] != v for k, v in expected.items()):
+            raise ValueError("formal fact source lineage mismatch")
+        return fact
+
+    def insert_formal_financial_facts(self, facts: Iterable[FormalFinancialFact]) -> None:
+        wires = []
+        for fact in facts:
+            if type(fact) is not FormalFinancialFact:
+                raise ValueError("formal fact must have exact type")
+            wires.append(fact.to_dict())
+        with self._transaction(immediate=True) as connection:
+            for wire in wires:
+                self._formal_fact_from_connection(connection, wire)
+                old = connection.execute("SELECT * FROM formal_financial_fact WHERE id=?", (wire["id"],)).fetchone()
+                if old is not None:
+                    previous = self._formal_fact_from_connection(connection, old).to_dict()
+                    previous.pop("created_at_utc")
+                    content = {k: v for k, v in wire.items() if k != "created_at_utc"}
+                    if _json(previous) != _json(content):
+                        raise ValueError("formal financial fact content conflict")
+                else:
+                    self._formal_insert_row(connection, "formal_financial_fact", wire)
+            for wire in wires:
+                row = connection.execute("SELECT * FROM formal_financial_fact WHERE id=?", (wire["id"],)).fetchone()
+                if row is None:
+                    raise ValueError("formal financial fact insert is missing")
+                inserted = self._formal_fact_from_connection(connection, row).to_dict()
+                if _json({k: v for k, v in inserted.items() if k != "created_at_utc"}) != _json({k: v for k, v in wire.items() if k != "created_at_utc"}):
+                    raise ValueError("formal financial fact insert conflict")
+
+    def list_formal_financial_facts(self, *, security_id: str | None = None) -> tuple[FormalFinancialFact, ...]:
+        args = () if security_id is None else (self._formal_security_filter(security_id),)
+        with self._transaction() as connection:
+            rows = connection.execute("SELECT * FROM formal_financial_fact" + (" WHERE security_id=?" if args else ""), args).fetchall()
+            facts = [self._formal_fact_from_connection(connection, row) for row in rows]
+            return tuple(sorted(facts, key=lambda fact: _json({k: v for k, v in fact.to_dict().items() if k != "created_at_utc"})))
+
+    def _formal_quarter_from_connection(self, connection, wire: dict) -> FormalQuarterFact:
+        quarter = FormalQuarterFact.from_dict(wire)
+        wire = quarter.to_dict()
+        components = []
+        for fact_id in wire["component_fact_ids"]:
+            row = connection.execute("SELECT * FROM formal_financial_fact WHERE id=?", (fact_id,)).fetchone()
+            if row is None:
+                raise ValueError("formal quarter component fact is missing")
+            components.append(self._formal_fact_from_connection(connection, row))
+        candidates = derive_comparable_quarters(components).facts
+        if not any(_json(candidate.to_dict()) == _json(wire) for candidate in candidates):
+            raise ValueError("formal quarter does not match exact component rederivation")
+        return quarter
+
+    @staticmethod
+    def _formal_quarter_wire(row) -> dict:
+        wire = dict(row)
+        _require_canonical_utc(wire.pop("created_at_utc"), "quarter creation time")
+        for key in ("component_fact_ids", "evidence"):
+            wire[key] = _decode_canonical_formal_array(wire.pop(key + "_json"), key)
+        return wire
+
+    def insert_formal_quarter_facts(self, quarters: Iterable[FormalQuarterFact]) -> None:
+        wires = []
+        for quarter in quarters:
+            if type(quarter) is not FormalQuarterFact:
+                raise ValueError("formal quarter must have exact type")
+            wires.append(quarter.to_dict())
+        with self._transaction(immediate=True) as connection:
+            for wire in wires:
+                self._formal_quarter_from_connection(connection, wire)
+                old = connection.execute("SELECT * FROM formal_quarter_fact WHERE id=?", (wire["id"],)).fetchone()
+                if old is not None:
+                    previous = self._formal_quarter_from_connection(connection, self._formal_quarter_wire(old))
+                    if _json(previous.to_dict()) != _json(wire):
+                        raise ValueError("formal quarter content conflict")
+                else:
+                    row = dict(wire)
+                    for key in ("component_fact_ids", "evidence"):
+                        row[key + "_json"] = _json(row.pop(key))
+                    row["created_at_utc"] = _require_canonical_utc(_utc_now(), "quarter creation time")
+                    self._formal_insert_row(connection, "formal_quarter_fact", row)
+            for wire in wires:
+                row = connection.execute("SELECT * FROM formal_quarter_fact WHERE id=?", (wire["id"],)).fetchone()
+                if row is None or _json(self._formal_quarter_from_connection(connection, self._formal_quarter_wire(row)).to_dict()) != _json(wire):
+                    raise ValueError("formal quarter insert conflict")
+
+    def list_formal_quarter_facts(self, *, security_id: str | None = None) -> tuple[FormalQuarterFact, ...]:
+        args = () if security_id is None else (self._formal_security_filter(security_id),)
+        with self._transaction() as connection:
+            rows = connection.execute("SELECT * FROM formal_quarter_fact" + (" WHERE security_id=?" if args else ""), args).fetchall()
+            quarters = [self._formal_quarter_from_connection(connection, self._formal_quarter_wire(row)) for row in rows]
+            return tuple(sorted(quarters, key=lambda quarter: _json(quarter.to_dict())))
+
+    def _require_registry_verifier(self):
+        verifier = self._registry_signature_verifier
+        if verifier is None or not callable(getattr(verifier, "verify", None)):
+            raise ValueError("formal registry signature verifier is not configured")
+        return verifier
+
+    @staticmethod
+    def _formal_token(value: object, field: str) -> str:
+        if type(value) is not str or not value or value != value.strip() or not value.isprintable():
+            raise ValueError(f"{field} must be an exact canonical token")
+        return value
+
+    def _verify_formal_signature(self, raw: bytes, signature: object, key_id: object) -> None:
+        signature = self._formal_token(signature, "signature")
+        key_id = self._formal_token(key_id, "key ID")
+        try:
+            result = self._require_registry_verifier().verify(raw, signature=signature, key_id=key_id)
+        except Exception as error:
+            raise ValueError("formal registry signature verification failed") from error
+        if result is not True:
+            raise ValueError("formal registry signature verification failed")
+
+    def _formal_blob_snapshot(self, blob: VerifiedRegistryBlob) -> dict:
+        self._require_registry_verifier()
+        if type(blob) is not VerifiedRegistryBlob:
+            raise ValueError("formal registry blob must have exact type")
+        try:
+            wire = {key: getattr(blob, key) for key in _FORMAL_BLOB_FIELDS}
+        except AttributeError as error:
+            raise ValueError("formal registry blob envelope is incomplete") from error
+        raw = wire["canonical_json"]
+        if type(raw) is not bytes:
+            raise ValueError("formal registry canonical JSON must be exact bytes")
+        try:
+            parsed = _decode_canonical_formal_json(raw.decode("utf-8"), "registry blob")
+        except UnicodeError as error:
+            raise ValueError("formal registry canonical JSON must be UTF-8") from error
+        role = self._formal_token(wire["registry_role"], "registry role")
+        if role not in _FORMAL_REGISTRY_ROLES or parsed.get("registry_role") != role:
+            raise ValueError("formal registry child role mismatch")
+        registry_hash = _require_formal_sha256(wire["registry_hash"], "registry hash")
+        if hashlib.sha256(raw).hexdigest() != registry_hash:
+            raise ValueError("formal registry child hash mismatch")
+        root_hash = _require_formal_sha256(wire["declared_registry_manifest_hash"], "declared registry root")
+        if wire["approval_id"] is not None:
+            self._formal_token(wire["approval_id"], "approval ID")
+        self._verify_formal_signature(raw, wire["signature"], wire["key_id"])
+        binding = _json({"child_sha256": registry_hash, "registry_manifest_hash": root_hash, "registry_role": role}).encode("utf-8")
+        self._verify_formal_signature(binding, wire["binding_signature"], wire["binding_key_id"])
+        return wire
+
+    def _formal_blob_from_connection(self, connection, registry_hash: str):
+        self._require_registry_verifier()
+        row = connection.execute("SELECT * FROM formal_registry_blob WHERE registry_hash=?", (registry_hash,)).fetchone()
+        if row is None:
+            return None
+        _require_canonical_utc(row["created_at_utc"], "registry blob creation time")
+        wire = self._formal_blob_snapshot(VerifiedRegistryBlob(**{key: row[key] for key in _FORMAL_BLOB_FIELDS}))
+        if wire["registry_hash"] != registry_hash:
+            raise ValueError("registry child stored identity mismatch")
+        return VerifiedRegistryBlob(**wire)
+
+    def put_formal_registry_blob(self, blob: VerifiedRegistryBlob) -> None:
+        wire = self._formal_blob_snapshot(blob)
+        with self._transaction(immediate=True) as connection:
+            old = self._formal_blob_from_connection(connection, wire["registry_hash"])
+            if old is not None:
+                if self._formal_blob_snapshot(old) != wire:
+                    raise ValueError("formal registry blob immutable envelope conflict")
+            else:
+                self._formal_insert_row(connection, "formal_registry_blob", {**wire, "created_at_utc": _require_canonical_utc(_utc_now(), "registry creation time")})
+            inserted = self._formal_blob_from_connection(connection, wire["registry_hash"])
+            if inserted is None or self._formal_blob_snapshot(inserted) != wire:
+                raise ValueError("formal registry blob insert conflict")
+
+    def get_formal_registry_blob(self, registry_hash: str) -> VerifiedRegistryBlob | None:
+        registry_hash = _require_formal_sha256(registry_hash, "registry hash")
+        with self._transaction() as connection:
+            return self._formal_blob_from_connection(connection, registry_hash)
+
+    def _formal_root_snapshot(self, manifest: FormalRegistryManifest) -> dict:
+        verifier = self._require_registry_verifier()
+        if type(manifest) is not FormalRegistryManifest:
+            raise ValueError("formal registry manifest must have exact type")
+        try:
+            hashes = {f"{role}_registry_hash": getattr(manifest, f"{role}_registry_hash") for role in _FORMAL_REGISTRY_ROLES}
+            manifest.assert_member_hashes(**hashes)
+            wire = {key: getattr(manifest, key) for key in _FORMAL_ROOT_FIELDS}
+        except AttributeError as error:
+            raise ValueError("formal registry manifest is incomplete") from error
+        fresh = FormalRegistryManifest.from_signed_bytes(wire["canonical_json"], wire["signature"], wire["key_id"], verifier)
+        expected = {key: getattr(fresh, key) for key in _FORMAL_ROOT_FIELDS}
+        if any(type(wire[k]) is not type(v) or wire[k] != v for k, v in expected.items()):
+            raise ValueError("formal registry manifest public fields mismatch")
+        return expected
+
+    def _formal_root_from_connection(self, connection, manifest_hash: str):
+        verifier = self._require_registry_verifier()
+        row = connection.execute("SELECT * FROM formal_registry_manifest WHERE manifest_hash=?", (manifest_hash,)).fetchone()
+        if row is None:
+            return None
+        _require_canonical_utc(row["created_at_utc"], "registry root creation time")
+        fresh = FormalRegistryManifest.from_signed_bytes(row["canonical_json"], row["signature"], row["key_id"], verifier)
+        expected = self._formal_root_snapshot(fresh)
+        if any(type(row[k]) is not type(v) or row[k] != v for k, v in expected.items()):
+            raise ValueError("formal registry root stored fields mismatch")
+        return fresh
+
+    def _formal_registry_bundle_from_connection(self, connection, manifest_hash, pending_root=None):
+        owner = self
+
+        class Repository:
+            def get_formal_registry_manifest(self, key):
+                if pending_root is not None and key == manifest_hash:
+                    return pending_root
+                return owner._formal_root_from_connection(connection, key)
+
+            def get_formal_registry_blob(self, key):
+                return owner._formal_blob_from_connection(connection, key)
+
+        return FormalRegistryBundleLoader(Repository(), self._require_registry_verifier()).load(manifest_hash)
+
+    def put_formal_registry_manifest(self, manifest: FormalRegistryManifest) -> None:
+        wire = self._formal_root_snapshot(manifest)
+        detached = FormalRegistryManifest.from_signed_bytes(wire["canonical_json"], wire["signature"], wire["key_id"], self._require_registry_verifier())
+        with self._transaction(immediate=True) as connection:
+            self._formal_registry_bundle_from_connection(connection, wire["manifest_hash"], detached)
+            old = self._formal_root_from_connection(connection, wire["manifest_hash"])
+            if old is not None:
+                if self._formal_root_snapshot(old) != wire:
+                    raise ValueError("formal registry root immutable envelope conflict")
+            else:
+                self._formal_insert_row(connection, "formal_registry_manifest", {**wire, "created_at_utc": _require_canonical_utc(_utc_now(), "registry creation time")})
+            loaded = self._formal_registry_bundle_from_connection(connection, wire["manifest_hash"])
+            if self._formal_root_snapshot(loaded.manifest) != wire:
+                raise ValueError("formal registry root insert conflict")
+
+    def get_formal_registry_manifest(self, manifest_hash: str) -> FormalRegistryManifest | None:
+        manifest_hash = _require_formal_sha256(manifest_hash, "manifest hash")
+        with self._transaction() as connection:
+            return self._formal_root_from_connection(connection, manifest_hash)
+
+    def list_formal_tasks(self, *, kinds: Sequence[str] | None = None, statuses: Sequence[str] | None = None) -> list[dict[str, object]]:
+        clauses, args = [], []
+        empty = False
+        for name, values in (("kind", kinds), ("status", statuses)):
+            if values is None:
+                continue
+            if type(values) not in (tuple, list):
+                raise ValueError("formal task filters must be exact lists or tuples")
+            requested = tuple(self._formal_token(value, name) for value in values)
+            if name == "status" and any(value not in FORMAL_TASK_STATES for value in requested):
+                raise ValueError("formal task status filter is invalid")
+            if not requested:
+                empty = True
+            else:
+                clauses.append(f"{name} IN ({','.join('?' for _ in requested)})")
+                args.extend(requested)
+        if empty:
+            return []
+        with self._transaction() as connection:
+            rows = connection.execute("SELECT * FROM formal_collection_task" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY created_at, id", args).fetchall()
+            result = []
+            for row in rows:
+                prerequisites = [item[0] for item in connection.execute("SELECT prerequisite_task_id FROM formal_collection_task_dependency WHERE task_id=? ORDER BY prerequisite_task_id", (row["id"],))]
+                self._formal_token(row["kind"], "stored task kind")
+                if type(row["status"]) is not str or row["status"] not in FORMAL_TASK_STATES:
+                    raise ValueError("stored formal task status is invalid")
+                result.append(self._formal_task_public(row, prerequisites))
+            return result
+
+    def _formal_circuit_payload(self, source, state, failure_count, reason, opened_at_utc, retry_after_utc):
+        source = self._formal_token(source, "source")
+        if type(state) is not str or state not in {"open", "closed"}:
+            raise ValueError("formal source circuit state is invalid")
+        if type(failure_count) is not int or failure_count < 0:
+            raise ValueError("formal source circuit failure count is invalid")
+        def snapshot(value):
+            if type(value) is dict:
+                return {self._formal_json_key(k): snapshot(v) for k, v in value.items()}
+            if type(value) is list:
+                return [snapshot(v) for v in value]
+            if value is None or type(value) in (str, bool, int, float):
+                return value
+            raise ValueError("formal circuit reason requires exact JSON types")
+        if type(reason) is not dict:
+            raise ValueError("formal circuit reason must be an exact mapping")
+        try:
+            reason_json = _json(snapshot(reason))
+        except (TypeError, ValueError, RecursionError) as error:
+            raise ValueError("formal circuit reason must be finite canonical JSON") from error
+        if state == "closed":
+            if failure_count != 0 or reason_json != "{}" or opened_at_utc is not None or retry_after_utc is not None:
+                raise ValueError("closed formal circuit must have no failure state")
+        else:
+            opened_at_utc = _require_canonical_utc(opened_at_utc, "circuit opened time")
+            retry_after_utc = _require_canonical_utc(retry_after_utc, "circuit retry time")
+            if failure_count <= 0 or reason_json == "{}" or datetime.fromisoformat(retry_after_utc) < datetime.fromisoformat(opened_at_utc):
+                raise ValueError("open formal circuit requires failures, reason and ordered times")
+        return dict(source=source, state=state, failure_count=failure_count, reason_json=reason_json, opened_at_utc=opened_at_utc, retry_after_utc=retry_after_utc)
+
+    @staticmethod
+    def _formal_json_key(key):
+        if type(key) is not str:
+            raise ValueError("formal JSON keys must be exact strings")
+        return key
+
+    def _formal_circuit_from_connection(self, connection, source):
+        row = connection.execute("SELECT * FROM formal_source_circuit WHERE source=?", (source,)).fetchone()
+        if row is None:
+            return None
+        reason = _decode_canonical_formal_json(row["reason_json"], "circuit reason")
+        expected = self._formal_circuit_payload(row["source"], row["state"], row["failure_count"], reason, row["opened_at_utc"], row["retry_after_utc"])
+        expected["updated_at_utc"] = _require_canonical_utc(row["updated_at_utc"], "circuit update time")
+        if any(type(row[k]) is not type(v) or row[k] != v for k, v in expected.items()):
+            raise ValueError("formal source circuit row is not canonical")
+        expected.pop("reason_json")
+        expected["reason"] = reason
+        return expected
+
+    def get_formal_source_circuit(self, source: str) -> dict[str, object] | None:
+        source = self._formal_token(source, "source")
+        with self._transaction() as connection:
+            return self._formal_circuit_from_connection(connection, source)
+
+    def set_formal_source_circuit(self, source: str, *, state: str, failure_count: int, reason: Mapping[str, object], opened_at_utc: str | None, retry_after_utc: str | None) -> None:
+        wire = self._formal_circuit_payload(source, state, failure_count, reason, opened_at_utc, retry_after_utc)
+        with self._transaction(immediate=True) as connection:
+            old = self._formal_circuit_from_connection(connection, wire["source"])
+            if old is not None:
+                previous = {k: v for k, v in old.items() if k != "updated_at_utc"}
+                previous["reason_json"] = _json(previous.pop("reason"))
+                if previous == wire:
+                    return
+            wire["updated_at_utc"] = _require_canonical_utc(_utc_now(), "circuit update time")
+            if old is None:
+                self._formal_insert_row(connection, "formal_source_circuit", wire)
+            else:
+                connection.execute("UPDATE formal_source_circuit SET state=?,failure_count=?,reason_json=?,opened_at_utc=?,retry_after_utc=?,updated_at_utc=? WHERE source=?", tuple(wire[k] for k in ("state", "failure_count", "reason_json", "opened_at_utc", "retry_after_utc", "updated_at_utc", "source")))
+            result = self._formal_circuit_from_connection(connection, wire["source"])
+            if result is None:
+                raise ValueError("formal circuit update is missing")
+            result["reason_json"] = _json(result.pop("reason"))
+            if result != wire:
+                raise ValueError("formal circuit update conflict")
+
+    def _formal_bundle_receipt_snapshot(self, stored, canonical: bytes) -> dict:
+        store = self._formal_feature_bundle_store
+        if type(store) is not FormalFeatureBundleStore or type(stored) is not FormalStoredFeatureBundle:
+            raise ValueError("formal feature bundle store and live receipt are required")
+        verified = store.read_verified(stored)
+        if type(verified) is not FormalFeatureBundle or verified.canonical_bytes() != canonical:
+            raise ValueError("formal feature live receipt bytes mismatch")
+        receipt = {key: getattr(stored, key) for key in ("bundle_hash", "manifest_hash", "bundle_path", "manifest_path")}
+        if any(type(v) is not str for v in receipt.values()) or receipt["bundle_hash"] != hashlib.sha256(canonical).hexdigest():
+            raise ValueError("formal feature receipt hash mismatch")
+        _require_formal_sha256(receipt["manifest_hash"], "feature manifest hash")
+        return receipt
+
+    def _validate_formal_bundle_sources(self, connection, wire: dict) -> None:
+        root_bundle = self._formal_registry_bundle_from_connection(connection, wire["registry_manifest_hash"])
+        child = root_bundle.blob("feature")
+        if child.registry_hash != wire["feature_registry_hash"]:
+            raise ValueError("formal feature child registry header mismatch")
+        registry = load_signed_feature_registry(child.canonical_json, child.signature, child.key_id,
+            self._require_registry_verifier(), registry_manifest=root_bundle.manifest)
+        slots = registry.slots_for_template(wire["template_id"])
+        if registry.source_registry_hash != root_bundle.manifest.source_registry_hash or registry.mapping_registry_hash != root_bundle.manifest.mapping_registry_hash:
+            raise ValueError("formal feature child source/mapping root binding mismatch")
+        if registry.contract_version != wire["contract_version"] or [slot.slot_id for slot in slots] != [value["slot_id"] for value in wire["values"]]:
+            raise ValueError("formal feature signed header or applicable slots mismatch")
+        cutoff = datetime.fromisoformat(wire["as_of_utc"])
+        for slot, value in zip(slots, wire["values"], strict=True):
+            if value["unit"] != slot.unit or value["formula_version"] != slot.formula_version:
+                raise ValueError("formal feature signed unit or formula version mismatch")
+            for evidence in value["evidence"]:
+                row = connection.execute("SELECT * FROM formal_financial_fact WHERE id=?", (evidence["formal_fact_id"],)).fetchone()
+                if row is None:
+                    raise ValueError("formal feature evidence fact is missing")
+                fact = self._formal_fact_from_connection(connection, row)
+                fact_wire = fact.to_dict()
+                if fact_wire["security_id"] != wire["security_id"] or _json(FormalEvidenceRef.from_formal_fact(fact).to_dict()) != _json(evidence):
+                    raise ValueError("formal feature evidence lineage mismatch")
+                for field in ("published_at_utc", "effective_at_utc", "source_updated_at_utc"):
+                    if fact_wire[field] is not None and datetime.fromisoformat(fact_wire[field]) > cutoff:
+                        raise ValueError("formal feature evidence is after cutoff")
+
+    @staticmethod
+    def _formal_feature_projection(wire: dict, receipt: dict) -> tuple[dict, list[dict]]:
+        header = {k: v for k, v in wire.items() if k != "values"}
+        for key in ("history_endpoints", "comparable_quarter_keys", "blockers"):
+            header[key + "_json"] = _json(header.pop(key))
+        header.update(id=receipt["bundle_hash"], bundle_hash=receipt["bundle_hash"],
+            bundle_manifest_hash=receipt["manifest_hash"], bundle_path=receipt["bundle_path"], manifest_path=receipt["manifest_path"])
+        values = []
+        for item in wire["values"]:
+            value = dict(item)
+            value["feature_set_id"] = receipt["bundle_hash"]
+            value["evidence_json"] = _json(value.pop("evidence"))
+            values.append(value)
+        return header, values
+
+    def _formal_feature_metadata_from_connection(self, connection, input_hash: str):
+        row = connection.execute("SELECT * FROM formal_feature_set WHERE input_hash=?", (input_hash,)).fetchone()
+        if row is None:
+            return None
+        header = dict(row)
+        _require_canonical_utc(header["created_at_utc"], "feature creation time")
+        _require_canonical_utc(header["as_of_utc"], "feature cutoff")
+        self._formal_security_filter(header["security_id"])
+        for key in ("id", "input_hash", "registry_manifest_hash", "feature_registry_hash", "bundle_hash", "bundle_manifest_hash"):
+            _require_formal_sha256(header[key], key)
+        if header["input_hash"] != input_hash or header["id"] != header["bundle_hash"]:
+            raise ValueError("formal feature metadata identity mismatch")
+        for key in ("contract_version", "template_id", "bundle_path", "manifest_path"):
+            self._formal_token(header[key], key)
+        if type(header["schema_version"]) is not int or header["schema_version"] != 1:
+            raise ValueError("formal feature metadata schema version mismatch")
+        for key in ("history_endpoints", "comparable_quarter_keys", "blockers"):
+            header[key] = _decode_canonical_formal_array(header.pop(key + "_json"), key)
+        values = []
+        for stored_value in connection.execute("SELECT * FROM formal_feature_value WHERE feature_set_id=? ORDER BY slot_id", (header["id"],)):
+            value = dict(stored_value)
+            value.pop("feature_set_id")
+            value["evidence"] = _decode_canonical_formal_array(value.pop("evidence_json"), "feature evidence")
+            values.append(FormalFeatureValue.from_dict(value).to_dict())
+        header["values"] = values
+        # This is a plain metadata integrity check, not a trusted bundle or an input-hash reconstruction.
+        bundle_wire = {k: header[k] for k in ("schema_version", "contract_version", "security_id", "as_of_utc", "template_id", "registry_manifest_hash", "feature_registry_hash", "input_hash", "values", "history_endpoints", "comparable_quarter_keys", "blockers")}
+        if hashlib.sha256(_json(bundle_wire).encode("utf-8")).hexdigest() != header["bundle_hash"]:
+            raise ValueError("formal feature metadata bundle hash mismatch")
+        return header
+
+    def put_formal_feature_bundle(self, bundle: FormalFeatureBundle, stored: FormalStoredFeatureBundle) -> tuple[str, bool]:
+        if type(bundle) is not FormalFeatureBundle:
+            raise ValueError("formal feature bundle must have exact type")
+        wire = bundle.to_dict()
+        canonical = bundle.canonical_bytes()
+        if _json(wire).encode("utf-8") != canonical:
+            raise ValueError("formal feature bundle snapshot changed")
+        receipt = self._formal_bundle_receipt_snapshot(stored, canonical)
+        header, values = self._formal_feature_projection(wire, receipt)
+        with self._transaction(immediate=True) as connection:
+            self._validate_formal_bundle_sources(connection, wire)
+            old = self._formal_feature_metadata_from_connection(connection, wire["input_hash"])
+            inserted = old is None
+            if inserted:
+                self._formal_insert_row(connection, "formal_feature_set", {**header, "created_at_utc": _require_canonical_utc(_utc_now(), "feature creation time")})
+                for value in values:
+                    self._formal_insert_row(connection, "formal_feature_value", value)
+            actual_header = connection.execute("SELECT * FROM formal_feature_set WHERE input_hash=?", (wire["input_hash"],)).fetchone()
+            actual_values = [dict(row) for row in connection.execute("SELECT * FROM formal_feature_value WHERE feature_set_id=? ORDER BY slot_id", (header["id"],))]
+            if actual_header is None or any(type(actual_header[k]) is not type(v) or actual_header[k] != v for k, v in header.items()) or actual_values != values:
+                raise ValueError("formal feature immutable input hash conflict")
+            self._formal_feature_metadata_from_connection(connection, wire["input_hash"])
+            self._validate_formal_bundle_sources(connection, wire)
+            if self._formal_bundle_receipt_snapshot(stored, canonical) != receipt:
+                raise ValueError("formal feature receipt changed during persistence")
+            return header["id"], inserted
+
+    def get_formal_feature_bundle_row(self, input_hash: str) -> dict[str, object] | None:
+        input_hash = _require_formal_sha256(input_hash, "feature input hash")
+        with self._transaction() as connection:
+            return self._formal_feature_metadata_from_connection(connection, input_hash)
 
     def _require_formal_snapshot_store(self) -> FormalSnapshotStore:
         if self._formal_snapshot_store is None:
@@ -2299,6 +2821,8 @@ class StateStore:
             )
         ]
         task_public = self._formal_task_public(task, prerequisites)
+        if task_public["kind"] not in _FORMAL_SOURCE_FETCH_KINDS:
+            raise ValueError("formal snapshot receipt task is not a source task")
         snapshot = connection.execute(
             "SELECT * FROM formal_source_snapshot WHERE id = ?",
             (receipt["snapshot_id"],),
@@ -2418,6 +2942,7 @@ class StateStore:
                 ref = self._formal_snapshot_row_to_ref(existing)
                 if not self._formal_ref_matches_projection(ref, validated):
                     raise ValueError("formal_task_snapshot_receipt_conflict")
+                self._require_formal_snapshot_owner(connection, task_id, worker_id, validated.refresh_generation)
                 return ref
 
             existing_manifest = connection.execute(
@@ -2445,6 +2970,7 @@ class StateStore:
                 self._formal_snapshot_row_to_ref(lineage)
                 raise ValueError("formal_snapshot_lineage_conflict")
 
+            now = _require_canonical_utc(_utc_now(), "snapshot ownership time")
             ownership = connection.execute(
                 """SELECT 1 FROM formal_collection_task
                 WHERE id = ? AND kind IN (?,?,?) AND status = 'leased'
@@ -2527,7 +3053,19 @@ class StateStore:
             ref = self._formal_snapshot_row_to_ref(inserted)
             if not self._formal_ref_matches_projection(ref, validated):
                 raise ValueError("formal_task_snapshot_receipt_conflict")
+            self._require_formal_snapshot_owner(connection, task_id, worker_id, validated.refresh_generation)
             return ref
+
+    def _require_formal_snapshot_owner(self, connection, task_id, worker_id, generation):
+        now = _require_canonical_utc(_utc_now(), "snapshot ownership time")
+        row = connection.execute(
+            """SELECT 1 FROM formal_collection_task WHERE id=? AND kind IN (?,?,?)
+            AND status='leased' AND lease_worker=? AND lease_expires_at>?
+            AND refresh_generation=?""",
+            (task_id, *_FORMAL_SOURCE_FETCH_KINDS, worker_id, now, generation),
+        ).fetchone()
+        if row is None:
+            raise ValueError("formal snapshot task lease expired or ownership changed")
 
     def get_formal_task_snapshot_receipt(
         self, task_id: str
@@ -3452,10 +3990,10 @@ class StateStore:
                   AND NOT EXISTS (
                     SELECT 1
                     FROM formal_collection_task_dependency AS dependency
-                    JOIN formal_collection_task AS prerequisite
+                    LEFT JOIN formal_collection_task AS prerequisite
                       ON prerequisite.id = dependency.prerequisite_task_id
                     WHERE dependency.task_id = task.id
-                      AND prerequisite.status <> 'verified'
+                      AND (prerequisite.id IS NULL OR prerequisite.status <> 'verified')
                   )
                 ORDER BY CASE
                     WHEN task.status = 'pending' THEN task.created_at
@@ -3499,10 +4037,10 @@ class StateStore:
                   AND NOT EXISTS (
                     SELECT 1
                     FROM formal_collection_task_dependency AS dependency
-                    JOIN formal_collection_task AS prerequisite
+                    LEFT JOIN formal_collection_task AS prerequisite
                       ON prerequisite.id = dependency.prerequisite_task_id
                     WHERE dependency.task_id = formal_collection_task.id
-                      AND prerequisite.status <> 'verified'
+                      AND (prerequisite.id IS NULL OR prerequisite.status <> 'verified')
                   )""",
                 (
                     worker_id,
