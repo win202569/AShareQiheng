@@ -551,8 +551,54 @@ def _make_signed_source_registry_type() -> type[object]:
         registry_fingerprint: tuple[object, ...]
         configs: tuple[SourceAdapterConfig, ...]
         configs_fingerprint: tuple[object, ...]
+        canonical_json: bytes
+        registry_hash: str
+        signature: str
+        key_id: str
 
     verified_registries: dict[int, _RegistryRecord] = {}
+
+    def configs_from_canonical(
+        canonical_json: bytes, registry_hash: str
+    ) -> tuple[SourceAdapterConfig, ...]:
+        wire = _load_canonical_object(canonical_json, label="source registry")
+        if set(wire) != {"configs", "registry_role", "schema_version"}:
+            raise ValueError("source registry has unknown or missing keys")
+        if wire["registry_role"] != "source":
+            raise ValueError("source registry role must be source")
+        if wire["schema_version"] != "formal-source-registry-v1":
+            raise ValueError("source registry schema_version is invalid")
+        if type(wire["configs"]) is not list:
+            raise ValueError("source registry configs must be a list")
+        configs: list[SourceAdapterConfig] = []
+        identities: set[tuple[str, str, str | None]] = set()
+        for item in wire["configs"]:
+            if type(item) is not dict or set(item) != _CONFIG_KEYS:
+                raise ValueError("source registry config has unknown or missing keys")
+            config = SourceAdapterConfig(
+                source=item["source"],
+                dataset=item["dataset"],
+                endpoint_url=item["endpoint_url"],
+                http_method=item["http_method"],
+                parser_id=item["parser_id"],
+                parser_version=item["parser_version"],
+                mapping_version=item["mapping_version"],
+                request_template=item["request_template"],
+                timeout_seconds=item["timeout_seconds"],
+                retry_base_seconds=item["retry_base_seconds"],
+                retry_max_attempts=item["retry_max_attempts"],
+                challenge_cooldown_seconds=item["challenge_cooldown_seconds"],
+                registry_hash=registry_hash,
+                exchange_scope=item["exchange_scope"],
+                calendar_selector=_selector_from_wire(item["calendar_selector"]),
+                bootstrap_calendar=item["bootstrap_calendar"],
+            )
+            identity = (config.source, config.dataset, config.exchange_scope)
+            if identity in identities:
+                raise ValueError("source registry has duplicate config identity")
+            identities.add(identity)
+            configs.append(config)
+        return tuple(configs)
 
     def value_fingerprint(value: object) -> object:
         """Preserve type, order, and nesting so mutation is never normalized away."""
@@ -614,17 +660,55 @@ def _make_signed_source_registry_type() -> type[object]:
             registry_fingerprint(registry),
             configs,
             configs_fingerprint(configs),
+            getattr(registry, "canonical_json"),
+            getattr(registry, "registry_hash"),
+            getattr(registry, "signature"),
+            getattr(registry, "key_id"),
         )
 
-    def is_verified(registry: object) -> bool:
+    def verified_record(registry: object) -> _RegistryRecord:
         record = verified_registries.get(id(registry))
-        return (
+        if not (
             record is not None
             and record.reference() is registry
             and getattr(registry, "configs", None) is record.configs
             and registry_fingerprint(registry) == record.registry_fingerprint
             and configs_fingerprint(getattr(registry, "configs", None)) == record.configs_fingerprint
-        )
+        ):
+            raise ValueError("signed source registry was not verified by from_signed_bytes")
+        return record
+
+    def is_verified(registry: object) -> bool:
+        try:
+            verified_record(registry)
+        except ValueError:
+            return False
+        return True
+
+    def trusted_config_snapshots(registry: object) -> tuple[SourceAdapterConfig, ...]:
+        record = verified_record(registry)
+        return configs_from_canonical(record.canonical_json, record.registry_hash)
+
+    def trusted_config_snapshot(
+        registry: object, request: OfficialRequest
+    ) -> SourceAdapterConfig:
+        _, exchange = _validate_request(request)
+        matching = [
+            config
+            for config in trusted_config_snapshots(registry)
+            if config.source == request.source and config.dataset == request.dataset
+        ]
+        if exchange is None:
+            matching = [config for config in matching if config.exchange_scope is None]
+        else:
+            matching = [
+                config
+                for config in matching
+                if config.exchange_scope is None or config.exchange_scope == exchange
+            ]
+        if len(matching) != 1:
+            raise FormalTerminalSourceError("signed source config is absent or ambiguous")
+        return matching[0]
 
     @dataclass(frozen=True, init=False)
     class SignedSourceRegistry:
@@ -643,6 +727,16 @@ def _make_signed_source_registry_type() -> type[object]:
             if not is_verified(self):
                 raise ValueError("signed source registry was not verified by from_signed_bytes")
 
+        @staticmethod
+        def _trusted_config_snapshots(registry: object) -> tuple[SourceAdapterConfig, ...]:
+            return trusted_config_snapshots(registry)
+
+        @staticmethod
+        def _trusted_config_snapshot(
+            registry: object, request: OfficialRequest
+        ) -> SourceAdapterConfig:
+            return trusted_config_snapshot(registry, request)
+
         @classmethod
         def from_signed_bytes(
             cls,
@@ -656,72 +750,19 @@ def _make_signed_source_registry_type() -> type[object]:
             signature_text, key_text = _verify_signature(
                 registry_bytes, signature, key_id, verifier, label="source registry"
             )
-            wire = _load_canonical_object(registry_bytes, label="source registry")
-            if set(wire) != {"configs", "registry_role", "schema_version"}:
-                raise ValueError("source registry has unknown or missing keys")
-            if wire["registry_role"] != "source":
-                raise ValueError("source registry role must be source")
-            if wire["schema_version"] != "formal-source-registry-v1":
-                raise ValueError("source registry schema_version is invalid")
-            if type(wire["configs"]) is not list:
-                raise ValueError("source registry configs must be a list")
             registry_hash = hashlib.sha256(registry_bytes).hexdigest()
-            configs: list[SourceAdapterConfig] = []
-            identities: set[tuple[str, str, str | None]] = set()
-            for item in wire["configs"]:
-                if type(item) is not dict or set(item) != _CONFIG_KEYS:
-                    raise ValueError("source registry config has unknown or missing keys")
-                config = SourceAdapterConfig(
-                    source=item["source"],
-                    dataset=item["dataset"],
-                    endpoint_url=item["endpoint_url"],
-                    http_method=item["http_method"],
-                    parser_id=item["parser_id"],
-                    parser_version=item["parser_version"],
-                    mapping_version=item["mapping_version"],
-                    request_template=item["request_template"],
-                    timeout_seconds=item["timeout_seconds"],
-                    retry_base_seconds=item["retry_base_seconds"],
-                    retry_max_attempts=item["retry_max_attempts"],
-                    challenge_cooldown_seconds=item["challenge_cooldown_seconds"],
-                    registry_hash=registry_hash,
-                    exchange_scope=item["exchange_scope"],
-                    calendar_selector=_selector_from_wire(item["calendar_selector"]),
-                    bootstrap_calendar=item["bootstrap_calendar"],
-                )
-                identity = (config.source, config.dataset, config.exchange_scope)
-                if identity in identities:
-                    raise ValueError("source registry has duplicate config identity")
-                identities.add(identity)
-                configs.append(config)
+            configs = configs_from_canonical(registry_bytes, registry_hash)
             registry = object.__new__(SignedSourceRegistry)
             object.__setattr__(registry, "canonical_json", registry_bytes)
             object.__setattr__(registry, "registry_hash", registry_hash)
             object.__setattr__(registry, "signature", signature_text)
             object.__setattr__(registry, "key_id", key_text)
-            object.__setattr__(registry, "configs", tuple(configs))
+            object.__setattr__(registry, "configs", configs)
             remember_verified(registry)
             return registry
 
         def select(self, request: OfficialRequest) -> SourceAdapterConfig:
-            SignedSourceRegistry._require_verified(self)
-            _, exchange = _validate_request(request)
-            matching = [
-                config
-                for config in self.configs
-                if config.source == request.source and config.dataset == request.dataset
-            ]
-            if exchange is None:
-                matching = [config for config in matching if config.exchange_scope is None]
-            else:
-                matching = [
-                    config
-                    for config in matching
-                    if config.exchange_scope is None or config.exchange_scope == exchange
-                ]
-            if len(matching) != 1:
-                raise FormalTerminalSourceError("signed source config is absent or ambiguous")
-            return matching[0]
+            return trusted_config_snapshot(self, request)
 
     return SignedSourceRegistry
 
@@ -840,6 +881,128 @@ def _build_transport_request(
     return TransportRequest(config.http_method, url, MappingProxyType(sent_headers), body, float(config.timeout_seconds))
 
 
+def _copy_template(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {_copy_template(key): _copy_template(item) for key, item in value.items()}
+    if type(value) is tuple or type(value) is list:
+        return [_copy_template(item) for item in value]
+    return value
+
+
+def _copy_config(config: SourceAdapterConfig) -> SourceAdapterConfig:
+    selector = config.calendar_selector
+    selector_copy = (
+        None
+        if selector is None
+        else CalendarSelector(
+            selector.context_kind,
+            selector.scope_key,
+            selector.exchange,
+            selector.as_of_rule,
+        )
+    )
+    return SourceAdapterConfig(
+        source=config.source,
+        dataset=config.dataset,
+        endpoint_url=config.endpoint_url,
+        http_method=config.http_method,
+        parser_id=config.parser_id,
+        parser_version=config.parser_version,
+        mapping_version=config.mapping_version,
+        request_template=_copy_template(config.request_template),
+        timeout_seconds=config.timeout_seconds,
+        retry_base_seconds=config.retry_base_seconds,
+        retry_max_attempts=config.retry_max_attempts,
+        challenge_cooldown_seconds=config.challenge_cooldown_seconds,
+        registry_hash=config.registry_hash,
+        exchange_scope=config.exchange_scope,
+        calendar_selector=selector_copy,
+        bootstrap_calendar=config.bootstrap_calendar,
+    )
+
+
+def _copy_request(request: OfficialRequest) -> OfficialRequest:
+    return OfficialRequest(
+        request.source,
+        request.dataset,
+        request.security_id,
+        request.period_or_date,
+        request.exchange,
+    )
+
+
+def _copy_calendar_binding(binding: VerifiedCalendarBinding) -> VerifiedCalendarBinding:
+    return VerifiedCalendarBinding(
+        snapshot_id=binding.snapshot_id,
+        manifest_sha256=binding.manifest_sha256,
+        exchange=binding.exchange,
+        freeze_at_utc=binding.freeze_at_utc,
+        registry_manifest_hash=binding.registry_manifest_hash,
+        selector_hash=binding.selector_hash,
+        prerequisite_task_id=binding.prerequisite_task_id,
+    )
+
+
+def _copy_snapshot_ref(snapshot_ref: OfficialSnapshotRef) -> OfficialSnapshotRef:
+    return OfficialSnapshotRef(
+        snapshot_id=snapshot_ref.snapshot_id,
+        source=snapshot_ref.source,
+        dataset=snapshot_ref.dataset,
+        request_fingerprint=snapshot_ref.request_fingerprint,
+        security_id=snapshot_ref.security_id,
+        period_or_date=snapshot_ref.period_or_date,
+        exchange=snapshot_ref.exchange,
+        content_sha256=snapshot_ref.content_sha256,
+        manifest_sha256=snapshot_ref.manifest_sha256,
+        content_path=snapshot_ref.content_path,
+        manifest_path=snapshot_ref.manifest_path,
+        original_url=snapshot_ref.original_url,
+        published_at_utc=snapshot_ref.published_at_utc,
+        published_precision=snapshot_ref.published_precision,
+        source_updated_at_utc=snapshot_ref.source_updated_at_utc,
+        captured_at_utc=snapshot_ref.captured_at_utc,
+        effective_at_utc=snapshot_ref.effective_at_utc,
+        effective_time_evidence_hash=snapshot_ref.effective_time_evidence_hash,
+        refresh_generation=snapshot_ref.refresh_generation,
+        producing_task_id=snapshot_ref.producing_task_id,
+        parser_id=snapshot_ref.parser_id,
+        parser_version=snapshot_ref.parser_version,
+        mapping_version=snapshot_ref.mapping_version,
+        verification_status=snapshot_ref.verification_status,
+    )
+
+
+@dataclass(frozen=True)
+class _PolicySpec:
+    source: str
+    allowed_hosts: frozenset[str]
+
+
+def _policy_specs_from_snapshot(
+    snapshot: tuple[tuple[str, str, frozenset[str]], ...],
+) -> Mapping[str, _PolicySpec]:
+    return MappingProxyType(
+        {
+            source: _PolicySpec(policy_source, frozenset(allowed_hosts))
+            for source, policy_source, allowed_hosts in snapshot
+        }
+    )
+
+
+@dataclass(frozen=True)
+class _OperationPlan:
+    transport: OfficialTransport
+    parser: OfficialDocumentParser
+    effective_time_resolver: EffectiveTimeResolver
+    request: OfficialRequest
+    config: SourceAdapterConfig
+    policy: SourcePolicy
+    resolved_exchange: str | None
+    calendar_binding: VerifiedCalendarBinding | None
+    transport_request: TransportRequest
+    refresh_generation: str
+
+
 class FormalOfficialSourceAdapter:
     """Turns one signed config and injected response into verified formal evidence."""
 
@@ -869,26 +1032,28 @@ class FormalOfficialSourceAdapter:
         if source_registry_hash != registry.registry_hash:
             raise ValueError("source_registry_hash does not match signed source registry")
         _require_aware_timestamp(freeze_at_utc, "freeze_at_utc")
+        configs = SignedSourceRegistry._trusted_config_snapshots(registry)
         self._transport = transport
         self.registry = registry
-        self._policies = dict(policies)
-        self._parsers = dict(parsers)
+        self._policies = MappingProxyType(dict(policies))
+        self._parsers = MappingProxyType(dict(parsers))
         self._effective_time_resolver = effective_time_resolver
         self.source_registry_hash = source_registry_hash
         self.registry_manifest_hash = registry_manifest_hash
         self.freeze_at_utc = freeze_at_utc
-        for config in registry.configs:
-            self._registered_policy(config)
-            self._registered_parser(config)
+        policy_specs: dict[str, _PolicySpec] = {}
+        for config in configs:
+            policy = FormalOfficialSourceAdapter._registered_policy(config, self._policies)
+            policy_specs[config.source] = _PolicySpec(policy.source, frozenset(policy.allowed_hosts))
+            FormalOfficialSourceAdapter._registered_parser(config, self._parsers)
+        self._policy_specs = MappingProxyType(policy_specs)
+        SignedSourceRegistry._require_verified(registry)
 
-    def _require_registry_provenance(self) -> None:
-        try:
-            SignedSourceRegistry._require_verified(self.registry)
-        except ValueError as error:
-            raise FormalTerminalSourceError("signed source registry is not verified") from error
-
-    def _registered_policy(self, config: SourceAdapterConfig) -> SourcePolicy:
-        policy = self._policies.get(config.source)
+    @staticmethod
+    def _registered_policy(
+        config: SourceAdapterConfig, policies: Mapping[str, SourcePolicy]
+    ) -> SourcePolicy:
+        policy = policies.get(config.source)
         if type(policy) is not SourcePolicy or policy.source != config.source or not policy.is_authoritative:
             raise ValueError("signed source policy is absent or non-authoritative")
         try:
@@ -899,17 +1064,36 @@ class FormalOfficialSourceAdapter:
             raise ValueError("signed endpoint host is not allowlisted by source policy")
         return policy
 
-    def _registered_parser(self, config: SourceAdapterConfig) -> OfficialDocumentParser:
-        parser = self._parsers.get(config.parser_id)
+    @staticmethod
+    def _registered_parser(
+        config: SourceAdapterConfig, parsers: Mapping[str, OfficialDocumentParser]
+    ) -> OfficialDocumentParser:
+        parser = parsers.get(config.parser_id)
         if not callable(getattr(parser, "parse", None)):
             raise ValueError("signed parser is not registered")
         return parser
 
+    @staticmethod
+    def _policy_snapshot(
+        config: SourceAdapterConfig, policy_specs: Mapping[str, _PolicySpec]
+    ) -> SourcePolicy:
+        spec = policy_specs.get(config.source)
+        if type(spec) is not _PolicySpec:
+            raise FormalTerminalSourceError("signed source policy is absent or non-authoritative")
+        try:
+            policy = SourcePolicy(spec.source, frozenset(spec.allowed_hosts))
+            return FormalOfficialSourceAdapter._registered_policy(config, {config.source: policy})
+        except ValueError as error:
+            raise FormalTerminalSourceError(str(error)) from error
+
+    @staticmethod
     def _resolve_calendar_binding(
-        self,
         config: SourceAdapterConfig,
         resolved_exchange: str | None,
         calendar_binding: VerifiedCalendarBinding | None,
+        *,
+        freeze_at_utc: str,
+        registry_manifest_hash: str,
     ) -> VerifiedCalendarBinding | None:
         if config.bootstrap_calendar:
             if calendar_binding is not None:
@@ -926,43 +1110,54 @@ class FormalOfficialSourceAdapter:
             raise FormalTerminalSourceError("date_only config requires an exact verified calendar binding")
         if resolved_exchange is None or resolved_exchange != selector.exchange:
             raise FormalTerminalSourceError("date_only config does not resolve its signed exchange")
+        binding = _copy_calendar_binding(calendar_binding)
         try:
-            _require_trimmed_text(calendar_binding.snapshot_id, "calendar binding snapshot_id")
-            _require_sha256(calendar_binding.manifest_sha256, "calendar binding manifest_sha256")
-            _require_exchange(calendar_binding.exchange, "calendar binding exchange")
-            _require_aware_timestamp(calendar_binding.freeze_at_utc, "calendar binding freeze_at_utc")
+            _require_trimmed_text(binding.snapshot_id, "calendar binding snapshot_id")
+            _require_sha256(binding.manifest_sha256, "calendar binding manifest_sha256")
+            _require_exchange(binding.exchange, "calendar binding exchange")
+            _require_aware_timestamp(binding.freeze_at_utc, "calendar binding freeze_at_utc")
             _require_sha256(
-                calendar_binding.registry_manifest_hash,
+                binding.registry_manifest_hash,
                 "calendar binding registry_manifest_hash",
             )
-            _require_sha256(calendar_binding.selector_hash, "calendar binding selector_hash")
-            _require_canonical_uuid(calendar_binding.prerequisite_task_id, "calendar binding prerequisite_task_id")
+            _require_sha256(binding.selector_hash, "calendar binding selector_hash")
+            _require_canonical_uuid(binding.prerequisite_task_id, "calendar binding prerequisite_task_id")
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
-        if calendar_binding.exchange != selector.exchange:
+        if binding.exchange != selector.exchange:
             raise FormalTerminalSourceError("calendar binding exchange does not match signed selector")
-        if calendar_binding.freeze_at_utc != self.freeze_at_utc:
+        if binding.freeze_at_utc != freeze_at_utc:
             raise FormalTerminalSourceError("calendar binding freeze does not match adapter freeze")
-        if calendar_binding.registry_manifest_hash != self.registry_manifest_hash:
+        if binding.registry_manifest_hash != registry_manifest_hash:
             raise FormalTerminalSourceError("calendar binding root does not match adapter root")
-        if calendar_binding.selector_hash != selector.selector_hash:
+        if binding.selector_hash != selector.selector_hash:
             raise FormalTerminalSourceError("calendar binding selector does not match signed selector")
-        return calendar_binding
+        return binding
 
+    @staticmethod
+    def _operation_record(adapter: object) -> object:
+        try:
+            return FormalOfficialSourceAdapter._trusted_operation_record(adapter)
+        except (AttributeError, ValueError) as error:
+            if "signed source registry" in str(error):
+                raise FormalTerminalSourceError("signed source registry is not verified") from error
+            raise FormalTerminalSourceError("formal source adapter was not verified") from error
+
+    @staticmethod
     def _preflight(
-        self,
+        adapter: object,
         request: OfficialRequest,
         refresh_generation: str,
         calendar_binding: VerifiedCalendarBinding | None,
-    ) -> tuple[OfficialRequest, SourceAdapterConfig, SourcePolicy, OfficialDocumentParser, str | None, VerifiedCalendarBinding | None, TransportRequest]:
-        self._require_registry_provenance()
+    ) -> _OperationPlan:
+        record = FormalOfficialSourceAdapter._operation_record(adapter)
         request, resolved_exchange = _validate_request(request)
+        request = _copy_request(request)
         try:
             _require_trimmed_text(refresh_generation, "refresh_generation")
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
-        config = SignedSourceRegistry.select(self.registry, request)
-        self._require_registry_provenance()
+        config = SignedSourceRegistry._trusted_config_snapshot(record.registry, request)
         if config.bootstrap_calendar and (
             request.exchange is not None or request.security_id is not None
         ):
@@ -980,16 +1175,35 @@ class FormalOfficialSourceAdapter:
         if config.exchange_scope is not None and resolved_exchange is not None and config.exchange_scope != resolved_exchange:
             raise FormalTerminalSourceError("request exchange does not match signed config scope")
         try:
-            policy = self._registered_policy(config)
-            parser = self._registered_parser(config)
+            policy = FormalOfficialSourceAdapter._policy_snapshot(
+                config, _policy_specs_from_snapshot(record.policy_snapshot)
+            )
+            parser = FormalOfficialSourceAdapter._registered_parser(config, record.parsers)
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
-        binding = self._resolve_calendar_binding(config, resolved_exchange, calendar_binding)
+        binding = FormalOfficialSourceAdapter._resolve_calendar_binding(
+            config,
+            resolved_exchange,
+            calendar_binding,
+            freeze_at_utc=record.freeze_at_utc,
+            registry_manifest_hash=record.registry_manifest_hash,
+        )
         try:
             transport_request = _build_transport_request(config, request, resolved_exchange)
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
-        return request, config, policy, parser, resolved_exchange, binding, transport_request
+        return _OperationPlan(
+            transport=record.transport,
+            parser=parser,
+            effective_time_resolver=record.effective_time_resolver,
+            request=request,
+            config=config,
+            policy=policy,
+            resolved_exchange=resolved_exchange,
+            calendar_binding=binding,
+            transport_request=transport_request,
+            refresh_generation=refresh_generation,
+        )
 
     @staticmethod
     def _validate_response(response: object) -> TransportResponse:
@@ -1025,14 +1239,15 @@ class FormalOfficialSourceAdapter:
         if not 200 <= response.status_code <= 299:
             raise FormalTerminalSourceError("official source returned a terminal HTTP response")
 
+    @staticmethod
     def _effective_document_fields(
-        self,
         document: object,
         *,
         request: OfficialRequest,
         config: SourceAdapterConfig,
         resolved_exchange: str | None,
         calendar_binding: VerifiedCalendarBinding | None,
+        effective_time_resolver: EffectiveTimeResolver,
     ) -> tuple[ParsedOfficialDocument, str, str | None]:
         if type(document) is not ParsedOfficialDocument:
             raise FormalTerminalSourceError("parser must return exact ParsedOfficialDocument")
@@ -1074,10 +1289,10 @@ class FormalOfficialSourceAdapter:
             raise FormalTerminalSourceError("date_only document requires a resolved calendar binding")
         disclosure_date = _require_date_only_anchor(document.published_at_utc)[:10]
         try:
-            close = self._effective_time_resolver.next_exchange_close(
+            close = effective_time_resolver.next_exchange_close(
                 exchange=resolved_exchange,
                 disclosure_date_cn=disclosure_date,
-                calendar_binding=calendar_binding,
+                calendar_binding=_copy_calendar_binding(calendar_binding),
             )
             effective_at = resolve_effective_at(
                 disclosure_date,
@@ -1108,46 +1323,45 @@ class FormalOfficialSourceAdapter:
         refresh_generation: str,
         calendar_binding: VerifiedCalendarBinding | None,
     ) -> tuple[OfficialFetch, EvidenceVerification, ParsedOfficialDocument]:
-        (
-            request,
-            config,
-            policy,
-            parser,
-            resolved_exchange,
-            binding,
-            transport_request,
-        ) = self._preflight(request, refresh_generation, calendar_binding)
+        plan = FormalOfficialSourceAdapter._preflight(
+            self, request, refresh_generation, calendar_binding
+        )
         try:
-            response = self._transport.send(transport_request)
+            response = plan.transport.send(plan.transport_request)
         except TimeoutError as error:
             raise FormalRetryableSourceError("official transport timed out") from error
         except FormalSourceError:
             raise
         except OSError as error:
             raise FormalRetryableSourceError("official transport failed") from error
-        response = self._validate_response(response)
+        response = FormalOfficialSourceAdapter._validate_response(response)
         try:
             host = _https_host(response.original_url, "transport response original_url")
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
-        if host not in policy.allowed_hosts:
+        if host not in plan.policy.allowed_hosts:
             raise FormalTerminalSourceError("transport response URL host is not allowlisted")
-        self._classify_response(response)
+        FormalOfficialSourceAdapter._classify_response(response)
         try:
-            document = parser.parse(response.raw_bytes, request=request, config=config)
+            document = plan.parser.parse(
+                response.raw_bytes,
+                request=_copy_request(plan.request),
+                config=_copy_config(plan.config),
+            )
         except FormalSourceError:
             raise
         except Exception as error:
             raise FormalTerminalSourceError("official document parser failed") from error
-        document, effective_at, evidence_hash = self._effective_document_fields(
+        document, effective_at, evidence_hash = FormalOfficialSourceAdapter._effective_document_fields(
             document,
-            request=request,
-            config=config,
-            resolved_exchange=resolved_exchange,
-            calendar_binding=binding,
+            request=plan.request,
+            config=plan.config,
+            resolved_exchange=plan.resolved_exchange,
+            calendar_binding=plan.calendar_binding,
+            effective_time_resolver=plan.effective_time_resolver,
         )
         fetch = OfficialFetch(
-            request=request,
+            request=plan.request,
             raw_bytes=response.raw_bytes,
             original_url=response.original_url,
             published_at_utc=document.published_at_utc,
@@ -1156,14 +1370,16 @@ class FormalOfficialSourceAdapter:
             captured_at_utc=response.captured_at_utc,
             effective_at_utc=effective_at,
             effective_time_evidence_hash=evidence_hash,
-            refresh_generation=refresh_generation,
-            parser_id=config.parser_id,
-            parser_version=config.parser_version,
-            mapping_version=config.mapping_version,
+            refresh_generation=plan.refresh_generation,
+            parser_id=plan.config.parser_id,
+            parser_version=plan.config.parser_version,
+            mapping_version=plan.config.mapping_version,
             declared_security_id=document.declared_security_id,
             declared_period=document.declared_period,
         )
-        verification = self._verify_or_raise(fetch, policy, binding)
+        verification = FormalOfficialSourceAdapter._verify_or_raise(
+            fetch, plan.policy, plan.calendar_binding
+        )
         return fetch, verification, document
 
     def parse_verified_snapshot(
@@ -1173,87 +1389,304 @@ class FormalOfficialSourceAdapter:
         *,
         calendar_binding: VerifiedCalendarBinding | None,
     ) -> ParsedOfficialDocument:
+        FormalOfficialSourceAdapter._operation_record(self)
         if type(snapshot_ref) is not OfficialSnapshotRef:
             raise FormalTerminalSourceError("snapshot_ref must have exact type OfficialSnapshotRef")
         if type(raw_bytes) is not bytes:
             raise FormalTerminalSourceError("snapshot raw_bytes must be bytes")
+        trusted_ref = _copy_snapshot_ref(snapshot_ref)
         try:
-            _require_sha256(snapshot_ref.content_sha256, "snapshot content_sha256")
-            _require_sha256(snapshot_ref.manifest_sha256, "snapshot manifest_sha256")
+            _require_sha256(trusted_ref.content_sha256, "snapshot content_sha256")
+            _require_sha256(trusted_ref.manifest_sha256, "snapshot manifest_sha256")
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
-        if hashlib.sha256(raw_bytes).hexdigest() != snapshot_ref.content_sha256:
+        if hashlib.sha256(raw_bytes).hexdigest() != trusted_ref.content_sha256:
             raise FormalTerminalSourceError("snapshot raw_bytes SHA-256 does not match reference")
         try:
             request = OfficialRequest(
-                snapshot_ref.source,
-                snapshot_ref.dataset,
-                snapshot_ref.security_id,
-                snapshot_ref.period_or_date,
-                snapshot_ref.exchange,
+                trusted_ref.source,
+                trusted_ref.dataset,
+                trusted_ref.security_id,
+                trusted_ref.period_or_date,
+                trusted_ref.exchange,
             )
-            request, config, policy, parser, resolved_exchange, binding, _ = self._preflight(
-                request, snapshot_ref.refresh_generation, calendar_binding
+            plan = FormalOfficialSourceAdapter._preflight(
+                self, request, trusted_ref.refresh_generation, calendar_binding
             )
         except FormalSourceError:
             raise
-        if request.request_fingerprint != snapshot_ref.request_fingerprint:
+        if plan.request.request_fingerprint != trusted_ref.request_fingerprint:
             raise FormalTerminalSourceError("snapshot request fingerprint does not match identity")
-        if snapshot_ref.verification_status != "verified":
+        if trusted_ref.verification_status != "verified":
             raise FormalTerminalSourceError("snapshot is not verified")
         if (
-            snapshot_ref.parser_id != config.parser_id
-            or snapshot_ref.parser_version != config.parser_version
-            or snapshot_ref.mapping_version != config.mapping_version
+            trusted_ref.parser_id != plan.config.parser_id
+            or trusted_ref.parser_version != plan.config.parser_version
+            or trusted_ref.mapping_version != plan.config.mapping_version
         ):
             raise FormalTerminalSourceError("snapshot parser or mapping identity does not match signed config")
         try:
-            snapshot_host = _https_host(snapshot_ref.original_url, "snapshot original_url")
-            _require_aware_timestamp(snapshot_ref.captured_at_utc, "snapshot captured_at_utc")
+            snapshot_host = _https_host(trusted_ref.original_url, "snapshot original_url")
+            _require_aware_timestamp(trusted_ref.captured_at_utc, "snapshot captured_at_utc")
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
-        if snapshot_host not in policy.allowed_hosts:
+        if snapshot_host not in plan.policy.allowed_hosts:
             raise FormalTerminalSourceError("snapshot URL host is not allowlisted")
         try:
-            document = parser.parse(raw_bytes, request=request, config=config)
+            document = plan.parser.parse(
+                raw_bytes,
+                request=_copy_request(plan.request),
+                config=_copy_config(plan.config),
+            )
         except FormalSourceError:
             raise
         except Exception as error:
             raise FormalTerminalSourceError("official document parser failed") from error
-        document, effective_at, evidence_hash = self._effective_document_fields(
+        document, effective_at, evidence_hash = FormalOfficialSourceAdapter._effective_document_fields(
             document,
-            request=request,
-            config=config,
-            resolved_exchange=resolved_exchange,
-            calendar_binding=binding,
+            request=plan.request,
+            config=plan.config,
+            resolved_exchange=plan.resolved_exchange,
+            calendar_binding=plan.calendar_binding,
+            effective_time_resolver=plan.effective_time_resolver,
         )
         if (
-            snapshot_ref.published_at_utc != document.published_at_utc
-            or snapshot_ref.published_precision != document.published_precision
-            or snapshot_ref.source_updated_at_utc != document.source_updated_at_utc
-            or snapshot_ref.effective_at_utc != effective_at
-            or snapshot_ref.effective_time_evidence_hash != evidence_hash
+            trusted_ref.published_at_utc != document.published_at_utc
+            or trusted_ref.published_precision != document.published_precision
+            or trusted_ref.source_updated_at_utc != document.source_updated_at_utc
+            or trusted_ref.effective_at_utc != effective_at
+            or trusted_ref.effective_time_evidence_hash != evidence_hash
         ):
             raise FormalTerminalSourceError("snapshot publication or effective-time lineage does not match parser")
         fetch = OfficialFetch(
-            request=request,
+            request=plan.request,
             raw_bytes=raw_bytes,
-            original_url=snapshot_ref.original_url,
-            published_at_utc=snapshot_ref.published_at_utc,
-            published_precision=snapshot_ref.published_precision,
-            source_updated_at_utc=snapshot_ref.source_updated_at_utc,
-            captured_at_utc=snapshot_ref.captured_at_utc,
-            effective_at_utc=snapshot_ref.effective_at_utc,
-            effective_time_evidence_hash=snapshot_ref.effective_time_evidence_hash,
-            refresh_generation=snapshot_ref.refresh_generation,
-            parser_id=snapshot_ref.parser_id,
-            parser_version=snapshot_ref.parser_version,
-            mapping_version=snapshot_ref.mapping_version,
+            original_url=trusted_ref.original_url,
+            published_at_utc=trusted_ref.published_at_utc,
+            published_precision=trusted_ref.published_precision,
+            source_updated_at_utc=trusted_ref.source_updated_at_utc,
+            captured_at_utc=trusted_ref.captured_at_utc,
+            effective_at_utc=trusted_ref.effective_at_utc,
+            effective_time_evidence_hash=trusted_ref.effective_time_evidence_hash,
+            refresh_generation=trusted_ref.refresh_generation,
+            parser_id=trusted_ref.parser_id,
+            parser_version=trusted_ref.parser_version,
+            mapping_version=trusted_ref.mapping_version,
             declared_security_id=document.declared_security_id,
             declared_period=document.declared_period,
         )
-        self._verify_or_raise(fetch, policy, binding)
+        FormalOfficialSourceAdapter._verify_or_raise(fetch, plan.policy, plan.calendar_binding)
         return document
+
+
+def _seal_formal_official_source_adapter_type(
+    adapter_type: type[FormalOfficialSourceAdapter],
+) -> type[FormalOfficialSourceAdapter]:
+    """Seal adapter anchors outside public instance fields.
+
+    Source adapters contain injected collaborators and public audit fields.
+    Their operation state is recorded by identity in this closure so changing
+    any public or collaborator anchor with ``object.__setattr__`` cannot
+    redirect a later request or change calendar-root validation.
+    """
+
+    @dataclass(frozen=True)
+    class _AdapterRecord:
+        reference: weakref.ReferenceType[object]
+        registry: SignedSourceRegistry
+        transport: OfficialTransport
+        effective_time_resolver: EffectiveTimeResolver
+        policies: Mapping[str, SourcePolicy]
+        parsers: Mapping[str, OfficialDocumentParser]
+        policy_specs: Mapping[str, _PolicySpec]
+        policy_snapshot: tuple[tuple[str, str, frozenset[str]], ...]
+        source_registry_hash: str
+        registry_manifest_hash: str
+        freeze_at_utc: str
+
+    @dataclass(frozen=True)
+    class _AdapterOperationSnapshot:
+        """Fresh operation inputs; never expose the closure-held seal record."""
+
+        registry: SignedSourceRegistry
+        transport: OfficialTransport
+        effective_time_resolver: EffectiveTimeResolver
+        parsers: Mapping[str, OfficialDocumentParser]
+        policy_snapshot: tuple[tuple[str, str, frozenset[str]], ...]
+        source_registry_hash: str
+        registry_manifest_hash: str
+        freeze_at_utc: str
+
+    verified_adapters: dict[int, _AdapterRecord] = {}
+    original_init = adapter_type.__init__
+    missing = object()
+
+    def policy_snapshot(
+        policy_specs: object,
+    ) -> tuple[tuple[str, str, frozenset[str]], ...] | None:
+        if not isinstance(policy_specs, Mapping):
+            return None
+        try:
+            sources = tuple(sorted(policy_specs))
+        except TypeError:
+            return None
+        entries: list[tuple[str, str, frozenset[str]]] = []
+        for source in sources:
+            if type(source) is not str:
+                return None
+            try:
+                spec = policy_specs[source]
+            except (KeyError, TypeError):
+                return None
+            if type(spec) is not _PolicySpec:
+                return None
+            if type(spec.source) is not str or type(spec.allowed_hosts) is not frozenset:
+                return None
+            entries.append((source, spec.source, frozenset(spec.allowed_hosts)))
+        return tuple(entries)
+
+    def remember(adapter: object) -> None:
+        try:
+            registry = adapter.registry
+            transport = adapter._transport
+            effective_time_resolver = adapter._effective_time_resolver
+            policies = adapter._policies
+            parsers = adapter._parsers
+            policy_specs = adapter._policy_specs
+            source_registry_hash = adapter.source_registry_hash
+            registry_manifest_hash = adapter.registry_manifest_hash
+            freeze_at_utc = adapter.freeze_at_utc
+        except AttributeError as error:
+            raise ValueError("formal source adapter anchors are incomplete") from error
+        if type(registry) is not SignedSourceRegistry:
+            raise ValueError("formal source adapter registry is invalid")
+        SignedSourceRegistry._require_verified(registry)
+        if not isinstance(policies, Mapping) or not isinstance(parsers, Mapping):
+            raise ValueError("formal source adapter mappings are invalid")
+        if not isinstance(policy_specs, Mapping):
+            raise ValueError("formal source adapter policy snapshots are invalid")
+        sealed_policy_snapshot = policy_snapshot(policy_specs)
+        if sealed_policy_snapshot is None:
+            raise ValueError("formal source adapter policy snapshots are invalid")
+        _require_sha256(source_registry_hash, "source_registry_hash")
+        _require_sha256(registry_manifest_hash, "registry_manifest_hash")
+        _require_aware_timestamp(freeze_at_utc, "freeze_at_utc")
+        identity = id(adapter)
+
+        def forget(reference: weakref.ReferenceType[object]) -> None:
+            record = verified_adapters.get(identity)
+            if record is not None and record.reference is reference:
+                verified_adapters.pop(identity, None)
+
+        verified_adapters[identity] = _AdapterRecord(
+            weakref.ref(adapter, forget),
+            registry,
+            transport,
+            effective_time_resolver,
+            policies,
+            parsers,
+            policy_specs,
+            sealed_policy_snapshot,
+            source_registry_hash,
+            registry_manifest_hash,
+            freeze_at_utc,
+        )
+
+    def trusted_record(adapter: object) -> _AdapterOperationSnapshot:
+        record = verified_adapters.get(id(adapter))
+        if record is None or record.reference() is not adapter:
+            raise ValueError("formal source adapter was not verified")
+        try:
+            current = (
+                adapter.registry,
+                adapter._transport,
+                adapter._effective_time_resolver,
+                adapter._policies,
+                adapter._parsers,
+                adapter._policy_specs,
+                adapter.source_registry_hash,
+                adapter.registry_manifest_hash,
+                adapter.freeze_at_utc,
+            )
+        except AttributeError as error:
+            raise ValueError("formal source adapter anchors are incomplete") from error
+        expected = (
+            record.registry,
+            record.transport,
+            record.effective_time_resolver,
+            record.policies,
+            record.parsers,
+            record.policy_specs,
+            record.source_registry_hash,
+            record.registry_manifest_hash,
+            record.freeze_at_utc,
+        )
+        if (
+            current[0] is not expected[0]
+            or current[1] is not expected[1]
+            or current[2] is not expected[2]
+            or current[3] is not expected[3]
+            or current[4] is not expected[4]
+            or current[5] is not expected[5]
+            or policy_snapshot(current[5]) != record.policy_snapshot
+            or any(
+                type(current[index]) is not type(expected[index])
+                or current[index] != expected[index]
+                for index in (6, 7, 8)
+            )
+        ):
+            raise ValueError("formal source adapter anchors have changed")
+        SignedSourceRegistry._require_verified(record.registry)
+        return _AdapterOperationSnapshot(
+            registry=record.registry,
+            transport=record.transport,
+            effective_time_resolver=record.effective_time_resolver,
+            parsers=MappingProxyType(dict(record.parsers)),
+            policy_snapshot=tuple(
+                (source, policy_source, frozenset(allowed_hosts))
+                for source, policy_source, allowed_hosts in record.policy_snapshot
+            ),
+            source_registry_hash=record.source_registry_hash,
+            registry_manifest_hash=record.registry_manifest_hash,
+            freeze_at_utc=record.freeze_at_utc,
+        )
+
+    def sealed_init(self: FormalOfficialSourceAdapter, *args: object, **kwargs: object) -> None:
+        expected_registry = kwargs.get("registry", missing)
+        expected_transport = kwargs.get("transport", missing)
+        expected_resolver = kwargs.get("effective_time_resolver", missing)
+        expected_source_hash = kwargs.get("source_registry_hash", missing)
+        expected_root_hash = kwargs.get("registry_manifest_hash", missing)
+        expected_freeze = kwargs.get("freeze_at_utc", FORMAL_FREEZE_AT_CN)
+        original_init(self, *args, **kwargs)
+        if (
+            expected_registry is missing
+            or expected_transport is missing
+            or expected_resolver is missing
+            or expected_source_hash is missing
+            or expected_root_hash is missing
+            or self.registry is not expected_registry
+            or self._transport is not expected_transport
+            or self._effective_time_resolver is not expected_resolver
+            or type(self.source_registry_hash) is not type(expected_source_hash)
+            or self.source_registry_hash != expected_source_hash
+            or type(self.registry_manifest_hash) is not type(expected_root_hash)
+            or self.registry_manifest_hash != expected_root_hash
+            or type(self.freeze_at_utc) is not type(expected_freeze)
+            or self.freeze_at_utc != expected_freeze
+        ):
+            raise ValueError("formal source adapter anchors changed during construction")
+        remember(self)
+
+    adapter_type.__init__ = sealed_init
+    adapter_type._trusted_operation_record = staticmethod(trusted_record)
+    return adapter_type
+
+
+FormalOfficialSourceAdapter = _seal_formal_official_source_adapter_type(
+    FormalOfficialSourceAdapter
+)
+del _seal_formal_official_source_adapter_type
 
 
 __all__ = [

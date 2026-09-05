@@ -61,6 +61,36 @@ class FixtureParser:
         return self.document
 
 
+class LookupMutatingParser(FixtureParser):
+    """Mutates a public registry config only after constructor parser lookup."""
+
+    def __init__(self, document, registry):
+        super().__init__(document)
+        self.registry = registry
+        self.parse_lookups = 0
+
+    @property
+    def parse(self):
+        self.parse_lookups += 1
+        if self.parse_lookups == 2:
+            object.__setattr__(
+                self.registry.configs[0],
+                "endpoint_url",
+                "https://evil.example.invalid/unsigned.json",
+            )
+        return self._parse
+
+    def _parse(self, raw_bytes, *, request, config):
+        self.calls.append((raw_bytes, request, config))
+        return self.document
+
+
+class ConfigMutatingParser(FixtureParser):
+    def parse(self, raw_bytes, *, request, config):
+        object.__setattr__(config, "mapping_version", "unsigned-map")
+        return super().parse(raw_bytes, request=request, config=config)
+
+
 class FixtureResolver:
     def __init__(self, close="2026-08-21T15:00:00+08:00"):
         self.close = close
@@ -69,6 +99,16 @@ class FixtureResolver:
     def next_exchange_close(self, *, exchange, disclosure_date_cn, calendar_binding):
         self.calls.append((exchange, disclosure_date_cn, calendar_binding))
         return self.close
+
+
+class BindingMutatingResolver(FixtureResolver):
+    def next_exchange_close(self, *, exchange, disclosure_date_cn, calendar_binding):
+        object.__setattr__(calendar_binding, "manifest_sha256", "0" * 64)
+        return super().next_exchange_close(
+            exchange=exchange,
+            disclosure_date_cn=disclosure_date_cn,
+            calendar_binding=calendar_binding,
+        )
 
 
 def registry_bytes(configs):
@@ -237,7 +277,11 @@ class FormalSourceTests(unittest.TestCase):
             SignedSourceRegistry(b"{}", "0" * 64, "signature", "fixture-key", ())
 
     def test_registry_provenance_blocks_forgery_and_config_mutation_before_network(self):
-        for name in ("_REGISTRY_CONSTRUCTION_TOKEN", "_make_signed_source_registry_type"):
+        for name in (
+            "_REGISTRY_CONSTRUCTION_TOKEN",
+            "_make_signed_source_registry_type",
+            "_seal_formal_official_source_adapter_type",
+        ):
             with self.subTest(module_capability=name):
                 self.assertFalse(hasattr(formal_sources_module, name))
         document = timestamp_document()
@@ -298,6 +342,249 @@ class FormalSourceTests(unittest.TestCase):
                     )
                 self.assertEqual(transport.requests, [])
                 self.assertEqual(parser.calls, [])
+
+    def test_parser_lookup_cannot_redirect_the_operation_from_its_signed_endpoint(self):
+        document = timestamp_document()
+        registry = SignedSourceRegistry.from_signed_bytes(
+            registry_bytes([config()]), "fixture-signature", "fixture-key", AcceptingVerifier()
+        )
+        transport = FakeTransport(response())
+        parser = LookupMutatingParser(document, registry)
+        adapter = FormalOfficialSourceAdapter(
+            transport=transport,
+            registry=registry,
+            policies={"cninfo": SourcePolicy.cninfo()},
+            parsers={"fixture-parser": parser},
+            effective_time_resolver=FixtureResolver(),
+            source_registry_hash=registry.registry_hash,
+            registry_manifest_hash="f" * 64,
+        )
+
+        adapter.fetch_verified(
+            OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31"),
+            refresh_generation="generation",
+            calendar_binding=None,
+        )
+
+        self.assertEqual(len(transport.requests), 1)
+        self.assertEqual(
+            transport.requests[0].url,
+            "https://www.cninfo.com.cn/fixture/annual.json?period=2025-12-31&symbol=BJ430001",
+        )
+
+    def test_parser_config_mutation_cannot_change_fetch_mapping_identity(self):
+        document = timestamp_document()
+        registry = SignedSourceRegistry.from_signed_bytes(
+            registry_bytes([config()]), "fixture-signature", "fixture-key", AcceptingVerifier()
+        )
+        transport = FakeTransport(response())
+        parser = ConfigMutatingParser(document)
+        adapter = FormalOfficialSourceAdapter(
+            transport=transport,
+            registry=registry,
+            policies={"cninfo": SourcePolicy.cninfo()},
+            parsers={"fixture-parser": parser},
+            effective_time_resolver=FixtureResolver(),
+            source_registry_hash=registry.registry_hash,
+            registry_manifest_hash="f" * 64,
+        )
+
+        fetch, _, _ = adapter.fetch_verified(
+            OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31"),
+            refresh_generation="generation",
+            calendar_binding=None,
+        )
+
+        self.assertEqual(fetch.mapping_version, "fixture-map-v1")
+        self.assertEqual(registry.configs[0].mapping_version, "fixture-map-v1")
+        self.assertEqual(parser.calls[0][2].mapping_version, "unsigned-map")
+
+    def test_parser_config_mutation_cannot_reject_or_rewrite_replay_identity(self):
+        raw = b"replay-config-mutation"
+        document = timestamp_document()
+        registry = SignedSourceRegistry.from_signed_bytes(
+            registry_bytes([config()]), "fixture-signature", "fixture-key", AcceptingVerifier()
+        )
+        transport = FakeTransport(response())
+        parser = ConfigMutatingParser(document)
+        adapter = FormalOfficialSourceAdapter(
+            transport=transport,
+            registry=registry,
+            policies={"cninfo": SourcePolicy.cninfo()},
+            parsers={"fixture-parser": parser},
+            effective_time_resolver=FixtureResolver(),
+            source_registry_hash=registry.registry_hash,
+            registry_manifest_hash="f" * 64,
+        )
+        request = OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31")
+        ref = OfficialSnapshotRef(
+            snapshot_id="snapshot-config-mutation",
+            source=request.source,
+            dataset=request.dataset,
+            request_fingerprint=request.request_fingerprint,
+            security_id=request.security_id,
+            period_or_date=request.period_or_date,
+            exchange=request.exchange,
+            content_sha256=hashlib.sha256(raw).hexdigest(),
+            manifest_sha256="a" * 64,
+            content_path="unused.bin",
+            manifest_path="unused.manifest.json",
+            original_url="https://www.cninfo.com.cn/fixture/annual.json",
+            published_at_utc=document.published_at_utc,
+            published_precision="timestamp",
+            source_updated_at_utc=document.source_updated_at_utc,
+            captured_at_utc="2026-09-04T00:00:00+00:00",
+            effective_at_utc=document.published_at_utc,
+            effective_time_evidence_hash=None,
+            refresh_generation="generation",
+            producing_task_id=None,
+            parser_id="fixture-parser",
+            parser_version="fixture-v1",
+            mapping_version="fixture-map-v1",
+            verification_status="verified",
+        )
+
+        self.assertIs(adapter.parse_verified_snapshot(ref, raw, calendar_binding=None), document)
+        self.assertEqual(registry.configs[0].mapping_version, "fixture-map-v1")
+        self.assertEqual(parser.calls[0][2].mapping_version, "unsigned-map")
+        self.assertEqual(transport.requests, [])
+
+    def test_adapter_anchor_mutation_rejects_fake_root_binding_before_transport(self):
+        selector = {
+            "context_kind": "trading_calendar",
+            "scope_key": "disclosure",
+            "exchange": "SZ",
+            "as_of_rule": "visible_at_freeze",
+        }
+        document = timestamp_document(
+            declared_security_id="SZ000001",
+            published_at_utc="2026-08-20T00:00:00+00:00",
+            published_precision="date_only",
+        )
+        date_config = config(calendar_selector=selector, exchange_scope="SZ")
+        request = OfficialRequest("cninfo", "annual_report", "SZ000001", "2025-12-31", "SZ")
+        cases = (
+            ("registry_manifest_hash", "0" * 64, binding(registry_manifest_hash="0" * 64)),
+            ("freeze_at_utc", "2026-08-30T15:00:00+08:00", binding(freeze_at_utc="2026-08-30T15:00:00+08:00")),
+            (
+                "registry",
+                SignedSourceRegistry.from_signed_bytes(
+                    registry_bytes([date_config]),
+                    "fixture-signature",
+                    "fixture-key",
+                    AcceptingVerifier(),
+                ),
+                binding(),
+            ),
+        )
+        for field, value, forged_binding in cases:
+            with self.subTest(field=field):
+                adapter, transport, _ = self.make_adapter(
+                    [date_config], document, resolver=FixtureResolver()
+                )
+                object.__setattr__(adapter, field, value)
+                with self.assertRaisesRegex(FormalTerminalSourceError, "adapter.*verified"):
+                    adapter.fetch_verified(
+                        request,
+                        refresh_generation="generation",
+                        calendar_binding=forged_binding,
+                    )
+                self.assertEqual(transport.requests, [])
+
+    def test_adapter_operation_record_cannot_be_reused_to_reanchor_a_date_only_fetch(self):
+        selector = {
+            "context_kind": "trading_calendar",
+            "scope_key": "disclosure",
+            "exchange": "SZ",
+            "as_of_rule": "visible_at_freeze",
+        }
+        document = timestamp_document(
+            declared_security_id="SZ000001",
+            published_at_utc="2026-08-20T00:00:00+00:00",
+            published_precision="date_only",
+        )
+        adapter, transport, _ = self.make_adapter(
+            [config(calendar_selector=selector, exchange_scope="SZ")],
+            document,
+            resolver=FixtureResolver(),
+        )
+        leaked_record = FormalOfficialSourceAdapter._trusted_operation_record(adapter)
+        object.__setattr__(leaked_record, "registry_manifest_hash", "0" * 64)
+        object.__setattr__(adapter, "registry_manifest_hash", "0" * 64)
+
+        with self.assertRaisesRegex(FormalTerminalSourceError, "adapter.*verified"):
+            adapter.fetch_verified(
+                OfficialRequest("cninfo", "annual_report", "SZ000001", "2025-12-31", "SZ"),
+                refresh_generation="generation",
+                calendar_binding=binding(registry_manifest_hash="0" * 64),
+            )
+        self.assertEqual(transport.requests, [])
+
+    def test_directly_forged_adapter_cannot_operate(self):
+        legitimate, _, _ = self.make_adapter([config()], timestamp_document())
+        forged = object.__new__(FormalOfficialSourceAdapter)
+        for field in (
+            "registry",
+            "_transport",
+            "_effective_time_resolver",
+            "_policies",
+            "_parsers",
+            "_policy_specs",
+            "source_registry_hash",
+            "registry_manifest_hash",
+            "freeze_at_utc",
+        ):
+            object.__setattr__(forged, field, getattr(legitimate, field))
+        object.__setattr__(forged, "_trusted_operation_record", lambda _adapter: None)
+
+        with self.assertRaisesRegex(FormalTerminalSourceError, "adapter.*verified"):
+            forged.fetch_verified(
+                OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31"),
+                refresh_generation="generation",
+                calendar_binding=None,
+            )
+
+    def test_adapter_rejects_mutated_public_policy_snapshot_before_transport(self):
+        adapter, transport, _ = self.make_adapter([config()], timestamp_document())
+        object.__setattr__(adapter._policy_specs["cninfo"], "allowed_hosts", frozenset({"evil.example.invalid"}))
+
+        with self.assertRaisesRegex(FormalTerminalSourceError, "adapter.*verified"):
+            adapter.fetch_verified(
+                OfficialRequest("cninfo", "annual_report", "BJ430001", "2025-12-31"),
+                refresh_generation="generation",
+                calendar_binding=None,
+            )
+        self.assertEqual(transport.requests, [])
+
+    def test_resolver_receives_an_isolated_calendar_binding_copy(self):
+        selector = {
+            "context_kind": "trading_calendar",
+            "scope_key": "disclosure",
+            "exchange": "SZ",
+            "as_of_rule": "visible_at_freeze",
+        }
+        document = timestamp_document(
+            declared_security_id="SZ000001",
+            published_at_utc="2026-08-20T00:00:00+00:00",
+            published_precision="date_only",
+        )
+        signed_binding = binding()
+        adapter, transport, _ = self.make_adapter(
+            [config(calendar_selector=selector, exchange_scope="SZ")],
+            document,
+            resolver=BindingMutatingResolver(),
+        )
+
+        fetch, verification, _ = adapter.fetch_verified(
+            OfficialRequest("cninfo", "annual_report", "SZ000001", "2025-12-31", "SZ"),
+            refresh_generation="generation",
+            calendar_binding=signed_binding,
+        )
+
+        self.assertEqual(fetch.effective_time_evidence_hash, "c" * 64)
+        self.assertEqual(signed_binding.manifest_sha256, "c" * 64)
+        self.assertEqual(verification.status, "verified")
+        self.assertEqual(len(transport.requests), 1)
 
     def test_adapter_requires_the_loaded_root_source_registry_hash(self):
         registry = SignedSourceRegistry.from_signed_bytes(
