@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 import hashlib
 import json
@@ -49,6 +50,50 @@ class EqualitySpoof:
 
     def __eq__(self, other: object) -> bool:
         return True
+
+
+class DuplicateKeyRow(Mapping[str, object]):
+    """A parser-like mapping whose items stream exposes duplicate keys."""
+
+    def __init__(self, pairs: tuple[tuple[str, object], ...]) -> None:
+        self._pairs = pairs
+        self._lookup = {key: value for key, value in pairs}
+
+    def __getitem__(self, key: str) -> object:
+        return self._lookup[key]
+
+    def __iter__(self):
+        return iter(self._lookup)
+
+    def __len__(self) -> int:
+        return len(self._lookup)
+
+    def items(self):
+        return self._pairs
+
+
+class InterruptedItemsRow(Mapping[str, object]):
+    """A mapping whose item stream fails after exposing a safe ITEM candidate."""
+
+    def __init__(self, prefix: tuple[tuple[str, object], ...]) -> None:
+        self._prefix = prefix
+        self._lookup = dict(prefix)
+
+    def __getitem__(self, key: str) -> object:
+        return self._lookup[key]
+
+    def __iter__(self):
+        return iter(self._lookup)
+
+    def __len__(self) -> int:
+        return len(self._lookup)
+
+    def items(self):
+        def stream():
+            yield from self._prefix
+            raise RuntimeError("fixture item stream interrupted")
+
+        return stream()
 
 
 def mapping(**changes: object) -> dict[str, object]:
@@ -455,6 +500,105 @@ class FormalFinancialSchemaTests(unittest.TestCase):
 
         self.assertEqual(result.facts, ())
         self.assertIn("duplicate_source_field", tuple(issue.code for issue in result.issues))
+        self.assertNotIn("required_source_field_missing", tuple(issue.code for issue in result.issues))
+
+    def test_duplicate_key_malformed_row_blocks_a_valid_mapped_fact(self) -> None:
+        malformed_rows = {
+            "duplicate_item": DuplicateKeyRow(
+                (
+                    ("ITEM", "OPERATING_PROFIT"),
+                    ("ITEM", "OPERATING_PROFIT"),
+                    ("VALUE", "2"),
+                )
+            ),
+            "duplicate_value": DuplicateKeyRow(
+                (
+                    ("ITEM", "OPERATING_PROFIT"),
+                    ("VALUE", "2"),
+                    ("VALUE", "999"),
+                )
+            ),
+        }
+        for label, malformed in malformed_rows.items():
+            with self.subTest(label=label):
+                document = fixture_document(
+                    rows=(
+                        {"ITEM": "OPERATING_PROFIT", "VALUE": "1"},
+                        malformed,
+                    )
+                )
+
+                result = extract(document=document, snapshot=fixture_snapshot(document))
+
+                self.assertEqual(result.facts, ())
+                duplicate = next(
+                    issue for issue in result.issues if issue.code == "duplicate_source_field"
+                )
+                self.assertEqual(duplicate.details["row_indices"], (0, 1))
+
+    def test_malformed_item_stream_keeps_late_and_interrupted_candidates(self) -> None:
+        malformed_rows = {
+            "item_after_duplicate_value": DuplicateKeyRow(
+                (
+                    ("VALUE", "2"),
+                    ("VALUE", "999"),
+                    ("ITEM", "OPERATING_PROFIT"),
+                )
+            ),
+            "item_after_non_string_key": DuplicateKeyRow(
+                (
+                    (0, "ignored"),
+                    ("ITEM", "OPERATING_PROFIT"),
+                    ("VALUE", "2"),
+                )
+            ),
+            "interrupted_after_item": InterruptedItemsRow(
+                (("ITEM", "OPERATING_PROFIT"),)
+            ),
+            "interrupted_after_complete_row": InterruptedItemsRow(
+                (
+                    ("ITEM", "OPERATING_PROFIT"),
+                    ("VALUE", "2"),
+                )
+            ),
+        }
+        for label, malformed in malformed_rows.items():
+            with self.subTest(label=label):
+                document = fixture_document(
+                    rows=(
+                        {"ITEM": "OPERATING_PROFIT", "VALUE": "1"},
+                        malformed,
+                    )
+                )
+
+                result = extract(document=document, snapshot=fixture_snapshot(document))
+
+                self.assertEqual(result.facts, ())
+                duplicate = next(
+                    issue for issue in result.issues if issue.code == "duplicate_source_field"
+                )
+                self.assertEqual(duplicate.details["row_indices"], (0, 1))
+
+    def test_repeated_item_inside_one_malformed_row_is_a_conflict(self) -> None:
+        document = fixture_document(
+            rows=(
+                DuplicateKeyRow(
+                    (
+                        ("ITEM", "OPERATING_PROFIT"),
+                        ("ITEM", "OPERATING_PROFIT"),
+                        ("VALUE", "2"),
+                    )
+                ),
+            )
+        )
+
+        result = extract(document=document, snapshot=fixture_snapshot(document))
+
+        self.assertEqual(result.facts, ())
+        duplicate = next(
+            issue for issue in result.issues if issue.code == "duplicate_source_field"
+        )
+        self.assertEqual(duplicate.details["row_indices"], (0,))
         self.assertNotIn("required_source_field_missing", tuple(issue.code for issue in result.issues))
 
     def test_date_only_lineage_requires_utc_anchor_evidence_and_later_effective_time(self) -> None:

@@ -1134,6 +1134,7 @@ class _RowSnapshot:
     index: int
     valid_shape: bool
     item: str | None
+    candidate_items: tuple[str, ...]
     raw_value: object
 
 
@@ -1288,19 +1289,62 @@ def _snapshot_lineage(snapshot_ref: object) -> _SnapshotLineage:
 
 
 def _snapshot_row(index: int, row: object) -> _RowSnapshot:
-    """Detach a parser row enough to avoid retaining mutable/custom row values."""
+    """Detach a parser row without losing safe field candidates from bad rows."""
 
     if not isinstance(row, Mapping):
-        return _RowSnapshot(index, False, None, _UNSAFE_RAW)
-    try:
-        pairs = tuple(row.items())
-    except Exception:
-        return _RowSnapshot(index, False, None, _UNSAFE_RAW)
+        return _RowSnapshot(
+            index=index,
+            valid_shape=False,
+            item=None,
+            candidate_items=(),
+            raw_value=_UNSAFE_RAW,
+        )
+
+    candidate_items: list[str] = []
+
+    def malformed() -> _RowSnapshot:
+        candidates = tuple(candidate_items)
+        return _RowSnapshot(
+            index=index,
+            valid_shape=False,
+            item=candidates[0] if candidates else None,
+            candidate_items=candidates,
+            raw_value=_UNSAFE_RAW,
+        )
+
     copied: dict[str, object] = {}
-    for key, value in pairs:
-        if type(key) is not str or key in copied:
-            return _RowSnapshot(index, False, None, _UNSAFE_RAW)
-        copied[key] = value
+    valid_shape = True
+    try:
+        # Consume the whole finite item stream.  A malformed parser row must
+        # not be allowed to hide a later (or previously seen) exact ITEM that
+        # conflicts with a signed mapping.  Only ordinary tuple/list pair
+        # snapshots and exact strings are observed; no parser-owned object is
+        # retained from an invalid row.
+        for pair in row.items():
+            if type(pair) is not tuple and type(pair) is not list:
+                valid_shape = False
+                continue
+            if len(pair) < 2:
+                valid_shape = False
+                continue
+            key, value = pair[0], pair[1]
+            if (
+                type(key) is str
+                and key == "ITEM"
+                and type(value) is str
+                and bool(value)
+                and value == value.strip()
+                and _CONTROL.search(value) is None
+            ):
+                candidate_items.append(value)
+            if len(pair) != 2 or type(key) is not str or key in copied:
+                valid_shape = False
+                continue
+            copied[key] = value
+    except Exception:
+        valid_shape = False
+    if not valid_shape:
+        return malformed()
     raw_item = copied.get("ITEM")
     item: str | None = None
     if (
@@ -1311,15 +1355,21 @@ def _snapshot_row(index: int, row: object) -> _RowSnapshot:
     ):
         item = raw_item
     if set(copied) != {"ITEM", "VALUE"}:
-        return _RowSnapshot(index, False, item, _UNSAFE_RAW)
+        return malformed()
     if item is None:
-        return _RowSnapshot(index, False, None, _UNSAFE_RAW)
+        return malformed()
     raw_value = copied["VALUE"]
     # A row's VALUE must itself be a raw JSON scalar.  Non-finite floats retain
     # their shape here and become deterministic nonnumeric issues downstream.
     if raw_value is not None and type(raw_value) not in {bool, int, float, str}:
-        return _RowSnapshot(index, False, item, _UNSAFE_RAW)
-    return _RowSnapshot(index, True, item, raw_value)
+        return malformed()
+    return _RowSnapshot(
+        index=index,
+        valid_shape=True,
+        item=item,
+        candidate_items=(item,),
+        raw_value=raw_value,
+    )
 
 
 def _document_lineage(document: object) -> _DocumentLineage:
@@ -1498,8 +1548,9 @@ def extract_formal_financial_facts(
                     {"row_index": row.index, **({"source_field": row.item} if row.item else {})},
                 )
             )
-            if row.item is not None and row.item in by_field:
-                invalid_matches[row.item].append(row)
+            for candidate in row.candidate_items:
+                if candidate in by_field:
+                    invalid_matches[candidate].append(row)
             continue
         assert row.item is not None
         if row.item not in by_field:
@@ -1526,7 +1577,7 @@ def extract_formal_financial_facts(
                     mapped.source_field,
                     {
                         "mapping_id": mapped.mapping_id,
-                        "row_indices": tuple(sorted(item.index for item in all_rows)),
+                        "row_indices": tuple(sorted({item.index for item in all_rows})),
                         "source_field": mapped.source_field,
                     },
                 )
