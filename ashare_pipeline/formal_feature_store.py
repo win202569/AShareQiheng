@@ -112,10 +112,11 @@ def _is_link(path: Path) -> bool:
 class _SecureDirectory:
     """Pin the verified directory chain and operate relative to the final directory."""
 
-    __slots__ = ("path", "_posix_descriptors", "_windows_handles")
+    __slots__ = ("path", "_create", "_posix_descriptors", "_windows_handles")
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, create: bool) -> None:
         self.path = path
+        self._create = create
         self._posix_descriptors: list[int] = []
         self._windows_handles: list[int] = []
 
@@ -147,7 +148,7 @@ class _SecureDirectory:
                 close_handle(self._windows_handles.pop())
 
     def _pin_posix_chain(self) -> None:
-        required = (os.open, os.stat, os.unlink, os.link)
+        required = (os.open, os.stat, os.mkdir, os.unlink, os.link)
         if (
             any(operation not in os.supports_dir_fd for operation in required)
             or not hasattr(os, "O_DIRECTORY")
@@ -158,7 +159,23 @@ class _SecureDirectory:
         descriptor = os.open(self.path.anchor, flags)
         self._posix_descriptors.append(descriptor)
         for component in self.path.parts[1:]:
-            descriptor = os.open(component, flags, dir_fd=descriptor)
+            try:
+                descriptor = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError as error:
+                if not self._create:
+                    raise ValueError("formal feature store directory does not exist") from error
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                try:
+                    descriptor = os.open(component, flags, dir_fd=descriptor)
+                except OSError as open_error:
+                    raise ValueError(
+                        "formal feature directory creation verification failed"
+                    ) from open_error
+            except OSError as error:
+                raise ValueError("formal feature directory traversal failed") from error
             self._posix_descriptors.append(descriptor)
         details = os.fstat(self.descriptor)
         if not stat.S_ISDIR(details.st_mode):
@@ -205,7 +222,7 @@ class _SecureDirectory:
         for component in self.path.parts[1:]:
             current = current / component
             candidates.append(current)
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
             handle = create_file(
                 str(candidate),
                 generic_read,
@@ -216,9 +233,29 @@ class _SecureDirectory:
                 None,
             )
             if handle == invalid_handle:
-                raise ValueError(
-                    "formal feature directory handle acquisition failed"
-                ) from ctypes.WinError(ctypes.get_last_error())
+                initial_error = ctypes.get_last_error()
+                if self._create and index > 0 and initial_error in {2, 3}:
+                    try:
+                        candidate.mkdir()
+                    except FileExistsError:
+                        pass
+                    except OSError as error:
+                        raise ValueError(
+                            "formal feature directory creation failed"
+                        ) from error
+                    handle = create_file(
+                        str(candidate),
+                        generic_read,
+                        file_share_read | file_share_write,
+                        None,
+                        open_existing,
+                        backup_semantics | open_reparse_point,
+                        None,
+                    )
+                if handle == invalid_handle:
+                    raise ValueError(
+                        "formal feature directory handle acquisition failed"
+                    ) from ctypes.WinError(ctypes.get_last_error() or initial_error)
             self._windows_handles.append(handle)
             details = FileAttributeTagInfo()
             if not get_info(handle, 9, ctypes.byref(details), ctypes.sizeof(details)):
@@ -347,31 +384,9 @@ def _make_store_type(construct_receipt: object, require_receipt: object) -> type
                 raise ValueError("formal feature store root is not canonical")
             return root
 
-        def _directory(self, *, create: bool) -> Path:
-            root = self._validated_root()
-            current = root
-            if _is_link(current):
-                raise ValueError("formal feature store root must not be a link")
-            if create:
-                current.mkdir(parents=True, exist_ok=True)
-            for component in ("data", "formal", "features"):
-                current = current / component
-                if current.exists() or _is_link(current):
-                    if _is_link(current):
-                        raise ValueError("formal feature store path must not contain a link")
-                    if not current.is_dir():
-                        raise ValueError("formal feature store path component is not a directory")
-                elif create:
-                    current.mkdir()
-                else:
-                    raise ValueError("formal feature store directory does not exist")
-            if current.resolve() != current:
-                raise ValueError("formal feature store directory escaped its root")
-            return current
-
-        def _paths(self, bundle_hash: str, *, create: bool) -> tuple[Path, Path, Path]:
+        def _paths(self, bundle_hash: str) -> tuple[Path, Path, Path]:
             _require_hash(bundle_hash, "formal feature bundle hash")
-            directory = self._directory(create=create)
+            directory = self._validated_root() / "data" / "formal" / "features"
             bundle_path = directory / f"{bundle_hash}.json"
             manifest_path = directory / f"{bundle_hash}.manifest.json"
             lock_path = directory / f"{bundle_hash}.lock"
@@ -458,8 +473,8 @@ def _make_store_type(construct_receipt: object, require_receipt: object) -> type
                 raise ValueError("formal feature bundle hash is inconsistent")
             manifest_bytes = _canonical_json_bytes(_manifest(bundle, bundle_hash))
             manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
-            bundle_path, manifest_path, lock_path = self._paths(bundle_hash, create=True)
-            with _SecureDirectory(bundle_path.parent) as directory:
+            bundle_path, manifest_path, lock_path = self._paths(bundle_hash)
+            with _SecureDirectory(bundle_path.parent, create=True) as directory:
                 try:
                     lock_descriptor = directory.open_exclusive(lock_path.name)
                 except FileExistsError as error:
@@ -514,10 +529,10 @@ def _make_store_type(construct_receipt: object, require_receipt: object) -> type
             bundle_path_text, manifest_path_text, bundle_hash, manifest_hash = require_receipt(
                 receipt
             )
-            bundle_path, manifest_path, _ = self._paths(bundle_hash, create=False)
+            bundle_path, manifest_path, _ = self._paths(bundle_hash)
             if bundle_path_text != str(bundle_path) or manifest_path_text != str(manifest_path):
                 raise ValueError("formal feature receipt paths do not belong to this store")
-            with _SecureDirectory(bundle_path.parent) as directory:
+            with _SecureDirectory(bundle_path.parent, create=False) as directory:
                 manifest_bytes = directory.read_regular(manifest_path.name, "manifest")
                 if hashlib.sha256(manifest_bytes).hexdigest() != manifest_hash:
                     raise ValueError("formal feature manifest hash mismatch")

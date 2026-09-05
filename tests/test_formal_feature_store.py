@@ -272,6 +272,46 @@ class FormalFeatureStoreTests(unittest.TestCase):
         self.assertEqual(list(displaced.glob("*.lock")), [])
         self.assertFalse(lock_path.exists())
 
+    def test_missing_directory_creation_is_bound_to_verified_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as sandbox:
+            sandbox_path = Path(sandbox)
+            root = sandbox_path / "store-root"
+            displaced = sandbox_path / "store-root.displaced"
+            external = sandbox_path / "external-target"
+            root.mkdir()
+            external.mkdir()
+            store = FormalFeatureBundleStore(root)
+            real_mkdir = os.mkdir
+            raced = False
+
+            def replacing_mkdir(
+                path: object, mode: int = 0o777, *, dir_fd: int | None = None
+            ) -> None:
+                nonlocal raced
+                is_target = (
+                    Path(path) == root / "data"
+                    if dir_fd is None
+                    else path == "data"
+                )
+                if not raced and is_target:
+                    raced = True
+                    root.rename(displaced)
+                    create_directory_link(root, external)
+                if dir_fd is None:
+                    real_mkdir(path, mode)
+                else:
+                    real_mkdir(path, mode, dir_fd=dir_fd)
+
+            with patch(
+                "ashare_pipeline.formal_feature_store.os.mkdir",
+                side_effect=replacing_mkdir,
+            ):
+                with self.assertRaises(ValueError):
+                    store.write(self.bundle)
+
+            self.assertTrue(raced)
+            self.assertEqual(list(external.iterdir()), [])
+
     def test_forged_or_mutated_receipt_and_wrong_store_root_are_rejected(self) -> None:
         saved = self.store.write(self.bundle)
         with self.assertRaises(TypeError):
