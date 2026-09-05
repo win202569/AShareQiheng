@@ -145,6 +145,74 @@ class FormalFeatureStoreTests(unittest.TestCase):
         self.assertEqual(second, first)
         self.assertEqual((bundle_path.read_bytes(), manifest_path.read_bytes()), before)
 
+    def test_recovery_after_restart_verifies_without_writing(self) -> None:
+        saved = self.store.write(self.bundle)
+        fields = {name: getattr(saved, name) for name in (
+            "bundle_path", "manifest_path", "bundle_hash", "manifest_hash"
+        )}
+        restarted = FormalFeatureBundleStore(self.root)
+        self.assertTrue(callable(getattr(restarted, "recover_verified_receipt", None)))
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                  for path in self.root.rglob("*.json")}
+        before_paths = set(self.root.rglob("*"))
+        with patch.object(FormalFeatureBundleStore, "write", side_effect=AssertionError("recovery wrote")):
+            recovered = restarted.recover_verified_receipt(**fields)
+        self.assertIs(type(recovered), FormalStoredFeatureBundle)
+        self.assertEqual(restarted.read_verified(recovered), self.bundle)
+        self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                  for path in self.root.rglob("*.json")})
+        self.assertEqual(set(self.root.rglob("*")), before_paths)
+
+    def test_recovery_rejects_noncanonical_or_substituted_receipt_fields(self) -> None:
+        saved = self.store.write(self.bundle)
+        fields = {name: getattr(saved, name) for name in (
+            "bundle_path", "manifest_path", "bundle_hash", "manifest_hash"
+        )}
+        self.assertTrue(callable(getattr(self.store, "recover_verified_receipt", None)))
+        class Text(str):
+            pass
+        for name, bad in (
+            ("bundle_path", Text(saved.bundle_path)),
+            ("bundle_path", saved.bundle_path + " "),
+            ("bundle_path", str(self.root / "different.json")),
+            ("manifest_path", saved.bundle_path),
+            ("bundle_hash", saved.bundle_hash.upper()),
+            ("manifest_hash", "f" * 64),
+        ):
+            with self.subTest(name=name, bad=bad), self.assertRaises(ValueError):
+                self.store.recover_verified_receipt(**{**fields, name: bad})
+        with project_temporary_directory() as other, self.assertRaises(ValueError):
+            FormalFeatureBundleStore(other).recover_verified_receipt(**fields)
+
+    def test_recovery_of_missing_files_never_creates_directories(self) -> None:
+        bundle_path, manifest_path, _ = self.expected_paths()
+        with self.assertRaises(ValueError):
+            self.store.recover_verified_receipt(bundle_path=str(bundle_path),
+                manifest_path=str(manifest_path), bundle_hash=self.bundle.bundle_hash(),
+                manifest_hash="f" * 64)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_recovery_rejects_corrupt_files_and_canonical_manifest_header_mismatch(self) -> None:
+        self.assertTrue(callable(getattr(self.store, "recover_verified_receipt", None)))
+        for target in ("bundle", "manifest", "header"):
+            with self.subTest(target=target), project_temporary_directory() as root:
+                store = FormalFeatureBundleStore(root)
+                saved = store.write(self.bundle)
+                fields = {name: getattr(saved, name) for name in (
+                    "bundle_path", "manifest_path", "bundle_hash", "manifest_hash"
+                )}
+                if target == "header":
+                    path = Path(saved.manifest_path)
+                    wire = json.loads(path.read_bytes())
+                    wire["security_id"] = "SH600002"
+                    raw = canonical_bytes(wire)
+                    path.write_bytes(raw)
+                    fields["manifest_hash"] = hashlib.sha256(raw).hexdigest()
+                else:
+                    Path(fields[target + "_path"]).write_bytes(b"corrupt")
+                with self.assertRaises(ValueError):
+                    store.recover_verified_receipt(**fields)
+
     def test_read_rejects_tampered_bundle_or_manifest(self) -> None:
         for target in ("bundle", "manifest"):
             with self.subTest(target=target), project_temporary_directory() as root:

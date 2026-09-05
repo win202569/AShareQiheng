@@ -525,6 +525,22 @@ def _make_store_type(construct_receipt: object, require_receipt: object) -> type
                     except OSError as error:
                         raise ValueError("formal feature bundle lock cleanup failed") from error
 
+        def recover_verified_receipt(
+            self, *, bundle_path: str, manifest_path: str,
+            bundle_hash: str, manifest_hash: str,
+        ) -> FormalStoredFeatureBundle:
+            """Recover an existing receipt only after complete read-only verification."""
+            if type(bundle_path) is not str or type(manifest_path) is not str:
+                raise ValueError("formal feature recovery paths must be exact strings")
+            _require_hash(bundle_hash, "formal feature recovery bundle hash")
+            _require_hash(manifest_hash, "formal feature recovery manifest hash")
+            expected_bundle, expected_manifest, _ = self._paths(bundle_hash)
+            if bundle_path != str(expected_bundle) or manifest_path != str(expected_manifest):
+                raise ValueError("formal feature recovery paths do not belong to this store")
+            receipt = construct_receipt(bundle_path, manifest_path, bundle_hash, manifest_hash)
+            self.read_verified(receipt)
+            return receipt
+
         def read_verified(self, receipt: FormalStoredFeatureBundle) -> FormalFeatureBundle:
             bundle_path_text, manifest_path_text, bundle_hash, manifest_hash = require_receipt(
                 receipt
