@@ -310,6 +310,35 @@ class FormulaTests(unittest.TestCase):
 
 
 class BundleTests(unittest.TestCase):
+    def test_input_hash_binds_effective_registry_release_eligibility(self):
+        slots = sorted(
+            [slot_wire(template, unit="CNY", formula=leaf().to_dict()) for template in TEMPLATES],
+            key=lambda item: item["slot_id"],
+        )
+        raw = feature_registry_bytes(slots=slots)
+        root = registry_manifest(raw)
+        bound = load_registry(raw, root)
+        unbound = load_registry(raw)
+        inputs = [fact(), fact(metric_key="profit", value=20)]
+        derived = bundle(inputs, registry=bound, registry_manifest=root)
+        blocked = bundle(inputs, registry=unbound, registry_manifest=root)
+        self.assertEqual(derived.values[0].status, "derived")
+        self.assertEqual(blocked.values[0].status, "blocked")
+        self.assertEqual(derived.registry_manifest_hash, blocked.registry_manifest_hash)
+        self.assertEqual(derived.feature_registry_hash, blocked.feature_registry_hash)
+        self.assertNotEqual(derived.input_hash, blocked.input_hash)
+        for registry, expected in ((bound, derived), (unbound, blocked)):
+            self.assertEqual(
+                expected.input_hash,
+                bundle(inputs[::-1], registry=registry, registry_manifest=root).input_hash,
+            )
+        # With a passed test root both children have the same effective false gate.
+        test_root = registry_manifest(raw, purpose="test")
+        bound_test = bundle(inputs, registry=bound, registry_manifest=test_root)
+        unbound_test = bundle(inputs, registry=unbound, registry_manifest=test_root)
+        self.assertEqual(bound_test.values[0].status, "blocked")
+        self.assertEqual(bound_test.input_hash, unbound_test.input_hash)
+
     def test_issue_iterator_cannot_mutate_facts_or_registry_snapshots(self):
         slots = sorted([slot_wire(template, unit="CNY", formula=leaf().to_dict()) for template in TEMPLATES], key=lambda item: item["slot_id"])
         raw = feature_registry_bytes(slots=slots)

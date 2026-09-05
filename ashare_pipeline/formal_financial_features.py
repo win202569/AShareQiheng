@@ -625,6 +625,7 @@ def build_formal_feature_bundle(*, security_id: str, as_of_utc: str, template_id
         source_registry_hash=source_hash,
         mapping_registry_hash=mapping_hash,
         feature_registry_hash=feature_hash,
+        effective_release_eligible=eligible,
         visible_candidates=[candidates[key] for key in sorted(candidates)],
         selected_fact_ids=sorted({wire["id"] for _, wire in selected}),
         quarter_ids=sorted(q.to_dict()["id"] for q in quarters.facts),
