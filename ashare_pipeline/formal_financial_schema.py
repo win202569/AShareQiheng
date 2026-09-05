@@ -691,44 +691,102 @@ def _copy_mapping(value: object, *, label: str) -> dict[str, object]:
     return copied
 
 
-@dataclass(frozen=True, slots=True)
-class FormalFactIssue:
-    code: str
-    mapping_id: str | None
-    source_field: str | None
-    details: Mapping[str, object]
+def _make_formal_fact_issue_type() -> type[object]:
+    """Create issues whose deep-frozen details cannot be silently replaced."""
 
-    def __post_init__(self) -> None:
-        _require_text(self.code, "fact issue code", identifier=True)
-        _require_optional_text(self.mapping_id, "fact issue mapping_id", identifier=True)
-        _require_optional_text(self.source_field, "fact issue source_field", controls=True)
-        frozen = _freeze_json(self.details, label="fact issue details")
+    IssueFingerprint = tuple[str | None | bytes, ...]
+    records: dict[int, tuple[weakref.ReferenceType[object], IssueFingerprint]] = {}
+
+    def forget(identity: int) -> None:
+        records.pop(identity, None)
+
+    def values_and_fingerprint(
+        issue: object,
+    ) -> tuple[tuple[str, str | None, str | None, Mapping[str, object]], IssueFingerprint] | None:
+        if type(issue) is not FormalFactIssue:
+            return None
+        try:
+            code = _require_text(issue.code, "fact issue code", identifier=True)
+            mapping_id = _require_optional_text(
+                issue.mapping_id, "fact issue mapping_id", identifier=True
+            )
+            source_field = _require_optional_text(
+                issue.source_field, "fact issue source_field", controls=True
+            )
+            frozen = _freeze_json(issue.details, label="fact issue details")
+        except (AttributeError, TypeError, ValueError):
+            return None
         if not isinstance(frozen, Mapping):
-            raise ValueError("fact issue details must be a mapping")
-        object.__setattr__(self, "details", frozen)
-
-    def to_dict(self) -> dict[str, object]:
-        """Return a detached JSON-native record safe for canonical serialization."""
-
-        code = _require_text(self.code, "fact issue code", identifier=True)
-        mapping_id = _require_optional_text(
-            self.mapping_id, "fact issue mapping_id", identifier=True
+            return None
+        try:
+            details_bytes = canonical_json_bytes(_thaw_json(frozen))
+        except (TypeError, ValueError):
+            return None
+        return (code, mapping_id, source_field, frozen), (
+            code,
+            mapping_id,
+            source_field,
+            details_bytes,
         )
-        source_field = _require_optional_text(
-            self.source_field, "fact issue source_field", controls=True
-        )
-        frozen = _freeze_json(self.details, label="fact issue details")
-        if not isinstance(frozen, Mapping):
-            raise ValueError("fact issue details must be a mapping")
-        return {
-            "code": code,
-            "mapping_id": mapping_id,
-            "source_field": source_field,
-            "details": _thaw_json(frozen),
-        }
 
-    def canonical_bytes(self) -> bytes:
-        return canonical_json_bytes(self.to_dict())
+    def remember(issue: object) -> None:
+        sealed = values_and_fingerprint(issue)
+        if sealed is None:
+            raise ValueError("fact issue is invalid")
+        identity = id(issue)
+        records[identity] = (
+            weakref.ref(issue, lambda _reference, identity=identity: forget(identity)),
+            sealed[1],
+        )
+
+    def require_seal(issue: object) -> tuple[str, str | None, str | None, Mapping[str, object]]:
+        record = records.get(id(issue))
+        sealed = values_and_fingerprint(issue)
+        if (
+            record is None
+            or sealed is None
+            or record[0]() is not issue
+            or record[1] != sealed[1]
+        ):
+            raise ValueError("formal fact issue was mutated or was not constructed safely")
+        return sealed[0]
+
+    @dataclass(frozen=True, slots=True, weakref_slot=True)
+    class FormalFactIssue:
+        code: str
+        mapping_id: str | None
+        source_field: str | None
+        details: Mapping[str, object]
+
+        def __post_init__(self) -> None:
+            _require_text(self.code, "fact issue code", identifier=True)
+            _require_optional_text(self.mapping_id, "fact issue mapping_id", identifier=True)
+            _require_optional_text(self.source_field, "fact issue source_field", controls=True)
+            frozen = _freeze_json(self.details, label="fact issue details")
+            if not isinstance(frozen, Mapping):
+                raise ValueError("fact issue details must be a mapping")
+            object.__setattr__(self, "details", frozen)
+            remember(self)
+
+        def to_dict(self) -> dict[str, object]:
+            """Return a detached JSON-native record safe for canonical serialization."""
+
+            code, mapping_id, source_field, details = require_seal(self)
+            return {
+                "code": code,
+                "mapping_id": mapping_id,
+                "source_field": source_field,
+                "details": _thaw_json(details),
+            }
+
+        def canonical_bytes(self) -> bytes:
+            return canonical_json_bytes(self.to_dict())
+
+    return FormalFactIssue
+
+
+FormalFactIssue = _make_formal_fact_issue_type()
+del _make_formal_fact_issue_type
 
 
 def _period_kind_for(period_end: str) -> str:
@@ -897,13 +955,7 @@ def _make_formal_financial_fact_type() -> type[object]:
     def forget(identity: int) -> None:
         records.pop(identity, None)
 
-    def values_and_fingerprint(fact: object) -> tuple[tuple[object, ...], FactFingerprint] | None:
-        if type(fact) is not FormalFinancialFact:
-            return None
-        try:
-            values = tuple(getattr(fact, field) for field in _FACT_FIELDS)
-        except AttributeError:
-            return None
+    def fingerprint_values(values: tuple[object, ...]) -> FactFingerprint:
         fingerprints: list[tuple[str, object]] = []
         for value in values:
             if type(value) is str:
@@ -917,7 +969,16 @@ def _make_formal_financial_fact_type() -> type[object]:
                 # Preserve any hostile replacement's exact type without invoking
                 # its equality or serialization methods.
                 fingerprints.append(("other", type(value)))
-        return values, tuple(fingerprints)
+        return tuple(fingerprints)
+
+    def values_and_fingerprint(fact: object) -> tuple[tuple[object, ...], FactFingerprint] | None:
+        if type(fact) is not FormalFinancialFact:
+            return None
+        try:
+            values = tuple(getattr(fact, field) for field in _FACT_FIELDS)
+        except AttributeError:
+            return None
+        return values, fingerprint_values(values)
 
     def require_seal(fact: object) -> tuple[object, ...]:
         identity = id(fact)
@@ -928,19 +989,8 @@ def _make_formal_financial_fact_type() -> type[object]:
         values = dict(zip(_FACT_FIELDS, current[0], strict=True))
         # Revalidate as defense in depth; this also rejects any impossible field mutation.
         normalized = _normalize_fact_values(values, require_id=True)
-        normalized_fingerprint = tuple(
-            (
-                "str",
-                normalized[field],
-            )
-            if type(normalized[field]) is str
-            else (
-                "float",
-                struct.pack(">d", normalized[field]),
-            )
-            if type(normalized[field]) is float
-            else ("none", None)
-            for field in _FACT_FIELDS
+        normalized_fingerprint = fingerprint_values(
+            tuple(normalized[field] for field in _FACT_FIELDS)
         )
         if normalized_fingerprint != current[1]:
             raise ValueError("formal financial fact no longer has a valid canonical identity")
@@ -948,6 +998,15 @@ def _make_formal_financial_fact_type() -> type[object]:
 
     def construct(values: Mapping[str, object], *, require_id: bool) -> "FormalFinancialFact":
         normalized = _normalize_fact_values(values, require_id=require_id)
+        if require_id:
+            supplied_fingerprint = fingerprint_values(
+                tuple(values[field] for field in _FACT_FIELDS)
+            )
+            normalized_fingerprint = fingerprint_values(
+                tuple(normalized[field] for field in _FACT_FIELDS)
+            )
+            if supplied_fingerprint != normalized_fingerprint:
+                raise ValueError("formal fact serialization values must already be canonical")
         fact = object.__new__(FormalFinancialFact)
         for field in _FACT_FIELDS:
             object.__setattr__(fact, field, normalized[field])
@@ -999,9 +1058,9 @@ def _make_formal_financial_fact_type() -> type[object]:
                 raise ValueError("FormalFinancialFact must have exact type")
             return construct(values, require_id=False)
 
-        def to_dict(self) -> Mapping[str, object]:
+        def to_dict(self) -> dict[str, object]:
             sealed = require_seal(self)
-            return MappingProxyType(dict(zip(_FACT_FIELDS, sealed, strict=True)))
+            return dict(zip(_FACT_FIELDS, sealed, strict=True))
 
         @classmethod
         def from_dict(cls, value: Mapping[str, object]) -> "FormalFinancialFact":
@@ -1458,7 +1517,22 @@ def extract_formal_financial_facts(
     for mapped in sorted(applicable, key=lambda item: (item.mapping_id, item.source_field)):
         field_rows = matches[mapped.source_field]
         malformed_rows = invalid_matches[mapped.source_field]
-        if not field_rows:
+        all_rows = (*field_rows, *malformed_rows)
+        if len(all_rows) > 1:
+            issues.append(
+                _new_issue(
+                    "duplicate_source_field",
+                    mapped.mapping_id,
+                    mapped.source_field,
+                    {
+                        "mapping_id": mapped.mapping_id,
+                        "row_indices": tuple(sorted(item.index for item in all_rows)),
+                        "source_field": mapped.source_field,
+                    },
+                )
+            )
+            continue
+        if not all_rows:
             issues.append(
                 _new_issue(
                     "required_source_field_missing",
@@ -1468,19 +1542,15 @@ def extract_formal_financial_facts(
                 )
             )
             continue
-        if len(field_rows) + len(malformed_rows) != 1:
+        if not field_rows:
+            # One malformed recognizable row remains a missing required source
+            # field; two or more occurrences were already handled as conflict.
             issues.append(
                 _new_issue(
-                    "duplicate_source_field",
+                    "required_source_field_missing",
                     mapped.mapping_id,
                     mapped.source_field,
-                    {
-                        "mapping_id": mapped.mapping_id,
-                        "row_indices": tuple(
-                            sorted(item.index for item in (*field_rows, *malformed_rows))
-                        ),
-                        "source_field": mapped.source_field,
-                    },
+                    {"mapping_id": mapped.mapping_id, "source_field": mapped.source_field},
                 )
             )
             continue

@@ -6,7 +6,6 @@ from dataclasses import replace
 import hashlib
 import json
 import math
-from types import MappingProxyType
 import unittest
 
 import ashare_pipeline.formal_financial_schema as formal_financial_schema
@@ -444,6 +443,20 @@ class FormalFinancialSchemaTests(unittest.TestCase):
         self.assertEqual(result.facts, ())
         self.assertEqual(duplicate.details["row_indices"], (0, 1))
 
+    def test_all_malformed_duplicate_mapped_items_are_a_conflict_not_missing(self) -> None:
+        document = fixture_document(
+            rows=(
+                {"ITEM": "OPERATING_PROFIT", "VALUE": {"bad": 1}},
+                {"ITEM": "OPERATING_PROFIT", "VALUE": {"bad": 2}},
+            )
+        )
+
+        result = extract(document=document, snapshot=fixture_snapshot(document))
+
+        self.assertEqual(result.facts, ())
+        self.assertIn("duplicate_source_field", tuple(issue.code for issue in result.issues))
+        self.assertNotIn("required_source_field_missing", tuple(issue.code for issue in result.issues))
+
     def test_date_only_lineage_requires_utc_anchor_evidence_and_later_effective_time(self) -> None:
         document = fixture_document(
             published_at_utc="2026-03-20T00:00:00+00:00",
@@ -488,7 +501,8 @@ class FormalFinancialSchemaTests(unittest.TestCase):
         fact = extract().facts[0]
         record = fact.to_dict()
 
-        self.assertIsInstance(record, MappingProxyType)
+        self.assertIs(type(record), dict)
+        self.assertEqual(canonical_json_bytes(record), canonical_bytes(record))
         self.assertEqual(FormalFinancialFact.from_dict(record), fact)
         with self.assertRaises(ValueError):
             FormalFinancialFact.from_dict({key: value for key, value in record.items() if key != "unit"})
@@ -496,6 +510,18 @@ class FormalFinancialSchemaTests(unittest.TestCase):
             FormalFinancialFact.from_dict({**dict(record), "id": "0" * 64})
         with self.assertRaises(ValueError):
             FormalFinancialFact.from_dict({**dict(record), "value": "120.0"})
+        with self.assertRaises(ValueError):
+            FormalFinancialFact.from_dict({**dict(record), "value": int(record["value"])})
+        zero_fields = dict(record)
+        zero_fields.pop("id")
+        zero_fields["value"] = 0.0
+        zero = FormalFinancialFact.create(**zero_fields)
+        zero_record = zero.to_dict()
+        for noncanonical_zero in (-0.0, 0):
+            with self.subTest(noncanonical_zero=noncanonical_zero), self.assertRaises(ValueError):
+                FormalFinancialFact.from_dict(
+                    {**zero_record, "value": noncanonical_zero}
+                )
         with self.assertRaises(TypeError):
             FormalFinancialFact()
 
@@ -589,6 +615,17 @@ class FormalFinancialSchemaTests(unittest.TestCase):
                 signed_registry(),
                 "2026-09-04T00:00:00+00:00",
             )
+
+    def test_issue_serialization_rejects_low_level_field_mutation(self) -> None:
+        issue = FormalFactIssue(
+            "sample_issue", None, None, {"nested": [{"answer": 1}]}
+        )
+        self.assertEqual(issue.to_dict()["details"], {"nested": [{"answer": 1}]})
+
+        object.__setattr__(issue, "details", {"nested": [{"answer": 99}]})
+
+        with self.assertRaises(ValueError):
+            issue.to_dict()
 
 
 if __name__ == "__main__":
