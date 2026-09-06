@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import ashare_pipeline.formal_deep_worker as _formal_deep_worker
 from ashare_pipeline.formal_deep_worker import (
     CalendarBindingPending,
     FormalContextTaskPayload,
@@ -28,6 +29,10 @@ from ashare_pipeline.formal_deep_worker import (
     formal_statement_task_specs,
 )
 from ashare_pipeline.formal_evidence import OfficialRequest, SourcePolicy, VerifiedCalendarBinding
+from ashare_pipeline.formal_financial_schema import (
+    FormalFinancialFact,
+    extract_formal_financial_facts,
+)
 from ashare_pipeline.formal_registry_manifest import (
     FormalRegistryBundleLoader,
     FormalRegistryManifest,
@@ -122,6 +127,18 @@ class CountingTransport:
         return self.response
 
 
+class PeriodDocumentParser:
+    """Return a real parsed statement document for each frozen report period."""
+
+    def __init__(self, documents: dict[str, object]) -> None:
+        self.documents = documents
+        self.calls: list[tuple[object, object, object]] = []
+
+    def parse(self, raw_bytes: object, *, request: object, config: object) -> object:
+        self.calls.append((raw_bytes, request, config))
+        return self.documents[getattr(request, "period_or_date")]
+
+
 class ReplayErrorParser(_formal_source_tests.FixtureParser):
     """Allow a verified fetch, then fail the mandated persisted-raw reparse."""
 
@@ -206,6 +223,52 @@ class PostFactLeaseLossStore:
         return self._store.supersede_formal_tasks(*args, **kwargs)
 
 
+class TemporarilyUnverifiedSourceStore:
+    """Expose a source task's pre-completion state while retaining real evidence."""
+
+    def __init__(self, store: StateStore, source_task_id: str) -> None:
+        self._store = store
+        self._source_task_id = source_task_id
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._store, name)
+
+    def get_formal_task(self, task_id: str) -> dict[str, object] | None:
+        task = self._store.get_formal_task(task_id)
+        if task is None or task_id != self._source_task_id:
+            return task
+        return {**task, "status": "leased"}
+
+
+class OrphanFeatureResultStore:
+    """Keep the actual source evidence but remove its statement→feature audit edge."""
+
+    def __init__(self, store: StateStore, source_task_id: str) -> None:
+        self._store = store
+        self._source_task_id = source_task_id
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._store, name)
+
+    def get_formal_task(self, task_id: str) -> dict[str, object] | None:
+        task = self._store.get_formal_task(task_id)
+        if task is None or task_id != self._source_task_id:
+            return task
+        result = dict(task["result"])
+        result["feature_task_ids"] = ["orphan-feature-task"]
+        return {**task, "result": result}
+
+
+class RawBytesDriftSnapshots:
+    """Leave real source provenance intact but surface changed stored raw bytes."""
+
+    def __init__(self, snapshots: FormalSnapshotRepository) -> None:
+        self._snapshots = snapshots
+
+    def read_verified_raw(self, _ref: object) -> bytes:
+        return b'{"tampered":true}'
+
+
 class EffectiveTimeResolver:
     def next_exchange_close(self, *_args: object, **_kwargs: object) -> str:
         return AS_OF
@@ -234,6 +297,10 @@ def fixture_bundle_loader(
     source_configs: list[dict[str, object]] | None = None,
     statement_dataset: str = "annual_report",
     statement_exchange: str = "BJ",
+    statement_mappings: list[dict[str, object]] | None = None,
+    binding_mapping_ids: list[str] | None = None,
+    feature_slots: list[dict[str, object]] | None = None,
+    feature_template_ids: list[str] | None = None,
 ) -> FormalRegistryBundleLoader:
     """Make a real, test-purpose verified root from signed child bytes."""
     roles = ("source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event")
@@ -249,31 +316,33 @@ def fixture_bundle_loader(
             "schema_version": "formal-source-registry-v1",
         }
     )
+    mappings = statement_mappings or [
+        {
+            "accounting_basis": "consolidated",
+            "mapping_id": "operating_profit",
+            "metric_key": "operating_profit",
+            "nature": "duration",
+            "period_kind": "FY",
+            "source_field": "OPERATING_PROFIT",
+            "statement": "income",
+            "unit": "CNY",
+        }
+    ]
+    mapping_ids = binding_mapping_ids or ["operating_profit"]
     raw["mapping"] = canonical_bytes(
         {
             "bindings": [
                 {
                     "dataset": statement_dataset,
                     "exchange_scope": statement_exchange,
-                    "mapping_ids": ["operating_profit"],
+                    "mapping_ids": mapping_ids,
                     "mapping_version": "fixture-map-v1",
                     "parser_id": "fixture-parser",
                     "parser_version": "fixture-v1",
                     "source": "cninfo",
                 }
             ],
-            "mappings": [
-                {
-                    "accounting_basis": "consolidated",
-                    "mapping_id": "operating_profit",
-                    "metric_key": "operating_profit",
-                    "nature": "duration",
-                    "period_kind": "FY",
-                    "source_field": "OPERATING_PROFIT",
-                    "statement": "income",
-                    "unit": "CNY",
-                }
-            ],
+            "mappings": mappings,
             "registry_role": "mapping",
             "row_format": "item_value_v1",
             "schema_version": "formal-financial-mapping-registry-v1",
@@ -285,7 +354,7 @@ def fixture_bundle_loader(
             "mapping_registry_hash": hashlib.sha256(raw["mapping"]).hexdigest(),
             "registry_role": "feature",
             "schema_version": "formal-feature-registry-v1",
-            "slots": [
+            "slots": feature_slots or [
                 {
                     "dimension": "G",
                     "formula": {"fact_key": "income.revenue", "op": "fact", "period_key": "FY0"},
@@ -297,7 +366,7 @@ def fixture_bundle_loader(
                 }
             ],
             "source_registry_hash": hashlib.sha256(raw["source"]).hexdigest(),
-            "template_ids": ["general_nonfinancial"],
+            "template_ids": feature_template_ids or ["general_nonfinancial"],
         }
     )
     hashes = {f"{role}_registry_hash": hashlib.sha256(value).hexdigest() for role, value in raw.items()}
@@ -466,9 +535,11 @@ def thin_context_resolver(
 def statement_execution_fixture(
     case: unittest.TestCase,
     *,
+    registry_purpose: str = "official",
     transport_error: Exception | None = None,
     replay_parse_error: Exception | None = None,
     initial_parse_error: Exception | None = None,
+    document_rows: tuple[dict[str, object], ...] | None = None,
 ) -> tuple[
     StateStore,
     FormalSnapshotRepository,
@@ -490,7 +561,7 @@ def statement_execution_fixture(
     )
     store.initialize()
     bundle_loader = fixture_bundle_loader(
-        purpose="official",
+        purpose=registry_purpose,
         source_configs=[_formal_source_tests.config(dataset="profit_sheet")],
         statement_dataset="profit_sheet",
         statement_exchange="SZ",
@@ -500,7 +571,11 @@ def statement_execution_fixture(
         declared_security_id="SZ000001",
         declared_period="2025-12-31",
         accounting_basis="consolidated",
-        rows=({"ITEM": "OPERATING_PROFIT", "VALUE": 100},),
+        rows=(
+            ({"ITEM": "OPERATING_PROFIT", "VALUE": 100},)
+            if document_rows is None
+            else document_rows
+        ),
     )
     transport = CountingTransport(
         _formal_source_tests.response(raw=b'{"statement":true}'),
@@ -555,6 +630,230 @@ def statement_execution_fixture(
         parser,
         manifest_hash,
         payload,
+    )
+
+
+def history_ready_feature_execution_fixture(
+    case: unittest.TestCase,
+) -> tuple[
+    StateStore,
+    FormalSnapshotRepository,
+    FormalRegistryRuntimeLoader,
+    CountingTransport,
+    PeriodDocumentParser,
+    str,
+    tuple[FormalStatementTaskPayload, ...],
+]:
+    """Create the exact 4-FY/8-quarter source evidence needed by the D1 gate."""
+
+    temporary = tempfile.TemporaryDirectory()
+    case.addCleanup(temporary.cleanup)
+    root = Path(temporary.name)
+    raw_store = FormalSnapshotStore(root / "raw")
+    store = StateStore(
+        root / "state.sqlite",
+        formal_snapshot_store=raw_store,
+        registry_signature_verifier=AcceptingVerifier(),
+    )
+    store.initialize()
+    mapping_ids = [
+        "operating_profit_fy",
+        "operating_profit_h1",
+        "operating_profit_q1",
+        "operating_profit_q3",
+    ]
+    mappings = [
+        {
+            "accounting_basis": "consolidated",
+            "mapping_id": mapping_id,
+            "metric_key": "income.operating_profit",
+            "nature": "duration",
+            "period_kind": period_kind,
+            "source_field": f"OPERATING_PROFIT_{period_kind}",
+            "statement": "income",
+            "unit": "CNY",
+        }
+        for mapping_id, period_kind in (
+            ("operating_profit_fy", "FY"),
+            ("operating_profit_h1", "H1"),
+            ("operating_profit_q1", "Q1"),
+            ("operating_profit_q3", "Q3"),
+        )
+    ]
+    bundle_loader = fixture_bundle_loader(
+        purpose="official",
+        source_configs=[_formal_source_tests.config(dataset="profit_sheet")],
+        statement_dataset="profit_sheet",
+        statement_exchange="SZ",
+        statement_mappings=mappings,
+        binding_mapping_ids=mapping_ids,
+        feature_slots=[
+            {
+                "dimension": "G",
+                "formula": {
+                    "fact_key": "income.operating_profit",
+                    "op": "fact",
+                    "period_key": "FY2025",
+                },
+                "formula_version": "formula-v1",
+                "required": True,
+                "slot_id": "bank.growth",
+                "template_id": "bank",
+                "unit": "CNY",
+            },
+            {
+                "dimension": "G",
+                "formula": {
+                    "fact_key": "income.operating_profit",
+                    "op": "fact",
+                    "period_key": "FY2025",
+                },
+                "formula_version": "formula-v1",
+                "required": True,
+                "slot_id": "broker.growth",
+                "template_id": "broker",
+                "unit": "CNY",
+            },
+            {
+                "dimension": "G",
+                "formula": {
+                    "fact_key": "income.operating_profit",
+                    "op": "fact",
+                    "period_key": "FY2025",
+                },
+                "formula_version": "formula-v1",
+                "required": True,
+                "slot_id": "general_nonfinancial.growth",
+                "template_id": "general_nonfinancial",
+                "unit": "CNY",
+            },
+            {
+                "dimension": "G",
+                "formula": {
+                    "fact_key": "income.operating_profit",
+                    "op": "fact",
+                    "period_key": "FY2025",
+                },
+                "formula_version": "formula-v1",
+                "required": True,
+                "slot_id": "insurance.growth",
+                "template_id": "insurance",
+                "unit": "CNY",
+            },
+            {
+                "dimension": "G",
+                "formula": {
+                    "fact_key": "income.operating_profit",
+                    "op": "fact",
+                    "period_key": "FY2025",
+                },
+                "formula_version": "formula-v1",
+                "required": True,
+                "slot_id": "real_estate.growth",
+                "template_id": "real_estate",
+                "unit": "CNY",
+            },
+        ],
+        feature_template_ids=[
+            "bank",
+            "broker",
+            "general_nonfinancial",
+            "insurance",
+            "real_estate",
+        ],
+    )
+    manifest_hash = bundle_loader._repository.manifest.manifest_hash
+    cumulative_values = {
+        "2022-12-31": 70,
+        "2023-12-31": 80,
+        "2024-03-31": 20,
+        "2024-06-30": 45,
+        "2024-09-30": 75,
+        "2024-12-31": 110,
+        "2025-03-31": 25,
+        "2025-06-30": 55,
+        "2025-09-30": 90,
+        "2025-12-31": 130,
+        "2026-03-31": 35,
+        "2026-06-30": 75,
+    }
+    period_kind_by_period = {
+        period: (
+            "FY"
+            if period.endswith("-12-31")
+            else "H1"
+            if period.endswith("-06-30")
+            else "Q1"
+            if period.endswith("-03-31")
+            else "Q3"
+        )
+        for period in cumulative_values
+    }
+    parser = PeriodDocumentParser(
+        {
+            period: _formal_source_tests.timestamp_document(
+                declared_security_id="SZ000001",
+                declared_period=period,
+                published_at_utc="2026-08-01T00:00:00+00:00",
+                source_updated_at_utc="2026-08-01T00:00:00+00:00",
+                accounting_basis="consolidated",
+                rows=(
+                    {
+                        "ITEM": f"OPERATING_PROFIT_{period_kind_by_period[period]}",
+                        "VALUE": value,
+                    },
+                ),
+            )
+            for period, value in cumulative_values.items()
+        }
+    )
+    transport = CountingTransport(_formal_source_tests.response(raw=b'{"history":true}'))
+    runtime_loader = FormalRegistryRuntimeLoader(
+        bundle_loader,
+        transport=transport,
+        policies={"cninfo": SourcePolicy.cninfo()},
+        parsers={"fixture-parser": parser},
+        effective_time_resolver=EffectiveTimeResolver(),
+    )
+    runtime = runtime_loader.load(manifest_hash)
+    generation = derive_collection_refresh_generation(
+        upstream_generation="history-upstream-v1",
+        registry_manifest_hash=manifest_hash,
+        relevant_registry_hashes={
+            "mapping": runtime.bundle.manifest.mapping_registry_hash,
+            "source": runtime.bundle.manifest.source_registry_hash,
+        },
+    )
+    payloads = tuple(
+        FormalStatementTaskPayload(
+            security_id="SZ000001",
+            dataset="profit_sheet",
+            report_period=period,
+            as_of_utc=AS_OF,
+            source="cninfo",
+            request_version="formal-v5",
+            source_registry_hash=runtime.bundle.manifest.source_registry_hash,
+            mapping_registry_hash=runtime.bundle.manifest.mapping_registry_hash,
+            upstream_generation="history-upstream-v1",
+            refresh_generation=generation,
+            registry_manifest_hash=manifest_hash,
+            relevant_registry_hashes=(
+                ("mapping", runtime.bundle.manifest.mapping_registry_hash),
+                ("source", runtime.bundle.manifest.source_registry_hash),
+            ),
+            calendar_prerequisite_task_id=None,
+            calendar_binding=None,
+        )
+        for period in cumulative_values
+    )
+    return (
+        store,
+        FormalSnapshotRepository(root / "raw", store),
+        runtime_loader,
+        transport,
+        parser,
+        manifest_hash,
+        payloads,
     )
 
 
@@ -1610,6 +1909,699 @@ class FormalDeepWorkerContractTests(unittest.TestCase):
         self.assertEqual(store.get_formal_task(different_template_id)["status"], "pending")
         self.assertEqual(store.get_formal_task(different_security_id)["status"], "pending")
         self.assertEqual(store.get_formal_task(different_as_of_id)["status"], "pending")
+
+    def test_feature_reconstruction_builds_only_frozen_raw_input_without_transport_or_publication(self) -> None:
+        """Removing frozen raw replay would otherwise let current V6 facts become bundle input."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        execute_queued_formal_work(dependencies, worker_id="source-worker", max_jobs=1)
+        leased_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "feature-worker", 120
+        )
+        self.assertIsNotNone(leased_feature)
+        assert leased_feature is not None
+        transport_count = len(transport.requests)
+
+        rebuild = getattr(_formal_deep_worker, "reconstruct_formal_feature_bundle", None)
+        self.assertTrue(
+            callable(rebuild),
+            "D3 must expose a pure frozen feature reconstruction helper",
+        )
+        bundle = rebuild(dependencies, leased_feature)
+
+        self.assertEqual(bundle.security_id, "SZ000001")
+        self.assertEqual(bundle.as_of_utc, AS_OF)
+        self.assertEqual(bundle.template_id, "general_nonfinancial")
+        self.assertTrue(bundle.blockers)
+        self.assertTrue(all(value.status == "blocked" for value in bundle.values))
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(store.get_formal_task(leased_feature["id"])["status"], "leased")
+
+    def test_feature_reconstruction_rejects_changed_source_calendar_binding_without_transport(self) -> None:
+        """Using the feature cutoff instead of the source binding would admit this replay."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _manifest_hash,
+            payload,
+            calendar_repository,
+        ) = date_only_statement_execution_fixture(self)
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=calendar_repository,
+        )
+        execute_queued_formal_work(dependencies, worker_id="date-source-worker", max_jobs=1)
+        leased_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "date-feature-worker", 120
+        )
+        self.assertIsNotNone(leased_feature)
+        assert leased_feature is not None
+        calendar_repository.binding = replace(
+            calendar_repository.binding, manifest_sha256="e" * 64
+        )
+        transport_count = len(transport.requests)
+
+        with self.assertRaisesRegex(ValueError, "calendar binding"):
+            _formal_deep_worker.reconstruct_formal_feature_bundle(
+                dependencies, leased_feature
+            )
+
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(store.get_formal_task(leased_feature["id"])["status"], "leased")
+
+    def test_feature_reconstruction_fails_closed_when_standard_date_only_raw_reader_loses_binding(self) -> None:
+        """A private historical-read bypass must not be needed to reject changed raw evidence."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _manifest_hash,
+            payload,
+            calendar_repository,
+        ) = date_only_statement_execution_fixture(self)
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=calendar_repository,
+        )
+        execute_queued_formal_work(dependencies, worker_id="date-source-worker", max_jobs=1)
+        leased_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "date-feature-worker", 120
+        )
+        self.assertIsNotNone(leased_feature)
+        assert leased_feature is not None
+        snapshots._raw_store._calendar_binding_resolver = lambda _request: replace(
+            payload.calendar_binding, manifest_sha256="e" * 64
+        )
+        transport_count = len(transport.requests)
+
+        with self.assertRaisesRegex(ValueError, "calendar.*manifest"):
+            _formal_deep_worker.reconstruct_formal_feature_bundle(
+                dependencies, leased_feature
+            )
+
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(store.get_formal_task(leased_feature["id"])["status"], "leased")
+
+    def test_feature_reconstruction_reports_unverified_source_as_temporary_hold(self) -> None:
+        """Turning an in-flight statement into a terminal feature failure would lose work."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        ready_dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        execute_queued_formal_work(ready_dependencies, worker_id="source-worker", max_jobs=1)
+        leased_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "feature-worker", 120
+        )
+        self.assertIsNotNone(leased_feature)
+        assert leased_feature is not None
+        source_task_id = store.list_formal_financial_facts(
+            security_id="SZ000001"
+        )[0].source_producing_task_id
+        self.assertIsInstance(source_task_id, str)
+        assert isinstance(source_task_id, str)
+        waiting_dependencies = FormalWorkerDependencies(
+            store=TemporarilyUnverifiedSourceStore(store, source_task_id),
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        pending_type = getattr(_formal_deep_worker, "FeatureSourcePending", None)
+        self.assertTrue(
+            isinstance(pending_type, type) and issubclass(pending_type, ValueError),
+            "D3 must distinguish a source task that D4 should hold and retry",
+        )
+        transport_count = len(transport.requests)
+
+        with self.assertRaises(pending_type):
+            _formal_deep_worker.reconstruct_formal_feature_bundle(
+                waiting_dependencies, leased_feature
+            )
+
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(store.get_formal_task(leased_feature["id"])["status"], "leased")
+
+    def test_feature_reconstruction_requires_a_source_statement_audit_link(self) -> None:
+        """An orphan equivalent payload must not bypass the statement→feature audit trail."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        ready_dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        execute_queued_formal_work(ready_dependencies, worker_id="source-worker", max_jobs=1)
+        leased_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "feature-worker", 120
+        )
+        self.assertIsNotNone(leased_feature)
+        assert leased_feature is not None
+        source_task_id = store.list_formal_financial_facts(
+            security_id="SZ000001"
+        )[0].source_producing_task_id
+        self.assertIsInstance(source_task_id, str)
+        assert isinstance(source_task_id, str)
+        orphan_dependencies = FormalWorkerDependencies(
+            store=OrphanFeatureResultStore(store, source_task_id),
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        transport_count = len(transport.requests)
+
+        with self.assertRaisesRegex(ValueError, "audit link"):
+            _formal_deep_worker.reconstruct_formal_feature_bundle(
+                orphan_dependencies, leased_feature
+            )
+
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(store.get_formal_task(leased_feature["id"])["status"], "leased")
+
+    def test_feature_reconstruction_keeps_nonofficial_registry_as_blocked_bundle(self) -> None:
+        """D3 replay verifies signed test evidence without treating it as release eligible."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self, registry_purpose="test")
+        source_spec = FormalTaskSpec.from_payload(payload)
+        source_task_id = store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        leased_source = store.lease_next_formal_task(
+            ("formal_statement",), "nonofficial-source-worker", 120
+        )
+        self.assertIsNotNone(leased_source)
+        runtime = runtime_loader.load(manifest_hash)
+        request = OfficialRequest(
+            "cninfo", "profit_sheet", "SZ000001", "2025-12-31", "SZ"
+        )
+        fetch, verification, _document = runtime.source_adapter.fetch_verified(
+            request,
+            refresh_generation=payload.refresh_generation,
+            calendar_binding=None,
+        )
+        snapshot = snapshots.persist_verified(
+            fetch,
+            verification,
+            producing_task_id=source_task_id,
+            worker_id="nonofficial-source-worker",
+        )
+        document = runtime.source_adapter.parse_verified_snapshot(
+            snapshot,
+            snapshots.read_verified_raw(snapshot),
+            calendar_binding=None,
+        )
+        extraction = extract_formal_financial_facts(
+            document,
+            snapshot,
+            runtime.mapping_registry,
+            snapshot.captured_at_utc,
+        )
+        store.insert_formal_financial_facts(extraction.facts)
+        feature_task_ids = enqueue_formal_feature_build(
+            store,
+            security_id=payload.security_id,
+            as_of_utc=payload.as_of_utc,
+            runtime=runtime,
+            facts=store.list_formal_financial_facts(security_id=payload.security_id),
+        )
+        store.complete_formal_task(
+            source_task_id,
+            "nonofficial-source-worker",
+            {
+                "fact_ids": [fact.id for fact in extraction.facts],
+                "feature_task_ids": list(feature_task_ids),
+                "kind": "formal_statement",
+                "manifest_sha256": snapshot.manifest_sha256,
+                "refresh_generation": payload.refresh_generation,
+                "registry_manifest_hash": payload.registry_manifest_hash,
+                "security_id": payload.security_id,
+                "snapshot_id": snapshot.snapshot_id,
+            },
+        )
+        leased_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "nonofficial-feature-worker", 120
+        )
+        self.assertIsNotNone(leased_feature)
+        assert leased_feature is not None
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        transport_count = len(transport.requests)
+
+        bundle = _formal_deep_worker.reconstruct_formal_feature_bundle(
+            dependencies, leased_feature
+        )
+
+        self.assertIn("feature_registry_not_release_eligible", bundle.blockers)
+        self.assertTrue(bundle.values)
+        self.assertTrue(all(value.status == "blocked" for value in bundle.values))
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(store.get_formal_task(leased_feature["id"])["status"], "leased")
+
+    def test_feature_reconstruction_rejects_complete_v6_fact_set_drift_before_build(self) -> None:
+        """Comparing only selected IDs would silently accept an extra fact in a frozen snapshot."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        execute_queued_formal_work(dependencies, worker_id="source-worker", max_jobs=1)
+        original_fact = store.list_formal_financial_facts(security_id="SZ000001")[0]
+        extra_wire = original_fact.to_dict()
+        extra_wire.pop("id")
+        extra_wire["metric_key"] = "unreplayed_extra_metric"
+        store.insert_formal_financial_facts((FormalFinancialFact.create(**extra_wire),))
+        runtime = runtime_loader.load(manifest_hash)
+        enqueue_formal_feature_build(
+            store,
+            security_id="SZ000001",
+            as_of_utc=AS_OF,
+            runtime=runtime,
+            facts=store.list_formal_financial_facts(security_id="SZ000001"),
+        )
+        leased_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "feature-worker", 120
+        )
+        self.assertIsNotNone(leased_feature)
+        assert leased_feature is not None
+        transport_count = len(transport.requests)
+
+        with self.assertRaisesRegex(ValueError, "facts do not match V6"):
+            _formal_deep_worker.reconstruct_formal_feature_bundle(
+                dependencies, leased_feature
+            )
+
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(store.get_formal_task(leased_feature["id"])["status"], "leased")
+
+    def test_feature_reconstruction_rejects_old_generation_before_raw_replay(self) -> None:
+        """Reusing a pre-D1-generation task would bypass the frozen history semantics."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        execute_queued_formal_work(dependencies, worker_id="source-worker", max_jobs=1)
+        current_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "current-feature-worker", 120
+        )
+        self.assertIsNotNone(current_feature)
+        assert current_feature is not None
+        current_wire = current_feature["payload"]
+        stale_payload = FormalFeatureBuildTaskPayload(
+            security_id=current_wire["security_id"],
+            as_of_utc=current_wire["as_of_utc"],
+            template_id=current_wire["template_id"],
+            source_registry_hash=current_wire["source_registry_hash"],
+            mapping_registry_hash=current_wire["mapping_registry_hash"],
+            feature_registry_hash=current_wire["feature_registry_hash"],
+            registry_manifest_hash=current_wire["registry_manifest_hash"],
+            source_snapshot_ids=tuple(current_wire["source_snapshot_ids"]),
+            refresh_generation="0" * 64,
+        )
+        stale_spec = FormalTaskSpec.from_payload(stale_payload)
+        store.enqueue_formal_task(
+            stale_spec.kind,
+            stale_spec.idempotency_key,
+            stale_spec.refresh_generation,
+            stale_spec.payload,
+            stale_spec.prerequisite_task_ids,
+        )
+        leased_stale = store.lease_next_formal_task(
+            ("formal_feature_build",), "stale-feature-worker", 120
+        )
+        self.assertIsNotNone(leased_stale)
+        assert leased_stale is not None
+        transport_count = len(transport.requests)
+        parse_count = len(parser.calls)
+
+        with self.assertRaisesRegex(ValueError, "generation no longer matches V6"):
+            _formal_deep_worker.reconstruct_formal_feature_bundle(
+                dependencies, leased_stale
+            )
+
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(len(parser.calls), parse_count)
+        self.assertEqual(store.get_formal_task(leased_stale["id"])["status"], "leased")
+
+    def test_feature_reconstruction_rejects_parser_fact_drift_before_build(self) -> None:
+        """Accepting a changed parser document would make verified raw bytes insufficient evidence."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        execute_queued_formal_work(dependencies, worker_id="source-worker", max_jobs=1)
+        leased_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "feature-worker", 120
+        )
+        self.assertIsNotNone(leased_feature)
+        assert leased_feature is not None
+        parser.document = _formal_source_tests.timestamp_document(
+            declared_security_id="SZ000001",
+            declared_period="2025-12-31",
+            accounting_basis="consolidated",
+            rows=({"ITEM": "OPERATING_PROFIT", "VALUE": 101},),
+        )
+        transport_count = len(transport.requests)
+
+        with self.assertRaisesRegex(ValueError, "facts do not match V6"):
+            _formal_deep_worker.reconstruct_formal_feature_bundle(
+                dependencies, leased_feature
+            )
+
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(store.get_formal_task(leased_feature["id"])["status"], "leased")
+
+    def test_feature_reconstruction_rejects_raw_byte_drift_before_parser_build(self) -> None:
+        """Calling a parser on bytes that no longer hash to the frozen snapshot is unsafe."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        ready_dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        execute_queued_formal_work(ready_dependencies, worker_id="source-worker", max_jobs=1)
+        leased_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "feature-worker", 120
+        )
+        self.assertIsNotNone(leased_feature)
+        assert leased_feature is not None
+        drift_dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=RawBytesDriftSnapshots(snapshots),
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        transport_count = len(transport.requests)
+
+        with self.assertRaisesRegex(FormalTerminalSourceError, "SHA-256"):
+            _formal_deep_worker.reconstruct_formal_feature_bundle(
+                drift_dependencies, leased_feature
+            )
+
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(store.get_formal_task(leased_feature["id"])["status"], "leased")
+
+    def test_feature_reconstruction_passes_replayed_issues_to_the_builder(self) -> None:
+        """Replacing reconstruction issues with an empty tuple would turn unsafe input into a clean bundle."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(
+            self,
+            document_rows=(
+                {"ITEM": "OPERATING_PROFIT", "VALUE": 100},
+                {"ITEM": "UNKNOWN_LINE", "VALUE": 7},
+            ),
+        )
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        execute_queued_formal_work(dependencies, worker_id="source-worker", max_jobs=1)
+        leased_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "feature-worker", 120
+        )
+        self.assertIsNotNone(leased_feature)
+        assert leased_feature is not None
+        transport_count = len(transport.requests)
+
+        bundle = _formal_deep_worker.reconstruct_formal_feature_bundle(
+            dependencies, leased_feature
+        )
+
+        self.assertIn("formal_fact_issue_unknown_source_field", bundle.blockers)
+        self.assertTrue(all(value.status == "blocked" for value in bundle.values))
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(store.get_formal_task(leased_feature["id"])["status"], "leased")
+
+    def test_feature_reconstruction_derives_from_four_fy_and_eight_quarters(self) -> None:
+        """Dropping the D1 history gate or a frozen statement would incorrectly change this result."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payloads,
+        ) = history_ready_feature_execution_fixture(self)
+        for payload in payloads:
+            spec = FormalTaskSpec.from_payload(payload)
+            store.enqueue_formal_task(
+                spec.kind,
+                spec.idempotency_key,
+                spec.refresh_generation,
+                spec.payload,
+                spec.prerequisite_task_ids,
+            )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="history-source-worker", max_jobs=len(payloads)
+        )
+        self.assertEqual(summary.verified_statement_count, len(payloads))
+        leased_feature = store.lease_next_formal_task(
+            ("formal_feature_build",), "history-feature-worker", 120
+        )
+        self.assertIsNotNone(leased_feature)
+        assert leased_feature is not None
+        transport_count = len(transport.requests)
+
+        bundle = _formal_deep_worker.reconstruct_formal_feature_bundle(
+            dependencies, leased_feature
+        )
+
+        self.assertEqual(bundle.history_endpoints, (
+            "2022-12-31",
+            "2023-12-31",
+            "2024-12-31",
+            "2025-12-31",
+        ))
+        self.assertEqual(bundle.comparable_quarter_keys[:2], ("2024Q1", "2024Q2"))
+        self.assertEqual(bundle.comparable_quarter_keys[-8:], (
+            "2024Q3",
+            "2024Q4",
+            "2025Q1",
+            "2025Q2",
+            "2025Q3",
+            "2025Q4",
+            "2026Q1",
+            "2026Q2",
+        ))
+        self.assertEqual(bundle.values[0].status, "derived")
+        self.assertEqual(bundle.values[0].value, 130.0)
+        self.assertEqual(len(transport.requests), transport_count)
+        self.assertEqual(store.get_formal_task(leased_feature["id"])["status"], "leased")
 
     def test_statement_source_block_opens_signed_circuit_and_retries_without_fact_write(self) -> None:
         (

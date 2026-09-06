@@ -20,9 +20,17 @@ from typing import Literal, Protocol
 
 from .formal_evidence import OfficialRequest, OfficialSnapshotRef, VerifiedCalendarBinding
 from .formal_context_schema import FormalContextRequest
-from .formal_feature_contract import SignedFormalFeatureRegistry, load_signed_feature_registry
-from .formal_financial_features import select_visible_formal_facts
+from .formal_feature_contract import (
+    FormalFeatureBundle,
+    SignedFormalFeatureRegistry,
+    load_signed_feature_registry,
+)
+from .formal_financial_features import (
+    build_formal_feature_bundle,
+    select_visible_formal_facts,
+)
 from .formal_financial_schema import (
+    FormalFactIssue,
     FormalFinancialFact,
     SignedFinancialMappingRegistry,
     extract_formal_financial_facts,
@@ -63,6 +71,10 @@ _FEATURE_HISTORY_GATE_VERSION = "formal-history-gate-noncyclic-v1"
 
 class CalendarBindingPending(ValueError):
     """A signed date-only request cannot proceed until its calendar is verified."""
+
+
+class FeatureSourcePending(ValueError):
+    """A frozen feature task must wait for its statement evidence to verify."""
 
 
 class _LostFormalTaskLease(RuntimeError):
@@ -924,6 +936,30 @@ def _statement_payload_from_wire(value: object) -> FormalStatementTaskPayload:
     )
 
 
+def _feature_payload_from_wire(value: object) -> FormalFeatureBuildTaskPayload:
+    """Restore only the exact persisted JSON shape for a feature build task."""
+
+    if type(value) is not dict:
+        raise ValueError("formal feature task payload must be an exact JSON object")
+    expected_fields = {item.name for item in fields(FormalFeatureBuildTaskPayload)}
+    if set(value) != expected_fields:
+        raise ValueError("formal feature task payload fields are invalid")
+    snapshot_ids = value["source_snapshot_ids"]
+    if type(snapshot_ids) is not list:
+        raise ValueError("formal feature task source snapshot IDs must be a JSON array")
+    return FormalFeatureBuildTaskPayload(
+        security_id=value["security_id"],
+        as_of_utc=value["as_of_utc"],
+        template_id=value["template_id"],
+        source_registry_hash=value["source_registry_hash"],
+        mapping_registry_hash=value["mapping_registry_hash"],
+        feature_registry_hash=value["feature_registry_hash"],
+        registry_manifest_hash=value["registry_manifest_hash"],
+        source_snapshot_ids=tuple(snapshot_ids),
+        refresh_generation=value["refresh_generation"],
+    )
+
+
 def _decode_leased_statement_task(task: object) -> tuple[str, FormalStatementTaskPayload]:
     if type(task) is not dict:
         raise ValueError("leased formal task must be an exact JSON object")
@@ -939,6 +975,27 @@ def _decode_leased_statement_task(task: object) -> tuple[str, FormalStatementTas
         or _canonical_bytes(task["payload"]) != _canonical_bytes(spec.payload)
     ):
         raise ValueError("leased formal statement task does not match its canonical payload")
+    return task_id, payload
+
+
+def _decode_leased_feature_task(
+    task: object,
+) -> tuple[str, FormalFeatureBuildTaskPayload]:
+    if type(task) is not dict:
+        raise ValueError("leased formal task must be an exact JSON object")
+    if task.get("kind") != "formal_feature_build" or task.get("status") != "leased":
+        raise ValueError("leased task is not a formal feature build")
+    task_id = _require_text(task.get("id"), "formal feature task id")
+    payload = _feature_payload_from_wire(task.get("payload"))
+    spec = FormalTaskSpec.from_payload(payload)
+    if (
+        task.get("idempotency_key") != spec.idempotency_key
+        or task.get("refresh_generation") != spec.refresh_generation
+        or task.get("prerequisite_task_ids") != []
+        or task.get("prerequisite_task_ids") != list(spec.prerequisite_task_ids)
+        or _canonical_bytes(task["payload"]) != _canonical_bytes(spec.payload)
+    ):
+        raise ValueError("leased formal feature task does not match its canonical payload")
     return task_id, payload
 
 
@@ -999,7 +1056,11 @@ def _require_statement_snapshot_identity(
 def _validated_statement_runtime(
     dependencies: FormalWorkerDependencies,
     payload: FormalStatementTaskPayload,
+    *,
+    require_official: bool = True,
 ) -> tuple[FormalRegistryRuntime, OfficialRequest, object]:
+    if type(require_official) is not bool:
+        raise ValueError("formal statement runtime official requirement must be boolean")
     if type(dependencies.registry_runtime_loader) is not FormalRegistryRuntimeLoader:
         raise ValueError("formal statement worker requires the exact runtime loader")
     runtime = dependencies.registry_runtime_loader.load(
@@ -1008,7 +1069,8 @@ def _validated_statement_runtime(
     )
     if type(runtime) is not FormalRegistryRuntime:
         raise ValueError("formal statement runtime loader returned an invalid runtime")
-    runtime.bundle.require_official()
+    if require_official:
+        runtime.bundle.require_official()
     manifest = runtime.bundle.manifest
     if (
         manifest.manifest_hash != payload.registry_manifest_hash
@@ -1054,6 +1116,117 @@ def _validated_statement_runtime(
     return runtime, request, config
 
 
+def _validated_feature_runtime(
+    dependencies: FormalWorkerDependencies,
+    payload: FormalFeatureBuildTaskPayload,
+) -> FormalRegistryRuntime:
+    if type(dependencies.registry_runtime_loader) is not FormalRegistryRuntimeLoader:
+        raise ValueError("formal feature worker requires the exact runtime loader")
+    runtime = dependencies.registry_runtime_loader.load(payload.registry_manifest_hash)
+    if type(runtime) is not FormalRegistryRuntime:
+        raise ValueError("formal feature runtime loader returned an invalid runtime")
+    manifest = runtime.bundle.manifest
+    if (
+        manifest.manifest_hash != payload.registry_manifest_hash
+        or manifest.source_registry_hash != payload.source_registry_hash
+        or manifest.mapping_registry_hash != payload.mapping_registry_hash
+        or manifest.feature_registry_hash != payload.feature_registry_hash
+        or runtime.source_adapter.source_registry_hash != payload.source_registry_hash
+        or runtime.mapping_registry.registry_hash != payload.mapping_registry_hash
+        or runtime.feature_registry.registry_hash != payload.feature_registry_hash
+    ):
+        raise ValueError("formal feature runtime registry hashes do not match payload")
+    return runtime
+
+
+def _fact_wire_without_created_at(fact: object) -> dict[str, object]:
+    if type(fact) is not FormalFinancialFact:
+        raise ValueError("frozen feature replay requires exact formal facts")
+    wire = fact.to_dict()
+    wire.pop("created_at_utc")
+    return wire
+
+
+def _canonical_fact_set(
+    facts: tuple[FormalFinancialFact, ...],
+) -> dict[str, bytes]:
+    result: dict[str, bytes] = {}
+    for fact in facts:
+        wire = _fact_wire_without_created_at(fact)
+        fact_id = _require_hash(wire.get("id"), "formal fact id")
+        encoded = _canonical_bytes(wire)
+        prior = result.setdefault(fact_id, encoded)
+        if prior != encoded:
+            raise ValueError("formal fact ID has conflicting frozen content")
+    return result
+
+
+def _decode_verified_statement_task(
+    task: object,
+) -> tuple[str, FormalStatementTaskPayload, dict[str, object]]:
+    if type(task) is not dict:
+        raise ValueError("source formal task must be an exact JSON object")
+    if task.get("kind") != "formal_statement":
+        raise ValueError("frozen feature source task is not a formal statement")
+    if task.get("status") in {"pending", "leased", "retryable_failed"}:
+        raise FeatureSourcePending("frozen feature source statement is not verified")
+    if task.get("status") != "verified":
+        raise ValueError("frozen feature source statement is not verified")
+    if (
+        task.get("error") is not None
+        or task.get("lease_worker") is not None
+        or task.get("lease_expires_at") is not None
+        or task.get("next_retry_at") is not None
+    ):
+        raise ValueError("verified source statement has mutable task state")
+    task_id = _require_text(task.get("id"), "source formal statement task id")
+    result = task.get("result")
+    if type(result) is not dict:
+        raise ValueError("verified source statement result is invalid")
+    expected_result_fields = {
+        "fact_ids",
+        "feature_task_ids",
+        "kind",
+        "manifest_sha256",
+        "refresh_generation",
+        "registry_manifest_hash",
+        "security_id",
+        "snapshot_id",
+    }
+    if set(result) != expected_result_fields:
+        raise ValueError("verified source statement result fields are invalid")
+    if (
+        result["kind"] != "formal_statement"
+        or type(result["fact_ids"]) is not list
+        or type(result["feature_task_ids"]) is not list
+        or len(set(result["fact_ids"])) != len(result["fact_ids"])
+        or len(set(result["feature_task_ids"])) != len(result["feature_task_ids"])
+    ):
+        raise ValueError("verified source statement result is invalid")
+    for value in result["fact_ids"]:
+        _require_hash(value, "source statement fact id")
+    for value in result["feature_task_ids"]:
+        _require_text(value, "source statement feature task id")
+    payload = _statement_payload_from_wire(task.get("payload"))
+    spec = FormalTaskSpec.from_payload(payload)
+    if (
+        task.get("idempotency_key") != spec.idempotency_key
+        or task.get("refresh_generation") != spec.refresh_generation
+        or task.get("prerequisite_task_ids") != list(spec.prerequisite_task_ids)
+        or _canonical_bytes(task["payload"]) != _canonical_bytes(spec.payload)
+    ):
+        raise ValueError("verified source statement does not match its canonical payload")
+    if (
+        result["refresh_generation"] != payload.refresh_generation
+        or result["registry_manifest_hash"] != payload.registry_manifest_hash
+        or result["security_id"] != payload.security_id
+    ):
+        raise ValueError("verified source statement result does not match payload")
+    _require_text(result["snapshot_id"], "source statement snapshot id")
+    _require_hash(result["manifest_sha256"], "source statement manifest hash")
+    return task_id, payload, result
+
+
 def _feature_refresh_generation(
     facts: tuple[FormalFinancialFact, ...],
     registry_manifest_hash: str,
@@ -1081,6 +1254,132 @@ def _feature_refresh_generation(
         "selected_statement_snapshots": [snapshots[item] for item in snapshot_ids],
     }
     return hashlib.sha256(_canonical_bytes(wire)).hexdigest(), snapshot_ids
+
+
+def reconstruct_formal_feature_bundle(
+    dependencies: FormalWorkerDependencies,
+    leased_task: dict[str, object],
+) -> FormalFeatureBundle:
+    """Replay a frozen V6 feature task locally without lease, transport, or publication."""
+
+    if type(dependencies) is not FormalWorkerDependencies:
+        raise ValueError("formal feature reconstruction requires exact worker dependencies")
+    feature_task_id, payload = _decode_leased_feature_task(leased_task)
+    feature_runtime = _validated_feature_runtime(dependencies, payload)
+    list_facts = getattr(dependencies.store, "list_formal_financial_facts", None)
+    get_snapshot = getattr(dependencies.store, "get_formal_snapshot", None)
+    get_task = getattr(dependencies.store, "get_formal_task", None)
+    get_receipt = getattr(dependencies.store, "get_formal_task_snapshot_receipt", None)
+    read_raw = getattr(dependencies.snapshots, "read_verified_raw", None)
+    if not all(callable(item) for item in (list_facts, get_snapshot, get_task, get_receipt, read_raw)):
+        raise ValueError("formal feature reconstruction requires verified fact and snapshot persistence")
+    current_facts = list_facts(security_id=payload.security_id)
+    if type(current_facts) is not tuple or any(
+        type(fact) is not FormalFinancialFact for fact in current_facts
+    ):
+        raise ValueError("formal feature reconstruction received invalid V6 facts")
+    selected = select_visible_formal_facts(current_facts, payload.as_of_utc).facts
+    generation, snapshot_ids = _feature_refresh_generation(
+        selected, payload.registry_manifest_hash
+    )
+    if (
+        generation != payload.refresh_generation
+        or snapshot_ids != payload.source_snapshot_ids
+    ):
+        raise ValueError("frozen feature task generation no longer matches V6 facts")
+
+    persisted_by_snapshot: dict[str, tuple[FormalFinancialFact, ...]] = {}
+    for snapshot_id in payload.source_snapshot_ids:
+        persisted_by_snapshot[snapshot_id] = tuple(
+            fact
+            for fact in current_facts
+            if fact.to_dict()["source_snapshot_id"] == snapshot_id
+        )
+    reconstructed_facts: list[FormalFinancialFact] = []
+    reconstructed_issues: list[FormalFactIssue] = []
+    source_audit_linked = False
+    for snapshot_id in payload.source_snapshot_ids:
+        snapshot = get_snapshot(snapshot_id)
+        if type(snapshot) is not OfficialSnapshotRef:
+            raise ValueError("frozen feature snapshot is absent or invalid")
+        source_task_id = _require_text(
+            snapshot.producing_task_id, "frozen feature source task id"
+        )
+        source_task_id_from_task, source_payload, source_result = _decode_verified_statement_task(
+            get_task(source_task_id)
+        )
+        if source_task_id_from_task != source_task_id:
+            raise ValueError("frozen feature source task identity does not match snapshot")
+        if (
+            source_payload.security_id != payload.security_id
+            or source_payload.as_of_utc != payload.as_of_utc
+            or source_payload.registry_manifest_hash != payload.registry_manifest_hash
+            or source_payload.source_registry_hash != payload.source_registry_hash
+            or source_payload.mapping_registry_hash != payload.mapping_registry_hash
+        ):
+            raise ValueError("frozen feature source task does not match feature payload")
+        receipt = get_receipt(source_task_id)
+        request = _statement_request(source_payload)
+        snapshot = _require_statement_snapshot_identity(
+            receipt,
+            snapshot,
+            task_id=source_task_id,
+            payload=source_payload,
+            request=request,
+        )
+        if (
+            source_result["snapshot_id"] != snapshot.snapshot_id
+            or source_result["manifest_sha256"] != snapshot.manifest_sha256
+        ):
+            raise ValueError("verified source statement result does not match snapshot")
+        if feature_task_id in source_result["feature_task_ids"]:
+            source_audit_linked = True
+        source_runtime, _request, _config = _validated_statement_runtime(
+            dependencies, source_payload, require_official=False
+        )
+        raw_bytes = read_raw(snapshot)
+        document = source_runtime.source_adapter.parse_verified_snapshot(
+            snapshot,
+            raw_bytes,
+            calendar_binding=source_payload.calendar_binding,
+        )
+        extraction = extract_formal_financial_facts(
+            document,
+            snapshot,
+            source_runtime.mapping_registry,
+            snapshot.captured_at_utc,
+        )
+        if _canonical_fact_set(extraction.facts) != _canonical_fact_set(
+            persisted_by_snapshot[snapshot_id]
+        ):
+            raise ValueError("frozen feature replay facts do not match V6 persistence")
+        if tuple(fact.id for fact in extraction.facts) != tuple(source_result["fact_ids"]):
+            raise ValueError("verified source statement result fact IDs do not match replay")
+        reconstructed_facts.extend(extraction.facts)
+        reconstructed_issues.extend(extraction.issues)
+
+    if not source_audit_linked:
+        raise ValueError("frozen feature task has no source statement audit link")
+
+    bundle = build_formal_feature_bundle(
+        security_id=payload.security_id,
+        as_of_utc=payload.as_of_utc,
+        template_id=payload.template_id,
+        facts=tuple(reconstructed_facts),
+        issues=tuple(reconstructed_issues),
+        registry=feature_runtime.feature_registry,
+        registry_manifest=feature_runtime.bundle.manifest,
+    )
+    if (
+        type(bundle) is not FormalFeatureBundle
+        or bundle.security_id != payload.security_id
+        or bundle.as_of_utc != payload.as_of_utc
+        or bundle.template_id != payload.template_id
+        or bundle.registry_manifest_hash != payload.registry_manifest_hash
+        or bundle.feature_registry_hash != payload.feature_registry_hash
+    ):
+        raise ValueError("reconstructed feature bundle does not match frozen task")
+    return bundle
 
 
 def enqueue_formal_feature_build(
@@ -1576,10 +1875,11 @@ def execute_queued_formal_work(
 
 
 __all__ = [
-    "CalendarBindingPending", "FormalCollectionSummary", "FormalContextTaskPayload", "FormalFeatureBuildTaskPayload",
+    "CalendarBindingPending", "FeatureSourcePending", "FormalCollectionSummary", "FormalContextTaskPayload", "FormalFeatureBuildTaskPayload",
     "FormalRegistryRuntime", "FormalRegistryRuntimeLoader", "FormalStatementTaskPayload", "FormalTaskSpec",
     "FormalUniverseFinalizeTaskPayload", "FormalUniverseSourceResolution", "FormalUniverseSourceTaskPayload",
     "FormalWorkerDependencies", "SignedUniverseRequestResolver", "derive_collection_refresh_generation",
     "enqueue_formal_feature_build", "enqueue_frozen_formal_universe", "execute_queued_formal_work",
     "formal_context_task_specs", "formal_statement_task_specs", "formal_universe_task_specs",
+    "reconstruct_formal_feature_bundle",
 ]
