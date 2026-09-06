@@ -22,6 +22,7 @@ from ashare_pipeline.formal_deep_worker import (
     FormalUniverseFinalizeTaskPayload,
     FormalUniverseSourceTaskPayload,
     derive_collection_refresh_generation,
+    enqueue_formal_feature_build,
     execute_queued_formal_work,
     formal_context_task_specs,
     formal_statement_task_specs,
@@ -57,6 +58,33 @@ def canonical_bytes(value: object) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
+
+
+def legacy_feature_refresh_generation(
+    facts: tuple[object, ...], registry_manifest_hash: str
+) -> tuple[str, tuple[str, ...]]:
+    """Hand-derived pre-D1 feature-task identity, retained only for migration coverage."""
+
+    snapshots: dict[str, dict[str, str]] = {}
+    fact_ids: list[str] = []
+    for fact in facts:
+        wire = fact.to_dict()
+        fact_ids.append(wire["id"])
+        snapshot = {
+            "content_sha256": wire["source_content_sha256"],
+            "refresh_generation": wire["source_refresh_generation"],
+            "snapshot_id": wire["source_snapshot_id"],
+        }
+        prior = snapshots.setdefault(snapshot["snapshot_id"], snapshot)
+        if prior != snapshot:
+            raise AssertionError("fixture has conflicting legacy snapshot lineage")
+    snapshot_ids = tuple(sorted(snapshots))
+    wire = {
+        "formal_fact_ids": sorted(set(fact_ids)),
+        "registry_manifest_hash": registry_manifest_hash,
+        "selected_statement_snapshots": [snapshots[item] for item in snapshot_ids],
+    }
+    return hashlib.sha256(canonical_bytes(wire)).hexdigest(), snapshot_ids
 
 
 class AcceptingVerifier:
@@ -1430,6 +1458,158 @@ class FormalDeepWorkerContractTests(unittest.TestCase):
             [task["status"] for task in feature_tasks if task["id"] != first_feature["id"]],
             ["pending"],
         )
+
+    def test_history_gate_rekeys_legacy_feature_input_and_preserves_verified_history(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            _transport,
+            _parser,
+            manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        execute_queued_formal_work(dependencies, worker_id="legacy-source-worker", max_jobs=1)
+        facts = store.list_formal_financial_facts(security_id="SZ000001")
+        legacy_generation, snapshot_ids = legacy_feature_refresh_generation(facts, manifest_hash)
+        post_d1_task = store.list_formal_tasks(kinds=("formal_feature_build",))[0]
+        legacy_verified_payload = FormalFeatureBuildTaskPayload(
+            security_id="SZ000001",
+            as_of_utc=AS_OF,
+            template_id="general_nonfinancial",
+            source_registry_hash=post_d1_task["payload"]["source_registry_hash"],
+            mapping_registry_hash=post_d1_task["payload"]["mapping_registry_hash"],
+            feature_registry_hash=post_d1_task["payload"]["feature_registry_hash"],
+            registry_manifest_hash=manifest_hash,
+            source_snapshot_ids=snapshot_ids,
+            refresh_generation=legacy_generation,
+        )
+        legacy_verified_spec = FormalTaskSpec.from_payload(legacy_verified_payload)
+        self.assertNotEqual(post_d1_task["refresh_generation"], legacy_generation)
+        self.assertNotEqual(post_d1_task["idempotency_key"], legacy_verified_spec.idempotency_key)
+        leased = store.lease_next_formal_task(
+            ("formal_feature_build",), "post-d1-feature-worker", 120
+        )
+        self.assertEqual(leased["id"], post_d1_task["id"])
+        store.complete_formal_task(
+            post_d1_task["id"], "post-d1-feature-worker", {"outcome": "post-d1"}
+        )
+        legacy_verified_id = store.enqueue_formal_task(
+            legacy_verified_spec.kind,
+            legacy_verified_spec.idempotency_key,
+            legacy_verified_spec.refresh_generation,
+            legacy_verified_spec.payload,
+            legacy_verified_spec.prerequisite_task_ids,
+        )
+        leased = store.lease_next_formal_task(
+            ("formal_feature_build",), "legacy-feature-worker", 120
+        )
+        self.assertEqual(leased["id"], legacy_verified_id)
+        store.complete_formal_task(
+            legacy_verified_id, "legacy-feature-worker", {"outcome": "legacy"}
+        )
+
+        legacy_retry_payload = replace(
+            legacy_verified_payload,
+            source_snapshot_ids=("legacy-retry-snapshot",),
+            refresh_generation=hashlib.sha256(b"legacy-retry-input").hexdigest(),
+        )
+        legacy_retry_spec = FormalTaskSpec.from_payload(legacy_retry_payload)
+        legacy_retry_id = store.enqueue_formal_task(
+            legacy_retry_spec.kind,
+            legacy_retry_spec.idempotency_key,
+            legacy_retry_spec.refresh_generation,
+            legacy_retry_spec.payload,
+            legacy_retry_spec.prerequisite_task_ids,
+        )
+        leased = store.lease_next_formal_task(
+            ("formal_feature_build",), "legacy-retry-worker", 120
+        )
+        self.assertEqual(leased["id"], legacy_retry_id)
+        store.fail_formal_task(
+            legacy_retry_id,
+            "legacy-retry-worker",
+            {"code": "legacy_retry"},
+            "retryable_failed",
+            "2026-09-01T00:00:00+00:00",
+        )
+
+        legacy_pending_payload = replace(
+            legacy_verified_payload,
+            source_snapshot_ids=("legacy-other-snapshot",),
+            refresh_generation=hashlib.sha256(b"legacy-other-input").hexdigest(),
+        )
+        legacy_pending_spec = FormalTaskSpec.from_payload(legacy_pending_payload)
+        legacy_pending_id = store.enqueue_formal_task(
+            legacy_pending_spec.kind,
+            legacy_pending_spec.idempotency_key,
+            legacy_pending_spec.refresh_generation,
+            legacy_pending_spec.payload,
+            legacy_pending_spec.prerequisite_task_ids,
+        )
+        different_template = replace(legacy_pending_payload, template_id="bank")
+        different_template_spec = FormalTaskSpec.from_payload(different_template)
+        different_template_id = store.enqueue_formal_task(
+            different_template_spec.kind,
+            different_template_spec.idempotency_key,
+            different_template_spec.refresh_generation,
+            different_template_spec.payload,
+            different_template_spec.prerequisite_task_ids,
+        )
+        different_security = replace(legacy_pending_payload, security_id="SZ000002")
+        different_security_spec = FormalTaskSpec.from_payload(different_security)
+        different_security_id = store.enqueue_formal_task(
+            different_security_spec.kind,
+            different_security_spec.idempotency_key,
+            different_security_spec.refresh_generation,
+            different_security_spec.payload,
+            different_security_spec.prerequisite_task_ids,
+        )
+        different_as_of = replace(
+            legacy_pending_payload, as_of_utc="2026-08-30T07:00:00+00:00"
+        )
+        different_as_of_spec = FormalTaskSpec.from_payload(different_as_of)
+        different_as_of_id = store.enqueue_formal_task(
+            different_as_of_spec.kind,
+            different_as_of_spec.idempotency_key,
+            different_as_of_spec.refresh_generation,
+            different_as_of_spec.payload,
+            different_as_of_spec.prerequisite_task_ids,
+        )
+
+        runtime = runtime_loader.load(manifest_hash)
+        task_ids = enqueue_formal_feature_build(
+            store,
+            security_id="SZ000001",
+            as_of_utc=AS_OF,
+            runtime=runtime,
+            facts=facts,
+        )
+
+        rebuilt = store.get_formal_task(task_ids[0])
+        self.assertNotEqual(rebuilt["refresh_generation"], legacy_generation)
+        self.assertNotEqual(rebuilt["idempotency_key"], legacy_verified_spec.idempotency_key)
+        self.assertEqual(store.get_formal_task(legacy_verified_id)["status"], "verified")
+        self.assertEqual(store.get_formal_task(legacy_pending_id)["status"], "superseded")
+        self.assertEqual(store.get_formal_task(legacy_retry_id)["status"], "superseded")
+        self.assertEqual(store.get_formal_task(different_template_id)["status"], "pending")
+        self.assertEqual(store.get_formal_task(different_security_id)["status"], "pending")
+        self.assertEqual(store.get_formal_task(different_as_of_id)["status"], "pending")
 
     def test_statement_source_block_opens_signed_circuit_and_retries_without_fact_write(self) -> None:
         (

@@ -56,6 +56,9 @@ _FORMAL_KINDS = frozenset(
 )
 _STATEMENT_EXECUTION_KINDS = ("formal_statement",)
 _STATEMENT_LEASE_SECONDS = 120
+# D1 seals this exact non-cyclic baseline into formal-feature-input-v2.  Keep
+# the task-generation wire explicit rather than importing D1's private detail.
+_FEATURE_HISTORY_GATE_VERSION = "formal-history-gate-noncyclic-v1"
 
 
 class CalendarBindingPending(ValueError):
@@ -1073,6 +1076,7 @@ def _feature_refresh_generation(
     snapshot_ids = tuple(sorted(snapshots))
     wire = {
         "formal_fact_ids": sorted(set(fact_ids)),
+        "history_gate_version": _FEATURE_HISTORY_GATE_VERSION,
         "registry_manifest_hash": registry_manifest_hash,
         "selected_statement_snapshots": [snapshots[item] for item in snapshot_ids],
     }
