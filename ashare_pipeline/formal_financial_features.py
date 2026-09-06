@@ -26,6 +26,8 @@ from .formal_universe import canonical_security_id
 _UNITS = frozenset({"CNY", "shares", "ratio", "CNY_per_share"})
 _ENDPOINTS = {"Q1": "03-31", "H1": "06-30", "Q3": "09-30", "FY": "12-31"}
 _DERIVATION = "formal-quarter-derivation-v1"
+_HISTORY_GATE = "formal-history-gate-noncyclic-v1"
+_FEATURE_INPUT_SCHEMA = "formal-feature-input-v2"
 _GROUP = ("security_id", "statement", "metric_key", "period_start", "period_end", "period_kind", "unit", "nature", "accounting_basis")
 _ROOT_HASHES = ("source_registry_hash", "mapping_registry_hash", "feature_registry_hash", "scoring_registry_hash", "industry_registry_hash", "cyclic_registry_hash", "redline_registry_hash", "status_registry_hash", "event_registry_hash")
 _ISSUES = frozenset({"required_source_field_missing", "duplicate_source_field", "nonnumeric_value", "invalid_row_shape", "unknown_source_field", "mapping_not_applicable"})
@@ -397,6 +399,17 @@ derive_comparable_quarters = _make_deriver(_construct_quarter)
 del _make_deriver, _construct_quarter
 
 
+def _required_history_quarter_keys(as_of_utc: str) -> tuple[str, ...]:
+    cutoff = datetime.fromisoformat(_utc(as_of_utc)).astimezone(ZoneInfo("Asia/Shanghai")).date()
+    quarter_ends = ("03-31", "06-30", "09-30", "12-31")
+    ended = sum(f"{cutoff.year:04d}-{end}" <= cutoff.isoformat() for end in quarter_ends)
+    latest_index = cutoff.year * 4 + ended - 1
+    return tuple(
+        f"{index // 4:04d}Q{index % 4 + 1}"
+        for index in range(latest_index - 7, latest_index + 1)
+    )
+
+
 def require_formal_history(annual_endpoints, *, comparable_quarter_keys, as_of_utc: str, cyclic: bool) -> FormalHistoryResult:
     cutoff = datetime.fromisoformat(_utc(as_of_utc)).astimezone(ZoneInfo("Asia/Shanghai")).date()
     if type(cyclic) is not bool:
@@ -404,10 +417,7 @@ def require_formal_history(annual_endpoints, *, comparable_quarter_keys, as_of_u
     count = 5 if cyclic else 4
     latest_year = cutoff.year if (cutoff.month, cutoff.day) == (12, 31) else cutoff.year - 1
     required = tuple(f"{year:04d}-12-31" for year in range(latest_year - count + 1, latest_year + 1))
-    quarter_ends = ("03-31", "06-30", "09-30", "12-31")
-    ended = sum(f"{cutoff.year:04d}-{end}" <= cutoff.isoformat() for end in quarter_ends)
-    latest_index = cutoff.year * 4 + ended - 1
-    expected_quarters = tuple(f"{index // 4:04d}Q{index % 4 + 1}" for index in range(latest_index - 7, latest_index + 1))
+    expected_quarters = _required_history_quarter_keys(as_of_utc)
     blockers = set()
     try:
         annuals = tuple(annual_endpoints)
@@ -580,11 +590,30 @@ def build_formal_feature_bundle(*, security_id: str, as_of_utc: str, template_id
         blockers.add("formal_fact_issue_" + wire["code"])
     selection = select_visible_formal_facts((item for item, _ in raw), as_of_utc)
     blockers.update(selection.blockers)
-    untrustworthy = bool(blockers)
-    quarters = derive_comparable_quarters(selection.facts)
-    blockers.update(quarters.blockers)
-    values, ambiguous, identities = {}, set(), {}
     selected = _snapshot_facts(selection.facts)
+    history_window_start_year = _required_history_quarter_keys(as_of_utc)[0][:4]
+    quarter_source_facts = [
+        item for item, wire in selected
+        if wire["period_kind"] in _ENDPOINTS and wire["period_end"][:4] >= history_window_start_year
+    ]
+    quarters = derive_comparable_quarters(quarter_source_facts)
+    blockers.update(quarters.blockers)
+    history_endpoints = tuple(
+        sorted({wire["period_end"] for _, wire in selected if wire["period_kind"] == "FY"})
+    )
+    comparable_quarter_keys = tuple(
+        sorted({q.to_dict()["quarter_key"] for q in quarters.facts})
+    )
+    history_quarter_window = comparable_quarter_keys[-8:]
+    history = require_formal_history(
+        history_endpoints,
+        comparable_quarter_keys=history_quarter_window,
+        as_of_utc=as_of_utc,
+        cyclic=False,
+    )
+    blockers.update(history.blockers)
+    untrustworthy = bool(blockers)
+    values, ambiguous, identities = {}, set(), {}
     formula_inputs = [item for item, wire in selected if wire["period_kind"] == "FY"] + list(quarters.facts)
     for item in formula_inputs:
         key, _, result = _formula_fact(item)
@@ -616,7 +645,7 @@ def build_formal_feature_bundle(*, security_id: str, as_of_utc: str, template_id
             record = {key: wire[key] for key in ("id", "source_snapshot_id", "source_content_sha256", "source_refresh_generation")}
             candidates[_bytes(record)] = record
     input_wire = dict(
-        schema_version="formal-feature-input-v1",
+        schema_version=_FEATURE_INPUT_SCHEMA,
         security_id=security_id,
         as_of_utc=as_of_utc,
         template_id=template_id,
@@ -630,6 +659,16 @@ def build_formal_feature_bundle(*, security_id: str, as_of_utc: str, template_id
         selected_fact_ids=sorted({wire["id"] for _, wire in selected}),
         quarter_ids=sorted(q.to_dict()["id"] for q in quarters.facts),
         derivation_version=_DERIVATION,
+        history_gate={
+            "blockers": list(history.blockers),
+            "cyclic": False,
+            "eligible": history.eligible,
+            "observed_annual_endpoints": list(history_endpoints),
+            "observed_comparable_quarter_keys": list(comparable_quarter_keys),
+            "required_annual_endpoints": list(history.annual_endpoints),
+            "version": _HISTORY_GATE,
+            "window_quarter_keys": list(history_quarter_window),
+        },
         issues=[issue_wires[key] for key in sorted(issue_wires)],
     )
     return FormalFeatureBundle(
@@ -642,8 +681,8 @@ def build_formal_feature_bundle(*, security_id: str, as_of_utc: str, template_id
         feature_registry_hash=feature_hash,
         input_hash=hashlib.sha256(_bytes(input_wire)).hexdigest(),
         values=tuple(output),
-        history_endpoints=tuple(sorted({wire["period_end"] for _, wire in selected if wire["period_kind"] == "FY"})),
-        comparable_quarter_keys=tuple(sorted({q.to_dict()["quarter_key"] for q in quarters.facts})),
+        history_endpoints=history_endpoints,
+        comparable_quarter_keys=comparable_quarter_keys,
         blockers=tuple(sorted(blockers)),
     )
 

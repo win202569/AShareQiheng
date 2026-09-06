@@ -20,6 +20,10 @@ from tests.test_formal_feature_contract import (
 CUTOFF = "2026-08-31T07:00:00+00:00"
 WINDOW = ("2024Q3", "2024Q4", "2025Q1", "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2")
 ANNUALS = tuple(f"{year}-12-31" for year in range(2022, 2026))
+OBSERVED_QUARTERS = (
+    "2024Q1", "2024Q2", "2024Q3", "2024Q4", "2025Q1", "2025Q2",
+    "2025Q3", "2025Q4", "2026Q1", "2026Q2",
+)
 
 
 def fact(kind="FY", value=100.0, year=2025, **changes):
@@ -27,6 +31,20 @@ def fact(kind="FY", value=100.0, year=2025, **changes):
     values = dict(period_start=None if kind == "OTHER" else f"{year}-01-01", period_end=f"{year}-{end}", period_kind=kind, value=value)
     values.update(changes)
     return formal_fact(**values)
+
+
+def history_ready_facts(**changes):
+    """Four FY endpoints plus the raw cumulative facts for the latest eight quarters."""
+    periods = (
+        ("FY", 2022, 70.0),
+        ("FY", 2023, 70.0),
+        ("Q1", 2024, 10.0), ("H1", 2024, 30.0),
+        ("Q3", 2024, 45.0), ("FY", 2024, 70.0),
+        ("Q1", 2025, 10.0), ("H1", 2025, 30.0),
+        ("Q3", 2025, 45.0), ("FY", 2025, 70.0),
+        ("Q1", 2026, 10.0), ("H1", 2026, 30.0),
+    )
+    return tuple(fact(kind, value=value, year=year, **changes) for kind, year, value in periods)
 
 
 def leaf(metric="revenue", period="FY2025"):
@@ -222,6 +240,88 @@ class HistoryTests(unittest.TestCase):
             require_formal_history(ANNUALS, comparable_quarter_keys=WINDOW, as_of_utc=CUTOFF, cyclic=1)
 
 
+class UniversalHistoryGateBuilderTests(unittest.TestCase):
+    def test_history_gate_semantics_change_input_hash_without_order_dependence(self):
+        facts = history_ready_facts()
+        result = bundle(facts)
+
+        self.assertNotEqual(
+            result.input_hash,
+            "2efc7eeccd9d95166b4884be184c179ba947aed089c49267d916a717d0ab3104",
+        )
+        self.assertEqual(result.input_hash, bundle(facts[::-1]).input_hash)
+
+    def test_latest_eight_quarter_window_allows_derived_slots_while_retaining_full_observed_history(self):
+        facts = history_ready_facts()
+        result = bundle(facts)
+        changed_old_fy = tuple(
+            fact("FY", year=2022, value=71.0)
+            if item.to_dict()["period_end"] == "2022-12-31" else item
+            for item in facts
+        )
+
+        self.assertEqual(result.history_endpoints, ANNUALS)
+        self.assertEqual(result.comparable_quarter_keys, OBSERVED_QUARTERS)
+        self.assertNotIn("quarter_missing_prerequisite", result.blockers)
+        self.assertNotEqual(result.input_hash, bundle(changed_old_fy).input_hash)
+        self.assertFalse(any(blocker.startswith("history_") for blocker in result.blockers))
+        self.assertFalse(any(blocker == "pending_evidence/history_not_mature" for blocker in result.blockers))
+        self.assertEqual(result.values[0].status, "derived")
+
+    def test_template_demanding_quarter_before_history_window_remains_fail_closed(self):
+        result = bundle(
+            history_ready_facts(),
+            slots=[
+                slot_wire(
+                    "general_nonfinancial",
+                    suffix="old-quarter",
+                    unit="CNY",
+                    formula=leaf(period="2023Q4").to_dict(),
+                )
+            ],
+        )
+
+        self.assertNotIn("quarter_missing_prerequisite", result.blockers)
+        self.assertEqual(result.values[0].status, "missing")
+        self.assertIsNone(result.values[0].value)
+        self.assertEqual(result.values[0].evidence, ())
+        self.assertEqual(result.values[0].missing_reason, "formula_fact_missing")
+
+    def test_missing_required_fy_blocks_every_slot_even_when_formula_has_fy2025(self):
+        slots = [
+            slot_wire("general_nonfinancial", suffix="a", unit="CNY", formula=leaf().to_dict()),
+            slot_wire("general_nonfinancial", suffix="b", unit="CNY", formula=leaf().to_dict()),
+        ]
+        facts = tuple(
+            item for item in history_ready_facts()
+            if item.to_dict()["period_end"] != "2022-12-31"
+        )
+
+        result = bundle(facts, slots=slots)
+
+        self.assertIn("history_annual_window_incomplete", result.blockers)
+        self.assertIn("pending_evidence/history_not_mature", result.blockers)
+        self.assertTrue(all(value.status == "blocked" for value in result.values))
+        self.assertTrue(all(value.value is None and value.evidence == () for value in result.values))
+
+    def test_missing_latest_quarter_blocks_every_slot_despite_full_fy_history(self):
+        slots = [
+            slot_wire("general_nonfinancial", suffix="a", unit="CNY", formula=leaf().to_dict()),
+            slot_wire("general_nonfinancial", suffix="b", unit="CNY", formula=leaf().to_dict()),
+        ]
+        facts = tuple(
+            item for item in history_ready_facts()
+            if item.to_dict()["period_end"] != "2026-06-30"
+        )
+
+        result = bundle(facts, slots=slots)
+
+        self.assertIn("history_quarter_window_incomplete", result.blockers)
+        self.assertIn("pending_evidence/history_not_mature", result.blockers)
+        self.assertTrue(all(value.status == "blocked" for value in result.values))
+        self.assertTrue(all(value.value is None and value.evidence == () for value in result.values))
+
+
 class FormulaTests(unittest.TestCase):
     def test_economic_units_and_arithmetic_failure(self):
         left, right = leaf("revenue"), leaf("shares")
@@ -319,7 +419,7 @@ class BundleTests(unittest.TestCase):
         root = registry_manifest(raw)
         bound = load_registry(raw, root)
         unbound = load_registry(raw)
-        inputs = [fact(), fact(metric_key="profit", value=20)]
+        inputs = history_ready_facts()
         derived = bundle(inputs, registry=bound, registry_manifest=root)
         blocked = bundle(inputs, registry=unbound, registry_manifest=root)
         self.assertEqual(derived.values[0].status, "derived")
@@ -368,18 +468,22 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(bundle([fact()], registry=load_registry(raw), registry_manifest=official).values[0].status, "blocked")
 
     def test_ambiguous_metric_fact_is_missing_and_others_survive(self):
-        raw = [fact(), fact(statement="cash_flow", value=80), fact(metric_key="profit", value=20)]
+        raw = (
+            history_ready_facts()
+            + history_ready_facts(statement="cash_flow")
+            + history_ready_facts(metric_key="profit")
+        )
         slots = [slot_wire("general_nonfinancial", suffix="a", unit="CNY", formula=leaf().to_dict()), slot_wire("general_nonfinancial", suffix="b", unit="CNY", formula=leaf("profit").to_dict())]
         result = bundle(raw, slots=slots)
         self.assertEqual(result.values[0].missing_reason, "formula_fact_ambiguous")
-        self.assertEqual((result.values[1].status, result.values[1].value), ("derived", 20))
+        self.assertEqual((result.values[1].status, result.values[1].value), ("derived", 70))
         self.assertEqual(result.input_hash, bundle(raw[::-1], slots=slots).input_hash)
 
     def test_quarter_blocker_propagation_and_slot_unit_binding(self):
-        result = bundle([fact("H1")])
+        result = bundle(history_ready_facts() + (fact("H1", metric_key="profit"),))
         self.assertIn("quarter_missing_prerequisite", result.blockers)
-        self.assertEqual(result.values[0].status, "missing")
-        result = bundle([fact()], slots=[slot_wire("general_nonfinancial", unit="ratio", formula=leaf().to_dict())])
+        self.assertEqual(result.values[0].status, "blocked")
+        result = bundle(history_ready_facts(), slots=[slot_wire("general_nonfinancial", unit="ratio", formula=leaf().to_dict())])
         self.assertEqual(result.values[0].missing_reason, "formula_unit_mismatch")
 
     def test_root_registry_and_issue_low_level_forgery(self):
@@ -393,17 +497,19 @@ class BundleTests(unittest.TestCase):
             bundle(issues=[issue])
 
     def test_derived_required_optional_and_nonrelease(self):
-        result = bundle([fact()])
+        facts = history_ready_facts()
+        result = bundle(facts)
         self.assertEqual(result.values[0].status, "derived")
-        self.assertEqual(result.history_endpoints, ("2025-12-31",))
+        self.assertEqual(result.history_endpoints, ANNUALS)
         self.assertNotIn("feature_required_slot_missing", result.blockers)
         for purpose in ("test",):
-            result = bundle([fact()], purpose=purpose)
+            result = bundle(facts, purpose=purpose)
             self.assertEqual(result.values[0].status, "blocked")
             self.assertIn("feature_registry_not_release_eligible", result.blockers)
-        self.assertIn("feature_required_slot_missing", bundle().blockers)
+        missing_formula_facts = history_ready_facts(metric_key="profit")
+        self.assertIn("feature_required_slot_missing", bundle(missing_formula_facts).blockers)
         optional = [slot_wire("general_nonfinancial", required=False, unit="CNY", formula=leaf().to_dict())]
-        self.assertNotIn("feature_required_slot_missing", bundle(slots=optional).blockers)
+        self.assertNotIn("feature_required_slot_missing", bundle(missing_formula_facts, slots=optional).blockers)
 
     def test_issues_conflicts_and_hash_inputs(self):
         issue = FormalFactIssue("nonnumeric_value", None, None, {})
