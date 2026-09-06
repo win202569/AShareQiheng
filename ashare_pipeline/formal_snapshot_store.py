@@ -152,7 +152,7 @@ class FormalSnapshotStore:
             manifest_sha256=manifest_sha256,
         )
 
-    def read_verified_raw(self, stored: FormalStoredSnapshot) -> bytes:
+    def read_verified_raw(self, stored: FormalStoredSnapshot, *, historical_read=None) -> bytes:
         """Return raw bytes only after validating selected content and lineage files."""
         if not isinstance(stored, FormalStoredSnapshot):
             raise ValueError("stored snapshot must be a FormalStoredSnapshot")
@@ -193,10 +193,12 @@ class FormalSnapshotStore:
         if _sha256_bytes(raw_bytes) != stored.content_sha256:
             raise ValueError("content hash verification failed")
         manifest_request = self._official_request_from_manifest(request)
-        self._resolve_calendar_binding(
+        self._read_calendar_binding(
+            stored,
             manifest_request,
             envelope.get("published_precision"),
             envelope.get("effective_time_evidence_hash"),
+            historical_read,
         )
         return raw_bytes
 
@@ -207,6 +209,7 @@ class FormalSnapshotStore:
         verification: EvidenceVerification,
         *,
         expected_producing_task_id: str | None,
+        historical_read=None,
     ) -> ValidatedFormalSnapshot:
         """Inspect exact fetch, verification, manifest, paths, and raw bytes.
 
@@ -218,10 +221,12 @@ class FormalSnapshotStore:
             fetch, stored, verification, expected_producing_task_id
         )
         self._validate_formal_fetch_values(fetch)
-        calendar_binding = self._resolve_calendar_binding(
+        calendar_binding = self._read_calendar_binding(
+            stored,
             fetch.request,
             fetch.published_precision,
             fetch.effective_time_evidence_hash,
+            historical_read,
         )
         self._require_recomputed_verification(fetch, verification, calendar_binding)
         content_sha256 = fetch.content_sha256
@@ -408,6 +413,13 @@ class FormalSnapshotStore:
             raise ValueError("verification effective_at_utc does not match canonical verification")
         if verification.content_sha256 != recomputed.content_sha256:
             raise ValueError("verification content hash does not match canonical verification")
+
+    def _read_calendar_binding(self, stored, request, precision, effective_hash, historical_read):
+        if historical_read is None:
+            return self._resolve_calendar_binding(request, precision, effective_hash)
+        # The capability and mint stay inside Context's closure; no write API takes it.
+        from .formal_context_repository import _historical_read_binding
+        return _historical_read_binding(self, historical_read, stored, request, precision, effective_hash)
 
     def _resolve_calendar_binding(
         self,

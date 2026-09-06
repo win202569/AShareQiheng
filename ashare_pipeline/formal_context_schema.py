@@ -585,9 +585,9 @@ def _trusted_context_types():
             current = Registry.load(state, verifier, root)
             return select_descriptor(current, request.context_kind, request.scope_key, request.security_id)
 
-        def normalize_verified(self, request, snapshot, raw_bytes, normalizer):
+        def normalize_verified(self, request, snapshot, raw_bytes, normalizer, *, task_id: str, worker_id: str):
             from .formal_snapshot_repository import FormalSnapshotRepository
-            from .formal_context_repository import _require_context_producer
+            from .formal_context_repository import _require_context_writer
             state, verifier, root, _, _, _ = registry_state(self)
             if type(request) is not Request or type(snapshot) is not OfficialSnapshotRef or type(raw_bytes) is not bytes:
                 raise ValueError("normalization requires exact verified Context inputs")
@@ -608,7 +608,7 @@ def _trusted_context_types():
             if _canonical(asdict(snapshot)) != _canonical(before) or repository.read_verified_raw(ref) != raw_bytes or hashlib.sha256(raw_bytes).hexdigest() != ref.content_sha256:
                 raise ValueError("normalization snapshot or raw SHA-256 mismatch")
             with state._transaction() as connection:
-                _require_context_producer(state, connection, ref)
+                writer = _require_context_writer(state, connection, ref, task_id=task_id, worker_id=worker_id)
             candidates = normalizer.normalize(request=current_request, snapshot=ref, raw_bytes=raw_bytes)
             if type(candidates) is not tuple or not candidates:
                 raise ValueError("normalization requires explicit nonempty Context facts")
@@ -627,7 +627,10 @@ def _trusted_context_types():
                 upstream_generation=request.upstream_generation)
             if after_request.canonical_bytes() != current_request.canonical_bytes() or repository.read_verified_raw(ref) != raw_bytes:
                 raise ValueError("Context normalization changed during verification")
-            return mint_normalization(dict(registry_manifest_hash=root, request=request_wire, facts=facts))
+            with state._transaction() as connection:
+                _require_context_writer(state, connection, ref, task_id=task_id, worker_id=worker_id,
+                    expected_writer=writer)
+            return mint_normalization(dict(registry_manifest_hash=root, request=request_wire, facts=facts, writer=writer))
 
     def select_descriptor(registry, kind, scope_key, security_id):
         if type(kind) is not str or kind not in CONTEXT_KINDS:
@@ -654,6 +657,19 @@ def _trusted_context_types():
             resolver_seals[identity] = (weakref.ref(self, lambda _: resolver_seals.pop(identity, None)), state_store, registry_signature_verifier)
 
         def resolve(self, context_kind, scope_key, security_id, as_of_utc, registry_manifest_hash, *, upstream_generation: str):
+            return self._resolve(context_kind, scope_key, security_id, as_of_utc, registry_manifest_hash,
+                upstream_generation=upstream_generation)
+
+        def _resolve_historical(self, fact):
+            if type(fact) is not FormalContextFact:
+                raise ValueError("historical Context requires an exact stored Fact")
+            fact.to_dict()
+            return self._resolve(fact.context_kind, fact.scope_key, fact.security_id, fact.as_of_utc,
+                fact.registry_manifest_hash, upstream_generation=fact.evidence["upstream_generation"],
+                historical_fact=fact)
+
+        def _resolve(self, context_kind, scope_key, security_id, as_of_utc, registry_manifest_hash, *,
+                upstream_generation, historical_fact=None):
             record = resolver_seals.get(id(self))
             if type(self) is not Resolver or record is None or record[0]() is not self:
                 raise ValueError("Context resolver is forged")
@@ -690,11 +706,17 @@ def _trusted_context_types():
                 raise ValueError("Context descriptor/source calendar selector mismatch")
             binding = None
             if config.calendar_selector is not None:
-                from .formal_context_repository import FormalContextRepository
+                from .formal_context_repository import FormalContextRepository, _prove_historical_calendar
                 from .formal_snapshot_repository import FormalSnapshotRepository
-                snapshots = FormalSnapshotRepository(state._configured_formal_snapshot_store_for_repository().root, state)
-                binding = FormalContextRepository(state, snapshots, verifier).resolve_verified_calendar_binding(
-                    config.calendar_selector, exchange, as_of_utc, registry_manifest_hash)
+                if historical_fact is not None:
+                    binding = _prove_historical_calendar(state, verifier, historical_fact,
+                        config.calendar_selector, exchange, as_of_utc, registry_manifest_hash)
+                else:
+                    snapshots = FormalSnapshotRepository(state._configured_formal_snapshot_store_for_repository().root, state)
+                    binding = FormalContextRepository(state, snapshots, verifier).resolve_verified_calendar_binding(
+                        config.calendar_selector, exchange, as_of_utc, registry_manifest_hash)
+            elif historical_fact is not None:
+                raise ValueError("historical Context requires a signed calendar selector")
             relevant = [[role, digest] for role, digest in role_hashes if role in descriptor["referenced_roles"]]
             descriptor_id = hashlib.sha256(_canonical(descriptor)).hexdigest()
             binding_wire = asdict(binding) if binding is not None else None

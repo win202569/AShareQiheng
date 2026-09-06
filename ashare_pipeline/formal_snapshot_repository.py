@@ -153,16 +153,16 @@ class FormalSnapshotRepository:
             as_of_utc=as_of_utc,
         )
 
-    def get_verified_by_manifest(self, manifest_sha256: str) -> OfficialSnapshotRef:
-        ref = self._state_store._get_formal_snapshot_verified_by_manifest(manifest_sha256)
+    def get_verified_by_manifest(self, manifest_sha256: str, *, historical_read=None) -> OfficialSnapshotRef:
+        ref = self._state_store._get_formal_snapshot_verified_by_manifest(manifest_sha256, historical_read=historical_read)
         if ref is None:
             raise ValueError("verified formal manifest is unknown")
         return ref
 
-    def read_verified_raw(self, ref: OfficialSnapshotRef) -> bytes:
+    def read_verified_raw(self, ref: OfficialSnapshotRef, *, historical_read=None) -> bytes:
         if type(ref) is not OfficialSnapshotRef:
             raise ValueError("ref must have exact type OfficialSnapshotRef")
-        current = self.get_verified_by_manifest(ref.manifest_sha256)
+        current = self.get_verified_by_manifest(ref.manifest_sha256, historical_read=historical_read)
         if any(getattr(ref, field) != getattr(current, field) for field in _REF_FIELDS):
             raise ValueError("formal snapshot reference does not match verified storage")
         stored = FormalStoredSnapshot(
@@ -171,7 +171,7 @@ class FormalSnapshotRepository:
             content_sha256=current.content_sha256,
             manifest_sha256=current.manifest_sha256,
         )
-        return self._raw_store.read_verified_raw(stored)
+        return self._raw_store.read_verified_raw(stored, historical_read=historical_read)
 
 
 __all__ = ["FormalSnapshotRepository"]

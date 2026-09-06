@@ -15,7 +15,7 @@ from unittest.mock import patch
 from ashare_pipeline.formal_evidence import OfficialFetch, SourcePolicy, verify_official_fetch
 from ashare_pipeline.formal_registry_manifest import FormalRegistryManifest, VerifiedRegistryBlob
 from ashare_pipeline.formal_snapshot_repository import FormalSnapshotRepository
-from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore
+from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore, FormalStoredSnapshot
 from ashare_pipeline.formal_sources import CalendarSelector
 from ashare_pipeline.state_store import StateStore
 from tests.test_formal_sources import config
@@ -119,12 +119,13 @@ class ContextIntegrationTests(unittest.TestCase):
         return self.resolver.resolve(**args)
 
     def produce(self, request=None, *, value=None, no_coverage=False, task_kind="formal_context",
-                published="2026-08-20T07:00:00+00:00", updated=None, captured="2026-09-04T07:00:00+00:00", raw=None):
+                published="2026-08-20T07:00:00+00:00", updated=None, captured="2026-09-04T07:00:00+00:00", raw=None,
+                complete=False, lease_seconds=300):
         request = request or self.request()
         value = dict(is_st=False, is_star_st=False, listing_status="listed", forced_delist_risk=False, suspended=False) if value is None else value
         task = self.store.enqueue_formal_task(task_kind, hashlib.sha256((request.refresh_generation + published + captured + str(value) + repr(raw) + task_kind).encode()).hexdigest(), request.refresh_generation, {})
         worker = "fixture-worker"
-        self.store.lease_next_formal_task((task_kind,), worker, 300)
+        self.store.lease_next_formal_task((task_kind,), worker, lease_seconds)
         raw = canonical(dict(value=value, no_coverage=no_coverage)) if raw is None else raw
         binding = request.calendar_binding
         if binding is not None:
@@ -141,7 +142,8 @@ class ContextIntegrationTests(unittest.TestCase):
         verification = verify_official_fetch(fetch, SourcePolicy.cninfo(), calendar_binding=binding)
         self.assertEqual(verification.status, "verified", verification)
         ref = self.snapshots.persist_verified(fetch, verification, producing_task_id=task, worker_id=worker)
-        self.store.complete_formal_task(task, worker, {"snapshot": ref.snapshot_id})
+        if complete:
+            self.store.complete_formal_task(task, worker, {"snapshot": ref.snapshot_id})
         return request, ref, raw
 
     def resolve_raw_calendar(self, candidate):
@@ -156,14 +158,16 @@ class ContextIntegrationTests(unittest.TestCase):
         return self.repo.resolve_verified_calendar_binding(selector, candidate.exchange,
             wire["as_of_utc"], wire["registry_manifest_hash"])
 
-    def normalize(self, request, ref, raw, normalizer=None):
+    def normalize(self, request, ref, raw, normalizer=None, *, task_id=None, worker_id="fixture-worker"):
         registry = self.schema.FormalContextRegistry.load(self.store, self.verifier, self.manifest.manifest_hash)
-        return registry.normalize_verified(request, ref, raw, normalizer or FixtureNormalizer())
+        return registry.normalize_verified(request, ref, raw, normalizer or FixtureNormalizer(),
+            task_id=ref.producing_task_id if task_id is None else task_id, worker_id=worker_id)
 
     def put(self, **kwargs):
         request, ref, raw = self.produce(**kwargs)
         receipt = self.normalize(request, ref, raw)
         self.store.put_formal_context_facts(receipt)
+        self.store.complete_formal_task(ref.producing_task_id, "fixture-worker", {"snapshot": ref.snapshot_id})
         return receipt.facts[0], ref, receipt
 
     def get(self, **changes):
@@ -188,6 +192,85 @@ class ContextIntegrationTests(unittest.TestCase):
             dict(security_id="SH600000"), dict(as_of_utc="2026-08-31"), dict(registry_manifest_hash="f" * 64)):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.request(**change)
+
+    def test_context_writer_persists_before_completion_without_publishing_leased_facts(self):
+        request, ref, raw = self.produce(complete=False)
+        receipt = self.normalize(request, ref, raw)
+        self.store.put_formal_context_facts(receipt)
+        self.assertEqual(receipt.writer, dict(task_id=ref.producing_task_id, worker_id="fixture-worker",
+            refresh_generation=ref.refresh_generation,
+            receipt=self.store.get_formal_task_snapshot_receipt(ref.producing_task_id)))
+        with self.assertRaisesRegex(ValueError, "verified formal_context producer"):
+            self.get()
+        with self.assertRaisesRegex(ValueError, "verified formal_context producer"):
+            self.store.list_formal_context_facts(registry_manifest_hash=self.manifest.manifest_hash)
+        self.store.complete_formal_task(ref.producing_task_id, "fixture-worker", {"snapshot": ref.snapshot_id})
+        self.assertEqual(self.get().id, receipt.facts[0].id)
+
+    def test_context_writer_rejects_wrong_worker_and_task(self):
+        request, ref, raw = self.produce()
+        for changes, reason in ((dict(worker_id="foreign-worker"), "lease expired or ownership changed"),
+                (dict(task_id="00000000-0000-4000-8000-000000000099"), "task does not match snapshot producer")):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, reason):
+                self.normalize(request, ref, raw, **changes)
+
+    def test_context_writer_rejects_expired_lease_at_normalize_and_put(self):
+        request, ref, raw = self.produce()
+        receipt = self.normalize(request, ref, raw)
+        self.sql("UPDATE formal_collection_task SET lease_expires_at=? WHERE id=?",
+            ("2000-01-01T00:00:00+00:00", ref.producing_task_id))
+        with self.assertRaisesRegex(ValueError, "lease expired or ownership changed"):
+            self.normalize(request, ref, raw)
+        with self.assertRaisesRegex(ValueError, "lease expired or ownership changed"):
+            self.store.put_formal_context_facts(receipt)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM formal_context_fact").fetchone()[0], 0)
+
+    def test_context_writer_rechecks_lease_after_normalizer_callback(self):
+        request, ref, raw = self.produce()
+        fixture = self
+        class ExpiringNormalizer(FixtureNormalizer):
+            def normalize(self, **kwargs):
+                facts = super().normalize(**kwargs)
+                fixture.sql("UPDATE formal_collection_task SET lease_expires_at=? WHERE id=?",
+                    ("2000-01-01T00:00:00+00:00", ref.producing_task_id))
+                return facts
+        with self.assertRaisesRegex(ValueError, "lease expired or ownership changed"):
+            self.normalize(request, ref, raw, ExpiringNormalizer())
+
+    def test_context_writer_new_owner_recovers_same_receipt_and_rejects_old_capability(self):
+        request, ref, raw = self.produce()
+        original = self.normalize(request, ref, raw)
+        self.store.put_formal_context_facts(original)
+        self.sql("UPDATE formal_collection_task SET lease_expires_at=? WHERE id=?",
+            ("2000-01-01T00:00:00+00:00", ref.producing_task_id))
+        recovered = self.store.lease_next_formal_task(("formal_context",), "recovered-worker", 300)
+        self.assertEqual(recovered["id"], ref.producing_task_id)
+        with self.assertRaisesRegex(ValueError, "lease expired or ownership changed"):
+            self.store.put_formal_context_facts(original)
+        current = self.normalize(request, ref, raw, worker_id="recovered-worker")
+        self.assertEqual(current.facts[0].id, original.facts[0].id)
+        self.store.put_formal_context_facts(current)
+        with self.assertRaisesRegex(ValueError, "verified formal_context producer"):
+            self.get()
+        self.store.complete_formal_task(ref.producing_task_id, "recovered-worker", {"snapshot": ref.snapshot_id})
+        self.assertEqual(self.get().id, original.facts[0].id)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM formal_context_fact").fetchone()[0], 1)
+
+    def test_context_writer_rolls_back_when_lease_expires_after_insert(self):
+        request, ref, raw = self.produce()
+        receipt = self.normalize(request, ref, raw)
+        self.sql("""CREATE TRIGGER fixture_expire_context_writer AFTER INSERT ON formal_context_fact
+            BEGIN UPDATE formal_collection_task SET lease_expires_at='2000-01-01T00:00:00+00:00'
+            WHERE id=(SELECT producing_task_id FROM formal_source_snapshot WHERE id=NEW.source_snapshot_id); END""")
+        with self.assertRaisesRegex(ValueError, "lease expired or ownership changed"):
+            self.store.put_formal_context_facts(receipt)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM formal_context_fact").fetchone()[0], 0)
+            expiry = conn.execute("SELECT lease_expires_at FROM formal_collection_task WHERE id=?",
+                (ref.producing_task_id,)).fetchone()[0]
+        self.assertNotEqual(expiry, "2000-01-01T00:00:00+00:00")
 
     def test_missing_duplicate_and_mismatched_descriptor_fail_closed(self):
         for descriptors in ([], [descriptor(), descriptor()], [descriptor(parser_id="other")],
@@ -228,8 +311,12 @@ class ContextIntegrationTests(unittest.TestCase):
 
     def test_persistence_idempotence_list_detachment_and_verified_read(self):
         with patch("socket.socket", side_effect=AssertionError("network forbidden")):
-            fact, ref, receipt = self.put()
+            request, ref, raw = self.produce()
+            receipt = self.normalize(request, ref, raw)
+            fact = receipt.facts[0]
             self.store.put_formal_context_facts(receipt)
+            self.store.put_formal_context_facts(receipt)
+            self.store.complete_formal_task(ref.producing_task_id, "fixture-worker", {"snapshot": ref.snapshot_id})
             found = self.store.list_formal_context_facts(registry_manifest_hash=self.manifest.manifest_hash)
             self.assertEqual([f.id for f in found], [fact.id])
             self.assertEqual(self.get().id, fact.id)
@@ -271,6 +358,42 @@ class ContextIntegrationTests(unittest.TestCase):
                     self.get()
             finally:
                 path.write_bytes(original)
+
+    def test_put_revalidates_only_incoming_logical_generation_while_public_list_stays_fail_closed(self):
+        self.install(descriptors=[descriptor(), descriptor("industry_snapshot", scope_key="fixture-industry")])
+        unrelated, unrelated_ref, _ = self.put(
+            request=self.request(kind="industry_snapshot", scope_key="fixture-industry"),
+            value=dict(classification_system="SW2021", primary_industry="bank", secondary_industry="regional",
+                source_version="fixture-v1", effective_date="2026-08-20", mapping_sha256="1" * 64))
+        self.sql("UPDATE formal_source_snapshot SET content_sha256=? WHERE id=?", ("f" * 64, unrelated_ref.snapshot_id))
+        request, ref, raw = self.produce()
+        receipt = self.normalize(request, ref, raw)
+        self.store.put_formal_context_facts(receipt)
+        self.store.put_formal_context_facts(receipt)
+        self.store.complete_formal_task(ref.producing_task_id, "fixture-worker", {"snapshot": ref.snapshot_id})
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM formal_context_fact WHERE source_snapshot_id=?",
+                (ref.snapshot_id,)).fetchone()[0], 1)
+        self.assertEqual(self.get().id, receipt.facts[0].id)
+        with self.assertRaisesRegex(ValueError, "content hash does not match manifest"):
+            self.store.list_formal_context_facts(registry_manifest_hash=self.manifest.manifest_hash)
+        self.sql("UPDATE formal_source_snapshot SET content_sha256=? WHERE id=?", (unrelated_ref.content_sha256, unrelated_ref.snapshot_id))
+        self.assertEqual({fact.id for fact in self.store.list_formal_context_facts(
+            registry_manifest_hash=self.manifest.manifest_hash)}, {unrelated.id, receipt.facts[0].id})
+
+    def test_calendar_exchange_is_a_logical_generation_discriminator(self):
+        anchor = self.install_calendars(exchanges=("SH",))["SH"][0]
+        wire = anchor.to_dict()
+        wire.pop("id")
+        wire["value"]["exchange"] = "SZ"
+        # A pure key boundary only: this changed record is never normalized or persisted.
+        alternate = self.schema.FormalContextFact.create(**wire)
+        original_key = self.api._logical_key(anchor)
+        alternate_key = self.api._logical_key(alternate)
+        self.assertEqual(original_key[:4], alternate_key[:4])
+        self.assertEqual(original_key[5:], alternate_key[5:])
+        self.assertEqual((original_key[4], alternate_key[4]), ("SH", "SZ"))
+        self.assertNotEqual(original_key, alternate_key)
 
     def test_same_generation_conflicts_preserve_existing_version(self):
         old, _, _ = self.put()
@@ -351,10 +474,10 @@ class ContextIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "leading"):
             self.get()
 
-    def install_calendars(self, *, date_only=False):
+    def install_calendars(self, *, date_only=False, exchanges=("SH", "SZ", "BJ")):
         descriptors = [descriptor("trading_calendar", scope_key="fixture-calendar-" + ex,
             security_scope="none", request_security="none", period_rule="none", exchange_rule="fixed_exchange",
-            fixed_exchange=ex, dataset="trading_calendar", bootstrap_calendar=True) for ex in ("SH", "SZ", "BJ")]
+            fixed_exchange=ex, dataset="trading_calendar", bootstrap_calendar=True) for ex in exchanges]
         configs = [config(dataset="trading_calendar", bootstrap_calendar=True)]
         if date_only:
             selector = asdict(CalendarSelector("trading_calendar", "fixture-calendar-SZ", "SZ", "visible_at_freeze"))
@@ -362,7 +485,7 @@ class ContextIntegrationTests(unittest.TestCase):
             configs.append(config(dataset="fixture-state", exchange_scope="SZ", calendar_selector=selector))
         self.install(descriptors, configs)
         calendars = {}
-        for exchange in ("SH", "SZ", "BJ"):
+        for exchange in exchanges:
             request = self.request(kind="trading_calendar", scope_key="fixture-calendar-" + exchange, security_id=None)
             calendars[exchange] = self.put(request=request, published="2026-08-19T07:00:00+00:00",
                 value=dict(exchange=exchange, calendar_version="fixture-v1", trading_days=["2026-08-21", "2026-08-31", "2026-09-02"]))
@@ -420,6 +543,125 @@ class ContextIntegrationTests(unittest.TestCase):
         selector = CalendarSelector("trading_calendar", "fixture-calendar-SZ", "SZ", "visible_at_freeze")
         with self.assertRaisesRegex(ValueError, "leading"):
             self.repo.resolve_verified_calendar_binding(selector, "SZ", FREEZE, self.manifest.manifest_hash)
+
+    def test_calendar_revision_preserves_date_only_history_and_rejects_missing_anchor(self):
+        calendars = self.install_calendars(date_only=True, exchanges=("SZ",))
+        c1 = calendars["SZ"][0]
+        r1 = self.request(upstream_generation="fixture-context-v1")
+        d1, _, _ = self.put(request=r1, published="2026-08-19T16:00:00+00:00", lease_seconds=3600)
+        c2_request = self.request(kind="trading_calendar", scope_key="fixture-calendar-SZ",
+            security_id=None, upstream_generation="fixture-calendar-v2")
+        c2, c2_ref, _ = self.put(request=c2_request, published="2026-08-20T07:00:00+00:00", lease_seconds=3600,
+            value=dict(exchange="SZ", calendar_version="fixture-v2",
+                trading_days=["2026-08-21", "2026-08-31", "2026-09-02"]))
+        self.assertNotEqual(c1.id, c2.id)
+        r2 = self.request(upstream_generation="fixture-context-v2")
+        self.assertEqual(r2.calendar_binding.manifest_sha256, c2_ref.manifest_sha256)
+        self.assertNotEqual(r1.refresh_generation, r2.refresh_generation)
+        d2, _, _ = self.put(request=r2, published="2026-08-19T16:00:00+00:00", lease_seconds=3600,
+            updated="2026-08-22T07:00:00+00:00",
+            value=dict(is_st=True, is_star_st=False, listing_status="listed",
+                forced_delist_risk=False, suspended=False))
+        facts = self.store.list_formal_context_facts(registry_manifest_hash=self.manifest.manifest_hash,
+            context_kind="security_state", scope_key="fixture-state", security_id="SZ000001", as_of_utc=FREEZE)
+        self.assertEqual({fact.id for fact in facts}, {d1.id, d2.id})
+        self.assertEqual(self.get().id, d2.id)
+        self.assertEqual(d1.evidence["calendar_binding"], asdict(r1.calendar_binding))
+        self.assertEqual(d2.evidence["calendar_binding"], asdict(r2.calendar_binding))
+        # The old row remains evidence, not something a newer leading D2 may hide.
+        self.sql("DELETE FROM formal_context_fact WHERE id=?", (c1.id,))
+        with self.assertRaises(ValueError):
+            self.get()
+
+    def test_historical_read_capability_is_target_bound_and_unforgeable(self):
+        calendars = self.install_calendars(date_only=True, exchanges=("SZ",))
+        original = self.request()
+        fact, ref, _ = self.put(request=original, published="2026-08-19T16:00:00+00:00", lease_seconds=3600)
+        capability = self.capture_historical_read()
+        snapshots = FormalSnapshotRepository(self.raw.root, self.store)
+        expected = snapshots.read_verified_raw(ref, historical_read=capability)
+        stored = FormalStoredSnapshot(ref.content_path, ref.manifest_path, ref.content_sha256, ref.manifest_sha256)
+        for forged in (object(), original.calendar_binding, object.__new__(type(capability))):
+            with self.subTest(forged=type(forged)), self.assertRaisesRegex(ValueError, "historical.*capability"):
+                self.raw.read_verified_raw(stored, historical_read=forged)
+        other_store = FormalSnapshotStore(self.raw.root, calendar_binding_resolver=self.resolve_raw_calendar)
+        with self.assertRaisesRegex(ValueError, "historical.*store"):
+            other_store.read_verified_raw(stored, historical_read=capability)
+        with self.assertRaisesRegex(ValueError, "historical.*target"):
+            snapshots.read_verified_raw(calendars["SZ"][1], historical_read=capability)
+        with self.assertRaisesRegex(ValueError, "reference does not match"):
+            snapshots.read_verified_raw(replace(ref, security_id="SZ000002"), historical_read=capability)
+        self.assertEqual(snapshots.read_verified_raw(ref, historical_read=capability), expected)
+        with self.assertRaises(TypeError):
+            self.raw.write_verified(None, None, producing_task_id=None, historical_read=capability)
+
+    def test_historical_capability_roundtrips_full_fact_record_and_rejects_id_changes(self):
+        calendars = self.install_calendars(date_only=True, exchanges=("SZ",))
+        fact, ref, _ = self.put(published="2026-08-19T16:00:00+00:00", lease_seconds=3600)
+        record = fact.to_dict()
+        scientific = json.loads(fact.canonical_bytes())
+        self.assertNotIn("id", scientific)
+        self.assertEqual(record["id"], fact.id)
+        self.assertEqual(self.schema.FormalContextFact.from_dict(record).canonical_bytes(), fact.canonical_bytes())
+        with self.assertRaisesRegex(ValueError, "ID is missing"):
+            self.schema.FormalContextFact.from_dict(scientific)
+        swapped = dict(record, id=calendars["SZ"][0].id)
+        with self.assertRaisesRegex(ValueError, "canonical ID mismatch"):
+            self.schema.FormalContextFact.from_dict(swapped)
+        capability = self.capture_historical_read()
+        expected = self.snapshots.read_verified_raw(ref, historical_read=capability)
+        for changed_id in ("f" * 64, None):
+            with self.subTest(changed_id=changed_id):
+                self.sql("UPDATE formal_context_fact SET id=? WHERE source_snapshot_id=?", (changed_id, ref.snapshot_id))
+                try:
+                    with self.assertRaisesRegex(ValueError, "historical read persisted Fact changed"):
+                        self.snapshots.read_verified_raw(ref, historical_read=capability)
+                finally:
+                    self.sql("UPDATE formal_context_fact SET id=? WHERE source_snapshot_id=?", (fact.id, ref.snapshot_id))
+        self.assertEqual(self.snapshots.read_verified_raw(ref, historical_read=capability), expected)
+
+    def test_historical_calendar_anchor_tamper_invalidates_existing_capability(self):
+        calendars = self.install_calendars(date_only=True, exchanges=("SZ",))
+        anchor, anchor_ref, _ = calendars["SZ"]
+        fact, ref, _ = self.put(published="2026-08-19T16:00:00+00:00", lease_seconds=3600)
+        capability = self.capture_historical_read()
+        snapshots = FormalSnapshotRepository(self.raw.root, self.store)
+        for table, field, bad, key, identity in (
+            ("formal_context_fact", "value_json", "{}", "id", anchor.id),
+            ("formal_collection_task", "result_json", None, "id", anchor_ref.producing_task_id),
+            ("formal_task_snapshot_receipt", "refresh_generation", "wrong", "task_id", anchor_ref.producing_task_id),
+            ("formal_source_snapshot", "content_sha256", "f" * 64, "id", anchor_ref.snapshot_id)):
+            with self.subTest(table=table), closing(sqlite3.connect(self.db)) as connection:
+                original = connection.execute(f"SELECT {field} FROM {table} WHERE {key}=?", (identity,)).fetchone()[0]
+                self.sql(f"UPDATE {table} SET {field}=? WHERE {key}=?", (bad, identity))
+                try:
+                    with self.assertRaises(ValueError):
+                        snapshots.read_verified_raw(ref, historical_read=capability)
+                finally:
+                    self.sql(f"UPDATE {table} SET {field}=? WHERE {key}=?", (original, identity))
+        path = Path(anchor_ref.content_path)
+        original = path.read_bytes()
+        try:
+            path.write_bytes(b"tampered historical calendar")
+            with self.assertRaises(ValueError):
+                snapshots.read_verified_raw(ref, historical_read=capability)
+        finally:
+            path.write_bytes(original)
+
+    def capture_historical_read(self):
+        """Observe only a capability produced by a successful real public read."""
+        captured = []
+        original_read = self.raw.read_verified_raw
+        def observe(stored, *, historical_read=None):
+            if historical_read is None:
+                return original_read(stored)
+            result = original_read(stored, historical_read=historical_read)
+            captured.append(historical_read)
+            return result
+        with patch.object(self.raw, "read_verified_raw", side_effect=observe):
+            self.get()
+        self.assertTrue(captured, "historical Context must use a sealed historical raw read")
+        return captured[-1]
 
     def test_descriptor_allowlists_reject_unknown_regulatory_and_event_codes(self):
         for kind, value, allowed in (("regulatory_state", dict(flags=[dict(flag_id="fixture-flag", active=True)]), dict(allowed_regulatory_flags=["fixture-flag"])),

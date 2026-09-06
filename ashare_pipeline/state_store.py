@@ -2444,9 +2444,9 @@ class StateStore:
             raise ValueError("formal snapshot task generation mismatch")
 
     def _formal_verified_snapshot_ref_from_connection(
-        self, connection: sqlite3.Connection, row: sqlite3.Row
+        self, connection: sqlite3.Connection, row: sqlite3.Row, *, historical_read=None
     ) -> OfficialSnapshotRef:
-        ref = self._formal_snapshot_row_to_ref(row)
+        ref = self._formal_snapshot_row_to_ref(row, historical_read=historical_read)
         self._require_formal_snapshot_receipt_lineage(connection, row, ref)
         return ref
 
@@ -2546,7 +2546,7 @@ class StateStore:
             )
 
     def _get_formal_snapshot_verified_by_manifest(
-        self, manifest_sha256: str
+        self, manifest_sha256: str, *, historical_read=None
     ) -> OfficialSnapshotRef | None:
         manifest_sha256 = _require_formal_sha256(manifest_sha256, "manifest hash")
         with self._transaction() as connection:
@@ -2556,9 +2556,9 @@ class StateStore:
             ).fetchone()
             if row is None:
                 return None
-            return self._formal_verified_snapshot_ref_from_connection(connection, row)
+            return self._formal_verified_snapshot_ref_from_connection(connection, row, historical_read=historical_read)
 
-    def _formal_snapshot_row_to_ref(self, row: sqlite3.Row) -> OfficialSnapshotRef:
+    def _formal_snapshot_row_to_ref(self, row: sqlite3.Row, *, historical_read=None) -> OfficialSnapshotRef:
         raw_store = self._require_formal_snapshot_store()
         snapshot_id = _require_canonical_uuid(row["id"], "snapshot ID")
         request_payload = _decode_canonical_formal_json(row["request_json"], "request")
@@ -2594,7 +2594,10 @@ class StateStore:
             content_sha256=_require_formal_sha256(row["content_sha256"], "content hash"),
             manifest_sha256=_require_formal_sha256(row["manifest_sha256"], "manifest hash"),
         )
-        raw_bytes = raw_store.read_verified_raw(stored)
+        if historical_read is not None:
+            from .formal_context_repository import _require_historical_read_target
+            _require_historical_read_target(historical_read, raw_store, snapshot_id, stored)
+        raw_bytes = raw_store.read_verified_raw(stored, historical_read=historical_read)
         verification = EvidenceVerification(
             status=verification_payload["status"],
             content_sha256=verification_payload["content_sha256"],
@@ -2623,6 +2626,7 @@ class StateStore:
             stored,
             verification,
             expected_producing_task_id=row["producing_task_id"],
+            historical_read=historical_read,
         )
         if type(validated) is not ValidatedFormalSnapshot:
             raise ValueError("formal snapshot validation returned an invalid projection")
@@ -2804,7 +2808,7 @@ class StateStore:
             return self._formal_snapshot_row_to_ref(row) if row is not None else None
 
     def _formal_task_snapshot_receipt_from_connection(
-        self, connection: sqlite3.Connection, task_id: str
+        self, connection: sqlite3.Connection, task_id: str, *, historical_read=None
     ) -> dict[str, object] | None:
         receipt = connection.execute(
             "SELECT * FROM formal_task_snapshot_receipt WHERE task_id = ?",
@@ -2847,7 +2851,7 @@ class StateStore:
         ).fetchone()
         if snapshot is None:
             raise ValueError("formal snapshot receipt snapshot is missing")
-        ref = self._formal_snapshot_row_to_ref(snapshot)
+        ref = self._formal_snapshot_row_to_ref(snapshot, historical_read=historical_read)
         if receipt["task_id"] != task_id or ref.producing_task_id != task_id:
             raise ValueError("formal snapshot receipt producer mismatch")
         manifest_sha256 = _require_formal_sha256(
