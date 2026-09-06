@@ -8151,6 +8151,17 @@ class FormalV6PersistenceTests(unittest.TestCase):
         values.update(changes)
         return formal_fact(**values)
 
+    def install_eligible_bundle_facts(self):
+        return tuple(
+            self.install_fact(report_period=report_period)
+            for report_period in (
+                "2022-12-31", "2023-12-31",
+                "2024-03-31", "2024-06-30", "2024-09-30", "2024-12-31",
+                "2025-03-31", "2025-06-30", "2025-09-30", "2025-12-31",
+                "2026-03-31", "2026-06-30",
+            )
+        )
+
     def test_formal_facts_replay_preserves_first_created_time_and_lists_detached(self):
         from ashare_pipeline.formal_financial_schema import FormalFinancialFact
         fact = self.install_fact()
@@ -8399,9 +8410,9 @@ class FormalV6PersistenceTests(unittest.TestCase):
         return bundle, receipt, feature_store
 
     def test_bundle_live_receipt_and_append_only_metadata(self):
-        fact = self.install_fact()
-        self.store.insert_formal_financial_facts((fact,))
-        bundle, receipt, feature_store = self.install_registry_and_bundle(facts=(fact,))
+        facts = self.install_eligible_bundle_facts()
+        self.store.insert_formal_financial_facts(facts)
+        bundle, receipt, feature_store = self.install_registry_and_bundle(facts=facts)
         self.assertEqual(self.store.put_formal_feature_bundle(bundle, receipt), (bundle.bundle_hash(), True))
         row = self.store.get_formal_feature_bundle_row(bundle.input_hash)
         self.assertIs(type(row), dict)
@@ -8417,8 +8428,8 @@ class FormalV6PersistenceTests(unittest.TestCase):
             self.store.put_formal_feature_bundle(bundle, receipt)
 
     def test_bundle_missing_evidence_and_missing_live_store_fail_closed(self):
-        fact = self.install_fact()
-        bundle, receipt, _ = self.install_registry_and_bundle(facts=(fact,))
+        facts = self.install_eligible_bundle_facts()
+        bundle, receipt, _ = self.install_registry_and_bundle(facts=facts)
         with self.assertRaises(ValueError):
             self.store.put_formal_feature_bundle(bundle, receipt)
         with self.assertRaises(ValueError):
@@ -8454,9 +8465,9 @@ class FormalV6PersistenceTests(unittest.TestCase):
 
     def test_bundle_rejects_signed_slot_unit_formula_and_foreign_evidence(self):
         from ashare_pipeline.formal_feature_contract import FormalFeatureBundle
-        fact = self.install_fact()
-        self.store.insert_formal_financial_facts((fact,))
-        bundle, _, store = self.install_registry_and_bundle(facts=(fact,))
+        facts = self.install_eligible_bundle_facts()
+        self.store.insert_formal_financial_facts(facts)
+        bundle, _, store = self.install_registry_and_bundle(facts=facts)
         changes = (
             ("unit", "ratio"), ("formula_version", "wrong-v1"), ("slot_id", "general_nonfinancial.unknown"),
         )
