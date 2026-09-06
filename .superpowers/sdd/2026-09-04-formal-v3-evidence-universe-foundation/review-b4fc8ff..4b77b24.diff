@@ -1,0 +1,387 @@
+# Review package: b4fc8ff..4b77b24
+
+## Commits
+4b77b24 fix: harden formal snapshot validation
+
+## Files changed
+ ashare_pipeline/formal_snapshot_store.py | 113 ++++++++++++++++++++++++++-
+ tests/test_formal_snapshot_store.py      | 127 +++++++++++++++++++++++++++++++
+ 2 files changed, 239 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_snapshot_store.py b/ashare_pipeline/formal_snapshot_store.py
+index 52a94e7..0db9e61 100644
+--- a/ashare_pipeline/formal_snapshot_store.py
++++ b/ashare_pipeline/formal_snapshot_store.py
+@@ -1,23 +1,44 @@
+ """Byte-preserving, content-addressed storage for verified formal evidence."""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++from datetime import date
+ import hashlib
+ import json
+ import os
+ from pathlib import Path, PureWindowsPath
++import re
+ import tempfile
+ from typing import Callable
+ 
+-from .formal_evidence import EvidenceVerification, OfficialFetch, OfficialRequest
++from .formal_evidence import (
++    EvidenceVerification,
++    OfficialFetch,
++    OfficialRequest,
++    SourcePolicy,
++    VerifiedCalendarBinding,
++    verify_official_fetch,
++)
++
++
++_SECURITY_ID = re.compile(r"^(?:SH|SZ|BJ)[0-9]{6}$")
++_VERSION_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
++_EXCHANGES = frozenset({"SH", "SZ", "BJ"})
++_POLICY_FACTORIES = {
++    "cninfo": SourcePolicy.cninfo,
++    "sse": SourcePolicy.sse,
++    "szse": SourcePolicy.szse,
++    "bse": SourcePolicy.bse,
++    "csrc": SourcePolicy.csrc,
++}
+ 
+ 
+ @dataclass(frozen=True)
+ class FormalStoredSnapshot:
+     """Paths and immutable identifiers for one verified formal snapshot."""
+ 
+     content_path: str
+     manifest_path: str
+     content_sha256: str
+     manifest_sha256: str
+@@ -166,20 +187,22 @@ class FormalSnapshotStore:
+     ) -> ValidatedFormalSnapshot:
+         """Inspect exact fetch, verification, manifest, paths, and raw bytes.
+ 
+         The returned frozen projection is populated from the re-read canonical manifest and
+         is suitable for a persistence boundary; no caller-supplied path or metadata is
+         returned until every immutable linkage has been checked.
+         """
+         self._validate_inspection_inputs(
+             fetch, stored, verification, expected_producing_task_id
+         )
++        self._validate_formal_fetch_values(fetch)
++        self._require_recomputed_verification(fetch, verification)
+         content_sha256 = fetch.content_sha256
+         self._require_sha256(content_sha256, "fetch content hash")
+         self._require_sha256(verification.content_sha256, "verification content hash")
+         self._require_sha256(stored.content_sha256, "stored content hash")
+         self._require_sha256(stored.manifest_sha256, "stored manifest hash")
+         if fetch.effective_time_evidence_hash is not None:
+             self._require_sha256(
+                 fetch.effective_time_evidence_hash, "effective_time_evidence_hash"
+             )
+         if verification.content_sha256 != content_sha256:
+@@ -281,20 +304,108 @@ class FormalSnapshotStore:
+             raise ValueError("fetch raw_bytes must have exact type bytes")
+         if verification.status != "verified":
+             raise ValueError("verification must be verified")
+         if expected_producing_task_id is not None and (
+             type(expected_producing_task_id) is not str or not expected_producing_task_id
+         ):
+             raise ValueError("expected producing_task_id must be a nonempty string or None")
+         if type(stored.content_path) is not str or type(stored.manifest_path) is not str:
+             raise ValueError("stored snapshot paths must have exact type str")
+ 
++    @classmethod
++    def _validate_formal_fetch_values(cls, fetch: OfficialFetch) -> None:
++        request = fetch.request
++        if type(request.source) is not str:
++            raise ValueError("formal request source must have exact type str")
++        if type(request.dataset) is not str:
++            raise ValueError("formal request dataset must have exact type str")
++        cls._safe_path_component(request.source, "source")
++        cls._safe_path_component(request.dataset, "dataset")
++        if request.security_id is not None and (
++            type(request.security_id) is not str
++            or _SECURITY_ID.fullmatch(request.security_id) is None
++        ):
++            raise ValueError("invalid formal request security_id")
++        if request.period_or_date is not None:
++            if type(request.period_or_date) is not str:
++                raise ValueError("formal request period_or_date must be a string or None")
++            try:
++                date.fromisoformat(request.period_or_date)
++            except ValueError as error:
++                raise ValueError("invalid formal request period_or_date") from error
++        if request.exchange is not None and (
++            type(request.exchange) is not str or request.exchange not in _EXCHANGES
++        ):
++            raise ValueError("invalid formal request exchange")
++        if request.security_id is not None and request.exchange is not None:
++            if request.security_id[:2] != request.exchange:
++                raise ValueError("formal request security_id does not match exchange")
++        if fetch.declared_security_id is not None and type(fetch.declared_security_id) is not str:
++            raise ValueError("declared_security_id must be a string or None")
++        if fetch.declared_period is not None and type(fetch.declared_period) is not str:
++            raise ValueError("declared_period must be a string or None")
++        cls._require_version_identifier(fetch.parser_id, "parser_id")
++        cls._require_version_identifier(fetch.parser_version, "parser_version")
++        cls._require_version_identifier(fetch.mapping_version, "mapping_version")
++        if type(fetch.refresh_generation) is not str or not fetch.refresh_generation:
++            raise ValueError("refresh_generation must be a nonempty string")
++
++    @staticmethod
++    def _require_version_identifier(value: object, field: str) -> None:
++        if type(value) is not str or _VERSION_IDENTIFIER.fullmatch(value) is None:
++            raise ValueError(f"invalid {field}")
++
++    @classmethod
++    def _require_recomputed_verification(
++        cls, fetch: OfficialFetch, verification: EvidenceVerification
++    ) -> None:
++        policy_factory = _POLICY_FACTORIES.get(fetch.request.source)
++        if policy_factory is None:
++            raise ValueError("fetch source has no canonical verification policy")
++        calendar_binding = cls._structural_calendar_binding(fetch)
++        recomputed = verify_official_fetch(
++            fetch, policy_factory(), calendar_binding=calendar_binding
++        )
++        if recomputed.status != "verified":
++            raise ValueError(
++                "fetch failed canonical verification: " + ",".join(recomputed.reasons)
++            )
++        if verification.reasons != recomputed.reasons:
++            raise ValueError("verification reasons do not match canonical verification")
++        if verification.effective_at_utc != recomputed.effective_at_utc:
++            raise ValueError("verification effective_at_utc does not match canonical verification")
++        if verification.content_sha256 != recomputed.content_sha256:
++            raise ValueError("verification content hash does not match canonical verification")
++
++    @staticmethod
++    def _structural_calendar_binding(
++        fetch: OfficialFetch,
++    ) -> VerifiedCalendarBinding | None:
++        if fetch.published_precision != "date_only":
++            return None
++        request = fetch.request
++        exchange = request.exchange
++        if exchange is None and isinstance(request.security_id, str):
++            exchange = request.security_id[:2]
++        evidence_hash = fetch.effective_time_evidence_hash
++        if exchange not in _EXCHANGES or not isinstance(evidence_hash, str):
++            return None
++        return VerifiedCalendarBinding(
++            snapshot_id="formal-raw-validation-calendar",
++            manifest_sha256=evidence_hash,
++            exchange=exchange,
++            freeze_at_utc=fetch.effective_at_utc,
++            registry_manifest_hash="0" * 64,
++            selector_hash="0" * 64,
++            prerequisite_task_id="formal-raw-validation-calendar-task",
++        )
++
+     @staticmethod
+     def _require_exact_manifest_payload(
+         payload: dict[str, object], expected: dict[str, object]
+     ) -> None:
+         if payload.keys() != expected.keys():
+             raise ValueError("manifest payload fields do not exactly match expected fields")
+         for field, expected_value in expected.items():
+             if _canonical_json_bytes(payload[field]) != _canonical_json_bytes(expected_value):
+                 raise ValueError(f"manifest {field} does not match fetch or verification")
+ 
+diff --git a/tests/test_formal_snapshot_store.py b/tests/test_formal_snapshot_store.py
+index b60f4ca..fcd507f 100644
+--- a/tests/test_formal_snapshot_store.py
++++ b/tests/test_formal_snapshot_store.py
+@@ -4,20 +4,21 @@ import os
+ from dataclasses import FrozenInstanceError, replace
+ from pathlib import Path
+ import tempfile
+ import unittest
+ 
+ from ashare_pipeline.formal_evidence import (
+     EvidenceVerification,
+     OfficialFetch,
+     OfficialRequest,
+     SourcePolicy,
++    VerifiedCalendarBinding,
+     verify_official_fetch,
+ )
+ from ashare_pipeline.formal_snapshot_store import (
+     FormalSnapshotStore,
+     FormalStoredSnapshot,
+     ValidatedFormalSnapshot,
+ )
+ 
+ 
+ def verified_fetch(
+@@ -68,20 +69,113 @@ def rewrite_manifest(
+     )
+     manifest_path.write_bytes(canonical_json_bytes(envelope))
+     return replace(
+         stored,
+         manifest_path=str(manifest_path),
+         manifest_sha256=manifest_sha256,
+     )
+ 
+ 
+ class FormalSnapshotStoreTests(unittest.TestCase):
++    def test_validate_stored_snapshot_recomputes_verification_instead_of_trusting_status(self):
++        """A public EvidenceVerification constructor must not mint trusted evidence."""
++        cases = (
++            (
++                lambda fetch: fetch,
++                lambda fetch: EvidenceVerification(
++                    "verified", fetch.content_sha256, ("forged_reason",), fetch.effective_at_utc
++                ),
++                "reasons",
++            ),
++            (
++                lambda fetch: fetch,
++                lambda fetch: EvidenceVerification(
++                    "verified",
++                    fetch.content_sha256,
++                    (),
++                    "2026-03-20T09:00:00+00:00",
++                ),
++                "effective",
++            ),
++            (
++                lambda fetch: replace(fetch, original_url="http://example.invalid/report.pdf"),
++                lambda fetch: EvidenceVerification(
++                    "verified", fetch.content_sha256, (), fetch.effective_at_utc
++                ),
++                "verification",
++            ),
++            (
++                lambda fetch: replace(fetch, published_at_utc="2026-03-20T08:00:00"),
++                lambda fetch: EvidenceVerification(
++                    "verified", fetch.content_sha256, (), fetch.effective_at_utc
++                ),
++                "verification",
++            ),
++        )
++        for mutate_fetch, build_verification, expected_error in cases:
++            with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as root:
++                store = FormalSnapshotStore(root)
++                fetch = mutate_fetch(verified_fetch())
++                verification = build_verification(fetch)
++                stored = store.write_verified(fetch, verification, producing_task_id=None)
++
++                with self.assertRaisesRegex(ValueError, expected_error):
++                    store.validate_stored_snapshot(
++                        fetch, stored, verification, expected_producing_task_id=None
++                    )
++
++    def test_validate_stored_snapshot_rejects_self_consistent_invalid_nested_values(self):
++        """Runtime-invalid typed fields must not escape in the validated projection."""
++        cases = (
++            (
++                lambda fetch: replace(
++                    fetch,
++                    request=replace(fetch.request, security_id="SZ１２３４５６"),
++                    declared_security_id="SZ１２３４５６",
++                ),
++                "security",
++            ),
++            (
++                lambda fetch: replace(
++                    fetch,
++                    request=replace(fetch.request, period_or_date=20251231),
++                    declared_period=20251231,
++                ),
++                "period_or_date",
++            ),
++            (
++                lambda fetch: replace(
++                    fetch,
++                    request=replace(fetch.request, exchange=1),
++                ),
++                "exchange",
++            ),
++            (lambda fetch: replace(fetch, parser_id=7), "parser_id"),
++            (lambda fetch: replace(fetch, parser_version=""), "parser_version"),
++            (lambda fetch: replace(fetch, mapping_version=7), "mapping_version"),
++            (lambda fetch: replace(fetch, mapping_version=""), "mapping_version"),
++            (lambda fetch: replace(fetch, mapping_version="bad/version"), "mapping_version"),
++        )
++        for mutate_fetch, expected_error in cases:
++            with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as root:
++                store = FormalSnapshotStore(root)
++                fetch = mutate_fetch(verified_fetch())
++                verification = EvidenceVerification(
++                    "verified", fetch.content_sha256, (), fetch.effective_at_utc
++                )
++                stored = store.write_verified(fetch, verification, producing_task_id=None)
++
++                with self.assertRaisesRegex(ValueError, expected_error):
++                    store.validate_stored_snapshot(
++                        fetch, stored, verification, expected_producing_task_id=None
++                    )
++
+     def test_validate_stored_snapshot_returns_frozen_manifest_derived_projection(self):
+         """Returning caller metadata would let StateStore persist uninspected lineage."""
+         with tempfile.TemporaryDirectory() as root:
+             store = FormalSnapshotStore(root)
+             fetch = verified_fetch(raw_bytes=b"\xe5\xae\xa1\xe8\xae\xa1\x00PDF")
+             verification = verified(fetch)
+             stored = store.write_verified(
+                 fetch, verification, producing_task_id="formal-task-2"
+             )
+ 
+@@ -175,20 +269,53 @@ class FormalSnapshotStoreTests(unittest.TestCase):
+             ).producing_task_id)
+             self.assertEqual(store.validate_stored_snapshot(
+                 fetch, task, verification, expected_producing_task_id="formal-task-2"
+             ).producing_task_id, "formal-task-2")
+             with self.assertRaisesRegex(ValueError, "producing_task_id"):
+                 store.validate_stored_snapshot(
+                     fetch, bootstrap, verification,
+                     expected_producing_task_id="formal-task-2",
+                 )
+ 
++    def test_validate_stored_snapshot_preserves_verified_date_only_snapshot(self):
++        """Recomputation must retain valid calendar-bound Task 2 evidence."""
++        with tempfile.TemporaryDirectory() as root:
++            store = FormalSnapshotStore(root)
++            binding = VerifiedCalendarBinding(
++                snapshot_id="calendar-snapshot-1",
++                manifest_sha256="c" * 64,
++                exchange="SZ",
++                freeze_at_utc="2026-08-31T07:00:00+00:00",
++                registry_manifest_hash="r" * 64,
++                selector_hash="s" * 64,
++                prerequisite_task_id="calendar-task-1",
++            )
++            fetch = replace(
++                verified_fetch(),
++                request=replace(verified_fetch().request, exchange="SZ"),
++                published_precision="date_only",
++                effective_time_evidence_hash=binding.manifest_sha256,
++            )
++            verification = verify_official_fetch(
++                fetch, SourcePolicy.cninfo(), calendar_binding=binding
++            )
++            self.assertEqual(verification.status, "verified")
++            stored = store.write_verified(fetch, verification, producing_task_id=None)
++
++            inspected = store.validate_stored_snapshot(
++                fetch, stored, verification, expected_producing_task_id=None
++            )
++
++            self.assertEqual(
++                inspected.effective_time_evidence_hash, binding.manifest_sha256
++            )
++
+     def test_validate_stored_snapshot_rejects_content_and_hash_forgery(self):
+         """Trusting stored hashes or filenames would permit substituted bytes or lineage."""
+         with tempfile.TemporaryDirectory() as root:
+             store = FormalSnapshotStore(root)
+             fetch = verified_fetch()
+             verification = verified(fetch)
+             stored = store.write_verified(fetch, verification, producing_task_id=None)
+ 
+             Path(stored.content_path).write_bytes(b"tampered")
+             with self.assertRaisesRegex(ValueError, "content hash"):

@@ -1,0 +1,302 @@
+# Review package: 99b0681..988765d
+
+## Commits
+988765d fix: harden formal universe status ledger
+
+## Files changed
+ ashare_pipeline/state_store.py |  26 ++++++--
+ tests/test_state_store.py      | 141 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 163 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index b8b69c4..dccf7aa 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -760,25 +760,25 @@ def _require_formal_universe_status_values(
+         raise ValueError("formal universe status security ID is invalid")
+     try:
+         canonical = canonical_security_id(security_id)
+     except (TypeError, ValueError) as error:
+         raise ValueError("formal universe status security ID is invalid") from error
+     if canonical != security_id:
+         raise ValueError("formal universe status security ID is not canonical")
+     if type(status) is not str or status not in _FORMAL_UNIVERSE_STATUSES:
+         raise ValueError("formal universe status is not recognized")
+     if type(reasons) is not tuple or any(
+-        type(reason) is not str or not reason for reason in reasons
++        type(reason) is not str or not reason.strip() for reason in reasons
+     ):
+         raise ValueError("formal universe status reasons must be canonical strings")
+     if type(veto_flags) is not tuple or any(
+-        type(flag) is not str or not flag for flag in veto_flags
++        type(flag) is not str or not flag.strip() for flag in veto_flags
+     ):
+         raise ValueError("formal universe status veto flags must be canonical strings")
+     if tuple(sorted(reasons)) != reasons or len(set(reasons)) != len(reasons):
+         raise ValueError("formal universe status reasons must be sorted and unique")
+     if tuple(sorted(veto_flags)) != veto_flags or len(set(veto_flags)) != len(veto_flags):
+         raise ValueError("formal universe status veto flags must be sorted and unique")
+     if status in {"out_of_scope", "pending_evidence"} and not reasons:
+         raise ValueError(f"{status} requires at least one reason")
+     if status == "pool_vetoed" and not veto_flags:
+         raise ValueError("pool_vetoed requires at least one veto flag")
+@@ -2442,21 +2442,23 @@ class StateStore:
+         if any(result.get(key) != value for key, value in expected_result.items()):
+             raise ValueError("formal universe source task result lineage mismatch")
+         return persisted_ref
+ 
+     def _formal_universe_from_connection(
+         self,
+         connection: sqlite3.Connection,
+         header: sqlite3.Row,
+     ) -> tuple[FormalFrozenUniverseInput, list[dict[str, object]]]:
+         snapshot_id = _require_canonical_uuid(header["id"], "universe snapshot ID")
+-        _require_canonical_utc(header["created_at"], "universe creation time")
++        header_created_at = _require_canonical_utc(
++            header["created_at"], "universe creation time"
++        )
+         for field in (
+             "registry_manifest_hash",
+             "universe_hash",
+             "source_audit_hash",
+             "frozen_input_hash",
+         ):
+             _require_formal_sha256(header[field], f"universe {field}")
+         source_rows = connection.execute(
+             """SELECT * FROM formal_universe_source
+             WHERE universe_snapshot_id = ? ORDER BY exchange""",
+@@ -2545,36 +2547,52 @@ class StateStore:
+             """SELECT * FROM formal_universe_status
+             WHERE snapshot_id = ? ORDER BY security_id""",
+             (snapshot_id,),
+         ).fetchall()
+         if (
+             len(status_rows) != len(members)
+             or [row["security_id"] for row in status_rows]
+             != [member.security_id for member in members]
+         ):
+             raise ValueError("stored formal universe must have exactly one status per member")
++        status_updated_at_values: set[str] = set()
+         for row in status_rows:
+             reasons_list = _decode_canonical_formal_array(row["reasons_json"], "reasons")
+             veto_flags_list = _decode_canonical_formal_array(
+                 row["veto_flags_json"], "veto flags"
+             )
+             if row["snapshot_id"] != snapshot_id:
+                 raise ValueError("stored formal universe status fields are invalid")
+             _require_formal_universe_status_values(
+                 security_id=row["security_id"],
+                 status=row["status"],
+                 reasons=tuple(reasons_list),
+                 veto_flags=tuple(veto_flags_list),
+                 evidence_hash=row["evidence_hash"],
+                 frozen_input_hash=header["frozen_input_hash"],
+             )
+-            _require_canonical_utc(row["updated_at"], "universe status update time")
++            status_updated_at_values.add(
++                _require_canonical_utc(
++                    row["updated_at"], "universe status update time"
++                )
++            )
++        if len(status_updated_at_values) != 1:
++            raise ValueError(
++                "stored formal universe statuses must share one update time"
++            )
++        status_updated_at = next(iter(status_updated_at_values))
++        if datetime.fromisoformat(status_updated_at) < datetime.fromisoformat(
++            header_created_at
++        ):
++            raise ValueError(
++                "stored formal universe status update time predates snapshot"
++            )
+ 
+         frozen = _create_frozen_universe_input(
+             as_of_utc=header["as_of_utc"],
+             registry_manifest_hash=header["registry_manifest_hash"],
+             members=tuple(members),
+             sources=tuple(sources),
+             universe_hash=header["universe_hash"],
+             source_audit_hash=header["source_audit_hash"],
+             frozen_input_hash=header["frozen_input_hash"],
+         )
+diff --git a/tests/test_state_store.py b/tests/test_state_store.py
+index 7536531..6f3d4a1 100644
+--- a/tests/test_state_store.py
++++ b/tests/test_state_store.py
+@@ -7567,20 +7567,80 @@ class StateStoreTestCase(unittest.TestCase):
+             connection.execute(
+                 "DELETE FROM formal_universe_status WHERE snapshot_id=? AND security_id='BJ430001'",
+                 (snapshot_id,),
+             )
+             connection.commit()
+         with self.assertRaises(ValueError):
+             store.list_formal_universe_statuses(snapshot_id)
+         with self.assertRaises(ValueError):
+             store.replace_formal_universe_statuses(snapshot_id, decisions)
+ 
++    def test_formal_universe_status_reader_rejects_mixed_and_precreation_timestamps_without_mutation(self) -> None:
++        for index, case in enumerate(("different", "pre-header")):
++            with self.subTest(case=case):
++                path = Path(self.tempdir.name) / f"status-time-{index}.sqlite3"
++                store, frozen, _ = self.task_backed_frozen_universe(
++                    label=f"status-time-{index}", db_path=path
++                )
++                snapshot_id = store.put_formal_universe_snapshot(frozen)
++                decisions = tuple(
++                    FormalUniverseDecision(member.security_id, "formal_scored", (), (), "d" * 64)
++                    for member in frozen.members
++                )
++                with closing(sqlite3.connect(path)) as connection:
++                    header_created_at = connection.execute(
++                        "SELECT created_at FROM formal_universe_snapshot WHERE id=?",
++                        (snapshot_id,),
++                    ).fetchone()[0]
++                    offset = 1 if case == "different" else -1
++                    tampered_at = (
++                        datetime.fromisoformat(header_created_at) + timedelta(seconds=offset)
++                    ).isoformat()
++                    connection.execute(
++                        "UPDATE formal_universe_status SET updated_at=? WHERE snapshot_id=? AND security_id='BJ430001'",
++                        (tampered_at, snapshot_id),
++                    )
++                    connection.commit()
++                    before = connection.execute(
++                        "SELECT * FROM formal_universe_status WHERE snapshot_id=? ORDER BY security_id",
++                        (snapshot_id,),
++                    ).fetchall()
++
++                with self.assertRaises(ValueError):
++                    store.list_formal_universe_statuses(snapshot_id)
++                with self.assertRaises(ValueError):
++                    store.replace_formal_universe_statuses(snapshot_id, decisions)
++                with closing(sqlite3.connect(path)) as connection:
++                    after = connection.execute(
++                        "SELECT * FROM formal_universe_status WHERE snapshot_id=? ORDER BY security_id",
++                        (snapshot_id,),
++                    ).fetchall()
++                self.assertEqual(after, before)
++
++    def test_formal_universe_status_replacement_rejects_blank_reason_or_veto_without_mutation(self) -> None:
++        store, frozen, _ = self.task_backed_frozen_universe(label="status-blank")
++        snapshot_id = store.put_formal_universe_snapshot(frozen)
++        before = store.list_formal_universe_statuses(snapshot_id)
++        valid = [
++            FormalUniverseDecision(member.security_id, "formal_scored", (), (), "e" * 64)
++            for member in frozen.members
++        ]
++        invalid_sets = (
++            [replace(valid[0], status="out_of_scope", reasons=(" ",)), *valid[1:]],
++            [replace(valid[0], status="pool_vetoed", veto_flags=("\t",)), *valid[1:]],
++        )
++        for decisions in invalid_sets:
++            with self.subTest(decisions=decisions):
++                with self.assertRaises(ValueError):
++                    store.replace_formal_universe_statuses(snapshot_id, decisions)
++                self.assertEqual(store.list_formal_universe_statuses(snapshot_id), before)
++
+     def test_formal_universe_finalizer_completion_and_getter_require_exact_bound_proof(self) -> None:
+         store, frozen, source_task_ids = self.task_backed_frozen_universe(
+             label="finalizer-valid"
+         )
+         snapshot_id = store.put_formal_universe_snapshot(frozen)
+         generation = "universe-finalizer-generation-v1"
+         ordered_sources = [source_task_ids[exchange] for exchange in ("BJ", "SH", "SZ")]
+         finalizer_id = store.enqueue_formal_task(
+             "formal_universe_finalize",
+             "formal-universe-finalize:valid",
+@@ -7766,13 +7826,94 @@ class StateStoreTestCase(unittest.TestCase):
+             connection.commit()
+         with self.assertRaises(ValueError):
+             store.get_formal_universe_snapshot_from_task(finalizer_id)
+ 
+         wrong_kind = store.enqueue_formal_task(
+             "formal_feature_build", "not-a-finalizer", "generation-v1", {}
+         )
+         with self.assertRaises(ValueError):
+             store.get_formal_universe_snapshot_from_task(wrong_kind)
+ 
++    def test_formal_universe_finalizer_and_getter_reject_status_timestamp_tamper_without_mutation(self) -> None:
++        for index, (operation, case) in enumerate(
++            (
++                ("complete", "different"),
++                ("complete", "pre-header"),
++                ("get", "different"),
++                ("get", "pre-header"),
++            )
++        ):
++            with self.subTest(operation=operation, case=case):
++                path = Path(self.tempdir.name) / f"finalizer-status-time-{index}.sqlite3"
++                store, frozen, source_task_ids = self.task_backed_frozen_universe(
++                    label=f"finalizer-status-time-{index}", db_path=path
++                )
++                snapshot_id = store.put_formal_universe_snapshot(frozen)
++                generation = f"finalizer-status-time-generation-{index}"
++                ordered_sources = [source_task_ids[e] for e in ("BJ", "SH", "SZ")]
++                finalizer_id = store.enqueue_formal_task(
++                    "formal_universe_finalize",
++                    f"formal-universe-finalize:status-time:{index}",
++                    generation,
++                    {
++                        "as_of_utc": frozen.as_of_utc,
++                        "registry_manifest_hash": frozen.registry_manifest_hash,
++                        "refresh_generation": generation,
++                        "source_task_ids": ordered_sources,
++                    },
++                    ordered_sources,
++                )
++                store.lease_next_formal_task(
++                    ("formal_universe_finalize",), "worker-finalizer", 300
++                )
++                result = {
++                    "universe_snapshot_id": snapshot_id,
++                    "frozen_input_hash": frozen.frozen_input_hash,
++                    "universe_hash": frozen.universe_hash,
++                    "registry_manifest_hash": frozen.registry_manifest_hash,
++                }
++                if operation == "get":
++                    store.complete_formal_task(finalizer_id, "worker-finalizer", result)
++
++                with closing(sqlite3.connect(path)) as connection:
++                    header_created_at = connection.execute(
++                        "SELECT created_at FROM formal_universe_snapshot WHERE id=?",
++                        (snapshot_id,),
++                    ).fetchone()[0]
++                    offset = 1 if case == "different" else -1
++                    tampered_at = (
++                        datetime.fromisoformat(header_created_at) + timedelta(seconds=offset)
++                    ).isoformat()
++                    connection.execute(
++                        "UPDATE formal_universe_status SET updated_at=? WHERE snapshot_id=? AND security_id='BJ430001'",
++                        (tampered_at, snapshot_id),
++                    )
++                    connection.commit()
++                    task_before = connection.execute(
++                        "SELECT * FROM formal_collection_task WHERE id=?", (finalizer_id,)
++                    ).fetchone()
++                    statuses_before = connection.execute(
++                        "SELECT * FROM formal_universe_status WHERE snapshot_id=? ORDER BY security_id",
++                        (snapshot_id,),
++                    ).fetchall()
++
++                if operation == "complete":
++                    with self.assertRaises(ValueError):
++                        store.complete_formal_task(finalizer_id, "worker-finalizer", result)
++                else:
++                    with self.assertRaises(ValueError):
++                        store.get_formal_universe_snapshot_from_task(finalizer_id)
++
++                with closing(sqlite3.connect(path)) as connection:
++                    task_after = connection.execute(
++                        "SELECT * FROM formal_collection_task WHERE id=?", (finalizer_id,)
++                    ).fetchone()
++                    statuses_after = connection.execute(
++                        "SELECT * FROM formal_universe_status WHERE snapshot_id=? ORDER BY security_id",
++                        (snapshot_id,),
++                    ).fetchall()
++                self.assertEqual(task_after, task_before)
++                self.assertEqual(statuses_after, statuses_before)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

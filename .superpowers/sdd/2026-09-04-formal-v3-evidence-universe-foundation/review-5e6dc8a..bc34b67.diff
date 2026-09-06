@@ -1,0 +1,319 @@
+# Review package: 5e6dc8a..bc34b67
+
+## Commits
+bc34b67 fix: harden formal universe integrity
+
+## Files changed
+ ashare_pipeline/state_store.py | 74 ++++++++++++++++++++++++++++++++-------
+ tests/test_state_store.py      | 79 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 140 insertions(+), 13 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index f48612f..e1faf89 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -715,20 +715,37 @@ def _formal_frozen_universe_payload(
+                 "exchange": source.exchange,
+                 "extraction": _formal_universe_extraction_payload(source.extraction),
+                 "snapshot": _formal_snapshot_ref_payload(source.snapshot),
+             }
+             for source in frozen.sources
+         ],
+         "universe_hash": frozen.universe_hash,
+     }
+ 
+ 
++def _formal_universe_initial_status_evidence_hash(
++    frozen_input_hash: str, security_id: str
++) -> str:
++    payload = {
++        "frozen_input_hash": frozen_input_hash,
++        "reasons": ["formal_collection_pending"],
++        "security_id": security_id,
++        "status": "pending_evidence",
++        "veto_flags": [],
++    }
++    return hashlib.sha256(
++        _canonical_formal_universe_json(
++            payload, "formal universe initial status evidence"
++        ).encode("utf-8")
++    ).hexdigest()
++
++
+ def _require_canonical_uuid(value: object, field: str) -> str:
+     if type(value) is not str:
+         raise ValueError(f"stored formal {field} must be a canonical UUID")
+     try:
+         parsed = uuid.UUID(value)
+     except (ValueError, AttributeError) as error:
+         raise ValueError(f"stored formal {field} must be a canonical UUID") from error
+     if str(parsed) != value:
+         raise ValueError(f"stored formal {field} must be a canonical UUID")
+     return value
+@@ -2321,20 +2338,21 @@ class StateStore:
+             for row in connection.execute(
+                 """SELECT prerequisite_task_id
+                 FROM formal_collection_task_dependency
+                 WHERE task_id = ? ORDER BY prerequisite_task_id""",
+                 (task_id,),
+             )
+         ]
+         task = self._formal_task_public(task_row, prerequisites)
+         if task["kind"] != "formal_universe_source" or task["status"] != "verified":
+             raise ValueError("formal universe source task must be verified")
++        self._require_formal_verified_task_state(task_row, task)
+         if task["refresh_generation"] != persisted_ref.refresh_generation:
+             raise ValueError("formal universe source task generation mismatch")
+         payload = task["payload"]
+         result = task["result"]
+         if type(payload) is not dict or type(result) is not dict:
+             raise ValueError("formal universe source task payload/result is missing")
+         expected_request = json.loads(
+             OfficialRequest(
+                 persisted_ref.source,
+                 persisted_ref.dataset,
+@@ -2482,21 +2500,35 @@ class StateStore:
+             veto_flags = _decode_canonical_formal_array(
+                 row["veto_flags_json"], "veto flags"
+             )
+             if (
+                 row["snapshot_id"] != snapshot_id
+                 or row["status"] not in _FORMAL_UNIVERSE_STATUSES
+                 or any(type(reason) is not str or not reason for reason in reasons)
+                 or any(type(flag) is not str or not flag for flag in veto_flags)
+             ):
+                 raise ValueError("stored formal universe status fields are invalid")
+-            _require_formal_sha256(row["evidence_hash"], "universe status evidence hash")
++            evidence_hash = _require_formal_sha256(
++                row["evidence_hash"], "universe status evidence hash"
++            )
++            if (
++                row["status"] == "pending_evidence"
++                and reasons == ["formal_collection_pending"]
++                and veto_flags == []
++                and evidence_hash
++                != _formal_universe_initial_status_evidence_hash(
++                    header["frozen_input_hash"], row["security_id"]
++                )
++            ):
++                raise ValueError(
++                    "stored formal universe initial status evidence hash mismatch"
++                )
+             _require_canonical_utc(row["updated_at"], "universe status update time")
+ 
+         frozen = _create_frozen_universe_input(
+             as_of_utc=header["as_of_utc"],
+             registry_manifest_hash=header["registry_manifest_hash"],
+             members=tuple(members),
+             sources=tuple(sources),
+             universe_hash=header["universe_hash"],
+             source_audit_hash=header["source_audit_hash"],
+             frozen_input_hash=header["frozen_input_hash"],
+@@ -2595,32 +2627,23 @@ class StateStore:
+                         member.exchange,
+                         member.security_id[2:],
+                         member.security_type,
+                         member.listing_status,
+                         raw_json,
+                     ),
+                 )
+                 status = "pending_evidence"
+                 reasons = ["formal_collection_pending"]
+                 veto_flags: list[str] = []
+-                evidence_payload = {
+-                    "frozen_input_hash": frozen.frozen_input_hash,
+-                    "reasons": reasons,
+-                    "security_id": member.security_id,
+-                    "status": status,
+-                    "veto_flags": veto_flags,
+-                }
+-                evidence_hash = hashlib.sha256(
+-                    _canonical_formal_universe_json(
+-                        evidence_payload, "formal universe initial status evidence"
+-                    ).encode("utf-8")
+-                ).hexdigest()
++                evidence_hash = _formal_universe_initial_status_evidence_hash(
++                    frozen.frozen_input_hash, member.security_id
++                )
+                 connection.execute(
+                     """INSERT INTO formal_universe_status
+                     (snapshot_id,security_id,status,reasons_json,veto_flags_json,
+                      evidence_hash,updated_at) VALUES (?,?,?,?,?,?,?)""",
+                     (
+                         snapshot_id,
+                         member.security_id,
+                         status,
+                         _json(reasons),
+                         _json(veto_flags),
+@@ -4536,20 +4559,45 @@ class StateStore:
+             else None
+         )
+         public["error"] = (
+             _decode_canonical_mapping_json(str(error_json), "error")
+             if error_json is not None
+             else None
+         )
+         public["prerequisite_task_ids"] = sorted(prerequisite_task_ids)
+         return public
+ 
++    @staticmethod
++    def _require_formal_verified_task_state(
++        row: sqlite3.Row, task: Mapping[str, object]
++    ) -> None:
++        _require_canonical_uuid(row["id"], "task ID")
++        created_at = _require_canonical_utc(row["created_at"], "task creation time")
++        updated_at = _require_canonical_utc(row["updated_at"], "task update time")
++        if datetime.fromisoformat(updated_at) < datetime.fromisoformat(created_at):
++            raise ValueError("stored formal verified task timestamps are out of order")
++        if (
++            task["status"] != "verified"
++            or task["result"] is None
++            or task["error"] is not None
++            or any(
++                row[field] is not None
++                for field in (
++                    "error_json",
++                    "lease_worker",
++                    "lease_expires_at",
++                    "next_retry_at",
++                )
++            )
++        ):
++            raise ValueError("stored formal verified task state is invalid")
++
+     @staticmethod
+     def _job_public(row: sqlite3.Row) -> dict:
+         return {
+             "id": row["id"], "kind": row["kind"], "idempotency_key": row["idempotency_key"],
+             "status": row["status"], "lease_worker": row["lease_worker"],
+             "lease_expires_at": row["lease_expires_at"], "payload": json.loads(row["payload_json"]),
+             "result": json.loads(row["result_json"]) if row["result_json"] else None,
+             "error": json.loads(row["last_error_json"]) if row["last_error_json"] else None,
+             "next_retry_at": row["next_retry_at"],
+             "created_at": row["created_at"], "updated_at": row["updated_at"],
+diff --git a/tests/test_state_store.py b/tests/test_state_store.py
+index 96178ac..6cec407 100644
+--- a/tests/test_state_store.py
++++ b/tests/test_state_store.py
+@@ -7036,20 +7036,40 @@ class StateStoreTestCase(unittest.TestCase):
+ 
+         with closing(sqlite3.connect(self.db_path)) as connection:
+             row = connection.execute(
+                 """SELECT status,reasons_json,veto_flags_json,evidence_hash
+                 FROM formal_universe_status
+                 WHERE snapshot_id=? AND security_id='BJ430001'""",
+                 (snapshot_id,),
+             ).fetchone()
+         self.assertEqual(row, ("pool_vetoed", '["verified-risk"]', '["ST"]', "a" * 64))
+ 
++    def test_formal_universe_initial_status_recomputes_evidence_hash_on_read_and_replay(self) -> None:
++        store, frozen, _ = self.task_backed_frozen_universe(
++            label="initial-status-evidence"
++        )
++        snapshot_id = store.put_formal_universe_snapshot(frozen)
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            connection.execute(
++                """UPDATE formal_universe_status SET evidence_hash=?
++                WHERE snapshot_id=? AND security_id='BJ430001'""",
++                ("a" * 64, snapshot_id),
++            )
++            connection.commit()
++
++        with self.assertRaises(ValueError):
++            store.get_formal_universe_snapshot_by_input_hash(
++                frozen.frozen_input_hash
++            )
++        with self.assertRaisesRegex(ValueError, "frozen_input_hash_conflict"):
++            store.put_formal_universe_snapshot(frozen)
++
+     def test_formal_universe_snapshot_requires_exact_typed_recomputed_input(self) -> None:
+         store, frozen, _ = self.task_backed_frozen_universe(label="typed")
+         with self.assertRaises(ValueError):
+             store.put_formal_universe_snapshot({"frozen_input_hash": frozen.frozen_input_hash})
+ 
+         mutations = (
+             ("as_of_utc", "2026-08-31T14:59:59+08:00"),
+             ("registry_manifest_hash", ""),
+             ("members", tuple(reversed(frozen.members))),
+             ("sources", tuple(reversed(frozen.sources))),
+@@ -7236,20 +7256,79 @@ class StateStoreTestCase(unittest.TestCase):
+                         )
+                     connection.commit()
+                 with self.assertRaises(ValueError):
+                     store.put_formal_universe_snapshot(frozen)
+                 with closing(sqlite3.connect(path)) as connection:
+                     self.assertEqual(
+                         connection.execute("SELECT COUNT(*) FROM formal_universe_snapshot").fetchone()[0],
+                         0,
+                     )
+ 
++    def test_formal_universe_snapshot_rejects_impossible_verified_source_task_state(self) -> None:
++        cases = (
++            ("error_json", '{"code":"ghost-error"}'),
++            ("lease_worker", "ghost-worker"),
++            ("lease_expires_at", "2099-01-01T00:00:00+00:00"),
++            ("next_retry_at", "2099-01-01T00:00:00+00:00"),
++            ("created_at", "2099-01-01T00:00:00+00:00"),
++        )
++        for index, (field, value) in enumerate(cases):
++            with self.subTest(field=field):
++                path = Path(self.tempdir.name) / f"universe-task-state-{index}.sqlite3"
++                store, frozen, task_ids = self.task_backed_frozen_universe(
++                    label=f"task-state-{index}", db_path=path
++                )
++                with closing(sqlite3.connect(path)) as connection:
++                    connection.execute(
++                        f"UPDATE formal_collection_task SET {field}=? WHERE id=?",
++                        (value, task_ids["BJ"]),
++                    )
++                    connection.commit()
++
++                with self.assertRaises(ValueError):
++                    store.put_formal_universe_snapshot(frozen)
++                with closing(sqlite3.connect(path)) as connection:
++                    self.assertEqual(
++                        connection.execute(
++                            "SELECT COUNT(*) FROM formal_universe_snapshot"
++                        ).fetchone()[0],
++                        0,
++                    )
++
++    def test_formal_universe_getter_and_replay_reject_corrupt_verified_source_task_state(self) -> None:
++        cases = (
++            ("error_json", '{"code":"ghost-error"}'),
++            ("lease_worker", "ghost-worker"),
++            ("lease_expires_at", "2099-01-01T00:00:00+00:00"),
++            ("next_retry_at", "2099-01-01T00:00:00+00:00"),
++        )
++        for index, (field, value) in enumerate(cases):
++            with self.subTest(field=field):
++                path = Path(self.tempdir.name) / f"universe-stored-task-state-{index}.sqlite3"
++                store, frozen, task_ids = self.task_backed_frozen_universe(
++                    label=f"stored-task-state-{index}", db_path=path
++                )
++                store.put_formal_universe_snapshot(frozen)
++                with closing(sqlite3.connect(path)) as connection:
++                    connection.execute(
++                        f"UPDATE formal_collection_task SET {field}=? WHERE id=?",
++                        (value, task_ids["BJ"]),
++                    )
++                    connection.commit()
++
++                with self.assertRaises(ValueError):
++                    store.get_formal_universe_snapshot_by_input_hash(
++                        frozen.frozen_input_hash
++                    )
++                with self.assertRaises(ValueError):
++                    store.put_formal_universe_snapshot(frozen)
++
+     def test_formal_universe_snapshot_rolls_back_late_child_failure(self) -> None:
+         store, frozen, _ = self.task_backed_frozen_universe(label="late-rollback")
+         with closing(sqlite3.connect(self.db_path)) as connection:
+             connection.execute(
+                 """CREATE TRIGGER fail_universe_status
+                 BEFORE INSERT ON formal_universe_status
+                 BEGIN SELECT RAISE(ABORT, 'forced status failure'); END"""
+             )
+             connection.commit()
+ 

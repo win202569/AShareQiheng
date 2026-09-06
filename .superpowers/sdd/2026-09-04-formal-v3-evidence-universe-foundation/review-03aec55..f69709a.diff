@@ -1,0 +1,451 @@
+# Review package: 03aec55cc531650363f93e2a36c708ccd0a7b46c..f69709a
+
+## Commits
+f69709a feat: add byte-preserving formal snapshot store
+
+## Files changed
+ ashare_pipeline/formal_snapshot_store.py | 284 +++++++++++++++++++++++++++++++
+ tests/test_formal_snapshot_store.py      | 144 ++++++++++++++++
+ 2 files changed, 428 insertions(+)
+
+## Diff
+diff --git a/ashare_pipeline/formal_snapshot_store.py b/ashare_pipeline/formal_snapshot_store.py
+new file mode 100644
+index 0000000..2ce3b3e
+--- /dev/null
++++ b/ashare_pipeline/formal_snapshot_store.py
+@@ -0,0 +1,284 @@
++"""Byte-preserving, content-addressed storage for verified formal evidence."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import hashlib
++import json
++import os
++from pathlib import Path, PureWindowsPath
++import tempfile
++from typing import Callable
++
++from .formal_evidence import EvidenceVerification, OfficialFetch, OfficialRequest
++
++
++@dataclass(frozen=True)
++class FormalStoredSnapshot:
++    """Paths and immutable identifiers for one verified formal snapshot."""
++
++    content_path: str
++    manifest_path: str
++    content_sha256: str
++    manifest_sha256: str
++
++
++def _canonical_json_bytes(value: object) -> bytes:
++    return json.dumps(
++        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
++    ).encode("utf-8")
++
++
++def _sha256_bytes(value: bytes) -> str:
++    return hashlib.sha256(value).hexdigest()
++
++
++class FormalSnapshotStore:
++    """Persist verified official fetches without decoding or re-encoding their bytes."""
++
++    def __init__(self, root: str | Path):
++        self.root = Path(root).resolve()
++
++    def write_verified(
++        self,
++        fetch: OfficialFetch,
++        verification: EvidenceVerification,
++        *,
++        producing_task_id: str | None,
++    ) -> FormalStoredSnapshot:
++        """Atomically write one verified raw payload and its immutable lineage manifest."""
++        self._validate_write_inputs(fetch, verification, producing_task_id)
++        assert isinstance(fetch.request, OfficialRequest)
++        source = self._safe_path_component(fetch.request.source, "source")
++        dataset = self._safe_path_component(fetch.request.dataset, "dataset")
++        content_sha256 = fetch.content_sha256
++        directory = self.root / "data" / "raw" / "formal" / source / dataset
++        self._require_target_within_root(directory)
++
++        content_path = directory / f"{content_sha256}.bin"
++        self._write_content(content_path, fetch.raw_bytes, content_sha256)
++
++        payload = self._manifest_payload(fetch, verification, producing_task_id, content_sha256)
++        manifest_sha256 = _sha256_bytes(_canonical_json_bytes(payload))
++        envelope = {**payload, "manifest_sha256": manifest_sha256}
++        manifest_path = directory / f"{manifest_sha256}.manifest.json"
++        self._write_manifest(manifest_path, envelope, manifest_sha256)
++
++        return FormalStoredSnapshot(
++            content_path=str(content_path),
++            manifest_path=str(manifest_path),
++            content_sha256=content_sha256,
++            manifest_sha256=manifest_sha256,
++        )
++
++    def read_verified_raw(self, stored: FormalStoredSnapshot) -> bytes:
++        """Return raw bytes only after validating selected content and lineage files."""
++        if not isinstance(stored, FormalStoredSnapshot):
++            raise ValueError("stored snapshot must be a FormalStoredSnapshot")
++        self._require_sha256(stored.content_sha256, "content hash")
++        self._require_sha256(stored.manifest_sha256, "manifest hash")
++
++        manifest_path = self._path_inside_root(stored.manifest_path)
++        content_path = self._path_inside_root(stored.content_path)
++        if manifest_path.name != f"{stored.manifest_sha256}.manifest.json":
++            raise ValueError("manifest hash does not match manifest path")
++
++        envelope = self._read_manifest(manifest_path, stored.manifest_sha256)
++        request = envelope.get("request")
++        if not isinstance(request, dict):
++            raise ValueError("invalid manifest request")
++        source = self._safe_path_component(request.get("source"), "source")
++        dataset = self._safe_path_component(request.get("dataset"), "dataset")
++        expected_directory = self.root / "data" / "raw" / "formal" / source / dataset
++        if manifest_path.parent != expected_directory:
++            raise ValueError("manifest path does not match manifest lineage")
++
++        manifest_content_sha256 = envelope.get("content_sha256")
++        if manifest_content_sha256 != stored.content_sha256:
++            raise ValueError("content hash does not match manifest")
++        verification = envelope.get("verification")
++        if not isinstance(verification, dict) or verification.get("status") != "verified":
++            raise ValueError("manifest verification is not verified")
++        if verification.get("content_sha256") != stored.content_sha256:
++            raise ValueError("content hash does not match verification")
++
++        expected_content_path = expected_directory / f"{stored.content_sha256}.bin"
++        if content_path != expected_content_path:
++            raise ValueError("content hash does not match content path")
++        try:
++            raw_bytes = content_path.read_bytes()
++        except OSError as error:
++            raise ValueError(f"unable to read stored content: {content_path}") from error
++        if _sha256_bytes(raw_bytes) != stored.content_sha256:
++            raise ValueError("content hash verification failed")
++        return raw_bytes
++
++    def _validate_write_inputs(
++        self,
++        fetch: object,
++        verification: object,
++        producing_task_id: object,
++    ) -> None:
++        if not isinstance(fetch, OfficialFetch):
++            raise ValueError("fetch must be an OfficialFetch")
++        if not isinstance(verification, EvidenceVerification):
++            raise ValueError("verification must be an EvidenceVerification")
++        if verification.status != "verified":
++            raise ValueError("verification must be verified")
++        if verification.content_sha256 != fetch.content_sha256:
++            raise ValueError("verification content hash does not match fetch content hash")
++        if not isinstance(fetch.request, OfficialRequest):
++            raise ValueError("fetch request must be an OfficialRequest")
++        if not isinstance(producing_task_id, str) and producing_task_id is not None:
++            raise ValueError("producing_task_id must be a string or None")
++
++    @staticmethod
++    def _manifest_payload(
++        fetch: OfficialFetch,
++        verification: EvidenceVerification,
++        producing_task_id: str | None,
++        content_sha256: str,
++    ) -> dict[str, object]:
++        request = fetch.request
++        return {
++            "schema_version": 1,
++            "request": {
++                "source": request.source,
++                "dataset": request.dataset,
++                "security_id": request.security_id,
++                "period_or_date": request.period_or_date,
++                "exchange": request.exchange,
++            },
++            "content_sha256": content_sha256,
++            "original_url": fetch.original_url,
++            "published_at_utc": fetch.published_at_utc,
++            "published_precision": fetch.published_precision,
++            "source_updated_at_utc": fetch.source_updated_at_utc,
++            "captured_at_utc": fetch.captured_at_utc,
++            "effective_at_utc": fetch.effective_at_utc,
++            "effective_time_evidence_hash": fetch.effective_time_evidence_hash,
++            "refresh_generation": fetch.refresh_generation,
++            "parser_id": fetch.parser_id,
++            "parser_version": fetch.parser_version,
++            "mapping_version": fetch.mapping_version,
++            "declared_security_id": fetch.declared_security_id,
++            "declared_period": fetch.declared_period,
++            "verification": {
++                "status": verification.status,
++                "content_sha256": verification.content_sha256,
++                "reasons": list(verification.reasons),
++                "effective_at_utc": verification.effective_at_utc,
++            },
++            "producing_task_id": producing_task_id,
++        }
++
++    def _write_content(self, target: Path, raw_bytes: bytes, content_sha256: str) -> None:
++        if target.exists():
++            try:
++                existing = target.read_bytes()
++            except OSError as error:
++                raise ValueError(f"unable to read stored content: {target}") from error
++            if _sha256_bytes(existing) != content_sha256 or existing != raw_bytes:
++                raise ValueError("content hash verification failed for existing content")
++            return
++        self._atomic_write(
++            target,
++            raw_bytes,
++            lambda part: self._validate_content_file(part, content_sha256),
++        )
++
++    def _write_manifest(self, target: Path, envelope: dict[str, object], manifest_sha256: str) -> None:
++        encoded = _canonical_json_bytes(envelope)
++        if target.exists():
++            existing = self._read_manifest(target, manifest_sha256)
++            if _canonical_json_bytes(existing) != encoded:
++                raise ValueError("manifest hash verification failed for existing manifest")
++            return
++        self._atomic_write(
++            target,
++            encoded,
++            lambda part: self._read_manifest(part, manifest_sha256),
++        )
++
++    def _atomic_write(
++        self, target: Path, payload: bytes, validator: Callable[[Path], object]
++    ) -> None:
++        self._require_target_within_root(target)
++        target.parent.mkdir(parents=True, exist_ok=True)
++        part_path: Path | None = None
++        try:
++            descriptor, part_name = tempfile.mkstemp(
++                prefix=f".{target.name}.", suffix=".part", dir=target.parent
++            )
++            part_path = Path(part_name)
++            with os.fdopen(descriptor, "wb") as handle:
++                handle.write(payload)
++                handle.flush()
++                os.fsync(handle.fileno())
++            validator(part_path)
++            os.replace(part_path, target)
++            part_path = None
++        finally:
++            if part_path is not None:
++                part_path.unlink(missing_ok=True)
++
++    @staticmethod
++    def _validate_content_file(path: Path, expected_sha256: str) -> None:
++        try:
++            actual = _sha256_bytes(path.read_bytes())
++        except OSError as error:
++            raise ValueError(f"unable to validate stored content: {path}") from error
++        if actual != expected_sha256:
++            raise ValueError("content hash verification failed before replacement")
++
++    def _read_manifest(self, path: Path, expected_sha256: str) -> dict[str, object]:
++        try:
++            envelope = json.loads(path.read_text(encoding="utf-8"))
++        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
++            raise ValueError(f"invalid manifest: {path}") from error
++        if not isinstance(envelope, dict):
++            raise ValueError("invalid manifest envelope")
++        manifest_sha256 = envelope.get("manifest_sha256")
++        if manifest_sha256 != expected_sha256:
++            raise ValueError("manifest hash does not match envelope")
++        payload = {key: value for key, value in envelope.items() if key != "manifest_sha256"}
++        if _sha256_bytes(_canonical_json_bytes(payload)) != expected_sha256:
++            raise ValueError("manifest hash verification failed")
++        return envelope
++
++    @staticmethod
++    def _require_sha256(value: object, label: str) -> None:
++        if (
++            not isinstance(value, str)
++            or len(value) != 64
++            or any(character not in "0123456789abcdef" for character in value)
++        ):
++            raise ValueError(f"invalid {label}")
++
++    @staticmethod
++    def _safe_path_component(value: object, field: str) -> str:
++        if (
++            not isinstance(value, str)
++            or not value
++            or value in {".", ".."}
++            or "/" in value
++            or "\\" in value
++            or PureWindowsPath(value).drive
++            or PureWindowsPath(value).root
++        ):
++            raise ValueError(f"formal snapshot {field} must be a safe single path component")
++        return value
++
++    def _path_inside_root(self, value: str) -> Path:
++        path = Path(value).resolve()
++        self._require_target_within_root(path)
++        return path
++
++    def _require_target_within_root(self, target: Path) -> None:
++        try:
++            target.resolve().relative_to(self.root)
++        except ValueError as error:
++            raise ValueError("formal snapshot path must stay inside the store root") from error
++
++
++__all__ = ["FormalSnapshotStore", "FormalStoredSnapshot"]
+diff --git a/tests/test_formal_snapshot_store.py b/tests/test_formal_snapshot_store.py
+new file mode 100644
+index 0000000..7f6d791
+--- /dev/null
++++ b/tests/test_formal_snapshot_store.py
+@@ -0,0 +1,144 @@
++import hashlib
++import json
++from pathlib import Path
++import tempfile
++import unittest
++
++from ashare_pipeline.formal_evidence import (
++    OfficialFetch,
++    OfficialRequest,
++    SourcePolicy,
++    verify_official_fetch,
++)
++from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore
++
++
++def verified_fetch(
++    *, raw_bytes: bytes = b"%PDF-1.7 official", refresh_generation: str = "index-v1"
++) -> OfficialFetch:
++    return OfficialFetch(
++        request=OfficialRequest("cninfo", "annual_report", "SZ000001", "2025-12-31"),
++        raw_bytes=raw_bytes,
++        original_url="https://static.cninfo.com.cn/finalpage/2026-03-20/123.pdf",
++        published_at_utc="2026-03-20T08:00:00+00:00",
++        published_precision="timestamp",
++        source_updated_at_utc=None,
++        captured_at_utc="2026-09-04T08:00:00+00:00",
++        effective_at_utc="2026-03-20T08:00:00+00:00",
++        effective_time_evidence_hash=None,
++        refresh_generation=refresh_generation,
++        parser_id="cninfo-pdf",
++        parser_version="cninfo-pdf-v1",
++        mapping_version="cninfo-annual-v1",
++        declared_security_id="SZ000001",
++        declared_period="2025-12-31",
++    )
++
++
++def verified(fetch: OfficialFetch):
++    result = verify_official_fetch(fetch, SourcePolicy.cninfo())
++    assert result.status == "verified"
++    return result
++
++
++class FormalSnapshotStoreTests(unittest.TestCase):
++    def test_binary_bytes_round_trip_without_json_reencoding(self):
++        """Removing raw-byte storage would turn this non-UTF-8 payload into a failure."""
++        with tempfile.TemporaryDirectory() as root:
++            store = FormalSnapshotStore(root)
++            fetch = verified_fetch(raw_bytes=b"%PDF\x00\xff\n")
++
++            stored = store.write_verified(fetch, verified(fetch), producing_task_id=None)
++
++            self.assertEqual(store.read_verified_raw(stored), b"%PDF\x00\xff\n")
++            self.assertEqual(Path(stored.content_path).read_bytes(), b"%PDF\x00\xff\n")
++            self.assertEqual(
++                stored.content_sha256, hashlib.sha256(b"%PDF\x00\xff\n").hexdigest()
++            )
++
++    def test_tampered_content_is_rejected_and_part_file_is_cleaned(self):
++        """Removing content-hash verification would allow corrupted source bytes through."""
++        with tempfile.TemporaryDirectory() as root:
++            store = FormalSnapshotStore(root)
++            fetch = verified_fetch()
++            stored = store.write_verified(fetch, verified(fetch), producing_task_id=None)
++            Path(stored.content_path).write_bytes(b"tampered")
++
++            with self.assertRaisesRegex(ValueError, "content hash"):
++                store.read_verified_raw(stored)
++
++            self.assertFalse(list(Path(root).rglob("*.part")))
++
++    def test_tampered_manifest_is_rejected(self):
++        """Skipping manifest lineage-hash validation would allow altered provenance through."""
++        with tempfile.TemporaryDirectory() as root:
++            store = FormalSnapshotStore(root)
++            fetch = verified_fetch()
++            stored = store.write_verified(fetch, verified(fetch), producing_task_id=None)
++            envelope = json.loads(Path(stored.manifest_path).read_text(encoding="utf-8"))
++            envelope["producing_task_id"] = "tampered-task"
++            Path(stored.manifest_path).write_text(json.dumps(envelope), encoding="utf-8")
++
++            with self.assertRaisesRegex(ValueError, "manifest hash"):
++                store.read_verified_raw(stored)
++
++    def test_same_bytes_in_new_generation_reuses_bin_but_keeps_two_manifests(self):
++        """Leaving refresh generation out of lineage would collapse distinct collections."""
++        with tempfile.TemporaryDirectory() as root:
++            store = FormalSnapshotStore(root)
++            first_fetch = verified_fetch(refresh_generation="index-v1")
++            second_fetch = verified_fetch(refresh_generation="index-v2")
++
++            first = store.write_verified(first_fetch, verified(first_fetch), producing_task_id=None)
++            second = store.write_verified(second_fetch, verified(second_fetch), producing_task_id=None)
++
++            self.assertEqual(first.content_path, second.content_path)
++            self.assertNotEqual(first.manifest_sha256, second.manifest_sha256)
++            self.assertNotEqual(first.manifest_path, second.manifest_path)
++            self.assertEqual(store.read_verified_raw(first), store.read_verified_raw(second))
++
++    def test_manifest_carries_fetch_verification_and_task_provenance(self):
++        """Dropping any persisted provenance field would make the envelope incomplete."""
++        with tempfile.TemporaryDirectory() as root:
++            store = FormalSnapshotStore(root)
++            fetch = verified_fetch()
++
++            stored = store.write_verified(fetch, verified(fetch), producing_task_id="formal-task-2")
++
++            envelope = json.loads(Path(stored.manifest_path).read_text(encoding="utf-8"))
++            self.assertEqual(envelope["content_sha256"], fetch.content_sha256)
++            self.assertEqual(envelope["refresh_generation"], "index-v1")
++            self.assertEqual(envelope["request"], {
++                "dataset": "annual_report",
++                "exchange": None,
++                "period_or_date": "2025-12-31",
++                "security_id": "SZ000001",
++                "source": "cninfo",
++            })
++            self.assertEqual(envelope["verification"], {
++                "content_sha256": fetch.content_sha256,
++                "effective_at_utc": "2026-03-20T08:00:00+00:00",
++                "reasons": [],
++                "status": "verified",
++            })
++            self.assertEqual(envelope["producing_task_id"], "formal-task-2")
++
++    def test_rejected_or_mismatched_verification_cannot_be_stored(self):
++        """Accepting unverified evidence or a different payload hash breaks the trust boundary."""
++        with tempfile.TemporaryDirectory() as root:
++            store = FormalSnapshotStore(root)
++            fetch = verified_fetch()
++            rejected = verify_official_fetch(
++                OfficialFetch(**{**fetch.__dict__, "raw_bytes": b""}), SourcePolicy.cninfo()
++            )
++
++            with self.assertRaisesRegex(ValueError, "verified"):
++                store.write_verified(fetch, rejected, producing_task_id=None)
++
++            other_fetch = verified_fetch(raw_bytes=b"other bytes")
++            with self.assertRaisesRegex(ValueError, "content hash"):
++                store.write_verified(fetch, verified(other_fetch), producing_task_id=None)
++
++
++if __name__ == "__main__":
++    unittest.main()

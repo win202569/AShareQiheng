@@ -1,0 +1,506 @@
+# Review package: dabb95d..4a734d4
+
+## Commits
+4a734d4 fix: harden formal universe invariants
+
+## Files changed
+ ashare_pipeline/formal_universe.py | 186 +++++++++++++++++++++++++++++++++----
+ tests/test_formal_universe.py      |  97 +++++++++++++++++++
+ 2 files changed, 264 insertions(+), 19 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_universe.py b/ashare_pipeline/formal_universe.py
+index 89ae8ad..5731b5e 100644
+--- a/ashare_pipeline/formal_universe.py
++++ b/ashare_pipeline/formal_universe.py
+@@ -1,49 +1,69 @@
+ """Pure, fail-closed construction of the formal full-market universe."""
+ 
+ from __future__ import annotations
+ 
+ from collections import Counter
+ from dataclasses import dataclass
+ import hashlib
+ import json
+ import re
++from types import MappingProxyType
+ from typing import Literal, Mapping, Sequence
+ 
+ from ashare_pipeline.formal_evidence import OfficialSnapshotRef
+ from ashare_pipeline.formal_time import FORMAL_FREEZE_AT_CN, is_visible_at
+ 
+ 
+ Exchange = Literal["SH", "SZ", "BJ"]
+ UniverseStatus = Literal["out_of_scope", "pending_evidence", "pool_vetoed", "formal_scored"]
+ _EXCHANGES = frozenset({"SH", "SZ", "BJ"})
++_OFFICIAL_LISTING_DATASETS = frozenset({"official_security_listing"})
+ _SECURITY_ID = re.compile(r"^(?:SH|SZ|BJ)[0-9]{6}$")
+ _SECURITY_TYPES = frozenset({
+     "ordinary_a", "b_share", "fund", "etf", "bond", "convertible",
+     "convertible_bond", "reit", "preferred_stock", "depositary_receipt",
+ })
+ _LISTING_STATUSES = frozenset({"listed", "suspended", "delisted"})
+ 
+ 
+ def _canonical_json_bytes(value: object) -> bytes:
+     try:
+         return json.dumps(
+-            value,
++            _plain_json(value),
+             ensure_ascii=False,
+             sort_keys=True,
+             separators=(",", ":"),
+             allow_nan=False,
+         ).encode("utf-8")
+     except (TypeError, ValueError) as exc:
+         raise ValueError("formal universe value must be canonical JSON") from exc
+ 
+ 
++def _plain_json(value: object) -> object:
++    if isinstance(value, Mapping):
++        if any(not isinstance(key, str) for key in value):
++            raise ValueError("formal universe JSON object keys must be strings")
++        return {key: _plain_json(item) for key, item in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_plain_json(item) for item in value]
++    return value
++
++
++def _freeze_json(value: object) -> object:
++    if isinstance(value, dict):
++        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
++    if isinstance(value, list):
++        return tuple(_freeze_json(item) for item in value)
++    return value
++
++
+ def _canonical_sha256(value: object) -> str:
+     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+ 
+ 
+ def _json_copy(value: object) -> object:
+     return json.loads(_canonical_json_bytes(value).decode("utf-8"))
+ 
+ 
+ def _nonempty_text(value: object, field: str) -> str:
+     if not isinstance(value, str) or not value:
+@@ -62,20 +82,40 @@ def canonical_security_id(value: str) -> str:
+ 
+ @dataclass(frozen=True)
+ class FormalUniverseMember:
+     security_id: str
+     exchange: Exchange
+     security_type: str
+     listing_status: str
+     raw_row: Mapping[str, object]
+     raw_row_hash: str
+ 
++    def __post_init__(self) -> None:
++        copied = _json_copy(self.raw_row)
++        assert isinstance(copied, dict)
++        security_id = canonical_security_id(self.security_id)
++        if security_id != self.security_id or self.exchange not in _EXCHANGES or security_id[:2] != self.exchange:
++            raise ValueError("formal universe member identity must be canonical and match exchange")
++        if self.security_type != "ordinary_a":
++            raise ValueError("formal universe member security_type must be ordinary_a")
++        if self.listing_status not in _LISTING_STATUSES:
++            raise ValueError("formal universe member listing_status is unknown")
++        if (
++            copied.get("security_id") != self.security_id
++            or copied.get("security_type") != self.security_type
++            or copied.get("listing_status") != self.listing_status
++        ):
++            raise ValueError("formal universe member raw row identity mismatch")
++        if _canonical_sha256(copied) != self.raw_row_hash:
++            raise ValueError("formal universe member raw_row_hash mismatch")
++        object.__setattr__(self, "raw_row", _freeze_json(copied))
++
+ 
+ @dataclass(frozen=True)
+ class FormalUniverseDecision:
+     security_id: str
+     status: UniverseStatus
+     reasons: tuple[str, ...]
+     veto_flags: tuple[str, ...]
+     evidence_hash: str
+ 
+ 
+@@ -120,20 +160,23 @@ class FormalUniverseSourceDocument:
+ @dataclass(frozen=True)
+ class FormalFrozenUniverseInput:
+     as_of_utc: str
+     registry_manifest_hash: str
+     members: tuple[FormalUniverseMember, ...]
+     sources: tuple[FormalUniverseSourceEvidence, ...]
+     universe_hash: str
+     source_audit_hash: str
+     frozen_input_hash: str
+ 
++    def __post_init__(self) -> None:
++        _validate_frozen_universe_input(self)
++
+ 
+ def classify_universe_status(
+     *, in_scope: bool, evidence_complete: bool, veto_flags: tuple[str, ...]
+ ) -> UniverseStatus:
+     if not in_scope:
+         return "out_of_scope"
+     if not evidence_complete:
+         return "pending_evidence"
+     if veto_flags:
+         return "pool_vetoed"
+@@ -239,20 +282,139 @@ def build_universe_snapshot(
+     if len(identifiers) != len(set(identifiers)):
+         raise ValueError("formal universe contains duplicate security_id across exchanges")
+     audit_hashes = [{"exchange": item.exchange, "audit_hash": item.audit.audit_hash} for item in sorted(materialized, key=lambda item: item.exchange)]
+     universe_hash = _canonical_sha256({
+         "members": [_member_payload(member) for member in members],
+         "source_audits": audit_hashes,
+     })
+     return members, universe_hash
+ 
+ 
++def _audit_fields(audit: FormalUniverseSourceAudit) -> dict[str, object]:
++    return {
++        "accepted_members_hash": audit.accepted_members_hash,
++        "accepted_ordinary_a_count": audit.accepted_ordinary_a_count,
++        "exchange": audit.exchange,
++        "excluded_by_security_type": audit.excluded_by_security_type,
++        "excluded_rows_hash": audit.excluded_rows_hash,
++        "parsed_rows_hash": audit.parsed_rows_hash,
++        "parser_id": audit.parser_id,
++        "parser_version": audit.parser_version,
++        "source_content_sha256": audit.source_content_sha256,
++        "source_row_count": audit.source_row_count,
++    }
++
++
++def _validate_source_evidence(
++    source: FormalUniverseSourceEvidence, as_of_utc: str
++) -> None:
++    if not isinstance(source, FormalUniverseSourceEvidence):
++        raise ValueError("formal frozen universe requires three verified SH/SZ/BJ sources")
++    snapshot = source.snapshot
++    extraction = source.extraction
++    if not isinstance(extraction, FormalUniverseExtraction):
++        raise ValueError("formal frozen universe source extraction is malformed")
++    if not isinstance(snapshot, OfficialSnapshotRef) or snapshot.verification_status != "verified":
++        raise ValueError("formal frozen universe source must be verified")
++    if snapshot.dataset not in _OFFICIAL_LISTING_DATASETS:
++        raise ValueError("formal frozen universe source must use an official listing dataset")
++    if snapshot.security_id is not None:
++        raise ValueError("formal frozen universe source must be global")
++    if source.exchange != snapshot.exchange or source.exchange != extraction.exchange:
++        raise ValueError("formal frozen universe source exchange mismatch")
++    if not is_visible_at(snapshot.published_at_utc, as_of_utc) or not is_visible_at(snapshot.effective_at_utc, as_of_utc):
++        raise ValueError("formal frozen universe source must be visible at the freeze")
++    audit = extraction.audit
++    if not isinstance(audit, FormalUniverseSourceAudit):
++        raise ValueError("formal frozen universe source audit is malformed")
++    if audit.exchange != source.exchange:
++        raise ValueError("formal frozen universe source audit exchange mismatch")
++    if audit.source_content_sha256 != snapshot.content_sha256:
++        raise ValueError("formal frozen universe source content hash mismatch")
++    if audit.parser_id != snapshot.parser_id or audit.parser_version != snapshot.parser_version:
++        raise ValueError("formal frozen universe source parser mismatch")
++    if not extraction.members or tuple(sorted(extraction.members, key=lambda member: member.security_id)) != extraction.members:
++        raise ValueError("formal frozen universe extraction must be nonempty and sorted")
++    if any(member.exchange != source.exchange for member in extraction.members):
++        raise ValueError("formal frozen universe extraction member exchange mismatch")
++    if audit.accepted_ordinary_a_count != len(extraction.members):
++        raise ValueError("formal frozen universe accepted member count mismatch")
++    excluded_count = sum(count for _, count in audit.excluded_by_security_type)
++    if any(count <= 0 for _, count in audit.excluded_by_security_type) or audit.source_row_count != len(extraction.members) + excluded_count:
++        raise ValueError("formal frozen universe source row count mismatch")
++    if audit.accepted_members_hash != _canonical_sha256([_member_payload(member) for member in extraction.members]):
++        raise ValueError("formal frozen universe accepted_members_hash mismatch")
++    if audit.audit_hash != _canonical_sha256(_audit_fields(audit)):
++        raise ValueError("formal frozen universe audit_hash mismatch")
++
++
++def _source_manifest(sources: Sequence[FormalUniverseSourceEvidence]) -> list[dict[str, str]]:
++    return [{
++        "audit_hash": source.extraction.audit.audit_hash,
++        "content_sha256": source.snapshot.content_sha256,
++        "exchange": source.exchange,
++        "manifest_sha256": source.snapshot.manifest_sha256,
++        "parser_id": source.snapshot.parser_id,
++        "parser_version": source.snapshot.parser_version,
++    } for source in sources]
++
++
++def _frozen_input_hash(
++    as_of_utc: str,
++    registry_manifest_hash: str,
++    universe_hash: str,
++    source_manifest: Sequence[Mapping[str, str]],
++) -> str:
++    return _canonical_sha256({
++        "as_of_utc": as_of_utc,
++        "registry_manifest_hash": registry_manifest_hash,
++        "sources": [{
++            "audit_hash": item["audit_hash"],
++            "exchange": item["exchange"],
++            "manifest_sha256": item["manifest_sha256"],
++        } for item in source_manifest],
++        "universe_hash": universe_hash,
++    })
++
++
++def _validate_frozen_universe_input(frozen: FormalFrozenUniverseInput) -> None:
++    if frozen.as_of_utc != FORMAL_FREEZE_AT_CN:
++        raise ValueError(f"formal universe freeze must be exactly {FORMAL_FREEZE_AT_CN}")
++    _nonempty_text(frozen.registry_manifest_hash, "registry_manifest_hash")
++    if not isinstance(frozen.sources, tuple) or len(frozen.sources) != 3:
++        raise ValueError("formal frozen universe requires three verified SH/SZ/BJ sources")
++    if {source.exchange for source in frozen.sources if isinstance(source, FormalUniverseSourceEvidence)} != _EXCHANGES:
++        raise ValueError("formal frozen universe requires three verified SH/SZ/BJ sources")
++    if tuple(sorted(frozen.sources, key=lambda source: source.exchange)) != frozen.sources:
++        raise ValueError("formal frozen universe sources must be sorted by exchange")
++    for source in frozen.sources:
++        _validate_source_evidence(source, frozen.as_of_utc)
++    expected_members, expected_universe_hash = build_universe_snapshot(
++        tuple(source.extraction for source in frozen.sources)
++    )
++    if not isinstance(frozen.members, tuple) or frozen.members != expected_members:
++        raise ValueError("formal frozen universe members must exactly match its source extractions")
++    if frozen.universe_hash != expected_universe_hash:
++        raise ValueError("formal frozen universe universe_hash mismatch")
++    manifest = _source_manifest(frozen.sources)
++    if frozen.source_audit_hash != _canonical_sha256(manifest):
++        raise ValueError("formal frozen universe source_audit_hash mismatch")
++    expected_frozen_hash = _frozen_input_hash(
++        frozen.as_of_utc,
++        frozen.registry_manifest_hash,
++        frozen.universe_hash,
++        manifest,
++    )
++    if frozen.frozen_input_hash != expected_frozen_hash:
++        raise ValueError("formal frozen universe frozen_input_hash mismatch")
++
++
+ class FormalUniverseIngestor:
+     def build(
+         self,
+         as_of_utc: str,
+         registry_manifest_hash: str,
+         documents: Sequence[FormalUniverseSourceDocument],
+     ) -> FormalFrozenUniverseInput:
+         if as_of_utc != FORMAL_FREEZE_AT_CN:
+             raise ValueError(f"formal universe freeze must be exactly {FORMAL_FREEZE_AT_CN}")
+         _nonempty_text(registry_manifest_hash, "registry_manifest_hash")
+@@ -270,39 +432,25 @@ class FormalUniverseIngestor:
+             if snapshot.exchange != document.exchange:
+                 raise ValueError("formal universe source must be exchange-scoped to its document")
+             if document.parser_id != snapshot.parser_id or document.parser_version != snapshot.parser_version:
+                 raise ValueError("formal universe document parser must match its verified snapshot")
+             if not is_visible_at(snapshot.published_at_utc, as_of_utc) or not is_visible_at(snapshot.effective_at_utc, as_of_utc):
+                 raise ValueError("formal universe source snapshot must be visible at the freeze")
+             extraction = extract_formal_universe_members(document)
+             sources.append(FormalUniverseSourceEvidence(document.exchange, snapshot, extraction))
+ 
+         members, universe_hash = build_universe_snapshot(tuple(source.extraction for source in sources))
+-        source_manifest = [{
+-            "audit_hash": source.extraction.audit.audit_hash,
+-            "content_sha256": source.snapshot.content_sha256,
+-            "exchange": source.exchange,
+-            "manifest_sha256": source.snapshot.manifest_sha256,
+-            "parser_id": source.snapshot.parser_id,
+-            "parser_version": source.snapshot.parser_version,
+-        } for source in sources]
++        source_manifest = _source_manifest(sources)
+         source_audit_hash = _canonical_sha256(source_manifest)
+-        frozen_input_hash = _canonical_sha256({
+-            "as_of_utc": as_of_utc,
+-            "registry_manifest_hash": registry_manifest_hash,
+-            "sources": [{
+-                "audit_hash": item["audit_hash"],
+-                "exchange": item["exchange"],
+-                "manifest_sha256": item["manifest_sha256"],
+-            } for item in source_manifest],
+-            "universe_hash": universe_hash,
+-        })
++        frozen_input_hash = _frozen_input_hash(
++            as_of_utc, registry_manifest_hash, universe_hash, source_manifest
++        )
+         return FormalFrozenUniverseInput(
+             as_of_utc=as_of_utc,
+             registry_manifest_hash=registry_manifest_hash,
+             members=members,
+             sources=tuple(sources),
+             universe_hash=universe_hash,
+             source_audit_hash=source_audit_hash,
+             frozen_input_hash=frozen_input_hash,
+         )
+ 
+diff --git a/tests/test_formal_universe.py b/tests/test_formal_universe.py
+index 2ae3b10..dfec5e9 100644
+--- a/tests/test_formal_universe.py
++++ b/tests/test_formal_universe.py
+@@ -1,15 +1,16 @@
+ from dataclasses import replace
+ import unittest
+ 
+ from ashare_pipeline.formal_evidence import OfficialSnapshotRef
+ from ashare_pipeline.formal_universe import (
++    FormalFrozenUniverseInput,
+     FormalUniverseIngestor,
+     FormalUniverseSourceDocument,
+     build_universe_snapshot,
+     canonical_security_id,
+     classify_universe_status,
+     extract_formal_universe_members,
+ )
+ 
+ 
+ FORMAL_FREEZE_AT_CN = "2026-08-31T15:00:00+08:00"
+@@ -83,20 +84,50 @@ class FormalUniverseTests(unittest.TestCase):
+         second = extract_formal_universe_members(listing_document("BJ", (
+             {"security_id": "BJ430001", "security_type": "ordinary_a", "listing_status": "listed", "name": "A"},
+             {"security_id": "BJ899001", "security_type": "bond", "listing_status": "listed", "name": "Bond B"},
+         )))
+         self.assertEqual([member.security_id for member in first.members], ["BJ430001"])
+         self.assertEqual(first.members[0].raw_row["name"], "A")
+         self.assertEqual(first.audit.excluded_by_security_type, (("bond", 1),))
+         self.assertNotEqual(first.audit.excluded_rows_hash, second.audit.excluded_rows_hash)
+         self.assertNotEqual(first.audit.audit_hash, second.audit.audit_hash)
+ 
++    def test_accepted_raw_json_is_defensively_copied_and_deeply_immutable(self):
++        raw_row = {
++            "security_id": "BJ430001",
++            "security_type": "ordinary_a",
++            "listing_status": "listed",
++            "metadata": {"aliases": ["alpha"]},
++        }
++        frozen = FormalUniverseIngestor().build(
++            FORMAL_FREEZE_AT_CN,
++            "m" * 64,
++            (
++                listing_document("BJ", (raw_row,)),
++                *verified_listing_documents("SH", "SZ"),
++            ),
++        )
++        member = frozen.members[0]
++        original_hashes = (member.raw_row_hash, frozen.universe_hash, frozen.frozen_input_hash)
++
++        raw_row["metadata"]["aliases"].append("source-mutation")
++        with self.assertRaises(TypeError):
++            member.raw_row["metadata"] = {}
++        with self.assertRaises(AttributeError):
++            member.raw_row["metadata"]["aliases"].append("member-mutation")
++
++        self.assertEqual(member.raw_row["metadata"]["aliases"], ("alpha",))
++        self.assertEqual(
++            (member.raw_row_hash, frozen.universe_hash, frozen.frozen_input_hash),
++            original_hashes,
++        )
++
+     def test_extraction_fails_closed_for_bad_rows_and_zero_ordinary_a(self):
+         invalid_rows = (
+             ({"security_id": "SZ000001", "listing_status": "listed"}, "unknown security_type"),
+             ({"security_id": "SZ000001", "security_type": "mystery", "listing_status": "listed"}, "unknown security_type"),
+             ({"security_id": "SZ000001", "security_type": "ordinary_a"}, "listing_status"),
+             ({"security_id": "SH600000", "security_type": "ordinary_a", "listing_status": "listed"}, "exchange"),
+         )
+         for row, message in invalid_rows:
+             with self.subTest(row=row), self.assertRaisesRegex(ValueError, message):
+                 extract_formal_universe_members(listing_document("SZ", (row,)))
+@@ -116,32 +147,98 @@ class FormalUniverseTests(unittest.TestCase):
+ 
+     def test_build_snapshot_requires_three_extractions_and_is_order_independent(self):
+         extractions = tuple(extract_formal_universe_members(document) for document in verified_listing_documents("SH", "SZ", "BJ"))
+         members, universe_hash = build_universe_snapshot(reversed(extractions))
+         self.assertEqual([member.security_id for member in members], ["BJ430001", "SH600000", "SZ000001"])
+         self.assertEqual(len(universe_hash), 64)
+         self.assertEqual(build_universe_snapshot(extractions), (members, universe_hash))
+         with self.assertRaisesRegex(ValueError, "SH/SZ/BJ"):
+             build_universe_snapshot(extractions[:2])
+ 
++    def test_frozen_input_constructor_rejects_bare_members_and_tampered_hash_graph(self):
++        with self.assertRaisesRegex(ValueError, "three verified SH/SZ/BJ sources"):
++            FormalFrozenUniverseInput(
++                as_of_utc=FORMAL_FREEZE_AT_CN,
++                registry_manifest_hash="m" * 64,
++                members=(),
++                sources=(),
++                universe_hash="u" * 64,
++                source_audit_hash="s" * 64,
++                frozen_input_hash="f" * 64,
++            )
++
++        frozen = FormalUniverseIngestor().build(
++            FORMAL_FREEZE_AT_CN,
++            "m" * 64,
++            verified_listing_documents("SH", "SZ", "BJ"),
++        )
++        for field in ("universe_hash", "source_audit_hash", "frozen_input_hash"):
++            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
++                replace(frozen, **{field: "0" * 64})
++
++        first_source = frozen.sources[0]
++        bad_audit = replace(first_source.extraction.audit, audit_hash="0" * 64)
++        bad_source = replace(
++            first_source,
++            extraction=replace(first_source.extraction, audit=bad_audit),
++        )
++        with self.assertRaisesRegex(ValueError, "audit_hash"):
++            replace(frozen, sources=(bad_source, *frozen.sources[1:]))
++
++        malformed_source = replace(first_source, extraction=None)
++        with self.assertRaises(Exception) as caught:
++            replace(frozen, sources=(malformed_source, *frozen.sources[1:]))
++        self.assertIsInstance(caught.exception, ValueError)
++        self.assertIn("extraction", str(caught.exception))
++
++        with self.assertRaisesRegex(ValueError, "members must exactly match"):
++            replace(frozen, members=frozen.members[1:])
++
++    def test_member_constructor_rejects_noncanonical_or_non_ordinary_identity(self):
++        frozen = FormalUniverseIngestor().build(
++            FORMAL_FREEZE_AT_CN,
++            "m" * 64,
++            verified_listing_documents("SH", "SZ", "BJ"),
++        )
++        member = frozen.members[0]
++
++        with self.assertRaisesRegex(ValueError, "ordinary_a"):
++            replace(member, security_type="bond")
++        with self.assertRaisesRegex(ValueError, "raw row identity"):
++            replace(member, security_id="BJ430002")
++
+     def test_ingestor_requires_three_verified_visible_exchange_scoped_documents(self):
+         documents = verified_listing_documents("SH", "SZ", "BJ")
+         frozen = FormalUniverseIngestor().build(FORMAL_FREEZE_AT_CN, "m" * 64, documents)
+         self.assertEqual(tuple(source.exchange for source in frozen.sources), ("BJ", "SH", "SZ"))
+         self.assertEqual([member.security_id for member in frozen.members], ["BJ430001", "SH600000", "SZ000001"])
+         self.assertEqual(len(frozen.source_audit_hash), 64)
+         self.assertEqual(len(frozen.frozen_input_hash), 64)
+         with self.assertRaisesRegex(ValueError, "SH/SZ/BJ"):
+             FormalUniverseIngestor().build(FORMAL_FREEZE_AT_CN, "m" * 64, documents[:2])
+         future = replace(documents[0], snapshot=replace(documents[0].snapshot, effective_at_utc="2026-08-31T15:00:01+08:00"))
+         with self.assertRaisesRegex(ValueError, "visible"):
+             FormalUniverseIngestor().build(FORMAL_FREEZE_AT_CN, "m" * 64, (future, *documents[1:]))
+         scoped = replace(documents[0], snapshot=replace(documents[0].snapshot, security_id="SH600000"))
+         with self.assertRaisesRegex(ValueError, "global"):
+             FormalUniverseIngestor().build(FORMAL_FREEZE_AT_CN, "m" * 64, (scoped, *documents[1:]))
+         parser_mismatch = replace(documents[0], parser_version="other-parser-v2")
+         with self.assertRaisesRegex(ValueError, "parser"):
+             FormalUniverseIngestor().build(FORMAL_FREEZE_AT_CN, "m" * 64, (parser_mismatch, *documents[1:]))
+ 
++    def test_ingestor_rejects_verified_non_listing_dataset(self):
++        documents = verified_listing_documents("SH", "SZ", "BJ")
++        annual_report = replace(
++            documents[0],
++            snapshot=replace(documents[0].snapshot, dataset="annual_report"),
++        )
++
++        with self.assertRaisesRegex(ValueError, "official listing dataset"):
++            FormalUniverseIngestor().build(
++                FORMAL_FREEZE_AT_CN,
++                "m" * 64,
++                (annual_report, *documents[1:]),
++            )
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

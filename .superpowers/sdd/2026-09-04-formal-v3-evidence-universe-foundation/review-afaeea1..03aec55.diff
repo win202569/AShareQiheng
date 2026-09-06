@@ -1,0 +1,165 @@
+# Review package: afaeea1..03aec55
+
+## Commits
+03aec55 fix: close formal evidence authority boundary
+
+## Files changed
+ ashare_pipeline/formal_evidence.py | 25 +++++++++++++++++++------
+ tests/test_formal_evidence.py      | 29 +++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_evidence.py b/ashare_pipeline/formal_evidence.py
+index ca8d356..bb69a81 100644
+--- a/ashare_pipeline/formal_evidence.py
++++ b/ashare_pipeline/formal_evidence.py
+@@ -4,22 +4,29 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ from datetime import datetime, timezone
+ import hashlib
+ import json
+ import re
+ from typing import Literal
+ from urllib.parse import urlsplit
+ 
+ 
+-_SECURITY_ID = re.compile(r"^(?:SH|SZ|BJ)\d{6}$")
++_SECURITY_ID = re.compile(r"^(?:SH|SZ|BJ)[0-9]{6}$")
+ _EXCHANGES = frozenset({"SH", "SZ", "BJ"})
++_AUTHORITATIVE_HOSTS = {
++    "cninfo": frozenset({"www.cninfo.com.cn", "static.cninfo.com.cn"}),
++    "sse": frozenset({"www.sse.com.cn", "query.sse.com.cn", "static.sse.com.cn"}),
++    "szse": frozenset({"www.szse.cn", "docs.static.szse.cn"}),
++    "bse": frozenset({"www.bse.cn"}),
++    "csrc": frozenset({"www.csrc.gov.cn"}),
++}
+ 
+ 
+ def _canonical_json_bytes(value: object) -> bytes:
+     return json.dumps(
+         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+     ).encode("utf-8")
+ 
+ 
+ def _aware_timestamp(value: object) -> datetime | None:
+     if not isinstance(value, str):
+@@ -187,39 +194,43 @@ class SourcePolicy:
+ 
+     def __post_init__(self) -> None:
+         if not _nonempty_text(self.source):
+             raise ValueError("source must be non-empty")
+         if not self.allowed_hosts or any(not _nonempty_text(host) for host in self.allowed_hosts):
+             raise ValueError("allowed_hosts must contain authoritative hostnames")
+         object.__setattr__(
+             self, "allowed_hosts", frozenset(host.lower() for host in self.allowed_hosts)
+         )
+ 
++    @property
++    def is_authoritative(self) -> bool:
++        return _AUTHORITATIVE_HOSTS.get(self.source) == self.allowed_hosts
++
+     @classmethod
+     def cninfo(cls) -> "SourcePolicy":
+-        return cls("cninfo", frozenset({"www.cninfo.com.cn", "static.cninfo.com.cn"}))
++        return cls("cninfo", _AUTHORITATIVE_HOSTS["cninfo"])
+ 
+     @classmethod
+     def sse(cls) -> "SourcePolicy":
+-        return cls("sse", frozenset({"www.sse.com.cn", "query.sse.com.cn", "static.sse.com.cn"}))
++        return cls("sse", _AUTHORITATIVE_HOSTS["sse"])
+ 
+     @classmethod
+     def szse(cls) -> "SourcePolicy":
+-        return cls("szse", frozenset({"www.szse.cn", "docs.static.szse.cn"}))
++        return cls("szse", _AUTHORITATIVE_HOSTS["szse"])
+ 
+     @classmethod
+     def bse(cls) -> "SourcePolicy":
+-        return cls("bse", frozenset({"www.bse.cn"}))
++        return cls("bse", _AUTHORITATIVE_HOSTS["bse"])
+ 
+     @classmethod
+     def csrc(cls) -> "SourcePolicy":
+-        return cls("csrc", frozenset({"www.csrc.gov.cn"}))
++        return cls("csrc", _AUTHORITATIVE_HOSTS["csrc"])
+ 
+     def verify(
+         self,
+         fetch: OfficialFetch,
+         *,
+         calendar_binding: VerifiedCalendarBinding | None = None,
+     ) -> EvidenceVerification:
+         return verify_official_fetch(fetch, self, calendar_binding=calendar_binding)
+ 
+ 
+@@ -271,20 +282,22 @@ def verify_official_fetch(
+ ) -> EvidenceVerification:
+     """Return a deterministic verification result without performing transport."""
+     content_sha256 = _fetch_content_sha256(fetch)
+     reasons: set[str] = set()
+     if not isinstance(fetch, OfficialFetch):
+         reasons.add("invalid_fetch")
+         return EvidenceVerification("rejected", content_sha256, tuple(sorted(reasons)))
+     if not isinstance(policy, SourcePolicy):
+         reasons.add("invalid_policy")
+         return EvidenceVerification("rejected", content_sha256, tuple(sorted(reasons)))
++    if not policy.is_authoritative:
++        reasons.add("source_not_authoritative")
+ 
+     request = fetch.request
+     if not isinstance(request, OfficialRequest):
+         reasons.add("invalid_request")
+         resolved_exchange = None
+     else:
+         if not _nonempty_text(request.source):
+             reasons.add("request_source_missing")
+         if not _nonempty_text(request.dataset):
+             reasons.add("request_dataset_missing")
+diff --git a/tests/test_formal_evidence.py b/tests/test_formal_evidence.py
+index c369d40..1a7c691 100644
+--- a/tests/test_formal_evidence.py
++++ b/tests/test_formal_evidence.py
+@@ -181,13 +181,42 @@ class FormalEvidenceTests(unittest.TestCase):
+         fetch = timestamp_fetch()
+         missing_capture_time = OfficialFetch(
+             **{**fetch.__dict__, "captured_at_utc": None}
+         )
+ 
+         result = verify_official_fetch(missing_capture_time, SourcePolicy.cninfo())
+ 
+         self.assertEqual(result.status, "rejected")
+         self.assertIn("invalid_timestamp", result.reasons)
+ 
++    def test_custom_akshare_policy_cannot_verify_formal_evidence(self):
++        fetch = OfficialFetch.minimal(
++            OfficialRequest("akshare", "daily", "SZ000001", "2026-08-31"),
++            b"rows",
++            "https://example.invalid/rows",
++            "2026-08-31T07:00:00+00:00",
++            "timestamp",
++            refresh_generation="fixture-index-v1",
++        )
++
++        result = verify_official_fetch(
++            fetch, SourcePolicy("akshare", frozenset({"example.invalid"}))
++        )
++
++        self.assertEqual(result.status, "rejected")
++        self.assertIn("source_not_authoritative", result.reasons)
++
++    def test_rejects_unicode_decimal_digits_in_security_identity(self):
++        request = OfficialRequest("cninfo", "annual_report", "SZ１２３４５６", "2025-12-31")
++        fetch = timestamp_fetch(request=request)
++        unicode_identity = OfficialFetch(
++            **{**fetch.__dict__, "declared_security_id": "SZ１２３４５６"}
++        )
++
++        result = verify_official_fetch(unicode_identity, SourcePolicy.cninfo())
++
++        self.assertEqual(result.status, "rejected")
++        self.assertIn("invalid_security_id", result.reasons)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,0 +1,48 @@
+# Review package: df1cbc1288e2264bfd9cc2ac3d52ab4f0b142cac..f121506a0a2e71fec033570aa9eb8e67fdded8eb
+
+## Commits
+f121506 test: preserve POSIX mkdir capability in race
+
+## Files changed
+ tests/test_formal_feature_store.py | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/tests/test_formal_feature_store.py b/tests/test_formal_feature_store.py
+index 2a9e179..bb056ca 100644
+--- a/tests/test_formal_feature_store.py
++++ b/tests/test_formal_feature_store.py
+@@ -309,23 +309,29 @@ class FormalFeatureStoreTests(unittest.TestCase):
+                     root.rename(displaced)
+                     create_directory_link(root, external)
+                 if dir_fd is None:
+                     real_mkdir(path, mode)
+                 else:
+                     real_mkdir(path, mode, dir_fd=dir_fd)
+ 
+             with patch(
+                 "ashare_pipeline.formal_feature_store.os.mkdir",
+                 side_effect=replacing_mkdir,
+-            ):
+-                with self.assertRaises(ValueError):
+-                    store.write(self.bundle)
++            ) as mocked_mkdir:
++                supported_dir_fd = set(os.supports_dir_fd)
++                supported_dir_fd.add(mocked_mkdir)
++                with patch(
++                    "ashare_pipeline.formal_feature_store.os.supports_dir_fd",
++                    supported_dir_fd,
++                ):
++                    with self.assertRaises(ValueError):
++                        store.write(self.bundle)
+ 
+             self.assertTrue(raced)
+             self.assertEqual(list(external.iterdir()), [])
+ 
+     def test_forged_or_mutated_receipt_and_wrong_store_root_are_rejected(self) -> None:
+         saved = self.store.write(self.bundle)
+         with self.assertRaises(TypeError):
+             FormalStoredFeatureBundle(
+                 saved.bundle_path, saved.manifest_path, saved.bundle_hash, saved.manifest_hash
+             )
+

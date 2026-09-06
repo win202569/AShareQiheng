@@ -1,0 +1,778 @@
+# Review package: 5518c28..d4ce87a
+
+## Commits
+d4ce87a feat: persist formal task snapshot receipts
+
+## Files changed
+ ashare_pipeline/state_store.py | 310 ++++++++++++++++++++++++++++++++-------
+ tests/test_state_store.py      | 324 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 583 insertions(+), 51 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index 0e213e6..5c57edf 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -107,20 +107,23 @@ _FROZEN_CALENDAR_SNAPSHOT_KEYS = frozenset(
+         "request",
+         "request_fingerprint",
+     }
+ )
+ _FORMAL_REQUEST_IDENTITY_KEYS = frozenset(
+     {"dataset", "exchange", "period_or_date", "security_id", "source"}
+ )
+ _FORMAL_VERIFICATION_KEYS = frozenset(
+     {"content_sha256", "effective_at_utc", "reasons", "status"}
+ )
++_FORMAL_SOURCE_FETCH_KINDS = frozenset(
++    {"formal_statement", "formal_context", "formal_universe_source"}
++)
+ 
+ FINANCIAL_FACT_COLUMNS = (
+     "id",
+     "security_id",
+     "statement",
+     "metric_key",
+     "period_start",
+     "period_end",
+     "period_kind",
+     "value",
+@@ -1709,91 +1712,296 @@ class StateStore:
+     def get_formal_snapshot(self, snapshot_id: str) -> OfficialSnapshotRef | None:
+         self._require_formal_snapshot_store()
+         if type(snapshot_id) is not str or not snapshot_id.strip():
+             raise ValueError("snapshot_id must be a nonempty string")
+         with closing(self._connect()) as connection:
+             row = connection.execute(
+                 "SELECT * FROM formal_source_snapshot WHERE id = ?", (snapshot_id,)
+             ).fetchone()
+             return self._formal_snapshot_row_to_ref(row) if row is not None else None
+ 
+-    def get_formal_task_snapshot_receipt(
+-        self, task_id: str
++    def _formal_task_snapshot_receipt_from_connection(
++        self, connection: sqlite3.Connection, task_id: str
+     ) -> dict[str, object] | None:
+-        self._require_formal_snapshot_store()
++        receipt = connection.execute(
++            "SELECT * FROM formal_task_snapshot_receipt WHERE task_id = ?",
++            (task_id,),
++        ).fetchone()
++        producer_snapshot_ids = [
++            str(row["id"])
++            for row in connection.execute(
++                """SELECT id FROM formal_source_snapshot
++                WHERE producing_task_id = ? ORDER BY id""",
++                (task_id,),
++            )
++        ]
++        if receipt is None:
++            if producer_snapshot_ids:
++                raise ValueError("formal snapshot producer has no exact receipt")
++            return None
++        if producer_snapshot_ids != [receipt["snapshot_id"]]:
++            raise ValueError("formal snapshot receipt producer set mismatch")
++        task = connection.execute(
++            "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
++        ).fetchone()
++        if task is None:
++            raise ValueError("formal snapshot receipt task is missing")
++        prerequisites = [
++            str(row["prerequisite_task_id"])
++            for row in connection.execute(
++                """SELECT prerequisite_task_id
++                FROM formal_collection_task_dependency
++                WHERE task_id = ? ORDER BY prerequisite_task_id""",
++                (task_id,),
++            )
++        ]
++        task_public = self._formal_task_public(task, prerequisites)
++        snapshot = connection.execute(
++            "SELECT * FROM formal_source_snapshot WHERE id = ?",
++            (receipt["snapshot_id"],),
++        ).fetchone()
++        if snapshot is None:
++            raise ValueError("formal snapshot receipt snapshot is missing")
++        ref = self._formal_snapshot_row_to_ref(snapshot)
++        if receipt["task_id"] != task_id or ref.producing_task_id != task_id:
++            raise ValueError("formal snapshot receipt producer mismatch")
++        manifest_sha256 = _require_formal_sha256(
++            receipt["manifest_sha256"], "receipt manifest hash"
++        )
++        if manifest_sha256 != ref.manifest_sha256:
++            raise ValueError("formal snapshot receipt manifest mismatch")
++        refresh_generation = receipt["refresh_generation"]
++        if (
++            type(refresh_generation) is not str
++            or not refresh_generation
++            or refresh_generation != ref.refresh_generation
++            or refresh_generation != task_public["refresh_generation"]
++        ):
++            raise ValueError("formal snapshot receipt refresh generation mismatch")
++        return {
++            "task_id": task_id,
++            "snapshot_id": ref.snapshot_id,
++            "manifest_sha256": manifest_sha256,
++            "refresh_generation": refresh_generation,
++            "recorded_at": _require_canonical_utc(
++                receipt["recorded_at"], "receipt time"
++            ),
++        }
++
++    def put_formal_snapshot_for_leased_task(
++        self,
++        fetch: OfficialFetch,
++        stored: FormalStoredSnapshot,
++        verification: EvidenceVerification,
++        *,
++        task_id: str,
++        worker_id: str,
++    ) -> OfficialSnapshotRef:
++        raw_store = self._require_formal_snapshot_store()
+         if type(task_id) is not str or not task_id.strip():
+             raise ValueError("task_id must be a nonempty string")
+-        with self._transaction() as connection:
+-            receipt = connection.execute(
+-                "SELECT * FROM formal_task_snapshot_receipt WHERE task_id = ?",
+-                (task_id,),
+-            ).fetchone()
+-            producer_snapshot_ids = [
+-                str(row["id"])
+-                for row in connection.execute(
+-                    """SELECT id FROM formal_source_snapshot
+-                    WHERE producing_task_id = ? ORDER BY id""",
+-                    (task_id,),
+-                )
+-            ]
+-            if receipt is None:
+-                if producer_snapshot_ids:
+-                    raise ValueError("formal snapshot producer has no exact receipt")
+-                return None
+-            if producer_snapshot_ids != [receipt["snapshot_id"]]:
+-                raise ValueError("formal snapshot receipt producer set mismatch")
++        if type(worker_id) is not str or not worker_id.strip():
++            raise ValueError("worker_id must be a nonempty string")
++        validated = raw_store.validate_stored_snapshot(
++            fetch,
++            stored,
++            verification,
++            expected_producing_task_id=task_id,
++        )
++        if type(validated) is not ValidatedFormalSnapshot:
++            raise ValueError("formal snapshot validation returned an invalid projection")
++        request_payload = _decode_canonical_formal_json(validated.request_json, "request")
++        if frozenset(request_payload) != _FORMAL_REQUEST_IDENTITY_KEYS:
++            raise ValueError("formal snapshot request identity keys mismatch")
++        if validated.request_fingerprint != hashlib.sha256(
++            validated.request_json.encode("utf-8")
++        ).hexdigest():
++            raise ValueError("formal snapshot request fingerprint mismatch")
++        if (
++            validated.producing_task_id != task_id
++            or validated.refresh_generation != fetch.refresh_generation
++        ):
++            raise ValueError("formal snapshot task producer or generation mismatch")
++
++        with self._transaction(immediate=True) as connection:
++            now = _utc_iso(_utc_now())
+             task = connection.execute(
+                 "SELECT * FROM formal_collection_task WHERE id = ?", (task_id,)
+             ).fetchone()
+             if task is None:
+-                raise ValueError("formal snapshot receipt task is missing")
++                raise ValueError("formal snapshot task does not exist")
+             prerequisites = [
+                 str(row["prerequisite_task_id"])
+                 for row in connection.execute(
+                     """SELECT prerequisite_task_id
+                     FROM formal_collection_task_dependency
+                     WHERE task_id = ? ORDER BY prerequisite_task_id""",
+                     (task_id,),
+                 )
+             ]
+             task_public = self._formal_task_public(task, prerequisites)
+-            snapshot = connection.execute(
+-                "SELECT * FROM formal_source_snapshot WHERE id = ?",
+-                (receipt["snapshot_id"],),
+-            ).fetchone()
+-            if snapshot is None:
+-                raise ValueError("formal snapshot receipt snapshot is missing")
+-            ref = self._formal_snapshot_row_to_ref(snapshot)
+-            if receipt["task_id"] != task_id or ref.producing_task_id != task_id:
+-                raise ValueError("formal snapshot receipt producer mismatch")
+-            manifest_sha256 = _require_formal_sha256(
+-                receipt["manifest_sha256"], "receipt manifest hash"
+-            )
+-            if manifest_sha256 != ref.manifest_sha256:
+-                raise ValueError("formal snapshot receipt manifest mismatch")
+-            refresh_generation = receipt["refresh_generation"]
++            lease_expires_at = _require_canonical_utc(
++                task_public["lease_expires_at"], "task lease expiry"
++            ) if task_public["lease_expires_at"] is not None else None
++            if (
++                task_public["kind"] not in _FORMAL_SOURCE_FETCH_KINDS
++                or task_public["status"] != "leased"
++                or task_public["lease_worker"] != worker_id
++                or lease_expires_at is None
++                or lease_expires_at <= now
++            ):
++                raise ValueError(
++                    "formal snapshot task is not held by the current unexpired source-task lease owner"
++                )
++            task_generation = task_public["refresh_generation"]
+             if (
+-                type(refresh_generation) is not str
+-                or not refresh_generation
+-                or refresh_generation != ref.refresh_generation
+-                or refresh_generation != task_public["refresh_generation"]
++                type(task_generation) is not str
++                or not task_generation
++                or task_generation != fetch.refresh_generation
++                or task_generation != validated.refresh_generation
+             ):
+-                raise ValueError("formal snapshot receipt refresh generation mismatch")
+-            return {
+-                "task_id": task_id,
+-                "snapshot_id": ref.snapshot_id,
+-                "manifest_sha256": manifest_sha256,
+-                "refresh_generation": refresh_generation,
+-                "recorded_at": _require_canonical_utc(
+-                    receipt["recorded_at"], "receipt time"
++                raise ValueError("formal snapshot task refresh generation mismatch")
++
++            existing_receipt = self._formal_task_snapshot_receipt_from_connection(
++                connection, task_id
++            )
++            if existing_receipt is not None:
++                existing = connection.execute(
++                    "SELECT * FROM formal_source_snapshot WHERE id = ?",
++                    (existing_receipt["snapshot_id"],),
++                ).fetchone()
++                if existing is None:
++                    raise ValueError("formal_task_snapshot_receipt_conflict")
++                ref = self._formal_snapshot_row_to_ref(existing)
++                if not self._formal_ref_matches_projection(ref, validated):
++                    raise ValueError("formal_task_snapshot_receipt_conflict")
++                return ref
++
++            existing_manifest = connection.execute(
++                "SELECT * FROM formal_source_snapshot WHERE manifest_sha256 = ?",
++                (validated.manifest_sha256,),
++            ).fetchone()
++            if existing_manifest is not None:
++                try:
++                    self._formal_snapshot_row_to_ref(existing_manifest)
++                except ValueError as error:
++                    raise ValueError("formal_snapshot_manifest_conflict") from error
++                raise ValueError("formal_task_snapshot_receipt_conflict")
++
++            lineage = connection.execute(
++                """SELECT * FROM formal_source_snapshot
++                WHERE request_fingerprint = ? AND refresh_generation = ?
++                  AND producing_task_id = ?""",
++                (
++                    validated.request_fingerprint,
++                    validated.refresh_generation,
++                    task_id,
+                 ),
+-            }
++            ).fetchone()
++            if lineage is not None:
++                self._formal_snapshot_row_to_ref(lineage)
++                raise ValueError("formal_snapshot_lineage_conflict")
++
++            ownership = connection.execute(
++                """SELECT 1 FROM formal_collection_task
++                WHERE id = ? AND kind IN (?,?,?) AND status = 'leased'
++                  AND lease_worker = ? AND lease_expires_at > ?
++                  AND refresh_generation = ?""",
++                (
++                    task_id,
++                    *_FORMAL_SOURCE_FETCH_KINDS,
++                    worker_id,
++                    now,
++                    validated.refresh_generation,
++                ),
++            ).fetchone()
++            if ownership is None:
++                raise ValueError(
++                    "formal snapshot task is not held by the current unexpired source-task lease owner"
++                )
++
++            snapshot_id = str(uuid.uuid4())
++            connection.execute(
++                """INSERT INTO formal_source_snapshot
++                (id,source,dataset,request_json,request_fingerprint,content_sha256,
++                 manifest_sha256,content_path,manifest_path,original_url,published_at_utc,
++                 published_precision,source_updated_at_utc,captured_at_utc,effective_at_utc,
++                 effective_time_evidence_hash,parser_id,parser_version,mapping_version,
++                 refresh_generation,producing_task_id,verification_json,created_at)
++                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
++                (
++                    snapshot_id,
++                    validated.source,
++                    validated.dataset,
++                    validated.request_json,
++                    validated.request_fingerprint,
++                    validated.content_sha256,
++                    validated.manifest_sha256,
++                    validated.content_path,
++                    validated.manifest_path,
++                    validated.original_url,
++                    validated.published_at_utc,
++                    validated.published_precision,
++                    validated.source_updated_at_utc,
++                    validated.captured_at_utc,
++                    validated.effective_at_utc,
++                    validated.effective_time_evidence_hash,
++                    validated.parser_id,
++                    validated.parser_version,
++                    validated.mapping_version,
++                    validated.refresh_generation,
++                    task_id,
++                    validated.verification_json,
++                    now,
++                ),
++            )
++            try:
++                connection.execute(
++                    """INSERT INTO formal_task_snapshot_receipt
++                    (task_id,snapshot_id,manifest_sha256,refresh_generation,recorded_at)
++                    VALUES (?,?,?,?,?)""",
++                    (
++                        task_id,
++                        snapshot_id,
++                        validated.manifest_sha256,
++                        validated.refresh_generation,
++                        now,
++                    ),
++                )
++            except sqlite3.IntegrityError as error:
++                raise ValueError("formal_task_snapshot_receipt_conflict") from error
++
++            receipt = self._formal_task_snapshot_receipt_from_connection(
++                connection, task_id
++            )
++            if receipt is None or receipt["snapshot_id"] != snapshot_id:
++                raise ValueError("formal_task_snapshot_receipt_conflict")
++            inserted = connection.execute(
++                "SELECT * FROM formal_source_snapshot WHERE id = ?", (snapshot_id,)
++            ).fetchone()
++            if inserted is None:
++                raise ValueError("formal snapshot insert was not visible")
++            ref = self._formal_snapshot_row_to_ref(inserted)
++            if not self._formal_ref_matches_projection(ref, validated):
++                raise ValueError("formal_task_snapshot_receipt_conflict")
++            return ref
++
++    def get_formal_task_snapshot_receipt(
++        self, task_id: str
++    ) -> dict[str, object] | None:
++        self._require_formal_snapshot_store()
++        if type(task_id) is not str or not task_id.strip():
++            raise ValueError("task_id must be a nonempty string")
++        with self._transaction() as connection:
++            return self._formal_task_snapshot_receipt_from_connection(
++                connection, task_id
++            )
+ 
+     def enqueue_formal_task(
+         self,
+         kind: str,
+         idempotency_key: str,
+         refresh_generation: str,
+         payload: Mapping[str, object],
+         prerequisite_task_ids: Iterable[str] = (),
+     ) -> str:
+         for value, field in (
+diff --git a/tests/test_state_store.py b/tests/test_state_store.py
+index 35b1db7..2b36522 100644
+--- a/tests/test_state_store.py
++++ b/tests/test_state_store.py
+@@ -1109,20 +1109,23 @@ class StateStoreTestCase(unittest.TestCase):
+                     VALUES (?,?,?,?,?)""",
+                     tuple(receipt.values()),
+                 )
+             connection.commit()
+         return snapshot_id, receipt
+ 
+     def test_formal_snapshot_store_injection_is_optional_but_formal_apis_fail_closed(self) -> None:
+         self.assertIsNone(self.store.get_job("missing"))
+         for operation in (
+             lambda: self.store.put_formal_snapshot(None, None, None),
++            lambda: self.store.put_formal_snapshot_for_leased_task(
++                None, None, None, task_id="task", worker_id="worker"
++            ),
+             lambda: self.store.get_formal_snapshot("missing"),
+             lambda: self.store.get_formal_task_snapshot_receipt("missing"),
+         ):
+             with self.subTest(operation=operation):
+                 with self.assertRaisesRegex(ValueError, "formal snapshot store.*configured"):
+                     operation()
+         with self.assertRaisesRegex(ValueError, "formal_snapshot_store"):
+             StateStore(self.db_path, formal_snapshot_store=object())
+ 
+     def test_put_formal_bootstrap_snapshot_returns_revalidated_ref_without_receipt(self) -> None:
+@@ -1284,20 +1287,339 @@ class StateStoreTestCase(unittest.TestCase):
+                         ).fetchone()[0],
+                         0,
+                     )
+                     self.assertEqual(
+                         connection.execute(
+                             "SELECT COUNT(*) FROM formal_task_snapshot_receipt"
+                         ).fetchone()[0],
+                         0,
+                     )
+ 
++    def test_put_formal_snapshot_for_leased_task_is_atomic_replayable_and_durable_after_failure(self) -> None:
++        generation = "leased-generation"
++        raw_root = Path(self.tempdir.name) / "formal-leased-success"
++        raw_store, bootstrap_fetch, bootstrap_stored, bootstrap_verification = written_formal_snapshot(
++            raw_root,
++            refresh_generation=generation,
++        )
++        store = StateStore(self.db_path, formal_snapshot_store=raw_store)
++        bootstrap = store.put_formal_snapshot(
++            bootstrap_fetch, bootstrap_stored, bootstrap_verification
++        )
++        task_id = store.enqueue_formal_task(
++            "formal_statement", "leased-success", generation, {"slot": 1}
++        )
++        store.lease_next_formal_task(
++            ("formal_statement",), "worker-a", 30, now_utc=utc_at(0)
++        )
++        _, fetch, stored, verification = written_formal_snapshot(
++            raw_root,
++            refresh_generation=generation,
++            producing_task_id=task_id,
++        )
++
++        for invalid_task_id, invalid_worker_id in (
++            (None, "worker-a"),
++            (7, "worker-a"),
++            ("", "worker-a"),
++            (task_id, None),
++            (task_id, 7),
++            (task_id, "   "),
++        ):
++            with self.subTest(
++                invalid_task_id=invalid_task_id,
++                invalid_worker_id=invalid_worker_id,
++            ):
++                with self.assertRaises(ValueError):
++                    store.put_formal_snapshot_for_leased_task(
++                        fetch,
++                        stored,
++                        verification,
++                        task_id=invalid_task_id,
++                        worker_id=invalid_worker_id,
++                    )
++
++        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(1)):
++            ref = store.put_formal_snapshot_for_leased_task(
++                fetch,
++                stored,
++                verification,
++                task_id=task_id,
++                worker_id="worker-a",
++            )
++        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(2)):
++            replay = store.put_formal_snapshot_for_leased_task(
++                fetch,
++                stored,
++                verification,
++                task_id=task_id,
++                worker_id="worker-a",
++            )
++
++        self.assertEqual(replay, ref)
++        self.assertNotEqual(ref.snapshot_id, bootstrap.snapshot_id)
++        self.assertNotEqual(ref.manifest_sha256, bootstrap.manifest_sha256)
++        self.assertEqual(ref.content_path, bootstrap.content_path)
++        self.assertEqual(ref.producing_task_id, task_id)
++        receipt = store.get_formal_task_snapshot_receipt(task_id)
++        self.assertEqual(receipt["snapshot_id"], ref.snapshot_id)
++        self.assertEqual(receipt["manifest_sha256"], ref.manifest_sha256)
++        self.assertEqual(receipt["refresh_generation"], generation)
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM formal_source_snapshot").fetchone()[0],
++                2,
++            )
++            self.assertEqual(
++                connection.execute(
++                    "SELECT COUNT(*) FROM formal_task_snapshot_receipt"
++                ).fetchone()[0],
++                1,
++            )
++
++        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(3)):
++            store.fail_formal_task(
++                task_id,
++                "worker-a",
++                {"code": "parse_failed", "snapshot_id": ref.snapshot_id},
++                "terminal_failed",
++                None,
++            )
++        self.assertEqual(
++            store.get_formal_task_snapshot_receipt(task_id)["snapshot_id"],
++            ref.snapshot_id,
++        )
++
++    def test_put_formal_snapshot_for_leased_task_accepts_only_source_fetch_kinds(self) -> None:
++        for index, kind in enumerate(
++            ("formal_statement", "formal_context", "formal_universe_source")
++        ):
++            with self.subTest(kind=kind):
++                path = Path(self.tempdir.name) / f"formal-source-kind-{index}.sqlite3"
++                task_store = StateStore(path)
++                task_store.initialize()
++                generation = f"source-kind-generation-{index}"
++                task_id = task_store.enqueue_formal_task(
++                    kind, f"source-kind-{index}", generation, {}
++                )
++                task_store.lease_next_formal_task(
++                    (kind,), "worker-a", 30, now_utc=utc_at(0)
++                )
++                raw_store, fetch, stored, verification = written_formal_snapshot(
++                    Path(self.tempdir.name) / f"formal-source-kind-raw-{index}",
++                    refresh_generation=generation,
++                    producing_task_id=task_id,
++                )
++                configured = StateStore(path, formal_snapshot_store=raw_store)
++                with patch(
++                    "ashare_pipeline.state_store._utc_now", return_value=utc_at(1)
++                ):
++                    ref = configured.put_formal_snapshot_for_leased_task(
++                        fetch,
++                        stored,
++                        verification,
++                        task_id=task_id,
++                        worker_id="worker-a",
++                    )
++                self.assertEqual(ref.producing_task_id, task_id)
++
++    def test_put_formal_snapshot_for_leased_task_rejects_fencing_and_evidence_mismatches_without_rows(self) -> None:
++        cases = (
++            "pending",
++            "verified",
++            "wrong-worker",
++            "expired",
++            "taken-over",
++            "wrong-generation",
++            "non-source-kind",
++            "mismatched-producer",
++            "raw-mismatch",
++        )
++        for index, case in enumerate(cases):
++            with self.subTest(case=case):
++                path = Path(self.tempdir.name) / f"formal-leased-rejection-{index}.sqlite3"
++                task_store = StateStore(path)
++                task_store.initialize()
++                task_generation = "task-generation"
++                kind = "formal_feature" if case == "non-source-kind" else "formal_statement"
++                task_id = task_store.enqueue_formal_task(
++                    kind, f"leased-rejection-{index}", task_generation, {}
++                )
++                if case != "pending":
++                    task_store.lease_next_formal_task(
++                        (kind,), "worker-a", 10, now_utc=utc_at(0)
++                    )
++                if case == "verified":
++                    with closing(sqlite3.connect(path)) as connection:
++                        connection.execute(
++                            "UPDATE formal_collection_task SET status='verified' WHERE id=?",
++                            (task_id,),
++                        )
++                        connection.commit()
++                if case == "taken-over":
++                    task_store.lease_next_formal_task(
++                        (kind,), "worker-new", 30, now_utc=utc_at(10)
++                    )
++                fetch_generation = (
++                    "wrong-generation" if case == "wrong-generation" else task_generation
++                )
++                producer = "other-task" if case == "mismatched-producer" else task_id
++                raw_store, fetch, stored, verification = written_formal_snapshot(
++                    Path(self.tempdir.name) / f"formal-leased-rejection-raw-{index}",
++                    refresh_generation=fetch_generation,
++                    producing_task_id=producer,
++                )
++                if case == "raw-mismatch":
++                    fetch = replace(fetch, raw_bytes=b"caller-substituted-raw")
++                configured = StateStore(path, formal_snapshot_store=raw_store)
++                worker = "worker-b" if case == "wrong-worker" else "worker-a"
++                now = utc_at(11) if case in {"expired", "taken-over"} else utc_at(1)
++
++                with patch("ashare_pipeline.state_store._utc_now", return_value=now):
++                    with self.assertRaises(ValueError):
++                        configured.put_formal_snapshot_for_leased_task(
++                            fetch,
++                            stored,
++                            verification,
++                            task_id=task_id,
++                            worker_id=worker,
++                        )
++                with closing(sqlite3.connect(path)) as connection:
++                    self.assertEqual(
++                        connection.execute(
++                            "SELECT COUNT(*) FROM formal_source_snapshot"
++                        ).fetchone()[0],
++                        0,
++                    )
++                    self.assertEqual(
++                        connection.execute(
++                            "SELECT COUNT(*) FROM formal_task_snapshot_receipt"
++                        ).fetchone()[0],
++                        0,
++                    )
++
++    def test_put_formal_snapshot_for_leased_task_rejects_replacement_and_cross_task_attachment(self) -> None:
++        generation = "receipt-conflict-generation"
++        raw_root = Path(self.tempdir.name) / "formal-receipt-conflict-raw"
++        task_id = self.store.enqueue_formal_task(
++            "formal_statement", "receipt-conflict-first", generation, {}
++        )
++        self.store.lease_next_formal_task(
++            ("formal_statement",), "worker-a", 30, now_utc=utc_at(0)
++        )
++        raw_store, first_fetch, first_stored, first_verification = written_formal_snapshot(
++            raw_root,
++            raw_bytes=b"first task evidence",
++            refresh_generation=generation,
++            producing_task_id=task_id,
++        )
++        store = StateStore(self.db_path, formal_snapshot_store=raw_store)
++        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(1)):
++            first_ref = store.put_formal_snapshot_for_leased_task(
++                first_fetch,
++                first_stored,
++                first_verification,
++                task_id=task_id,
++                worker_id="worker-a",
++            )
++        _, second_fetch, second_stored, second_verification = written_formal_snapshot(
++            raw_root,
++            raw_bytes=b"replacement task evidence",
++            refresh_generation=generation,
++            producing_task_id=task_id,
++        )
++        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(2)):
++            with self.assertRaisesRegex(ValueError, "receipt.*conflict"):
++                store.put_formal_snapshot_for_leased_task(
++                    second_fetch,
++                    second_stored,
++                    second_verification,
++                    task_id=task_id,
++                    worker_id="worker-a",
++                )
++
++        other_task_id = store.enqueue_formal_task(
++            "formal_statement", "receipt-conflict-second", generation, {}
++        )
++        store.lease_next_formal_task(
++            ("formal_statement",), "worker-b", 30, now_utc=utc_at(2)
++        )
++        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(3)):
++            with self.assertRaises(ValueError):
++                store.put_formal_snapshot_for_leased_task(
++                    first_fetch,
++                    first_stored,
++                    first_verification,
++                    task_id=other_task_id,
++                    worker_id="worker-b",
++                )
++
++        self.assertEqual(store.get_formal_snapshot(first_ref.snapshot_id), first_ref)
++        self.assertIsNone(store.get_formal_task_snapshot_receipt(other_task_id))
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM formal_source_snapshot").fetchone()[0],
++                1,
++            )
++            self.assertEqual(
++                connection.execute(
++                    "SELECT COUNT(*) FROM formal_task_snapshot_receipt"
++                ).fetchone()[0],
++                1,
++            )
++
++    def test_put_formal_snapshot_for_leased_task_rolls_back_snapshot_when_receipt_insert_fails(self) -> None:
++        path = Path(self.tempdir.name) / "formal-late-receipt-failure.sqlite3"
++        task_store = StateStore(path)
++        task_store.initialize()
++        generation = "late-failure-generation"
++        task_id = task_store.enqueue_formal_task(
++            "formal_statement", "late-receipt-failure", generation, {}
++        )
++        task_store.lease_next_formal_task(
++            ("formal_statement",), "worker-a", 30, now_utc=utc_at(0)
++        )
++        raw_store, fetch, stored, verification = written_formal_snapshot(
++            Path(self.tempdir.name) / "formal-late-receipt-failure-raw",
++            refresh_generation=generation,
++            producing_task_id=task_id,
++        )
++        store = StateStore(path, formal_snapshot_store=raw_store)
++        with closing(sqlite3.connect(path)) as connection:
++            connection.execute(
++                """CREATE TRIGGER force_late_receipt_failure
++                BEFORE INSERT ON formal_task_snapshot_receipt
++                BEGIN SELECT RAISE(ABORT, 'forced late receipt failure'); END"""
++            )
++            connection.commit()
++
++        with patch("ashare_pipeline.state_store._utc_now", return_value=utc_at(1)):
++            with self.assertRaisesRegex(ValueError, "receipt.*conflict"):
++                store.put_formal_snapshot_for_leased_task(
++                    fetch,
++                    stored,
++                    verification,
++                    task_id=task_id,
++                    worker_id="worker-a",
++                )
++        with closing(sqlite3.connect(path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM formal_source_snapshot").fetchone()[0],
++                0,
++            )
++            self.assertEqual(
++                connection.execute(
++                    "SELECT COUNT(*) FROM formal_task_snapshot_receipt"
++                ).fetchone()[0],
++                0,
++            )
++
+     def test_formal_snapshot_getter_rejects_malformed_ids_and_stored_tamper(self) -> None:
+         store, raw_store, fetch, stored, verification = self.configured_formal_store(
+             label="getter-inputs"
+         )
+         ref = store.put_formal_snapshot(fetch, stored, verification)
+         for invalid_id in ("", "   ", None, 7):
+             with self.subTest(invalid_id=invalid_id):
+                 with self.assertRaises(ValueError):
+                     store.get_formal_snapshot(invalid_id)
+         self.assertIsNone(store.get_formal_snapshot("missing-snapshot"))
+@@ -1375,20 +1697,22 @@ class StateStoreTestCase(unittest.TestCase):
+         for invalid_id in ("", None, 9):
+             with self.subTest(invalid_id=invalid_id):
+                 with self.assertRaises(ValueError):
+                     store.get_formal_task_snapshot_receipt(invalid_id)
+         self.assertIsNone(store.get_formal_task_snapshot_receipt("missing-task"))
+ 
+     def test_formal_receipt_getter_rejects_every_cross_lineage_mismatch(self) -> None:
+         mutations = (
+             ("formal_task_snapshot_receipt", "manifest_sha256", "0" * 64),
+             ("formal_task_snapshot_receipt", "refresh_generation", "wrong-generation"),
++            ("formal_source_snapshot", "manifest_sha256", "0" * 64),
++            ("formal_source_snapshot", "refresh_generation", "wrong-generation"),
+             ("formal_source_snapshot", "producing_task_id", None),
+             ("formal_collection_task", "refresh_generation", "wrong-generation"),
+             ("formal_task_snapshot_receipt", "recorded_at", "2026-09-04T08:00:00"),
+         )
+         for index, (table, column, value) in enumerate(mutations):
+             with self.subTest(table=table, column=column):
+                 path = Path(self.tempdir.name) / f"receipt-mismatch-{index}.sqlite3"
+                 task_store = StateStore(path)
+                 task_store.initialize()
+                 task_id = task_store.enqueue_formal_task(

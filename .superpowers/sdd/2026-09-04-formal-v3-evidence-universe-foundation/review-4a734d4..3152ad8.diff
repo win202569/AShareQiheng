@@ -1,0 +1,309 @@
+# Review package: 4a734d4..3152ad8
+
+## Commits
+3152ad8 fix: restrict formal universe construction
+
+## Files changed
+ ashare_pipeline/formal_universe.py |  42 ++++++++++++--
+ tests/test_formal_universe.py      | 110 +++++++++++++++++++++++++++++--------
+ 2 files changed, 126 insertions(+), 26 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_universe.py b/ashare_pipeline/formal_universe.py
+index 5731b5e..f4cceaf 100644
+--- a/ashare_pipeline/formal_universe.py
++++ b/ashare_pipeline/formal_universe.py
+@@ -150,32 +150,44 @@ class FormalUniverseSourceEvidence:
+ 
+ @dataclass(frozen=True)
+ class FormalUniverseSourceDocument:
+     exchange: Exchange
+     snapshot: OfficialSnapshotRef
+     parser_id: str
+     parser_version: str
+     parsed_rows: tuple[Mapping[str, object], ...]
+ 
+ 
+-@dataclass(frozen=True)
++@dataclass(frozen=True, init=False)
+ class FormalFrozenUniverseInput:
+     as_of_utc: str
+     registry_manifest_hash: str
+     members: tuple[FormalUniverseMember, ...]
+     sources: tuple[FormalUniverseSourceEvidence, ...]
+     universe_hash: str
+     source_audit_hash: str
+     frozen_input_hash: str
+ 
+-    def __post_init__(self) -> None:
+-        _validate_frozen_universe_input(self)
++    def __init__(
++        self,
++        *,
++        as_of_utc: str,
++        registry_manifest_hash: str,
++        members: tuple[FormalUniverseMember, ...],
++        sources: tuple[FormalUniverseSourceEvidence, ...],
++        universe_hash: str,
++        source_audit_hash: str,
++        frozen_input_hash: str,
++    ) -> None:
++        raise ValueError(
++            "FormalFrozenUniverseInput must be constructed by FormalUniverseIngestor"
++        )
+ 
+ 
+ def classify_universe_status(
+     *, in_scope: bool, evidence_complete: bool, veto_flags: tuple[str, ...]
+ ) -> UniverseStatus:
+     if not in_scope:
+         return "out_of_scope"
+     if not evidence_complete:
+         return "pending_evidence"
+     if veto_flags:
+@@ -401,20 +413,42 @@ def _validate_frozen_universe_input(frozen: FormalFrozenUniverseInput) -> None:
+     expected_frozen_hash = _frozen_input_hash(
+         frozen.as_of_utc,
+         frozen.registry_manifest_hash,
+         frozen.universe_hash,
+         manifest,
+     )
+     if frozen.frozen_input_hash != expected_frozen_hash:
+         raise ValueError("formal frozen universe frozen_input_hash mismatch")
+ 
+ 
++def _create_frozen_universe_input(
++    *,
++    as_of_utc: str,
++    registry_manifest_hash: str,
++    members: tuple[FormalUniverseMember, ...],
++    sources: tuple[FormalUniverseSourceEvidence, ...],
++    universe_hash: str,
++    source_audit_hash: str,
++    frozen_input_hash: str,
++) -> FormalFrozenUniverseInput:
++    frozen = object.__new__(FormalFrozenUniverseInput)
++    object.__setattr__(frozen, "as_of_utc", as_of_utc)
++    object.__setattr__(frozen, "registry_manifest_hash", registry_manifest_hash)
++    object.__setattr__(frozen, "members", members)
++    object.__setattr__(frozen, "sources", sources)
++    object.__setattr__(frozen, "universe_hash", universe_hash)
++    object.__setattr__(frozen, "source_audit_hash", source_audit_hash)
++    object.__setattr__(frozen, "frozen_input_hash", frozen_input_hash)
++    _validate_frozen_universe_input(frozen)
++    return frozen
++
++
+ class FormalUniverseIngestor:
+     def build(
+         self,
+         as_of_utc: str,
+         registry_manifest_hash: str,
+         documents: Sequence[FormalUniverseSourceDocument],
+     ) -> FormalFrozenUniverseInput:
+         if as_of_utc != FORMAL_FREEZE_AT_CN:
+             raise ValueError(f"formal universe freeze must be exactly {FORMAL_FREEZE_AT_CN}")
+         _nonempty_text(registry_manifest_hash, "registry_manifest_hash")
+@@ -437,21 +471,21 @@ class FormalUniverseIngestor:
+                 raise ValueError("formal universe source snapshot must be visible at the freeze")
+             extraction = extract_formal_universe_members(document)
+             sources.append(FormalUniverseSourceEvidence(document.exchange, snapshot, extraction))
+ 
+         members, universe_hash = build_universe_snapshot(tuple(source.extraction for source in sources))
+         source_manifest = _source_manifest(sources)
+         source_audit_hash = _canonical_sha256(source_manifest)
+         frozen_input_hash = _frozen_input_hash(
+             as_of_utc, registry_manifest_hash, universe_hash, source_manifest
+         )
+-        return FormalFrozenUniverseInput(
++        return _create_frozen_universe_input(
+             as_of_utc=as_of_utc,
+             registry_manifest_hash=registry_manifest_hash,
+             members=members,
+             sources=tuple(sources),
+             universe_hash=universe_hash,
+             source_audit_hash=source_audit_hash,
+             frozen_input_hash=frozen_input_hash,
+         )
+ 
+ 
+diff --git a/tests/test_formal_universe.py b/tests/test_formal_universe.py
+index dfec5e9..10c252d 100644
+--- a/tests/test_formal_universe.py
++++ b/tests/test_formal_universe.py
+@@ -1,28 +1,45 @@
+ from dataclasses import replace
++import hashlib
++import json
++from collections.abc import Mapping
+ import unittest
+ 
+ from ashare_pipeline.formal_evidence import OfficialSnapshotRef
+ from ashare_pipeline.formal_universe import (
+     FormalFrozenUniverseInput,
+     FormalUniverseIngestor,
+     FormalUniverseSourceDocument,
+     build_universe_snapshot,
+     canonical_security_id,
+     classify_universe_status,
+     extract_formal_universe_members,
+ )
+ 
+ 
+ FORMAL_FREEZE_AT_CN = "2026-08-31T15:00:00+08:00"
+ 
+ 
++def canonical_hash(value: object) -> str:
++    def plain(item: object) -> object:
++        if isinstance(item, Mapping):
++            return {key: plain(child) for key, child in item.items()}
++        if isinstance(item, (list, tuple)):
++            return [plain(child) for child in item]
++        return item
++
++    payload = json.dumps(
++        plain(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
++    ).encode("utf-8")
++    return hashlib.sha256(payload).hexdigest()
++
++
+ def snapshot_ref(exchange: str) -> OfficialSnapshotRef:
+     parser_id = f"{exchange.lower()}-listing-json"
+     return OfficialSnapshotRef(
+         snapshot_id=f"{exchange.lower()}-listing-1",
+         source={"SH": "sse", "SZ": "szse", "BJ": "bse"}[exchange],
+         dataset="official_security_listing",
+         request_fingerprint="1" * 64,
+         security_id=None,
+         period_or_date="2026-08-31",
+         exchange=exchange,
+@@ -147,58 +164,107 @@ class FormalUniverseTests(unittest.TestCase):
+ 
+     def test_build_snapshot_requires_three_extractions_and_is_order_independent(self):
+         extractions = tuple(extract_formal_universe_members(document) for document in verified_listing_documents("SH", "SZ", "BJ"))
+         members, universe_hash = build_universe_snapshot(reversed(extractions))
+         self.assertEqual([member.security_id for member in members], ["BJ430001", "SH600000", "SZ000001"])
+         self.assertEqual(len(universe_hash), 64)
+         self.assertEqual(build_universe_snapshot(extractions), (members, universe_hash))
+         with self.assertRaisesRegex(ValueError, "SH/SZ/BJ"):
+             build_universe_snapshot(extractions[:2])
+ 
+-    def test_frozen_input_constructor_rejects_bare_members_and_tampered_hash_graph(self):
+-        with self.assertRaisesRegex(ValueError, "three verified SH/SZ/BJ sources"):
++    def test_frozen_input_public_constructor_rejects_bare_members(self):
++        with self.assertRaisesRegex(ValueError, "FormalUniverseIngestor"):
+             FormalFrozenUniverseInput(
+                 as_of_utc=FORMAL_FREEZE_AT_CN,
+                 registry_manifest_hash="m" * 64,
+                 members=(),
+                 sources=(),
+                 universe_hash="u" * 64,
+                 source_audit_hash="s" * 64,
+                 frozen_input_hash="f" * 64,
+             )
+ 
+-        frozen = FormalUniverseIngestor().build(
++    def test_public_constructor_rejects_a_self_consistent_fabricated_source_graph(self):
++        legitimate = FormalUniverseIngestor().build(
+             FORMAL_FREEZE_AT_CN,
+             "m" * 64,
+             verified_listing_documents("SH", "SZ", "BJ"),
+         )
+-        for field in ("universe_hash", "source_audit_hash", "frozen_input_hash"):
+-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+-                replace(frozen, **{field: "0" * 64})
+-
+-        first_source = frozen.sources[0]
+-        bad_audit = replace(first_source.extraction.audit, audit_hash="0" * 64)
+-        bad_source = replace(
+-            first_source,
+-            extraction=replace(first_source.extraction, audit=bad_audit),
++        first = legitimate.sources[0]
++        forged_audit_fields = {
++            "accepted_members_hash": first.extraction.audit.accepted_members_hash,
++            "accepted_ordinary_a_count": first.extraction.audit.accepted_ordinary_a_count,
++            "exchange": first.extraction.audit.exchange,
++            "excluded_by_security_type": first.extraction.audit.excluded_by_security_type,
++            "excluded_rows_hash": "9" * 64,
++            "parsed_rows_hash": "8" * 64,
++            "parser_id": first.extraction.audit.parser_id,
++            "parser_version": first.extraction.audit.parser_version,
++            "source_content_sha256": first.extraction.audit.source_content_sha256,
++            "source_row_count": first.extraction.audit.source_row_count,
++        }
++        forged_audit = replace(
++            first.extraction.audit,
++            **forged_audit_fields,
++            audit_hash=canonical_hash(forged_audit_fields),
+         )
+-        with self.assertRaisesRegex(ValueError, "audit_hash"):
+-            replace(frozen, sources=(bad_source, *frozen.sources[1:]))
+-
+-        malformed_source = replace(first_source, extraction=None)
+-        with self.assertRaises(Exception) as caught:
+-            replace(frozen, sources=(malformed_source, *frozen.sources[1:]))
+-        self.assertIsInstance(caught.exception, ValueError)
+-        self.assertIn("extraction", str(caught.exception))
++        forged_first = replace(
++            first,
++            extraction=replace(first.extraction, audit=forged_audit),
++        )
++        forged_sources = (forged_first, *legitimate.sources[1:])
++        member_payloads = [{
++            "exchange": member.exchange,
++            "listing_status": member.listing_status,
++            "raw_row": member.raw_row,
++            "raw_row_hash": member.raw_row_hash,
++            "security_id": member.security_id,
++            "security_type": member.security_type,
++        } for member in legitimate.members]
++        source_audits = [{
++            "exchange": source.exchange,
++            "audit_hash": source.extraction.audit.audit_hash,
++        } for source in forged_sources]
++        forged_universe_hash = canonical_hash({
++            "members": member_payloads,
++            "source_audits": source_audits,
++        })
++        source_manifest = [{
++            "audit_hash": source.extraction.audit.audit_hash,
++            "content_sha256": source.snapshot.content_sha256,
++            "exchange": source.exchange,
++            "manifest_sha256": source.snapshot.manifest_sha256,
++            "parser_id": source.snapshot.parser_id,
++            "parser_version": source.snapshot.parser_version,
++        } for source in forged_sources]
++        forged_source_audit_hash = canonical_hash(source_manifest)
++        forged_frozen_input_hash = canonical_hash({
++            "as_of_utc": legitimate.as_of_utc,
++            "registry_manifest_hash": legitimate.registry_manifest_hash,
++            "sources": [{
++                "audit_hash": item["audit_hash"],
++                "exchange": item["exchange"],
++                "manifest_sha256": item["manifest_sha256"],
++            } for item in source_manifest],
++            "universe_hash": forged_universe_hash,
++        })
+ 
+-        with self.assertRaisesRegex(ValueError, "members must exactly match"):
+-            replace(frozen, members=frozen.members[1:])
++        with self.assertRaisesRegex(ValueError, "FormalUniverseIngestor"):
++            FormalFrozenUniverseInput(
++                as_of_utc=legitimate.as_of_utc,
++                registry_manifest_hash=legitimate.registry_manifest_hash,
++                members=legitimate.members,
++                sources=forged_sources,
++                universe_hash=forged_universe_hash,
++                source_audit_hash=forged_source_audit_hash,
++                frozen_input_hash=forged_frozen_input_hash,
++            )
+ 
+     def test_member_constructor_rejects_noncanonical_or_non_ordinary_identity(self):
+         frozen = FormalUniverseIngestor().build(
+             FORMAL_FREEZE_AT_CN,
+             "m" * 64,
+             verified_listing_documents("SH", "SZ", "BJ"),
+         )
+         member = frozen.members[0]
+ 
+         with self.assertRaisesRegex(ValueError, "ordinary_a"):
