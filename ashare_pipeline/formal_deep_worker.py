@@ -25,6 +25,7 @@ from .formal_feature_contract import (
     SignedFormalFeatureRegistry,
     load_signed_feature_registry,
 )
+from .formal_feature_store import FormalFeatureBundleStore, FormalStoredFeatureBundle
 from .formal_financial_features import (
     build_formal_feature_bundle,
     select_visible_formal_facts,
@@ -63,7 +64,9 @@ _FORMAL_KINDS = frozenset(
     }
 )
 _STATEMENT_EXECUTION_KINDS = ("formal_statement",)
+_FEATURE_EXECUTION_KINDS = ("formal_feature_build",)
 _STATEMENT_LEASE_SECONDS = 120
+_FEATURE_SOURCE_PENDING_HOLD_SECONDS = 30
 # D1 seals this exact non-cyclic baseline into formal-feature-input-v2.  Keep
 # the task-generation wire explicit rather than importing D1's private detail.
 _FEATURE_HISTORY_GATE_VERSION = "formal-history-gate-noncyclic-v1"
@@ -1776,13 +1779,217 @@ def _fail_statement_terminal(
     return True
 
 
+def _renew_feature_lease(
+    store: object,
+    task_id: str,
+    worker_id: str,
+) -> None:
+    _renew_statement_lease(
+        store,
+        task_id,
+        worker_id,
+        remote_attempts=0,
+    )
+
+
+def _feature_completion_result(
+    payload: FormalFeatureBuildTaskPayload,
+    bundle: FormalFeatureBundle,
+    receipt: FormalStoredFeatureBundle,
+) -> dict[str, object]:
+    if type(bundle) is not FormalFeatureBundle or type(receipt) is not FormalStoredFeatureBundle:
+        raise ValueError("feature completion requires exact rebuilt evidence")
+    if (
+        bundle.security_id != payload.security_id
+        or bundle.as_of_utc != payload.as_of_utc
+        or bundle.template_id != payload.template_id
+        or bundle.registry_manifest_hash != payload.registry_manifest_hash
+        or bundle.feature_registry_hash != payload.feature_registry_hash
+        or receipt.bundle_hash != bundle.bundle_hash()
+    ):
+        raise ValueError("feature completion evidence does not match frozen task")
+    return {
+        "kind": "formal_feature_build",
+        "security_id": payload.security_id,
+        "as_of_utc": payload.as_of_utc,
+        "template_id": payload.template_id,
+        "registry_manifest_hash": payload.registry_manifest_hash,
+        "feature_registry_hash": payload.feature_registry_hash,
+        "refresh_generation": payload.refresh_generation,
+        "input_hash": bundle.input_hash,
+        "bundle_hash": receipt.bundle_hash,
+        "bundle_manifest_hash": receipt.manifest_hash,
+    }
+
+
+def _recover_exact_feature_bundle(
+    feature_store: FormalFeatureBundleStore,
+    bundle: FormalFeatureBundle,
+    row: object,
+) -> FormalStoredFeatureBundle:
+    if type(feature_store) is not FormalFeatureBundleStore or type(bundle) is not FormalFeatureBundle:
+        raise ValueError("feature recovery requires exact rebuilt bundle storage")
+    if type(row) is not dict:
+        raise ValueError("formal feature database row is invalid")
+    input_hash = row.get("input_hash")
+    bundle_path = row.get("bundle_path")
+    manifest_path = row.get("manifest_path")
+    bundle_hash = row.get("bundle_hash")
+    manifest_hash = row.get("bundle_manifest_hash")
+    if (
+        type(input_hash) is not str
+        or type(bundle_path) is not str
+        or type(manifest_path) is not str
+        or type(bundle_hash) is not str
+        or type(manifest_hash) is not str
+    ):
+        raise ValueError("formal feature database receipt is invalid")
+    if _require_hash(input_hash, "formal feature database input hash") != bundle.input_hash:
+        raise ValueError("formal feature database receipt does not match rebuilt input")
+    receipt = feature_store.recover_verified_receipt(
+        bundle_path=bundle_path,
+        manifest_path=manifest_path,
+        bundle_hash=bundle_hash,
+        manifest_hash=manifest_hash,
+    )
+    if type(receipt) is not FormalStoredFeatureBundle:
+        raise ValueError("formal feature recovered receipt is invalid")
+    recovered = feature_store.read_verified(receipt)
+    if (
+        type(recovered) is not FormalFeatureBundle
+        or recovered.canonical_bytes() != bundle.canonical_bytes()
+        or recovered.bundle_hash() != bundle.bundle_hash()
+    ):
+        raise ValueError("formal feature database/file bundle does not match rebuilt input")
+    return receipt
+
+
+def _complete_feature_task(
+    store: object,
+    task_id: str,
+    worker_id: str,
+    result: dict[str, object],
+) -> None:
+    try:
+        store.complete_formal_task(task_id, worker_id, result)
+    except ValueError as error:
+        if _is_lost_formal_task_lease_error(error):
+            raise _LostFormalTaskLease(0) from error
+        raise
+
+
+def _hold_feature_source_pending(
+    store: object,
+    task_id: str,
+    worker_id: str,
+) -> None:
+    _renew_feature_lease(store, task_id, worker_id)
+    retry_at = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=_FEATURE_SOURCE_PENDING_HOLD_SECONDS)
+    ).isoformat()
+    try:
+        store.fail_formal_task(
+            task_id,
+            worker_id,
+            {"code": "feature_source_pending"},
+            "retryable_failed",
+            retry_at,
+        )
+    except ValueError as error:
+        if _is_lost_formal_task_lease_error(error):
+            raise _LostFormalTaskLease(0) from error
+        raise
+
+
+def _execute_feature_task(
+    dependencies: FormalWorkerDependencies,
+    task: dict[str, object],
+    *,
+    worker_id: str,
+) -> tuple[bool, str]:
+    """Persist or recover one frozen feature bundle before completing its lease."""
+
+    task_id, payload = _decode_leased_feature_task(task)
+    if type(dependencies.feature_store) is not FormalFeatureBundleStore:
+        raise _TerminalFormalTask(0, "feature_persistence_failed")
+    feature_store = dependencies.feature_store
+    try:
+        bundle = reconstruct_formal_feature_bundle(dependencies, task)
+    except FeatureSourcePending:
+        raise
+    except Exception as error:
+        raise _TerminalFormalTask(0, "feature_reconstruction_failed") from error
+
+    get_row = getattr(dependencies.store, "get_formal_feature_bundle_row", None)
+    put_bundle = getattr(dependencies.store, "put_formal_feature_bundle", None)
+    if not callable(get_row) or not callable(put_bundle):
+        raise _TerminalFormalTask(0, "feature_persistence_failed")
+    try:
+        existing = get_row(bundle.input_hash)
+        if existing is not None:
+            receipt = _recover_exact_feature_bundle(feature_store, bundle, existing)
+            _renew_feature_lease(dependencies.store, task_id, worker_id)
+            persisted = put_bundle(bundle, receipt)
+            if (
+                type(persisted) is not tuple
+                or persisted != (bundle.bundle_hash(), False)
+                or type(persisted[0]) is not str
+                or type(persisted[1]) is not bool
+            ):
+                raise ValueError("formal feature recovery persistence returned an invalid result")
+            _renew_feature_lease(dependencies.store, task_id, worker_id)
+            _complete_feature_task(
+                dependencies.store,
+                task_id,
+                worker_id,
+                _feature_completion_result(payload, bundle, receipt),
+            )
+            return False, payload.security_id
+
+        _renew_feature_lease(dependencies.store, task_id, worker_id)
+        receipt = feature_store.write(bundle)
+        if type(receipt) is not FormalStoredFeatureBundle:
+            raise ValueError("formal feature write returned an invalid receipt")
+        _renew_feature_lease(dependencies.store, task_id, worker_id)
+        persisted = put_bundle(bundle, receipt)
+        if (
+            type(persisted) is not tuple
+            or len(persisted) != 2
+            or type(persisted[0]) is not str
+            or type(persisted[1]) is not bool
+            or persisted[0] != bundle.bundle_hash()
+        ):
+            raise ValueError("formal feature persistence returned an invalid result")
+        existing = get_row(bundle.input_hash)
+        if existing is None:
+            raise ValueError("formal feature persistence did not create a readable row")
+        receipt = _recover_exact_feature_bundle(feature_store, bundle, existing)
+        _renew_feature_lease(dependencies.store, task_id, worker_id)
+        _complete_feature_task(
+            dependencies.store,
+            task_id,
+            worker_id,
+            _feature_completion_result(payload, bundle, receipt),
+        )
+        return persisted[1], payload.security_id
+    except _LostFormalTaskLease:
+        raise
+    except ValueError as error:
+        if _is_lost_formal_task_lease_error(error):
+            raise _LostFormalTaskLease(0) from error
+        raise _TerminalFormalTask(0, "feature_persistence_failed") from error
+    except Exception as error:
+        raise _TerminalFormalTask(0, "feature_persistence_failed") from error
+
+
 def execute_queued_formal_work(
     dependencies: FormalWorkerDependencies,
     *,
     worker_id: str,
     max_jobs: int | None = None,
 ) -> FormalCollectionSummary:
-    """Run the currently implemented safe subset: leased formal statements only."""
+    """Run leased statement and frozen feature tasks with durable recovery fences."""
 
     if type(dependencies) is not FormalWorkerDependencies:
         raise ValueError("formal worker dependencies must have exact type")
@@ -1802,13 +2009,73 @@ def execute_queued_formal_work(
     terminal_failed = 0
     open_circuits: set[str] = set()
     rebuilt_security_ids: set[str] = set()
+    feature_bundles_written = 0
     processed = 0
     while max_jobs is None or processed < max_jobs:
         task = lease_next(_STATEMENT_EXECUTION_KINDS, owner, _STATEMENT_LEASE_SECONDS)
         if task is None:
+            task = lease_next(_FEATURE_EXECUTION_KINDS, owner, _STATEMENT_LEASE_SECONDS)
+        if task is None:
             break
         if type(task) is not dict:
             raise ValueError("formal task lease returned an invalid task")
+        if task.get("kind") == "formal_feature_build":
+            try:
+                created, security_id = _execute_feature_task(
+                    dependencies, task, worker_id=owner
+                )
+            except FeatureSourcePending:
+                task_id = _require_text(task.get("id"), "formal feature task id")
+                try:
+                    _hold_feature_source_pending(dependencies.store, task_id, owner)
+                except _LostFormalTaskLease:
+                    processed += 1
+                    continue
+                except Exception:
+                    if _fail_statement_terminal(
+                        dependencies.store,
+                        task_id,
+                        owner,
+                        code="feature_persistence_failed",
+                    ):
+                        terminal_failed += 1
+                    processed += 1
+                    continue
+                retryable_failed += 1
+                processed += 1
+                continue
+            except _LostFormalTaskLease:
+                processed += 1
+                continue
+            except _TerminalFormalTask as error:
+                task_id = _require_text(task.get("id"), "formal feature task id")
+                if _fail_statement_terminal(
+                    dependencies.store,
+                    task_id,
+                    owner,
+                    code=error.code,
+                ):
+                    terminal_failed += 1
+                processed += 1
+                continue
+            except Exception:
+                task_id = _require_text(task.get("id"), "formal feature task id")
+                if _fail_statement_terminal(
+                    dependencies.store,
+                    task_id,
+                    owner,
+                    code="feature_reconstruction_failed",
+                ):
+                    terminal_failed += 1
+                processed += 1
+                continue
+            if created:
+                feature_bundles_written += 1
+            rebuilt_security_ids.add(security_id)
+            processed += 1
+            continue
+        if task.get("kind") != "formal_statement":
+            raise ValueError("formal task lease returned an unsupported task kind")
         try:
             attempts, security_id = _execute_statement_task(
                 dependencies, task, worker_id=owner
@@ -1868,7 +2135,7 @@ def execute_queued_formal_work(
         frozen_universe_snapshot_ids=(),
         retryable_failed=retryable_failed,
         terminal_failed=terminal_failed,
-        feature_bundles_written=0,
+        feature_bundles_written=feature_bundles_written,
         open_circuits=tuple(sorted(open_circuits)),
         rebuilt_security_ids=tuple(sorted(rebuilt_security_ids)),
     )

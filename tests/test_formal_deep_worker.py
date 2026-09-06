@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import ashare_pipeline.formal_deep_worker as _formal_deep_worker
 from ashare_pipeline.formal_deep_worker import (
@@ -29,6 +30,7 @@ from ashare_pipeline.formal_deep_worker import (
     formal_statement_task_specs,
 )
 from ashare_pipeline.formal_evidence import OfficialRequest, SourcePolicy, VerifiedCalendarBinding
+from ashare_pipeline.formal_feature_store import FormalFeatureBundleStore
 from ashare_pipeline.formal_financial_schema import (
     FormalFinancialFact,
     extract_formal_financial_facts,
@@ -49,6 +51,7 @@ from ashare_pipeline.formal_sources import (
 )
 from ashare_pipeline.state_store import StateStore
 import tests.test_formal_sources as _formal_source_tests
+from tests.test_formal_feature_store import project_temporary_directory
 
 
 AS_OF = "2026-08-31T07:00:00+00:00"
@@ -238,6 +241,62 @@ class TemporarilyUnverifiedSourceStore:
         if task is None or task_id != self._source_task_id:
             return task
         return {**task, "status": "leased"}
+
+
+class FeatureLeaseFenceStore:
+    """Record D4 writes while simulating an ownership loss at one exact boundary."""
+
+    def __init__(
+        self,
+        store: object,
+        *,
+        lose_on_renewal: int | None = None,
+        lose_on_put: bool = False,
+        lose_on_fail: bool = False,
+        lose_on_complete: bool = False,
+    ) -> None:
+        self._store = store
+        self._lose_on_renewal = lose_on_renewal
+        self._lose_on_put = lose_on_put
+        self._lose_on_fail = lose_on_fail
+        self._lose_on_complete = lose_on_complete
+        self.renewal_calls = 0
+        self.put_calls = 0
+        self.put_delegated = 0
+        self.complete_calls = 0
+        self.complete_delegated = 0
+        self.fail_calls = 0
+        self.fail_delegated = 0
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._store, name)
+
+    def renew_formal_task_lease(self, *args: object, **kwargs: object) -> object:
+        self.renewal_calls += 1
+        if self.renewal_calls == self._lose_on_renewal:
+            raise ValueError("formal task is not held by the current unexpired lease owner")
+        return self._store.renew_formal_task_lease(*args, **kwargs)
+
+    def put_formal_feature_bundle(self, *args: object, **kwargs: object) -> object:
+        self.put_calls += 1
+        if self._lose_on_put:
+            raise ValueError("formal task is not held by the current unexpired lease owner")
+        self.put_delegated += 1
+        return self._store.put_formal_feature_bundle(*args, **kwargs)
+
+    def complete_formal_task(self, *args: object, **kwargs: object) -> object:
+        self.complete_calls += 1
+        if self._lose_on_complete:
+            raise ValueError("formal task is not held by the current unexpired lease owner")
+        self.complete_delegated += 1
+        return self._store.complete_formal_task(*args, **kwargs)
+
+    def fail_formal_task(self, *args: object, **kwargs: object) -> object:
+        self.fail_calls += 1
+        if self._lose_on_fail:
+            raise ValueError("formal task is not held by the current unexpired lease owner")
+        self.fail_delegated += 1
+        return self._store.fail_formal_task(*args, **kwargs)
 
 
 class OrphanFeatureResultStore:
@@ -550,14 +609,16 @@ def statement_execution_fixture(
     FormalStatementTaskPayload,
 ]:
     """Create one real signed official statement task with local-only evidence."""
-    temporary = tempfile.TemporaryDirectory()
+    temporary = project_temporary_directory()
     case.addCleanup(temporary.cleanup)
     root = Path(temporary.name)
     raw_store = FormalSnapshotStore(root / "raw")
+    feature_store = FormalFeatureBundleStore(root)
     store = StateStore(
         root / "state.sqlite",
         formal_snapshot_store=raw_store,
         registry_signature_verifier=AcceptingVerifier(),
+        formal_feature_bundle_store=feature_store,
     )
     store.initialize()
     bundle_loader = fixture_bundle_loader(
@@ -567,6 +628,9 @@ def statement_execution_fixture(
         statement_exchange="SZ",
     )
     manifest_hash = bundle_loader._repository.manifest.manifest_hash
+    for blob in bundle_loader._repository.blobs.values():
+        store.put_formal_registry_blob(blob)
+    store.put_formal_registry_manifest(bundle_loader._repository.manifest)
     document = _formal_source_tests.timestamp_document(
         declared_security_id="SZ000001",
         declared_period="2025-12-31",
@@ -633,6 +697,96 @@ def statement_execution_fixture(
     )
 
 
+def configured_feature_store(store: StateStore) -> FormalFeatureBundleStore:
+    """Expose the exact test fixture store that StateStore verifies receipts against."""
+
+    feature_store = store._formal_feature_bundle_store
+    if type(feature_store) is not FormalFeatureBundleStore:
+        raise AssertionError("statement fixture must configure an exact feature bundle store")
+    return feature_store
+
+
+def ready_feature_execution_fixture(
+    case: unittest.TestCase,
+) -> tuple[
+    StateStore,
+    FormalSnapshotRepository,
+    FormalRegistryRuntimeLoader,
+    CountingTransport,
+    FormalWorkerDependencies,
+]:
+    """Run one source task so its frozen feature task is ready for D4 execution."""
+
+    (
+        store,
+        snapshots,
+        runtime_loader,
+        transport,
+        _parser,
+        _manifest_hash,
+        payload,
+    ) = statement_execution_fixture(case)
+    source_spec = FormalTaskSpec.from_payload(payload)
+    store.enqueue_formal_task(
+        source_spec.kind,
+        source_spec.idempotency_key,
+        source_spec.refresh_generation,
+        source_spec.payload,
+        source_spec.prerequisite_task_ids,
+    )
+    dependencies = FormalWorkerDependencies(
+        store=store,
+        snapshots=snapshots,
+        registry_runtime_loader=runtime_loader,
+        feature_store=configured_feature_store(store),
+        context_repository=object(),
+    )
+    summary = execute_queued_formal_work(
+        dependencies, worker_id="source-worker", max_jobs=1
+    )
+    case.assertEqual(summary.verified_statement_count, 1)
+    return store, snapshots, runtime_loader, transport, dependencies
+
+
+def requeue_feature_task_for_lease_test(
+    case: unittest.TestCase,
+    store: StateStore,
+    dependencies: FormalWorkerDependencies,
+) -> tuple[dict[str, object], object]:
+    """Build once for a deterministic expected receipt, then make the task available again."""
+
+    leased = store.lease_next_formal_task(
+        ("formal_feature_build",), "lease-test-setup", 120
+    )
+    case.assertIsNotNone(leased)
+    assert leased is not None
+    bundle = _formal_deep_worker.reconstruct_formal_feature_bundle(dependencies, leased)
+    store.fail_formal_task(
+        leased["id"],
+        "lease-test-setup",
+        {"code": "lease_test_setup"},
+        "retryable_failed",
+        (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+    )
+    return leased, bundle
+
+
+def expire_feature_lease_for_next_owner(
+    case: unittest.TestCase,
+    store: StateStore,
+    task_id: str,
+) -> None:
+    """Model a crashed owner without letting that owner publish a transition."""
+
+    with store._transaction(immediate=True) as connection:
+        cursor = connection.execute(
+            """UPDATE formal_collection_task SET lease_expires_at = ?
+            WHERE id = ? AND status = 'leased'""",
+            ("2000-01-01T00:00:00+00:00", task_id),
+        )
+    case.assertEqual(cursor.rowcount, 1)
+
+
 def history_ready_feature_execution_fixture(
     case: unittest.TestCase,
 ) -> tuple[
@@ -646,14 +800,16 @@ def history_ready_feature_execution_fixture(
 ]:
     """Create the exact 4-FY/8-quarter source evidence needed by the D1 gate."""
 
-    temporary = tempfile.TemporaryDirectory()
+    temporary = project_temporary_directory()
     case.addCleanup(temporary.cleanup)
     root = Path(temporary.name)
     raw_store = FormalSnapshotStore(root / "raw")
+    feature_store = FormalFeatureBundleStore(root)
     store = StateStore(
         root / "state.sqlite",
         formal_snapshot_store=raw_store,
         registry_signature_verifier=AcceptingVerifier(),
+        formal_feature_bundle_store=feature_store,
     )
     store.initialize()
     mapping_ids = [
@@ -763,6 +919,9 @@ def history_ready_feature_execution_fixture(
         ],
     )
     manifest_hash = bundle_loader._repository.manifest.manifest_hash
+    for blob in bundle_loader._repository.blobs.values():
+        store.put_formal_registry_blob(blob)
+    store.put_formal_registry_manifest(bundle_loader._repository.manifest)
     cumulative_values = {
         "2022-12-31": 70,
         "2023-12-31": 80,
@@ -1097,7 +1256,7 @@ class FormalDeepWorkerContractTests(unittest.TestCase):
             "crashed-owner",
             {"code": "simulated_crash"},
             "retryable_failed",
-            datetime.now(timezone.utc).isoformat(),
+            (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
         )
         parser_calls_before_recovery = len(parser.calls)
         dependencies = FormalWorkerDependencies(
@@ -1909,6 +2068,718 @@ class FormalDeepWorkerContractTests(unittest.TestCase):
         self.assertEqual(store.get_formal_task(different_template_id)["status"], "pending")
         self.assertEqual(store.get_formal_task(different_security_id)["status"], "pending")
         self.assertEqual(store.get_formal_task(different_as_of_id)["status"], "pending")
+
+    def _assert_feature_lease_loss_recovers_with_new_owner(
+        self,
+        *,
+        lose_on_renewal: int | None = None,
+        lose_on_complete: bool = False,
+        expected_file: bool,
+        expected_row: bool,
+        expected_put_calls: int,
+        expected_complete_calls: int,
+        expected_recovery_writes: int,
+    ) -> None:
+        """Exercise one D4 fence and prove a fresh owner can finish the same evidence."""
+
+        store, snapshots, runtime_loader, transport, dependencies = ready_feature_execution_fixture(
+            self
+        )
+        leased, bundle = requeue_feature_task_for_lease_test(self, store, dependencies)
+        loss_store = FeatureLeaseFenceStore(
+            store,
+            lose_on_renewal=lose_on_renewal,
+            lose_on_complete=lose_on_complete,
+        )
+        loss_dependencies = FormalWorkerDependencies(
+            store=loss_store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=dependencies.feature_store,
+            context_repository=object(),
+        )
+        feature_path = (
+            snapshots.root.parent
+            / "data"
+            / "formal"
+            / "features"
+            / f"{bundle.bundle_hash()}.json"
+        )
+        transport_count = len(transport.requests)
+        initial_error = store.get_formal_task(leased["id"])["error"]
+
+        summary = execute_queued_formal_work(
+            loss_dependencies, worker_id="lost-feature-owner", max_jobs=1
+        )
+
+        task = store.get_formal_task(leased["id"])
+        self.assertEqual(summary.feature_bundles_written, 0)
+        self.assertEqual(summary.retryable_failed, 0)
+        self.assertEqual(summary.terminal_failed, 0)
+        self.assertEqual(task["status"], "leased")
+        self.assertIsNone(task["result"])
+        self.assertEqual(task["error"], initial_error)
+        self.assertEqual(feature_path.exists(), expected_file)
+        row = store.get_formal_feature_bundle_row(bundle.input_hash)
+        self.assertEqual(row is not None, expected_row)
+        if row is not None:
+            self.assertEqual(row["bundle_hash"], bundle.bundle_hash())
+        self.assertEqual(loss_store.put_calls, expected_put_calls)
+        self.assertEqual(loss_store.complete_calls, expected_complete_calls)
+        self.assertEqual(loss_store.complete_delegated, 0)
+        self.assertEqual(loss_store.fail_calls, 0)
+        self.assertEqual(loss_store.fail_delegated, 0)
+        self.assertEqual(len(transport.requests), transport_count)
+
+        expire_feature_lease_for_next_owner(self, store, leased["id"])
+        recovered = execute_queued_formal_work(
+            dependencies, worker_id="new-feature-owner", max_jobs=1
+        )
+        self.assertEqual(recovered.feature_bundles_written, expected_recovery_writes)
+        self.assertEqual(store.get_formal_task(leased["id"])["status"], "verified")
+        self.assertIsNotNone(store.get_formal_feature_bundle_row(bundle.input_hash))
+
+    def test_feature_worker_lost_lease_before_file_leaves_no_receipt_for_new_owner(self) -> None:
+        self._assert_feature_lease_loss_recovers_with_new_owner(
+            lose_on_renewal=1,
+            expected_file=False,
+            expected_row=False,
+            expected_put_calls=0,
+            expected_complete_calls=0,
+            expected_recovery_writes=1,
+        )
+
+    def test_feature_worker_lost_lease_after_file_leaves_only_orphan_for_new_owner(self) -> None:
+        self._assert_feature_lease_loss_recovers_with_new_owner(
+            lose_on_renewal=2,
+            expected_file=True,
+            expected_row=False,
+            expected_put_calls=0,
+            expected_complete_calls=0,
+            expected_recovery_writes=1,
+        )
+
+    def test_feature_worker_lost_lease_after_db_leaves_receipt_for_new_owner(self) -> None:
+        self._assert_feature_lease_loss_recovers_with_new_owner(
+            lose_on_renewal=3,
+            expected_file=True,
+            expected_row=True,
+            expected_put_calls=1,
+            expected_complete_calls=0,
+            expected_recovery_writes=0,
+        )
+
+    def test_feature_worker_lost_lease_at_completion_leaves_receipt_for_new_owner(self) -> None:
+        self._assert_feature_lease_loss_recovers_with_new_owner(
+            lose_on_complete=True,
+            expected_file=True,
+            expected_row=True,
+            expected_put_calls=1,
+            expected_complete_calls=1,
+            expected_recovery_writes=0,
+        )
+
+    def test_feature_worker_persists_reconstructed_bundle_and_completes_task(self) -> None:
+        """Leaving a rebuilt bundle unpersisted would make a verified feature task unauditable."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=configured_feature_store(store),
+            context_repository=object(),
+        )
+        execute_queued_formal_work(
+            dependencies, worker_id="source-worker", max_jobs=1
+        )
+        transport_count = len(transport.requests)
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="feature-worker", max_jobs=1
+        )
+
+        tasks = store.list_formal_tasks(kinds=("formal_feature_build",))
+        verified = [item for item in tasks if item["status"] == "verified"]
+        self.assertEqual(len(verified), 1)
+        task = verified[0]
+        self.assertEqual(task["status"], "verified")
+        self.assertEqual(summary.feature_bundles_written, 1)
+        self.assertEqual(summary.retryable_failed, 0)
+        self.assertEqual(summary.terminal_failed, 0)
+        self.assertEqual(
+            set(task["result"]),
+            {
+                "kind",
+                "security_id",
+                "as_of_utc",
+                "template_id",
+                "registry_manifest_hash",
+                "feature_registry_hash",
+                "refresh_generation",
+                "input_hash",
+                "bundle_hash",
+                "bundle_manifest_hash",
+            },
+        )
+        self.assertEqual(task["result"]["kind"], "formal_feature_build")
+        self.assertEqual(task["result"]["security_id"], "SZ000001")
+        self.assertEqual(task["result"]["template_id"], "general_nonfinancial")
+        row = store.get_formal_feature_bundle_row(task["result"]["input_hash"])
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["bundle_hash"], task["result"]["bundle_hash"])
+        receipt = dependencies.feature_store.recover_verified_receipt(
+            bundle_path=row["bundle_path"],
+            manifest_path=row["manifest_path"],
+            bundle_hash=row["bundle_hash"],
+            manifest_hash=row["bundle_manifest_hash"],
+        )
+        persisted = dependencies.feature_store.read_verified(receipt)
+        self.assertIn("feature_registry_not_release_eligible", persisted.blockers)
+        self.assertTrue(all(value.status == "blocked" for value in persisted.values))
+        self.assertEqual(len(transport.requests), transport_count)
+
+    def test_feature_worker_persists_derived_history_complete_bundle(self) -> None:
+        """A valid history-complete bundle must reach both receipts before task completion."""
+
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payloads,
+        ) = history_ready_feature_execution_fixture(self)
+        for payload in payloads:
+            source_spec = FormalTaskSpec.from_payload(payload)
+            store.enqueue_formal_task(
+                source_spec.kind,
+                source_spec.idempotency_key,
+                source_spec.refresh_generation,
+                source_spec.payload,
+                source_spec.prerequisite_task_ids,
+            )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=configured_feature_store(store),
+            context_repository=object(),
+        )
+        source_summary = execute_queued_formal_work(
+            dependencies, worker_id="history-source-worker", max_jobs=len(payloads)
+        )
+        self.assertEqual(source_summary.verified_statement_count, len(payloads))
+        transport_count = len(transport.requests)
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="history-feature-worker", max_jobs=1
+        )
+
+        tasks = store.list_formal_tasks(kinds=("formal_feature_build",))
+        verified = [item for item in tasks if item["status"] == "verified"]
+        self.assertEqual(len(verified), 1)
+        task = verified[0]
+        self.assertEqual(task["status"], "verified")
+        self.assertEqual(summary.feature_bundles_written, 1)
+        row = store.get_formal_feature_bundle_row(task["result"]["input_hash"])
+        self.assertIsNotNone(row)
+        assert row is not None
+        receipt = dependencies.feature_store.recover_verified_receipt(
+            bundle_path=row["bundle_path"],
+            manifest_path=row["manifest_path"],
+            bundle_hash=row["bundle_hash"],
+            manifest_hash=row["bundle_manifest_hash"],
+        )
+        persisted = dependencies.feature_store.read_verified(receipt)
+        self.assertEqual(persisted.values[0].status, "derived")
+        self.assertEqual(persisted.values[0].value, 130.0)
+        self.assertEqual(len(transport.requests), transport_count)
+
+    def test_feature_worker_recovers_file_only_orphan_before_completion(self) -> None:
+        """A crash after the immutable file write must not require another write or fetch."""
+
+        store, _snapshots, _loader, transport, dependencies = ready_feature_execution_fixture(
+            self
+        )
+        leased = store.lease_next_formal_task(
+            ("formal_feature_build",), "orphan-writer", 120
+        )
+        self.assertIsNotNone(leased)
+        assert leased is not None
+        bundle = _formal_deep_worker.reconstruct_formal_feature_bundle(
+            dependencies, leased
+        )
+        receipt = dependencies.feature_store.write(bundle)
+        self.assertIsNone(store.get_formal_feature_bundle_row(bundle.input_hash))
+        store.fail_formal_task(
+            leased["id"],
+            "orphan-writer",
+            {"code": "simulated_crash_after_file"},
+            "retryable_failed",
+            (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        )
+        transport_count = len(transport.requests)
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="file-recovery-worker", max_jobs=1
+        )
+
+        task = store.get_formal_task(leased["id"])
+        self.assertEqual(summary.feature_bundles_written, 1)
+        self.assertEqual(task["status"], "verified")
+        self.assertEqual(task["result"]["bundle_hash"], receipt.bundle_hash)
+        self.assertEqual(
+            store.get_formal_feature_bundle_row(bundle.input_hash)["bundle_hash"],
+            receipt.bundle_hash,
+        )
+        self.assertEqual(len(transport.requests), transport_count)
+
+    def test_feature_worker_recovers_db_receipt_before_completion(self) -> None:
+        """A crash after DB publication must only verify the receipt and complete the task."""
+
+        store, _snapshots, _loader, transport, dependencies = ready_feature_execution_fixture(
+            self
+        )
+        leased = store.lease_next_formal_task(
+            ("formal_feature_build",), "db-writer", 120
+        )
+        self.assertIsNotNone(leased)
+        assert leased is not None
+        bundle = _formal_deep_worker.reconstruct_formal_feature_bundle(
+            dependencies, leased
+        )
+        receipt = dependencies.feature_store.write(bundle)
+        self.assertEqual(store.put_formal_feature_bundle(bundle, receipt), (bundle.bundle_hash(), True))
+        store.fail_formal_task(
+            leased["id"],
+            "db-writer",
+            {"code": "simulated_crash_after_db"},
+            "retryable_failed",
+            (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        )
+        transport_count = len(transport.requests)
+
+        with patch.object(
+            FormalFeatureBundleStore,
+            "write",
+            side_effect=AssertionError("existing DB recovery must not write feature files"),
+        ):
+            summary = execute_queued_formal_work(
+                dependencies, worker_id="db-recovery-worker", max_jobs=1
+            )
+
+        task = store.get_formal_task(leased["id"])
+        self.assertEqual(summary.feature_bundles_written, 0)
+        self.assertEqual(task["status"], "verified")
+        self.assertEqual(task["result"]["bundle_hash"], receipt.bundle_hash)
+        self.assertEqual(len(transport.requests), transport_count)
+
+    def test_feature_worker_rejects_existing_row_when_state_store_receipt_root_changes(self) -> None:
+        """Completing from an A receipt after StateStore moves to B would strand the DB row."""
+
+        store, snapshots, _loader, transport, dependencies = ready_feature_execution_fixture(
+            self
+        )
+        leased = store.lease_next_formal_task(
+            ("formal_feature_build",), "root-a-writer", 120
+        )
+        self.assertIsNotNone(leased)
+        assert leased is not None
+        bundle = _formal_deep_worker.reconstruct_formal_feature_bundle(
+            dependencies, leased
+        )
+        receipt = dependencies.feature_store.write(bundle)
+        store.put_formal_feature_bundle(bundle, receipt)
+        store.fail_formal_task(
+            leased["id"],
+            "root-a-writer",
+            {"code": "simulated_crash_after_db"},
+            "retryable_failed",
+            (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        )
+        configured_b = FormalFeatureBundleStore(snapshots.root.parent / "other-root")
+        store._formal_feature_bundle_store = configured_b
+        transport_count = len(transport.requests)
+
+        with patch.object(
+            FormalFeatureBundleStore,
+            "write",
+            side_effect=AssertionError("existing DB recovery must not write feature files"),
+        ):
+            summary = execute_queued_formal_work(
+                dependencies, worker_id="root-mismatch-worker", max_jobs=1
+            )
+
+        task = store.get_formal_task(leased["id"])
+        self.assertEqual(summary.feature_bundles_written, 0)
+        self.assertEqual(summary.terminal_failed, 1)
+        self.assertEqual(task["status"], "terminal_failed")
+        self.assertEqual(task["result"], None)
+        self.assertEqual(task["error"], {"code": "feature_persistence_failed"})
+        self.assertEqual(Path(receipt.bundle_path).read_bytes(), bundle.canonical_bytes())
+        self.assertFalse((snapshots.root.parent / "other-root" / "data").exists())
+        self.assertEqual(len(transport.requests), transport_count)
+
+    def test_feature_worker_terminalizes_db_file_receipt_mismatch_without_overwrite(self) -> None:
+        """Treating a corrupt stored bundle as current input would silently replace audit evidence."""
+
+        store, _snapshots, _loader, transport, dependencies = ready_feature_execution_fixture(
+            self
+        )
+        leased = store.lease_next_formal_task(
+            ("formal_feature_build",), "mismatch-writer", 120
+        )
+        self.assertIsNotNone(leased)
+        assert leased is not None
+        bundle = _formal_deep_worker.reconstruct_formal_feature_bundle(
+            dependencies, leased
+        )
+        receipt = dependencies.feature_store.write(bundle)
+        store.put_formal_feature_bundle(bundle, receipt)
+        Path(receipt.bundle_path).write_bytes(b'{"corrupt":true}')
+        store.fail_formal_task(
+            leased["id"],
+            "mismatch-writer",
+            {"code": "simulated_crash_after_db"},
+            "retryable_failed",
+            (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        )
+        transport_count = len(transport.requests)
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="mismatch-recovery-worker", max_jobs=1
+        )
+
+        task = store.get_formal_task(leased["id"])
+        self.assertEqual(summary.feature_bundles_written, 0)
+        self.assertEqual(summary.terminal_failed, 1)
+        self.assertEqual(task["status"], "terminal_failed")
+        self.assertEqual(task["error"], {"code": "feature_persistence_failed"})
+        self.assertEqual(store.get_formal_feature_bundle_row(bundle.input_hash)["bundle_hash"], receipt.bundle_hash)
+        self.assertEqual(Path(receipt.bundle_path).read_bytes(), b'{"corrupt":true}')
+        self.assertEqual(len(transport.requests), transport_count)
+
+    def test_feature_worker_holds_pending_source_without_transport_or_circuit_change(self) -> None:
+        """A feature scheduled before its source completes must be retried, not terminalized."""
+
+        store, snapshots, runtime_loader, transport, dependencies = ready_feature_execution_fixture(
+            self
+        )
+        source_task_id = store.list_formal_financial_facts(
+            security_id="SZ000001"
+        )[0].source_producing_task_id
+        self.assertIsInstance(source_task_id, str)
+        assert isinstance(source_task_id, str)
+        waiting_dependencies = FormalWorkerDependencies(
+            store=TemporarilyUnverifiedSourceStore(store, source_task_id),
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=dependencies.feature_store,
+            context_repository=object(),
+        )
+        feature_directory = snapshots.root.parent / "data" / "formal" / "features"
+        transport_count = len(transport.requests)
+
+        summary = execute_queued_formal_work(
+            waiting_dependencies, worker_id="pending-feature-worker", max_jobs=1
+        )
+
+        task = store.list_formal_tasks(kinds=("formal_feature_build",))[0]
+        self.assertEqual(summary.remote_attempts, 0)
+        self.assertEqual(summary.retryable_failed, 1)
+        self.assertEqual(summary.terminal_failed, 0)
+        self.assertEqual(task["status"], "retryable_failed")
+        self.assertEqual(task["error"], {"code": "feature_source_pending"})
+        self.assertIsInstance(task["next_retry_at"], str)
+        self.assertFalse(feature_directory.exists())
+        self.assertIsNone(store.get_formal_source_circuit("cninfo"))
+        self.assertEqual(len(transport.requests), transport_count)
+
+    def test_feature_source_pending_hold_is_future_after_renewal_delay(self) -> None:
+        """A delayed lease fence must not make the finite pending hold immediately eligible."""
+
+        store, _snapshots, _loader, _transport, _dependencies = ready_feature_execution_fixture(
+            self
+        )
+        leased = store.lease_next_formal_task(
+            ("formal_feature_build",), "pending-hold-worker", 120
+        )
+        self.assertIsNotNone(leased)
+        assert leased is not None
+        start = datetime.now(timezone.utc)
+
+        class FeatureHoldClock:
+            current = start
+
+            @classmethod
+            def now(cls, _timezone: object) -> datetime:
+                return cls.current
+
+            @staticmethod
+            def fromisoformat(value: str) -> datetime:
+                return datetime.fromisoformat(value)
+
+        class DelayedRenewStore:
+            def __getattr__(self, name: str) -> object:
+                return getattr(store, name)
+
+            def renew_formal_task_lease(
+                self, *args: object, **kwargs: object
+            ) -> object:
+                FeatureHoldClock.current += timedelta(
+                    seconds=_formal_deep_worker._FEATURE_SOURCE_PENDING_HOLD_SECONDS + 1
+                )
+                return store.renew_formal_task_lease(*args, **kwargs)
+
+        with patch.object(_formal_deep_worker, "datetime", FeatureHoldClock):
+            _formal_deep_worker._hold_feature_source_pending(
+                DelayedRenewStore(), leased["id"], "pending-hold-worker"
+            )
+
+        task = store.get_formal_task(leased["id"])
+        self.assertEqual(task["status"], "retryable_failed")
+        self.assertGreater(
+            datetime.fromisoformat(task["next_retry_at"]), FeatureHoldClock.current
+        )
+
+    def test_feature_worker_lost_pending_hold_owner_never_fails_or_publishes(self) -> None:
+        """A source-pending task that loses its hold fence must remain recoverable."""
+
+        store, snapshots, runtime_loader, transport, dependencies = ready_feature_execution_fixture(
+            self
+        )
+        source_task_id = store.list_formal_financial_facts(
+            security_id="SZ000001"
+        )[0].source_producing_task_id
+        self.assertIsInstance(source_task_id, str)
+        assert isinstance(source_task_id, str)
+        loss_store = FeatureLeaseFenceStore(
+            TemporarilyUnverifiedSourceStore(store, source_task_id),
+            lose_on_renewal=1,
+        )
+        waiting_dependencies = FormalWorkerDependencies(
+            store=loss_store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=dependencies.feature_store,
+            context_repository=object(),
+        )
+        feature_directory = snapshots.root.parent / "data" / "formal" / "features"
+        transport_count = len(transport.requests)
+
+        summary = execute_queued_formal_work(
+            waiting_dependencies, worker_id="lost-pending-hold-owner", max_jobs=1
+        )
+
+        task = store.list_formal_tasks(kinds=("formal_feature_build",))[0]
+        self.assertEqual(summary.feature_bundles_written, 0)
+        self.assertEqual(summary.retryable_failed, 0)
+        self.assertEqual(summary.terminal_failed, 0)
+        self.assertEqual(task["status"], "leased")
+        self.assertIsNone(task["result"])
+        self.assertIsNone(task["error"])
+        self.assertEqual(loss_store.fail_calls, 0)
+        self.assertFalse(feature_directory.exists())
+        self.assertIsNone(store.get_formal_source_circuit("cninfo"))
+        self.assertEqual(len(transport.requests), transport_count)
+
+        expire_feature_lease_for_next_owner(self, store, task["id"])
+        recovered = execute_queued_formal_work(
+            dependencies, worker_id="new-pending-hold-owner", max_jobs=1
+        )
+        self.assertEqual(recovered.feature_bundles_written, 1)
+        self.assertEqual(store.get_formal_task(task["id"])["status"], "verified")
+
+    def test_feature_worker_lost_pending_hold_failure_never_terminalizes(self) -> None:
+        """Loss at the retryable-hold write itself must leave the feature task untouched."""
+
+        store, snapshots, runtime_loader, transport, dependencies = ready_feature_execution_fixture(
+            self
+        )
+        source_task_id = store.list_formal_financial_facts(
+            security_id="SZ000001"
+        )[0].source_producing_task_id
+        self.assertIsInstance(source_task_id, str)
+        assert isinstance(source_task_id, str)
+        loss_store = FeatureLeaseFenceStore(
+            TemporarilyUnverifiedSourceStore(store, source_task_id),
+            lose_on_fail=True,
+        )
+        waiting_dependencies = FormalWorkerDependencies(
+            store=loss_store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=dependencies.feature_store,
+            context_repository=object(),
+        )
+        feature_directory = snapshots.root.parent / "data" / "formal" / "features"
+        transport_count = len(transport.requests)
+
+        summary = execute_queued_formal_work(
+            waiting_dependencies, worker_id="lost-pending-fail-owner", max_jobs=1
+        )
+
+        task = store.list_formal_tasks(kinds=("formal_feature_build",))[0]
+        self.assertEqual(summary.feature_bundles_written, 0)
+        self.assertEqual(summary.retryable_failed, 0)
+        self.assertEqual(summary.terminal_failed, 0)
+        self.assertEqual(task["status"], "leased")
+        self.assertIsNone(task["result"])
+        self.assertIsNone(task["error"])
+        self.assertEqual(loss_store.fail_calls, 1)
+        self.assertEqual(loss_store.fail_delegated, 0)
+        self.assertFalse(feature_directory.exists())
+        self.assertIsNone(store.get_formal_source_circuit("cninfo"))
+        self.assertEqual(len(transport.requests), transport_count)
+
+        expire_feature_lease_for_next_owner(self, store, task["id"])
+        recovered = execute_queued_formal_work(
+            dependencies, worker_id="new-pending-fail-owner", max_jobs=1
+        )
+        self.assertEqual(recovered.feature_bundles_written, 1)
+        self.assertEqual(store.get_formal_task(task["id"])["status"], "verified")
+
+    def test_feature_worker_executes_only_leased_security_template_scope(self) -> None:
+        """Completing one feature build must not consume adjacent security/template work."""
+
+        store, _snapshots, _loader, transport, dependencies = ready_feature_execution_fixture(
+            self
+        )
+        original = store.list_formal_tasks(kinds=("formal_feature_build",))[0]
+        payload = _formal_deep_worker._feature_payload_from_wire(original["payload"])
+        different_security = FormalTaskSpec.from_payload(
+            replace(payload, security_id="SZ000002")
+        )
+        different_template = FormalTaskSpec.from_payload(
+            replace(payload, template_id="bank")
+        )
+        different_security_id = store.enqueue_formal_task(
+            different_security.kind,
+            different_security.idempotency_key,
+            different_security.refresh_generation,
+            different_security.payload,
+            different_security.prerequisite_task_ids,
+        )
+        different_template_id = store.enqueue_formal_task(
+            different_template.kind,
+            different_template.idempotency_key,
+            different_template.refresh_generation,
+            different_template.payload,
+            different_template.prerequisite_task_ids,
+        )
+        transport_count = len(transport.requests)
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="scoped-feature-worker", max_jobs=1
+        )
+
+        completed = store.get_formal_task(original["id"])
+        self.assertEqual(summary.feature_bundles_written, 1)
+        self.assertEqual(completed["status"], "verified")
+        self.assertEqual(store.get_formal_task(different_security_id)["status"], "pending")
+        self.assertEqual(store.get_formal_task(different_template_id)["status"], "pending")
+        self.assertIsNone(store.get_formal_task(different_security_id)["result"])
+        self.assertIsNone(store.get_formal_task(different_template_id)["result"])
+        self.assertEqual(len(transport.requests), transport_count)
+
+    def test_feature_worker_stops_on_lost_owner_value_error_from_persistence(self) -> None:
+        """A lost-owner-shaped store error must leave its file orphan for a new owner."""
+
+        store, snapshots, runtime_loader, transport, dependencies = ready_feature_execution_fixture(
+            self
+        )
+        leased, bundle = requeue_feature_task_for_lease_test(self, store, dependencies)
+        loss_store = FeatureLeaseFenceStore(store, lose_on_put=True)
+        loss_dependencies = FormalWorkerDependencies(
+            store=loss_store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=dependencies.feature_store,
+            context_repository=object(),
+        )
+        feature_path = (
+            snapshots.root.parent
+            / "data"
+            / "formal"
+            / "features"
+            / f"{bundle.bundle_hash()}.json"
+        )
+        transport_count = len(transport.requests)
+        initial_error = store.get_formal_task(leased["id"])["error"]
+
+        summary = execute_queued_formal_work(
+            loss_dependencies, worker_id="lost-put-worker", max_jobs=1
+        )
+
+        task = store.get_formal_task(leased["id"])
+        self.assertEqual(summary.feature_bundles_written, 0)
+        self.assertEqual(summary.retryable_failed, 0)
+        self.assertEqual(summary.terminal_failed, 0)
+        self.assertEqual(task["status"], "leased")
+        self.assertIsNone(task["result"])
+        self.assertEqual(task["error"], initial_error)
+        self.assertEqual(loss_store.put_calls, 1)
+        self.assertEqual(loss_store.complete_calls, 0)
+        self.assertEqual(loss_store.fail_calls, 0)
+        self.assertTrue(feature_path.exists())
+        self.assertIsNone(store.get_formal_feature_bundle_row(bundle.input_hash))
+        self.assertEqual(len(transport.requests), transport_count)
+
+        expire_feature_lease_for_next_owner(self, store, leased["id"])
+        recovered = execute_queued_formal_work(
+            dependencies, worker_id="new-put-owner", max_jobs=1
+        )
+        self.assertEqual(recovered.feature_bundles_written, 1)
+        self.assertEqual(store.get_formal_task(leased["id"])["status"], "verified")
+
+    def test_feature_worker_terminalizes_replay_failure_before_file_or_db_write(self) -> None:
+        """A raw replay failure must not manufacture a new feature receipt or DB row."""
+
+        store, snapshots, runtime_loader, transport, dependencies = ready_feature_execution_fixture(
+            self
+        )
+        failing_dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=RawBytesDriftSnapshots(snapshots),
+            registry_runtime_loader=runtime_loader,
+            feature_store=dependencies.feature_store,
+            context_repository=object(),
+        )
+        feature_directory = snapshots.root.parent / "data" / "formal" / "features"
+        transport_count = len(transport.requests)
+
+        summary = execute_queued_formal_work(
+            failing_dependencies, worker_id="replay-failure-worker", max_jobs=1
+        )
+
+        task = store.list_formal_tasks(kinds=("formal_feature_build",))[0]
+        self.assertEqual(summary.remote_attempts, 0)
+        self.assertEqual(summary.feature_bundles_written, 0)
+        self.assertEqual(summary.terminal_failed, 1)
+        self.assertEqual(task["status"], "terminal_failed")
+        self.assertEqual(task["error"], {"code": "feature_reconstruction_failed"})
+        self.assertFalse(feature_directory.exists())
+        self.assertIsNone(store.get_formal_source_circuit("cninfo"))
+        self.assertEqual(len(transport.requests), transport_count)
 
     def test_feature_reconstruction_builds_only_frozen_raw_input_without_transport_or_publication(self) -> None:
         """Removing frozen raw replay would otherwise let current V6 facts become bundle input."""
