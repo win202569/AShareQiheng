@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 import copy
-from dataclasses import InitVar, asdict, dataclass, fields, is_dataclass
+from dataclasses import InitVar, asdict, dataclass, field, fields, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
@@ -19,7 +19,14 @@ from types import MappingProxyType
 from typing import Literal, Protocol
 
 from .formal_evidence import OfficialRequest, OfficialSnapshotRef, VerifiedCalendarBinding
-from .formal_context_schema import FormalContextRequest
+from .formal_context_schema import (
+    FormalContextNormalizer,
+    FormalContextRegistry,
+    FormalContextRequest,
+    SignedContextRequestResolver,
+)
+from .formal_snapshot_repository import FormalSnapshotRepository
+from .state_store import StateStore
 from .formal_feature_contract import (
     FormalFeatureBundle,
     SignedFormalFeatureRegistry,
@@ -64,6 +71,7 @@ _FORMAL_KINDS = frozenset(
     }
 )
 _STATEMENT_EXECUTION_KINDS = ("formal_statement",)
+_CONTEXT_EXECUTION_KINDS = ("formal_context",)
 _FEATURE_EXECUTION_KINDS = ("formal_feature_build",)
 _STATEMENT_LEASE_SECONDS = 120
 _FEATURE_SOURCE_PENDING_HOLD_SECONDS = 30
@@ -824,6 +832,20 @@ class FormalWorkerDependencies:
     registry_runtime_loader: FormalRegistryRuntimeLoader
     feature_store: object
     context_repository: object
+    context_normalizers: Mapping[str, FormalContextNormalizer] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.context_normalizers, Mapping):
+            raise ValueError("Context normalizers must be a version-keyed mapping")
+        normalizers: dict[str, FormalContextNormalizer] = {}
+        for version, normalizer in self.context_normalizers.items():
+            _require_text(version, "Context normalizer version key")
+            if version in normalizers:
+                raise ValueError("duplicate Context normalizer version")
+            normalizers[version] = normalizer
+        object.__setattr__(self, "context_normalizers", MappingProxyType(normalizers))
 
 
 @dataclass(frozen=True)
@@ -1448,6 +1470,211 @@ def enqueue_formal_feature_build(
     return tuple(task_ids)
 
 
+def _decode_leased_context_task(
+    dependencies: FormalWorkerDependencies, task: object,
+) -> tuple[str, FormalContextRequest]:
+    """Resolve authority afresh; persisted JSON never mints a capability."""
+    store = dependencies.store
+    if type(store) is not StateStore or type(task) is not dict:
+        raise ValueError("Context execution requires exact StateStore and leased task")
+    if task.get("kind") != "formal_context" or task.get("status") != "leased":
+        raise ValueError("leased task is not Context")
+    task_id = _require_text(task.get("id"), "Context task id")
+    wire = task.get("payload")
+    if type(wire) is not dict:
+        raise ValueError("Context payload must be an exact JSON object")
+    request = SignedContextRequestResolver(store, store._require_registry_verifier()).resolve(
+        context_kind=wire.get("context_kind"), scope_key=wire.get("scope_key"),
+        security_id=wire.get("security_id"), as_of_utc=wire.get("as_of_utc"),
+        registry_manifest_hash=wire.get("registry_manifest_hash"),
+        upstream_generation=wire.get("upstream_generation"),
+    )
+    spec = FormalTaskSpec.from_payload(FormalContextTaskPayload.from_request(request))
+    if (
+        type(task.get("idempotency_key")) is not str
+        or task["idempotency_key"] != spec.idempotency_key
+        or type(task.get("refresh_generation")) is not str
+        or task["refresh_generation"] != spec.refresh_generation
+        or _canonical_bytes(task.get("prerequisite_task_ids")) != _canonical_bytes(list(spec.prerequisite_task_ids))
+        or _canonical_bytes(wire) != _canonical_bytes(spec.payload)
+    ):
+        raise ValueError("Context leased task differs from fresh signed request")
+    return task_id, request
+
+
+def _validated_context_runtime(
+    dependencies: FormalWorkerDependencies, request: FormalContextRequest,
+) -> tuple[FormalRegistryRuntime, object, FormalContextNormalizer]:
+    store = dependencies.store
+    verifier = store._require_registry_verifier()
+    loader = dependencies.registry_runtime_loader
+    if (
+        type(loader) is not FormalRegistryRuntimeLoader
+        or type(loader._bundle_loader) is not FormalRegistryBundleLoader
+        or loader._bundle_loader._repository is not store
+        or loader._bundle_loader._verifier is not verifier
+        or loader._verifier is not verifier
+    ):
+        raise ValueError("Context runtime must use the configured StateStore and verifier")
+    snapshots = dependencies.snapshots
+    raw_store = store._configured_formal_snapshot_store_for_repository()
+    if (
+        type(snapshots) is not FormalSnapshotRepository
+        or snapshots._state_store is not store
+        or snapshots._raw_store is not raw_store
+        or snapshots.root != raw_store.root
+    ):
+        raise ValueError("Context snapshots must use the configured StateStore and raw root")
+    runtime = loader.load(request.registry_manifest_hash, adapter_freeze_at_utc=request.as_of_utc)
+    if type(runtime) is not FormalRegistryRuntime:
+        raise ValueError("Context runtime has invalid type")
+    runtime.bundle.require_official()
+    if runtime.bundle.manifest.manifest_hash != request.registry_manifest_hash:
+        raise ValueError("Context runtime root mismatch")
+    for role, digest in request.relevant_registry_hashes:
+        if runtime.bundle.blob(role).registry_hash != digest:
+            raise ValueError("Context runtime role mismatch")
+    adapter = runtime.source_adapter
+    source_hash = dict(request.relevant_registry_hashes)["source"]
+    if (
+        type(adapter) is not FormalOfficialSourceAdapter
+        or _require_hash(adapter.source_registry_hash, "Context adapter source hash") != source_hash
+        or adapter.source_registry_hash != runtime.bundle.manifest.source_registry_hash
+        or adapter.registry.registry_hash != source_hash
+        or _require_hash(adapter.registry_manifest_hash, "Context adapter root") != request.registry_manifest_hash
+        or _require_timestamp(adapter.freeze_at_utc, "Context adapter freeze") != request.as_of_utc
+    ):
+        raise ValueError("Context adapter does not match signed root, source or freeze")
+    config = adapter.registry.select(request.official_request)
+    descriptor = FormalContextRegistry.load(store, verifier, request.registry_manifest_hash).descriptor_for(request)
+    for name in ("source", "dataset", "parser_id", "parser_version", "mapping_version", "bootstrap_calendar"):
+        if getattr(config, name) != descriptor[name]:
+            raise ValueError("Context runtime source configuration mismatch")
+    selector = None if config.calendar_selector is None else asdict(config.calendar_selector)
+    exchange_scope = None if descriptor["bootstrap_calendar"] else request.official_request.exchange
+    if selector != request.calendar_selector or config.exchange_scope != exchange_scope:
+        raise ValueError("Context runtime source calendar configuration mismatch")
+    normalizer = dependencies.context_normalizers.get(request.normalizer_version)
+    version = getattr(normalizer, "normalizer_version", None)
+    if type(version) is not str or version != request.normalizer_version or not callable(getattr(normalizer, "normalize", None)):
+        raise ValueError("missing or unsupported Context normalizer version")
+    return runtime, config, normalizer
+
+
+def _require_context_snapshot_identity(
+    receipt: object, snapshot: object, *, task_id: str, request: FormalContextRequest,
+) -> OfficialSnapshotRef:
+    if type(receipt) is not dict or type(snapshot) is not OfficialSnapshotRef:
+        raise ValueError("invalid Context receipt or snapshot")
+    for name, expected in dict(task_id=task_id, snapshot_id=snapshot.snapshot_id,
+        manifest_sha256=snapshot.manifest_sha256, refresh_generation=request.refresh_generation).items():
+        if type(receipt.get(name)) is not str or receipt[name] != expected:
+            raise ValueError("Context receipt lineage mismatch")
+    official = request.official_request
+    expected_fields = dict(source=official.source, dataset=official.dataset, security_id=official.security_id,
+        period_or_date=official.period_or_date, exchange=official.exchange,
+        request_fingerprint=official.request_fingerprint, producing_task_id=task_id,
+        refresh_generation=request.refresh_generation, parser_id=request.parser_id,
+        parser_version=request.parser_version, mapping_version=request.mapping_version, verification_status="verified",
+        published_precision="date_only" if request.calendar_binding else "timestamp",
+        effective_time_evidence_hash=request.calendar_binding.manifest_sha256 if request.calendar_binding else None)
+    for name, expected in expected_fields.items():
+        actual = getattr(snapshot, name)
+        if type(actual) is not type(expected) or actual != expected:
+            raise ValueError("Context snapshot request or source lineage mismatch")
+    return snapshot
+
+
+def _execute_context_task(
+    dependencies: FormalWorkerDependencies, task: dict[str, object], *, worker_id: str,
+) -> int:
+    task_id = _require_text(task.get("id"), "Context task id")
+    store = dependencies.store
+    remote_attempts = 0
+
+    def fence() -> None:
+        _renew_statement_lease(store, task_id, worker_id, remote_attempts=remote_attempts)
+
+    def source_call(callback: Callable[[], object]) -> object:
+        try:
+            return callback()
+        except FormalSourceBlocked:
+            fence()
+            retry_after = _open_source_circuit(store, request.official_request.source,
+                cooldown_seconds=config.challenge_cooldown_seconds, code="source_blocked", before_mutation=fence)
+            fence()
+            _fail_statement_retryable(store, task_id, worker_id, code="source_blocked",
+                next_retry_at=retry_after, remote_attempts=remote_attempts)
+            raise _RetryableFormalTask(remote_attempts, request.official_request.source, circuit_open=True)
+        except FormalRetryableSourceError:
+            fence()
+            _, retry_after = _retry_window(config.retry_base_seconds)
+            _fail_statement_retryable(store, task_id, worker_id, code="source_retryable_failed",
+                next_retry_at=retry_after, remote_attempts=remote_attempts)
+            raise _RetryableFormalTask(remote_attempts, request.official_request.source, circuit_open=False)
+        except FormalTerminalSourceError as error:
+            fence()
+            raise _TerminalFormalTask(remote_attempts, "context_terminal_source_error") from error
+
+    try:
+        task_id, request = _decode_leased_context_task(dependencies, task)
+        runtime, config, normalizer = _validated_context_runtime(dependencies, request)
+        receipt = store.get_formal_task_snapshot_receipt(task_id)
+        if receipt is None:
+            fence()
+            retry_after = _active_source_circuit_retry_after(store, request.official_request.source, before_mutation=fence)
+            if retry_after is not None:
+                fence()
+                _fail_statement_retryable(store, task_id, worker_id, code="source_circuit_open",
+                    next_retry_at=retry_after, remote_attempts=0)
+                raise _RetryableFormalTask(0, request.official_request.source, circuit_open=True)
+            fence()
+            remote_attempts = 1
+            fetch, verification, _ = source_call(lambda: runtime.source_adapter.fetch_verified(
+                request.official_request, refresh_generation=request.refresh_generation, calendar_binding=request.calendar_binding))
+            fence()
+            dependencies.snapshots.persist_verified(fetch, verification, producing_task_id=task_id, worker_id=worker_id)
+            fence()
+            receipt = store.get_formal_task_snapshot_receipt(task_id)
+        if type(receipt) is not dict or type(receipt.get("manifest_sha256")) is not str:
+            raise ValueError("Context receipt missing after raw persistence")
+        snapshot = _require_context_snapshot_identity(receipt,
+            dependencies.snapshots.get_verified_by_manifest(receipt["manifest_sha256"]), task_id=task_id, request=request)
+        raw_bytes = dependencies.snapshots.read_verified_raw(snapshot)
+        if type(raw_bytes) is not bytes or hashlib.sha256(raw_bytes).hexdigest() != snapshot.content_sha256:
+            raise ValueError("Context verified raw bytes differ from source hash")
+        source_call(lambda: runtime.source_adapter.parse_verified_snapshot(snapshot, raw_bytes,
+            calendar_binding=request.calendar_binding))
+        fence()
+        registry = FormalContextRegistry.load(store, store._require_registry_verifier(), request.registry_manifest_hash)
+        normalization = registry.normalize_verified(request, snapshot, raw_bytes, normalizer,
+            task_id=task_id, worker_id=worker_id)
+        facts = normalization.facts
+        if len(facts) != 1:
+            raise ValueError("one Context task must normalize exactly one fact")
+        fence()
+        store.put_formal_context_facts(normalization)
+        fence()
+        fact = facts[0]
+        result = dict(kind="formal_context", context_kind=request.context_kind, scope_key=request.scope_key,
+            security_id=request.security_id, as_of_utc=request.as_of_utc,
+            registry_manifest_hash=request.registry_manifest_hash, refresh_generation=request.refresh_generation,
+            descriptor_id=request.descriptor_id, normalizer_version=request.normalizer_version,
+            snapshot_id=snapshot.snapshot_id, manifest_sha256=snapshot.manifest_sha256,
+            source_content_sha256=snapshot.content_sha256, parser_id=request.parser_id,
+            parser_version=request.parser_version, mapping_version=request.mapping_version,
+            fact_id=fact.id, normalization_input_hash=fact.evidence["normalization_input_hash"])
+        store.complete_formal_task(task_id, worker_id, result)
+    except (_LostFormalTaskLease, _RetryableFormalTask, _TerminalFormalTask):
+        raise
+    except Exception as error:
+        if isinstance(error, ValueError) and _is_lost_formal_task_lease_error(error):
+            raise _LostFormalTaskLease(remote_attempts) from error
+        fence()
+        raise _TerminalFormalTask(remote_attempts, "context_validation_failed") from error
+    return remote_attempts
+
+
 def _execute_statement_task(
     dependencies: FormalWorkerDependencies,
     task: dict[str, object],
@@ -1664,6 +1891,7 @@ def _open_source_circuit(
     *,
     cooldown_seconds: object,
     code: str,
+    before_mutation: Callable[[], None] | None = None,
 ) -> str:
     opened_at, retry_after = _retry_window(cooldown_seconds)
     existing = store.get_formal_source_circuit(source)
@@ -1672,6 +1900,8 @@ def _open_source_circuit(
         count = existing.get("failure_count")
         if type(count) is int and count > 0:
             failures = count + 1
+    if before_mutation is not None:
+        before_mutation()
     store.set_formal_source_circuit(
         source,
         state="open",
@@ -1683,7 +1913,9 @@ def _open_source_circuit(
     return retry_after
 
 
-def _active_source_circuit_retry_after(store: object, source: str) -> str | None:
+def _active_source_circuit_retry_after(
+    store: object, source: str, *, before_mutation: Callable[[], None] | None = None,
+) -> str | None:
     circuit = store.get_formal_source_circuit(source)
     if circuit is None:
         return None
@@ -1694,6 +1926,8 @@ def _active_source_circuit_retry_after(store: object, source: str) -> str | None
     retry_after = _require_timestamp(circuit.get("retry_after_utc"), "circuit retry time")
     if datetime.fromisoformat(retry_after) > datetime.now(timezone.utc):
         return retry_after
+    if before_mutation is not None:
+        before_mutation()
     store.set_formal_source_circuit(
         source,
         state="closed",
@@ -1989,7 +2223,7 @@ def execute_queued_formal_work(
     worker_id: str,
     max_jobs: int | None = None,
 ) -> FormalCollectionSummary:
-    """Run leased statement and frozen feature tasks with durable recovery fences."""
+    """Run statements, Context, and frozen features in that priority order."""
 
     if type(dependencies) is not FormalWorkerDependencies:
         raise ValueError("formal worker dependencies must have exact type")
@@ -2014,11 +2248,29 @@ def execute_queued_formal_work(
     while max_jobs is None or processed < max_jobs:
         task = lease_next(_STATEMENT_EXECUTION_KINDS, owner, _STATEMENT_LEASE_SECONDS)
         if task is None:
+            task = lease_next(_CONTEXT_EXECUTION_KINDS, owner, _STATEMENT_LEASE_SECONDS)
+        if task is None:
             task = lease_next(_FEATURE_EXECUTION_KINDS, owner, _STATEMENT_LEASE_SECONDS)
         if task is None:
             break
         if type(task) is not dict:
             raise ValueError("formal task lease returned an invalid task")
+        if task.get("kind") == "formal_context":
+            try:
+                remote_attempts += _execute_context_task(dependencies, task, worker_id=owner)
+            except _LostFormalTaskLease as error:
+                remote_attempts += error.remote_attempts
+            except _RetryableFormalTask as error:
+                remote_attempts += error.remote_attempts
+                retryable_failed += 1
+                if error.circuit_open:
+                    open_circuits.add(error.source)
+            except _TerminalFormalTask as error:
+                remote_attempts += error.remote_attempts
+                if _fail_statement_terminal(dependencies.store, task["id"], owner, code=error.code):
+                    terminal_failed += 1
+            processed += 1
+            continue
         if task.get("kind") == "formal_feature_build":
             try:
                 created, security_id = _execute_feature_task(

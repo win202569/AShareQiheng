@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -29,7 +31,7 @@ from ashare_pipeline.formal_deep_worker import (
     formal_context_task_specs,
     formal_statement_task_specs,
 )
-from ashare_pipeline.formal_evidence import OfficialRequest, SourcePolicy, VerifiedCalendarBinding
+from ashare_pipeline.formal_evidence import OfficialFetch, OfficialRequest, SourcePolicy, VerifiedCalendarBinding, verify_official_fetch
 from ashare_pipeline.formal_feature_store import FormalFeatureBundleStore
 from ashare_pipeline.formal_financial_schema import (
     FormalFinancialFact,
@@ -41,6 +43,7 @@ from ashare_pipeline.formal_registry_manifest import (
     VerifiedRegistryBlob,
 )
 from ashare_pipeline.formal_context_schema import FormalContextRequest, SignedContextRequestResolver
+from ashare_pipeline.formal_context_repository import FormalContextRepository, build_effective_time_resolver
 from ashare_pipeline.formal_snapshot_repository import FormalSnapshotRepository
 from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore
 from ashare_pipeline.formal_sources import (
@@ -51,6 +54,7 @@ from ashare_pipeline.formal_sources import (
 )
 from ashare_pipeline.state_store import StateStore
 import tests.test_formal_sources as _formal_source_tests
+from tests.test_formal_context_repository import FixtureNormalizer
 from tests.test_formal_feature_store import project_temporary_directory
 
 
@@ -1214,6 +1218,578 @@ def date_only_statement_execution_fixture(
         payload,
         ExactCalendarBindingRepository(binding),
     )
+
+
+def context_execution_fixture(case, *, descriptors=None, configs=None):
+    """A complete signed runtime, real Context store, and hermetic transport."""
+    temporary = project_temporary_directory()
+    case.addCleanup(temporary.cleanup)
+    root = Path(temporary.name)
+    verifier = ContextRequestVerifier()
+    calendar_requests = {}
+    def resolve_raw_binding(candidate):
+        signed = calendar_requests.get(candidate.canonical_json_bytes())
+        if signed is None:
+            raise ValueError("unregistered fixture calendar request")
+        current = resolver.resolve(context_kind=signed.context_kind, scope_key=signed.scope_key,
+            security_id=signed.security_id, as_of_utc=signed.as_of_utc,
+            registry_manifest_hash=signed.registry_manifest_hash, upstream_generation=signed.upstream_generation)
+        if current.canonical_bytes() != signed.canonical_bytes():
+            raise ValueError("fixture calendar binding changed")
+        return current.calendar_binding
+    raw = FormalSnapshotStore(root / "raw", calendar_binding_resolver=resolve_raw_binding)
+    store = StateStore(root / "state.sqlite", formal_snapshot_store=raw,
+                       registry_signature_verifier=verifier)
+    store.initialize()
+    loader = fixture_bundle_loader(purpose="official", source_configs=configs or [
+        _formal_source_tests.config(dataset="fixture-state", exchange_scope="SZ")])
+    blobs = {blob.registry_role: blob.canonical_json for blob in loader._repository.blobs.values()}
+    blobs["scoring"] = canonical_bytes(dict(registry_role="scoring",
+        schema_version="formal-context-registry-v1", descriptors=descriptors or [context_descriptor()]))
+    root_bytes = canonical_bytes(dict(schema_version="formal-registry-manifest-v1", purpose="official",
+        approval_id="fixture-approval", **{role + "_registry_hash": hashlib.sha256(value).hexdigest()
+                                        for role, value in blobs.items()}))
+    manifest = FormalRegistryManifest.from_signed_bytes(root_bytes, hashlib.sha256(root_bytes).hexdigest(),
+                                                       "fixture-key", verifier)
+    for role, value in blobs.items():
+        digest = hashlib.sha256(value).hexdigest()
+        binding = canonical_bytes(dict(child_sha256=digest, registry_manifest_hash=manifest.manifest_hash,
+                                       registry_role=role))
+        store.put_formal_registry_blob(VerifiedRegistryBlob(registry_role=role, registry_hash=digest,
+            canonical_json=value, signature=digest, key_id="fixture-key", approval_id="fixture-approval",
+            declared_registry_manifest_hash=manifest.manifest_hash,
+            binding_signature=hashlib.sha256(binding).hexdigest(), binding_key_id="fixture-key"))
+    store.put_formal_registry_manifest(manifest)
+    value = dict(is_st=False, is_star_st=False, listing_status="listed", forced_delist_risk=False, suspended=False)
+    transport = CountingTransport(_formal_source_tests.response(raw=canonical_bytes(dict(value=value, no_coverage=False))))
+    parser = _formal_source_tests.FixtureParser(_formal_source_tests.timestamp_document(
+        declared_security_id="SZ000001", declared_period="2026-08-31"))
+    snapshots = FormalSnapshotRepository(raw.root, store)
+    context_repository = FormalContextRepository(store, snapshots, verifier)
+    runtime_loader = FormalRegistryRuntimeLoader(FormalRegistryBundleLoader(store, verifier), transport=transport,
+        policies={"cninfo": SourcePolicy.cninfo()}, parsers={"fixture-parser": parser},
+        effective_time_resolver=build_effective_time_resolver(context_repository))
+    dependencies = FormalWorkerDependencies(store, snapshots, runtime_loader, None, None,
+        context_normalizers={"fixture-normalizer-v1": FixtureNormalizer()})
+    resolver = SignedContextRequestResolver(store, verifier)
+    return SimpleNamespace(root=root, store=store, raw=raw, snapshots=snapshots, verifier=verifier,
+        registry_root=manifest.manifest_hash, resolver=resolver, transport=transport, parser=parser,
+        dependencies=dependencies, value=value, calendar_requests=calendar_requests, context_repository=context_repository)
+
+
+def enqueue_context(fixture, **changes):
+    args = dict(context_kind="security_state", scope_key="fixture-state", security_id="SZ000001",
+        as_of_utc=AS_OF, registry_manifest_hash=fixture.registry_root, upstream_generation="fixture-upstream-v1")
+    args.update(changes)
+    request = fixture.resolver.resolve(**args)
+    if request.calendar_binding is not None:
+        fixture.calendar_requests[request.official_request.canonical_json_bytes()] = request
+    spec = formal_context_task_specs(request)[0]
+    task_id = fixture.store.enqueue_formal_task(spec.kind, spec.idempotency_key, spec.refresh_generation,
+        spec.payload, prerequisite_task_ids=spec.prerequisite_task_ids)
+    return task_id, request
+
+
+def date_only_context_fixture(case):
+    from dataclasses import asdict
+    selector = asdict(CalendarSelector("trading_calendar", "fixture-calendar-SZ", "SZ", "visible_at_freeze"))
+    fixture = context_execution_fixture(case, descriptors=[
+        context_descriptor(kind="trading_calendar", scope_key="fixture-calendar-SZ", security_scope="none",
+            request_security="none", period_rule="none", exchange_rule="fixed_exchange", fixed_exchange="SZ",
+            dataset="trading_calendar", bootstrap_calendar=True),
+        context_descriptor(calendar_selector=selector),
+    ], configs=[_formal_source_tests.config(dataset="trading_calendar", bootstrap_calendar=True),
+                _formal_source_tests.config(dataset="fixture-state", exchange_scope="SZ", calendar_selector=selector)])
+    fixture.transport.response = _formal_source_tests.response(raw=canonical_bytes(dict(no_coverage=False,
+        value=dict(exchange="SZ", calendar_version="fixture-v1", trading_days=["2026-08-21", "2026-08-31"]))))
+    fixture.parser.document = _formal_source_tests.timestamp_document(declared_security_id=None, declared_period=None,
+        published_at_utc="2026-08-19T07:00:00+00:00", source_updated_at_utc=None)
+    return fixture
+
+
+def seed_verified_context_calendar(case, fixture):
+    """Seed signed raw provenance to exercise date-only dependents independently of bootstrap dispatch."""
+    from ashare_pipeline.formal_context_schema import FormalContextRegistry
+    task_id, request = enqueue_context(fixture, context_kind="trading_calendar", scope_key="fixture-calendar-SZ", security_id=None)
+    fixture.store.lease_next_formal_task(("formal_context",), "fixture-worker", 120)
+    fetch = OfficialFetch(request=request.official_request, raw_bytes=fixture.transport.response.raw_bytes,
+        original_url="https://www.cninfo.com.cn/fixture/calendar.json", published_at_utc="2026-08-19T07:00:00+00:00",
+        published_precision="timestamp", source_updated_at_utc=None, captured_at_utc="2026-09-04T00:00:00+00:00",
+        effective_at_utc="2026-08-19T07:00:00+00:00", effective_time_evidence_hash=None,
+        refresh_generation=request.refresh_generation, parser_id=request.parser_id, parser_version=request.parser_version,
+        mapping_version=request.mapping_version, declared_security_id=None, declared_period=None)
+    verification = verify_official_fetch(fetch, SourcePolicy.cninfo())
+    case.assertEqual(verification.status, "verified")
+    snapshot = fixture.snapshots.persist_verified(fetch, verification, producing_task_id=task_id, worker_id="fixture-worker")
+    normalization = FormalContextRegistry.load(fixture.store, fixture.verifier, fixture.registry_root).normalize_verified(
+        request, snapshot, fixture.snapshots.read_verified_raw(snapshot), FixtureNormalizer(), task_id=task_id, worker_id="fixture-worker")
+    fixture.store.put_formal_context_facts(normalization)
+    fixture.store.complete_formal_task(task_id, "fixture-worker", {"snapshot_id": snapshot.snapshot_id})
+    return task_id
+
+
+class FormalContextWorkerExecutionTests(unittest.TestCase):
+    def test_context_timestamp_executes_one_fact_without_financial_mutation(self):
+        fixture = context_execution_fixture(self)
+        task_id, request = enqueue_context(fixture)
+        summary = execute_queued_formal_work(fixture.dependencies, worker_id="context-worker", max_jobs=1)
+        task = fixture.store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "verified")
+        self.assertEqual((summary.remote_attempts, len(fixture.transport.requests)), (1, 1))
+        facts = fixture.store.list_formal_context_facts(registry_manifest_hash=fixture.registry_root)
+        self.assertEqual(len(facts), 1)
+        self.assertEqual(facts[0].value, fixture.value)
+        self.assertEqual(facts[0].refresh_generation, request.refresh_generation)
+        receipt = fixture.store.get_formal_task_snapshot_receipt(task_id)
+        self.assertEqual(task["result"], dict(kind="formal_context", context_kind="security_state",
+            scope_key="fixture-state", security_id="SZ000001", as_of_utc=AS_OF,
+            registry_manifest_hash=fixture.registry_root, refresh_generation=request.refresh_generation,
+            descriptor_id=request.descriptor_id, normalizer_version="fixture-normalizer-v1",
+            snapshot_id=receipt["snapshot_id"], manifest_sha256=receipt["manifest_sha256"],
+            source_content_sha256=facts[0].source_content_sha256, parser_id="fixture-parser",
+            parser_version="fixture-v1", mapping_version="fixture-map-v1", fact_id=facts[0].id,
+            normalization_input_hash=facts[0].evidence["normalization_input_hash"]))
+        self.assertEqual((summary.verified_statement_count, summary.feature_bundles_written,
+                          summary.rebuilt_security_ids), (0, 0, ()))
+        with fixture.store._transaction() as connection:
+            for table in ("formal_financial_fact", "formal_quarter_fact", "formal_feature_set", "formal_feature_value"):
+                self.assertEqual(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT count(*) FROM formal_collection_task").fetchone()[0], 1)
+
+    def test_context_missing_wrong_and_mutating_normalizer_fail_closed(self):
+        for mode in ("missing", "wrong", "empty", "multiple", "error", "mutated"):
+            with self.subTest(mode=mode):
+                fixture = context_execution_fixture(self)
+                task_id, _ = enqueue_context(fixture)
+                normalizer = FixtureNormalizer()
+                original = normalizer.normalize
+
+                def normalize(**kwargs):
+                    if mode == "empty":
+                        return ()
+                    if mode == "error":
+                        raise RuntimeError("private callback exception /local/path")
+                    facts = original(**kwargs)
+                    if mode == "multiple":
+                        parsed = json.loads(kwargs["raw_bytes"])
+                        parsed["value"]["is_st"] = True
+                        return facts + original(**{**kwargs, "raw_bytes": canonical_bytes(parsed)})
+                    normalizer.normalizer_version = "changed"
+                    return facts
+
+                if mode == "wrong":
+                    normalizer.normalizer_version = "other-version"
+                elif mode not in ("missing",):
+                    normalizer.normalize = normalize
+                dependencies = replace(fixture.dependencies, context_normalizers={} if mode == "missing" else
+                    {"fixture-normalizer-v1": normalizer})
+                summary = execute_queued_formal_work(dependencies, worker_id="context-worker", max_jobs=1)
+                task = fixture.store.get_formal_task(task_id)
+                self.assertEqual((task["status"], task["error"]),
+                    ("terminal_failed", {"code": "context_validation_failed"}))
+                self.assertEqual(summary.terminal_failed, 1)
+                self.assertEqual(len(fixture.transport.requests), 0 if mode in ("missing", "wrong") else 1)
+                self.assertEqual(fixture.store.list_formal_context_facts(registry_manifest_hash=fixture.registry_root), ())
+
+    def test_context_source_error_mapping_and_signed_circuit_cooldown(self):
+        for error, code, status in (
+            (FormalSourceBlocked("private"), "source_blocked", "retryable_failed"),
+            (FormalRetryableSourceError("private"), "source_retryable_failed", "retryable_failed"),
+            (FormalTerminalSourceError("private"), "context_terminal_source_error", "terminal_failed"),
+        ):
+            with self.subTest(code=code):
+                fixture = context_execution_fixture(self)
+                fixture.transport.error = error
+                task_id, _ = enqueue_context(fixture)
+                summary = execute_queued_formal_work(fixture.dependencies, worker_id="context-worker", max_jobs=1)
+                task = fixture.store.get_formal_task(task_id)
+                self.assertEqual((task["status"], task["error"]), (status, {"code": code}))
+                self.assertEqual((summary.remote_attempts, len(fixture.transport.requests)), (1, 1))
+                circuit = fixture.store.get_formal_source_circuit("cninfo")
+                if code == "source_blocked":
+                    self.assertEqual(circuit["state"], "open")
+                    self.assertEqual((datetime.fromisoformat(circuit["retry_after_utc"]) -
+                                      datetime.fromisoformat(circuit["opened_at_utc"])).total_seconds(), 15)
+                    self.assertEqual(summary.open_circuits, ("cninfo",))
+                else:
+                    self.assertIsNone(circuit)
+
+    def test_context_raw_receipt_and_db_before_completion_recover_without_transport(self):
+        from ashare_pipeline.formal_context_schema import FormalContextRegistry
+        for persisted in (False, True):
+            with self.subTest(persisted=persisted):
+                fixture = context_execution_fixture(self)
+                task_id, request = enqueue_context(fixture)
+                fixture.store.lease_next_formal_task(("formal_context",), "old-worker", 120)
+                runtime = fixture.dependencies.registry_runtime_loader.load(fixture.registry_root, adapter_freeze_at_utc=AS_OF)
+                fetch, verification, _ = runtime.source_adapter.fetch_verified(request.official_request,
+                    refresh_generation=request.refresh_generation, calendar_binding=None)
+                ref = fixture.snapshots.persist_verified(fetch, verification, producing_task_id=task_id, worker_id="old-worker")
+                if persisted:
+                    registry = FormalContextRegistry.load(fixture.store, fixture.verifier, fixture.registry_root)
+                    receipt = registry.normalize_verified(request, ref, fixture.snapshots.read_verified_raw(ref),
+                        FixtureNormalizer(), task_id=task_id, worker_id="old-worker")
+                    fixture.store.put_formal_context_facts(receipt)
+                expire_feature_lease_for_next_owner(self, fixture.store, task_id)
+                summary = execute_queued_formal_work(fixture.dependencies, worker_id="new-worker", max_jobs=1)
+                self.assertEqual(fixture.store.get_formal_task(task_id)["status"], "verified")
+                self.assertEqual((summary.remote_attempts, len(fixture.transport.requests)), (0, 1))
+                facts = fixture.store.list_formal_context_facts(registry_manifest_hash=fixture.registry_root)
+                self.assertEqual(len(facts), 1)
+                if persisted:
+                    self.assertEqual(facts[0].id, receipt.facts[0].id)
+
+    def test_context_malformed_payload_spec_and_stale_generation_fail_before_transport(self):
+        for field, value in (("source", "sse"), ("scope_key", "missing"), ("request_version", "wrong"),
+            ("refresh_generation", "a" * 64), ("registry_manifest_hash", "b" * 64),
+            ("relevant_registry_hashes", [["source", "c" * 64]]),
+            ("official_request", dict(source="cninfo", dataset="other", security_id="SZ000001",
+                                     period_or_date="2026-08-31", exchange="SZ")), ("unknown", True),
+            ("idempotency_key", "forged"), ("prerequisite_task_ids", ["forged"])):
+            with self.subTest(field=field):
+                fixture = context_execution_fixture(self)
+                task_id, _ = enqueue_context(fixture)
+                lease = fixture.store.lease_next_formal_task
+                def tampered(*args, **kwargs):
+                    task = lease(*args, **kwargs)
+                    if task is not None and task["id"] == task_id:
+                        if field in ("idempotency_key", "prerequisite_task_ids"):
+                            task[field] = value
+                        else:
+                            task["payload"][field] = value
+                    return task
+                with patch.object(fixture.store, "lease_next_formal_task", side_effect=tampered):
+                    summary = execute_queued_formal_work(fixture.dependencies, worker_id="context-worker", max_jobs=1)
+                self.assertEqual(fixture.store.get_formal_task(task_id)["error"], {"code": "context_validation_failed"})
+                self.assertEqual((summary.terminal_failed, summary.remote_attempts, len(fixture.transport.requests)), (1, 0, 0))
+
+
+    def test_context_lease_loss_at_each_stage_stops_and_next_owner_recovers(self):
+        stages = ("before_fetch", "before_persist", "after_raw", "after_parser", "after_normalization", "after_db", "completion")
+        for stage in stages:
+            with self.subTest(stage=stage):
+                fixture = context_execution_fixture(self)
+                task_id, _ = enqueue_context(fixture)
+                def expire():
+                    expire_feature_lease_for_next_owner(self, fixture.store, task_id)
+                with ExitStack() as patches:
+                    if stage == "before_fetch":
+                        original = fixture.store.get_formal_task_snapshot_receipt
+                        def receipt(*args, **kwargs):
+                            value = original(*args, **kwargs)
+                            expire()
+                            return value
+                        patches.enter_context(patch.object(fixture.store, "get_formal_task_snapshot_receipt", side_effect=receipt))
+                    elif stage == "before_persist":
+                        original = fixture.transport.send
+                        def send(*args, **kwargs):
+                            value = original(*args, **kwargs)
+                            expire()
+                            return value
+                        patches.enter_context(patch.object(fixture.transport, "send", side_effect=send))
+                    elif stage == "after_raw":
+                        original = fixture.snapshots.persist_verified
+                        def persist(*args, **kwargs):
+                            value = original(*args, **kwargs)
+                            expire()
+                            return value
+                        patches.enter_context(patch.object(fixture.snapshots, "persist_verified", side_effect=persist))
+                    elif stage == "after_parser":
+                        original = fixture.parser.parse
+                        def parse(*args, **kwargs):
+                            value = original(*args, **kwargs)
+                            if len(fixture.parser.calls) == 2:
+                                expire()
+                            return value
+                        patches.enter_context(patch.object(fixture.parser, "parse", side_effect=parse))
+                    elif stage == "after_normalization":
+                        normalizer = fixture.dependencies.context_normalizers["fixture-normalizer-v1"]
+                        original = normalizer.normalize
+                        def normalize(**kwargs):
+                            value = original(**kwargs)
+                            expire()
+                            return value
+                        patches.enter_context(patch.object(normalizer, "normalize", side_effect=normalize))
+                    elif stage == "after_db":
+                        original = fixture.store.put_formal_context_facts
+                        def put(*args, **kwargs):
+                            value = original(*args, **kwargs)
+                            expire()
+                            return value
+                        patches.enter_context(patch.object(fixture.store, "put_formal_context_facts", side_effect=put))
+                    else:
+                        original = fixture.store.complete_formal_task
+                        def complete(*args, **kwargs):
+                            expire()
+                            return original(*args, **kwargs)
+                        patches.enter_context(patch.object(fixture.store, "complete_formal_task", side_effect=complete))
+                    summary = execute_queued_formal_work(fixture.dependencies, worker_id="old-worker", max_jobs=1)
+                task = fixture.store.get_formal_task(task_id)
+                self.assertEqual((task["status"], task["result"], task["error"]), ("leased", None, None))
+                self.assertEqual((summary.retryable_failed, summary.terminal_failed, summary.feature_bundles_written), (0, 0, 0))
+                with fixture.store._transaction() as connection:
+                    self.assertEqual(connection.execute("SELECT count(*) FROM formal_context_fact").fetchone()[0],
+                                     1 if stage in ("after_db", "completion") else 0)
+                self.assertEqual(len(fixture.transport.requests), 0 if stage == "before_fetch" else 1)
+                recovered = execute_queued_formal_work(fixture.dependencies, worker_id="new-worker", max_jobs=1)
+                self.assertEqual(fixture.store.get_formal_task(task_id)["status"], "verified")
+                self.assertEqual(recovered.remote_attempts, 1 if stage in ("before_fetch", "before_persist") else 0)
+                self.assertEqual(len(fixture.transport.requests), 2 if stage == "before_persist" else 1)
+                self.assertEqual(len(fixture.store.list_formal_context_facts(registry_manifest_hash=fixture.registry_root)), 1)
+
+    def test_context_lost_callback_owner_never_opens_circuit_or_fails_task(self):
+        for stage in ("fetch", "replay"):
+            for exception in (FormalSourceBlocked, FormalRetryableSourceError, FormalTerminalSourceError):
+                with self.subTest(stage=stage, exception=exception.__name__):
+                    fixture = context_execution_fixture(self)
+                    task_id, _ = enqueue_context(fixture)
+                    target = fixture.transport if stage == "fetch" else fixture.parser
+                    method = "send" if stage == "fetch" else "parse"
+                    original = getattr(target, method)
+                    def callback(*args, **kwargs):
+                        if stage == "fetch" or len(fixture.parser.calls) == 1:
+                            expire_feature_lease_for_next_owner(self, fixture.store, task_id)
+                            raise exception("private callback details")
+                        return original(*args, **kwargs)
+                    with patch.object(target, method, side_effect=callback):
+                        summary = execute_queued_formal_work(fixture.dependencies, worker_id="old-worker", max_jobs=1)
+                    task = fixture.store.get_formal_task(task_id)
+                    self.assertEqual((task["status"], task["result"], task["error"]), ("leased", None, None))
+                    self.assertEqual((summary.terminal_failed, summary.retryable_failed, summary.open_circuits), (0, 0, ()))
+                    self.assertIsNone(fixture.store.get_formal_source_circuit("cninfo"))
+
+    def test_context_rejects_runtime_verifier_store_and_snapshot_boundary_substitution(self):
+        for mode in ("verifier", "runtime_repository", "snapshots", "raw_root", "runtime_root", "source_config"):
+            with self.subTest(mode=mode):
+                fixture = context_execution_fixture(self)
+                other = context_execution_fixture(self)
+                task_id, _ = enqueue_context(fixture)
+                loader = fixture.dependencies.registry_runtime_loader
+                with ExitStack() as patches:
+                    dependencies = fixture.dependencies
+                    if mode == "verifier":
+                        patches.enter_context(patch.object(loader, "_verifier", ContextRequestVerifier()))
+                    elif mode == "runtime_repository":
+                        patches.enter_context(patch.object(loader._bundle_loader, "_repository", other.store))
+                    elif mode == "snapshots":
+                        dependencies = replace(dependencies, snapshots=other.snapshots)
+                    elif mode == "raw_root":
+                        patches.enter_context(patch.object(fixture.snapshots, "root", other.raw.root))
+                    else:
+                        runtime = loader.load(fixture.registry_root, adapter_freeze_at_utc=AS_OF)
+                        if mode == "runtime_root":
+                            foreign = fixture_bundle_loader(purpose="official")
+                            runtime = FormalRegistryRuntimeLoader(foreign, transport=NoTransport(), policies={}, parsers={},
+                                effective_time_resolver=EffectiveTimeResolver()).load(foreign._repository.manifest.manifest_hash)
+                        else:
+                            object.__setattr__(runtime.source_adapter.registry.configs[0], "mapping_version", "wrong-map")
+                        patches.enter_context(patch.object(FormalRegistryRuntimeLoader, "load", return_value=runtime))
+                    summary = execute_queued_formal_work(dependencies, worker_id="context-worker", max_jobs=1)
+                self.assertEqual(fixture.store.get_formal_task(task_id)["error"], {"code": "context_validation_failed"})
+                self.assertEqual((summary.remote_attempts, summary.terminal_failed, len(fixture.transport.requests)), (0, 1, 0))
+
+    def test_context_bootstrap_calendar_executes_signed_exchange_request(self):
+        fixture = date_only_context_fixture(self)
+        task_id, request = enqueue_context(fixture, context_kind="trading_calendar", scope_key="fixture-calendar-SZ", security_id=None)
+        self.assertEqual(request.official_request.exchange, "SZ")
+        summary = execute_queued_formal_work(fixture.dependencies, worker_id="calendar-worker", max_jobs=1)
+        self.assertEqual(fixture.store.get_formal_task(task_id)["status"], "verified")
+        self.assertEqual((summary.remote_attempts, len(fixture.transport.requests)), (1, 1))
+
+    def test_context_date_only_dependent_requires_exact_binding_and_raw_bridge(self):
+        from dataclasses import asdict
+        for mode in ("valid", "missing", "substituted", "stale", "bridge_missing"):
+            with self.subTest(mode=mode):
+                fixture = date_only_context_fixture(self)
+                calendar_id = seed_verified_context_calendar(self, fixture)
+                self.assertEqual(fixture.store.get_formal_task(calendar_id)["status"], "verified")
+                fixture.transport.response = _formal_source_tests.response(raw=canonical_bytes(dict(value=fixture.value, no_coverage=False)))
+                fixture.parser.document = _formal_source_tests.timestamp_document(declared_security_id="SZ000001",
+                    declared_period="2026-08-31", published_at_utc="2026-08-20T00:00:00+00:00", published_precision="date_only",
+                    source_updated_at_utc=None)
+                task_id, request = enqueue_context(fixture)
+                self.assertEqual(fixture.store.get_formal_task(task_id)["prerequisite_task_ids"], [calendar_id])
+                self.assertEqual(request.calendar_binding.prerequisite_task_id, calendar_id)
+                if mode == "stale":
+                    with fixture.store._transaction(immediate=True) as connection:
+                        connection.execute("DELETE FROM formal_context_fact WHERE context_kind='trading_calendar'")
+                if mode == "bridge_missing":
+                    fixture.calendar_requests.clear()
+                lease = fixture.store.lease_next_formal_task
+                def tampered(*args, **kwargs):
+                    task = lease(*args, **kwargs)
+                    if task is not None and task["id"] == task_id:
+                        if mode == "missing":
+                            task["payload"]["calendar_binding"] = None
+                            task["payload"]["calendar_prerequisite_task_id"] = None
+                        elif mode == "substituted":
+                            task["payload"]["calendar_binding"]["manifest_sha256"] = "f" * 64
+                    return task
+                with patch.object(fixture.store, "lease_next_formal_task", side_effect=tampered):
+                    summary = execute_queued_formal_work(fixture.dependencies, worker_id="context-worker", max_jobs=1)
+                task = fixture.store.get_formal_task(task_id)
+                if mode == "valid":
+                    self.assertEqual(task["status"], "verified")
+                    facts = fixture.store.list_formal_context_facts(registry_manifest_hash=fixture.registry_root, context_kind="security_state")
+                    self.assertEqual(len(facts), 1)
+                    self.assertEqual(facts[0].effective_at_utc, "2026-08-21T15:00:00+08:00")
+                    self.assertEqual(facts[0].evidence["calendar_binding"], asdict(request.calendar_binding))
+                else:
+                    self.assertEqual((task["status"], task["error"]), ("terminal_failed", {"code": "context_validation_failed"}))
+                    with fixture.store._transaction() as connection:
+                        self.assertEqual(connection.execute("SELECT count(*) FROM formal_context_fact WHERE context_kind='security_state'").fetchone()[0], 0)
+                self.assertEqual(len(fixture.transport.requests), 1 if mode in ("valid", "bridge_missing") else 0)
+
+    def test_context_receipt_raw_and_parser_lineage_failures_retain_receipt_without_facts(self):
+        for mode in ("receipt", "raw", "parser", "snapshot", "persistence"):
+            with self.subTest(mode=mode):
+                fixture = context_execution_fixture(self)
+                task_id, request = enqueue_context(fixture)
+                fixture.store.lease_next_formal_task(("formal_context",), "old-worker", 120)
+                runtime = fixture.dependencies.registry_runtime_loader.load(fixture.registry_root, adapter_freeze_at_utc=AS_OF)
+                fetch, verification, _ = runtime.source_adapter.fetch_verified(request.official_request,
+                    refresh_generation=request.refresh_generation, calendar_binding=None)
+                ref = fixture.snapshots.persist_verified(fetch, verification, producing_task_id=task_id, worker_id="old-worker")
+                original_receipt = fixture.store.get_formal_task_snapshot_receipt(task_id)
+                expire_feature_lease_for_next_owner(self, fixture.store, task_id)
+                with ExitStack() as patches:
+                    if mode == "receipt":
+                        patches.enter_context(patch.object(fixture.store, "get_formal_task_snapshot_receipt",
+                            return_value={**original_receipt, "task_id": "other-task"}))
+                    elif mode == "raw":
+                        patches.enter_context(patch.object(fixture.snapshots, "read_verified_raw", return_value=b"tampered"))
+                    elif mode == "parser":
+                        fixture.parser.document = replace(fixture.parser.document, source_updated_at_utc="2026-03-21T08:30:00+00:00")
+                    elif mode == "snapshot":
+                        patches.enter_context(patch.object(fixture.snapshots, "get_verified_by_manifest",
+                            return_value=replace(ref, parser_version="wrong-parser")))
+                    else:
+                        patches.enter_context(patch.object(fixture.store, "put_formal_context_facts",
+                            side_effect=ValueError("Context same-generation conflict")))
+                    summary = execute_queued_formal_work(fixture.dependencies, worker_id="new-worker", max_jobs=1)
+                task = fixture.store.get_formal_task(task_id)
+                self.assertEqual(task["status"], "terminal_failed")
+                self.assertEqual(task["error"], {"code": "context_terminal_source_error" if mode == "parser" else "context_validation_failed"})
+                self.assertEqual((summary.remote_attempts, summary.terminal_failed, len(fixture.transport.requests)), (0, 1, 1))
+                self.assertEqual(fixture.store.get_formal_task_snapshot_receipt(task_id), original_receipt)
+                with fixture.store._transaction() as connection:
+                    self.assertEqual(connection.execute("SELECT count(*) FROM formal_context_fact").fetchone()[0], 0)
+
+    def test_context_security_scope_and_normalizer_versions_are_independent(self):
+        class OtherNormalizer(FixtureNormalizer):
+            normalizer_version = "fixture-normalizer-v2"
+        fixture = context_execution_fixture(self, descriptors=[context_descriptor(),
+            context_descriptor(scope_key="other-scope", dataset="other-state", normalizer_version="fixture-normalizer-v2")],
+            configs=[_formal_source_tests.config(dataset="fixture-state", exchange_scope="SZ"),
+                     _formal_source_tests.config(dataset="other-state", exchange_scope="SZ")])
+        first_id, first_request = enqueue_context(fixture)
+        summary = execute_queued_formal_work(fixture.dependencies, worker_id="context-worker", max_jobs=1)
+        first_task = fixture.store.get_formal_task(first_id)
+        first_fact = fixture.store.list_formal_context_facts(registry_manifest_hash=fixture.registry_root)[0]
+        self.assertEqual(first_task["status"], "verified")
+        second_id, _ = enqueue_context(fixture, scope_key="other-scope", security_id="SZ000002")
+        fixture.parser.document = replace(fixture.parser.document, declared_security_id="SZ000002")
+        # A valid normalizer for the first descriptor cannot serve the second version.
+        summary = execute_queued_formal_work(fixture.dependencies, worker_id="context-worker", max_jobs=1)
+        self.assertEqual(fixture.store.get_formal_task(second_id)["error"], {"code": "context_validation_failed"})
+        self.assertEqual(len(fixture.transport.requests), 1)
+        third_id, _ = enqueue_context(fixture, scope_key="other-scope", security_id="SZ000002", upstream_generation="new-generation")
+        dependencies = replace(fixture.dependencies, context_normalizers={
+            "fixture-normalizer-v1": FixtureNormalizer(), "fixture-normalizer-v2": OtherNormalizer()})
+        foreign_receipt = fixture.store.get_formal_task_snapshot_receipt(first_id)
+        with patch.object(fixture.store, "get_formal_task_snapshot_receipt", return_value=foreign_receipt):
+            summary = execute_queued_formal_work(dependencies, worker_id="context-worker", max_jobs=1)
+        self.assertEqual(fixture.store.get_formal_task(third_id)["error"], {"code": "context_validation_failed"})
+        self.assertEqual(len(fixture.transport.requests), 1)
+        fourth_id, _ = enqueue_context(fixture, scope_key="other-scope", security_id="SZ000002", upstream_generation="final-generation")
+        summary = execute_queued_formal_work(dependencies, worker_id="context-worker", max_jobs=1)
+        self.assertEqual(fixture.store.get_formal_task(fourth_id)["status"], "verified")
+        self.assertEqual(fixture.store.get_formal_task(first_id), first_task)
+        facts = fixture.store.list_formal_context_facts(registry_manifest_hash=fixture.registry_root)
+        self.assertEqual(len(facts), 2)
+        self.assertEqual(next(fact for fact in facts if fact.security_id == "SZ000001").id, first_fact.id)
+        self.assertEqual({(fact.security_id, fact.scope_key) for fact in facts},
+                         {("SZ000001", "fixture-state"), ("SZ000002", "other-scope")})
+        self.assertEqual((summary.verified_statement_count, summary.feature_bundles_written, summary.rebuilt_security_ids), (0, 0, ()))
+        with fixture.store._transaction() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM formal_collection_task WHERE kind != 'formal_context'").fetchone()[0], 0)
+            for table in ("formal_financial_fact", "formal_quarter_fact", "formal_feature_set", "formal_feature_value"):
+                self.assertEqual(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0], 0)
+
+    def test_context_dispatch_preserves_statement_priority_and_precedes_features(self):
+        fixture = context_execution_fixture(self)
+        context_id, _ = enqueue_context(fixture)
+        feature_id = fixture.store.enqueue_formal_task("formal_feature_build", "fixture-feature", "f" * 64, {})
+        statement_id = fixture.store.enqueue_formal_task("formal_statement", "fixture-statement", "e" * 64, {})
+        execute_queued_formal_work(fixture.dependencies, worker_id="priority-worker", max_jobs=1)
+        self.assertEqual(fixture.store.get_formal_task(statement_id)["status"], "terminal_failed")
+        self.assertEqual(fixture.store.get_formal_task(context_id)["status"], "pending")
+        self.assertEqual(fixture.store.get_formal_task(feature_id)["status"], "pending")
+        execute_queued_formal_work(fixture.dependencies, worker_id="priority-worker", max_jobs=1)
+        self.assertEqual(fixture.store.get_formal_task(context_id)["status"], "verified")
+        self.assertEqual(fixture.store.get_formal_task(feature_id)["status"], "pending")
+
+    def test_context_open_circuit_retries_without_transport_and_expired_circuit_is_fenced(self):
+        for expired in (False, True):
+            with self.subTest(expired=expired):
+                fixture = context_execution_fixture(self)
+                task_id, _ = enqueue_context(fixture)
+                now = datetime.now(timezone.utc)
+                fixture.store.set_formal_source_circuit("cninfo", state="open", failure_count=2, reason={"code": "source_blocked"},
+                    opened_at_utc=(now - timedelta(seconds=30)).isoformat(),
+                    retry_after_utc=(now + timedelta(seconds=-10 if expired else 60)).isoformat())
+                circuit = fixture.store.get_formal_source_circuit("cninfo")
+                original = fixture.store.get_formal_source_circuit
+                def get_circuit(*args, **kwargs):
+                    value = original(*args, **kwargs)
+                    if expired:
+                        expire_feature_lease_for_next_owner(self, fixture.store, task_id)
+                    return value
+                with patch.object(fixture.store, "get_formal_source_circuit", side_effect=get_circuit):
+                    summary = execute_queued_formal_work(fixture.dependencies, worker_id="old-worker", max_jobs=1)
+                self.assertEqual(len(fixture.transport.requests), 0)
+                self.assertEqual(fixture.store.get_formal_source_circuit("cninfo"), circuit)
+                task = fixture.store.get_formal_task(task_id)
+                self.assertEqual((task["status"], task["error"]), ("leased", None) if expired else
+                                 ("retryable_failed", {"code": "source_circuit_open"}))
+                self.assertEqual(summary.terminal_failed, 0)
+
+    def test_context_normalizer_registry_is_immutable_and_rejects_duplicate_or_nonexact_keys(self):
+        from collections.abc import Mapping
+        class DuplicateMapping(Mapping):
+            def __iter__(self):
+                return iter(("fixture-normalizer-v1",))
+            def __len__(self):
+                return 1
+            def __getitem__(self, key):
+                return FixtureNormalizer()
+            def items(self):
+                return (("fixture-normalizer-v1", FixtureNormalizer()), ("fixture-normalizer-v1", FixtureNormalizer()))
+        fixture = context_execution_fixture(self)
+        default = FormalWorkerDependencies(fixture.store, fixture.snapshots,
+            fixture.dependencies.registry_runtime_loader, None, None)
+        with self.assertRaises(TypeError):
+            default.context_normalizers["injected"] = FixtureNormalizer()
+        with self.assertRaises(ValueError):
+            replace(fixture.dependencies, context_normalizers=DuplicateMapping())
+        class NonexactVersion(str):
+            pass
+        with self.assertRaises(ValueError):
+            replace(fixture.dependencies, context_normalizers={NonexactVersion("fixture-normalizer-v1"): FixtureNormalizer()})
+
+    def test_context_foreign_signed_adapter_cannot_borrow_local_runtime_root(self):
+        fixture = context_execution_fixture(self)
+        other = context_execution_fixture(self, configs=[_formal_source_tests.config(dataset="fixture-state",
+            exchange_scope="SZ", endpoint_url="https://www.cninfo.com.cn/fixture/foreign-endpoint.json")])
+        task_id, _ = enqueue_context(fixture)
+        runtime = fixture.dependencies.registry_runtime_loader.load(fixture.registry_root, adapter_freeze_at_utc=AS_OF)
+        foreign = other.dependencies.registry_runtime_loader.load(other.registry_root, adapter_freeze_at_utc=AS_OF)
+        object.__setattr__(runtime, "source_adapter", foreign.source_adapter)
+        with patch.object(FormalRegistryRuntimeLoader, "load", return_value=runtime):
+            summary = execute_queued_formal_work(fixture.dependencies, worker_id="context-worker", max_jobs=1)
+        self.assertEqual(fixture.store.get_formal_task(task_id)["error"], {"code": "context_validation_failed"})
+        self.assertEqual((summary.remote_attempts, summary.terminal_failed), (0, 1))
+        self.assertEqual((len(fixture.transport.requests), len(other.transport.requests)), (0, 0))
 
 
 class FormalDeepWorkerContractTests(unittest.TestCase):
