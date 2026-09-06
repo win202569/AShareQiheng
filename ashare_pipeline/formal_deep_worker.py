@@ -8,25 +8,33 @@ construct a runtime from a verified registry bundle.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import copy
 from dataclasses import InitVar, asdict, dataclass, fields, is_dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import re
 from types import MappingProxyType
 from typing import Literal, Protocol
 
-from .formal_evidence import OfficialRequest, VerifiedCalendarBinding
+from .formal_evidence import OfficialRequest, OfficialSnapshotRef, VerifiedCalendarBinding
 from .formal_context_schema import FormalContextRequest
 from .formal_feature_contract import SignedFormalFeatureRegistry, load_signed_feature_registry
-from .formal_financial_schema import SignedFinancialMappingRegistry
+from .formal_financial_features import select_visible_formal_facts
+from .formal_financial_schema import (
+    FormalFinancialFact,
+    SignedFinancialMappingRegistry,
+    extract_formal_financial_facts,
+)
 from .formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
 from .formal_sources import (
     CalendarSelector,
     EffectiveTimeResolver,
     FormalOfficialSourceAdapter,
+    FormalRetryableSourceError,
+    FormalSourceBlocked,
+    FormalTerminalSourceError,
     OfficialDocumentParser,
     OfficialTransport,
     SignedSourceRegistry,
@@ -46,10 +54,33 @@ _FORMAL_KINDS = frozenset(
         "formal_feature_build",
     }
 )
+_STATEMENT_EXECUTION_KINDS = ("formal_statement",)
+_STATEMENT_LEASE_SECONDS = 120
 
 
 class CalendarBindingPending(ValueError):
     """A signed date-only request cannot proceed until its calendar is verified."""
+
+
+class _LostFormalTaskLease(RuntimeError):
+    def __init__(self, remote_attempts: int) -> None:
+        self.remote_attempts = remote_attempts
+        super().__init__("formal task lease ownership was lost")
+
+
+class _RetryableFormalTask(RuntimeError):
+    def __init__(self, remote_attempts: int, source: str, *, circuit_open: bool) -> None:
+        self.remote_attempts = remote_attempts
+        self.source = source
+        self.circuit_open = circuit_open
+        super().__init__("formal task has a retryable source failure")
+
+
+class _TerminalFormalTask(RuntimeError):
+    def __init__(self, remote_attempts: int, code: str) -> None:
+        self.remote_attempts = remote_attempts
+        self.code = code
+        super().__init__("formal task has a terminal failure")
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -693,8 +724,18 @@ class FormalRegistryRuntimeLoader:
         self._parsers = MappingProxyType(dict(parsers))
         self._effective_time_resolver = effective_time_resolver
 
-    def load(self, manifest_hash: str) -> FormalRegistryRuntime:
+    def load(
+        self,
+        manifest_hash: str,
+        *,
+        adapter_freeze_at_utc: str | None = None,
+    ) -> FormalRegistryRuntime:
         root = _require_hash(manifest_hash, "manifest_hash")
+        freeze_at_utc = (
+            None
+            if adapter_freeze_at_utc is None
+            else _require_timestamp(adapter_freeze_at_utc, "adapter_freeze_at_utc")
+        )
         bundle = self._bundle_loader.load(root)
         if type(bundle) is not VerifiedRegistryBundle or bundle.manifest.manifest_hash != root:
             raise ValueError("verified bundle root does not match requested manifest")
@@ -717,14 +758,19 @@ class FormalRegistryRuntimeLoader:
             or feature_registry.registry_hash != feature_blob.registry_hash
         ):
             raise ValueError("compiled registry hash does not match verified bundle blob")
+        adapter_kwargs: dict[str, object] = {
+            "transport": self._transport,
+            "registry": source_registry,
+            "policies": self._policies,
+            "parsers": self._parsers,
+            "effective_time_resolver": self._effective_time_resolver,
+            "source_registry_hash": source_blob.registry_hash,
+            "registry_manifest_hash": root,
+        }
+        if freeze_at_utc is not None:
+            adapter_kwargs["freeze_at_utc"] = freeze_at_utc
         adapter = FormalOfficialSourceAdapter(
-            transport=self._transport,
-            registry=source_registry,
-            policies=self._policies,
-            parsers=self._parsers,
-            effective_time_resolver=self._effective_time_resolver,
-            source_registry_hash=source_blob.registry_hash,
-            registry_manifest_hash=root,
+            **adapter_kwargs,
         )
         return FormalRegistryRuntime(bundle, adapter, mapping_registry, feature_registry)
 
@@ -834,12 +880,695 @@ def enqueue_frozen_formal_universe(*_args: object, **_kwargs: object) -> str:
     raise NotImplementedError("formal universe enqueue is owned by Task 6D")
 
 
-def enqueue_formal_feature_build(*_args: object, **_kwargs: object) -> str:
-    raise NotImplementedError("formal feature enqueue is owned by Task 6B")
+def _statement_payload_from_wire(value: object) -> FormalStatementTaskPayload:
+    """Restore only the exact persisted JSON shape for a statement task."""
+
+    if type(value) is not dict:
+        raise ValueError("formal statement task payload must be an exact JSON object")
+    expected_fields = {item.name for item in fields(FormalStatementTaskPayload)}
+    if set(value) != expected_fields:
+        raise ValueError("formal statement task payload fields are invalid")
+    roles = value["relevant_registry_hashes"]
+    if type(roles) is not list:
+        raise ValueError("formal statement task registry roles must be a JSON array")
+    role_pairs: list[tuple[str, str]] = []
+    for pair in roles:
+        if type(pair) is not list or len(pair) != 2:
+            raise ValueError("formal statement task registry role pair is invalid")
+        role_pairs.append((pair[0], pair[1]))
+    binding_wire = value["calendar_binding"]
+    if binding_wire is None:
+        binding = None
+    else:
+        if type(binding_wire) is not dict:
+            raise ValueError("formal statement calendar binding must be a JSON object")
+        binding = VerifiedCalendarBinding(**binding_wire)
+    return FormalStatementTaskPayload(
+        security_id=value["security_id"],
+        dataset=value["dataset"],
+        report_period=value["report_period"],
+        as_of_utc=value["as_of_utc"],
+        source=value["source"],
+        request_version=value["request_version"],
+        source_registry_hash=value["source_registry_hash"],
+        mapping_registry_hash=value["mapping_registry_hash"],
+        upstream_generation=value["upstream_generation"],
+        refresh_generation=value["refresh_generation"],
+        registry_manifest_hash=value["registry_manifest_hash"],
+        relevant_registry_hashes=tuple(role_pairs),
+        calendar_prerequisite_task_id=value["calendar_prerequisite_task_id"],
+        calendar_binding=binding,
+    )
 
 
-def execute_queued_formal_work(*_args: object, **_kwargs: object) -> FormalCollectionSummary:
-    raise NotImplementedError("formal work execution is owned by later Task 6 deliveries")
+def _decode_leased_statement_task(task: object) -> tuple[str, FormalStatementTaskPayload]:
+    if type(task) is not dict:
+        raise ValueError("leased formal task must be an exact JSON object")
+    if task.get("kind") != "formal_statement" or task.get("status") != "leased":
+        raise ValueError("leased task is not a formal statement")
+    task_id = _require_text(task.get("id"), "formal statement task id")
+    payload = _statement_payload_from_wire(task.get("payload"))
+    spec = FormalTaskSpec.from_payload(payload)
+    if (
+        task.get("idempotency_key") != spec.idempotency_key
+        or task.get("refresh_generation") != spec.refresh_generation
+        or task.get("prerequisite_task_ids") != list(spec.prerequisite_task_ids)
+        or _canonical_bytes(task["payload"]) != _canonical_bytes(spec.payload)
+    ):
+        raise ValueError("leased formal statement task does not match its canonical payload")
+    return task_id, payload
+
+
+def _statement_request(payload: FormalStatementTaskPayload) -> OfficialRequest:
+    return OfficialRequest(
+        payload.source,
+        payload.dataset,
+        payload.security_id,
+        payload.report_period,
+        payload.security_id[:2],
+    )
+
+
+def _require_statement_snapshot_identity(
+    receipt: object,
+    snapshot: object,
+    *,
+    task_id: str,
+    payload: FormalStatementTaskPayload,
+    request: OfficialRequest,
+) -> OfficialSnapshotRef:
+    """Bind replay evidence to this immutable leased statement request before parsing."""
+
+    if type(receipt) is not dict or type(snapshot) is not OfficialSnapshotRef:
+        raise ValueError("formal statement receipt or snapshot identity is invalid")
+    receipt_fields = {
+        "task_id": task_id,
+        "snapshot_id": snapshot.snapshot_id,
+        "manifest_sha256": snapshot.manifest_sha256,
+        "refresh_generation": payload.refresh_generation,
+    }
+    for field, expected in receipt_fields.items():
+        actual = receipt.get(field)
+        if type(actual) is not str or actual != expected:
+            raise ValueError("formal statement receipt does not match its persisted snapshot")
+    expected_request_fields = {
+        "source": request.source,
+        "dataset": request.dataset,
+        "security_id": request.security_id,
+        "period_or_date": request.period_or_date,
+        "exchange": request.exchange,
+        "request_fingerprint": request.request_fingerprint,
+    }
+    for field, expected in expected_request_fields.items():
+        actual = getattr(snapshot, field)
+        if type(actual) is not type(expected) or actual != expected:
+            raise ValueError("formal statement persisted snapshot request does not match payload")
+    if (
+        type(snapshot.refresh_generation) is not str
+        or snapshot.refresh_generation != payload.refresh_generation
+        or type(snapshot.producing_task_id) is not str
+        or snapshot.producing_task_id != task_id
+    ):
+        raise ValueError("formal statement persisted snapshot lineage does not match task")
+    return snapshot
+
+
+def _validated_statement_runtime(
+    dependencies: FormalWorkerDependencies,
+    payload: FormalStatementTaskPayload,
+) -> tuple[FormalRegistryRuntime, OfficialRequest, object]:
+    if type(dependencies.registry_runtime_loader) is not FormalRegistryRuntimeLoader:
+        raise ValueError("formal statement worker requires the exact runtime loader")
+    runtime = dependencies.registry_runtime_loader.load(
+        payload.registry_manifest_hash,
+        adapter_freeze_at_utc=payload.as_of_utc,
+    )
+    if type(runtime) is not FormalRegistryRuntime:
+        raise ValueError("formal statement runtime loader returned an invalid runtime")
+    runtime.bundle.require_official()
+    manifest = runtime.bundle.manifest
+    if (
+        manifest.manifest_hash != payload.registry_manifest_hash
+        or manifest.source_registry_hash != payload.source_registry_hash
+        or manifest.mapping_registry_hash != payload.mapping_registry_hash
+        or runtime.source_adapter.source_registry_hash != payload.source_registry_hash
+        or runtime.mapping_registry.registry_hash != payload.mapping_registry_hash
+    ):
+        raise ValueError("formal statement runtime registry hashes do not match payload")
+    request = _statement_request(payload)
+    config = runtime.source_adapter.registry.select(request)
+    selector = config.calendar_selector
+    if selector is None:
+        if payload.calendar_binding is not None or payload.calendar_prerequisite_task_id is not None:
+            raise ValueError("timestamp-only statement task cannot carry calendar evidence")
+    else:
+        if payload.calendar_binding is None or payload.calendar_prerequisite_task_id is None:
+            raise CalendarBindingPending("date-only statement task requires a verified calendar binding")
+        repository = dependencies.context_repository
+        resolver = getattr(repository, "resolve_verified_calendar_binding", None)
+        if not callable(resolver):
+            raise ValueError("date-only statement task requires a verified context repository")
+        current = resolver(
+            selector,
+            request.exchange,
+            payload.as_of_utc,
+            payload.registry_manifest_hash,
+        )
+        if type(current) is not VerifiedCalendarBinding or _binding_wire(current) != _binding_wire(payload.calendar_binding):
+            raise ValueError("statement calendar binding no longer matches verified context")
+    expected_generation = derive_collection_refresh_generation(
+        upstream_generation=payload.upstream_generation,
+        registry_manifest_hash=payload.registry_manifest_hash,
+        relevant_registry_hashes={
+            "mapping": payload.mapping_registry_hash,
+            "source": payload.source_registry_hash,
+        },
+        calendar_selector=selector,
+        calendar_binding=payload.calendar_binding,
+    )
+    if expected_generation != payload.refresh_generation:
+        raise ValueError("formal statement refresh generation does not match runtime")
+    return runtime, request, config
+
+
+def _feature_refresh_generation(
+    facts: tuple[FormalFinancialFact, ...],
+    registry_manifest_hash: str,
+) -> tuple[str, tuple[str, ...]]:
+    snapshots: dict[str, dict[str, str]] = {}
+    fact_ids: list[str] = []
+    for fact in facts:
+        if type(fact) is not FormalFinancialFact:
+            raise ValueError("feature rebuild requires exact formal facts")
+        wire = fact.to_dict()
+        fact_ids.append(wire["id"])
+        snapshot = {
+            "content_sha256": wire["source_content_sha256"],
+            "refresh_generation": wire["source_refresh_generation"],
+            "snapshot_id": wire["source_snapshot_id"],
+        }
+        prior = snapshots.setdefault(snapshot["snapshot_id"], snapshot)
+        if prior != snapshot:
+            raise ValueError("one feature snapshot ID has conflicting evidence lineage")
+    snapshot_ids = tuple(sorted(snapshots))
+    wire = {
+        "formal_fact_ids": sorted(set(fact_ids)),
+        "registry_manifest_hash": registry_manifest_hash,
+        "selected_statement_snapshots": [snapshots[item] for item in snapshot_ids],
+    }
+    return hashlib.sha256(_canonical_bytes(wire)).hexdigest(), snapshot_ids
+
+
+def enqueue_formal_feature_build(
+    store: object,
+    *,
+    security_id: str,
+    as_of_utc: str,
+    runtime: FormalRegistryRuntime,
+    facts: tuple[FormalFinancialFact, ...],
+    before_mutation: Callable[[], None] | None = None,
+) -> tuple[str, ...]:
+    """Schedule only the affected security's immutable V6 feature inputs."""
+
+    if type(runtime) is not FormalRegistryRuntime:
+        raise ValueError("feature rebuild enqueue requires an exact formal runtime")
+    security = _require_security_id(security_id)
+    as_of = _require_timestamp(as_of_utc, "as_of_utc")
+    selected = select_visible_formal_facts(facts, as_of).facts
+    generation, snapshot_ids = _feature_refresh_generation(
+        selected, runtime.bundle.manifest.manifest_hash
+    )
+    task_ids: list[str] = []
+    for template_id in runtime.feature_registry.template_ids:
+        payload = FormalFeatureBuildTaskPayload(
+            security_id=security,
+            as_of_utc=as_of,
+            template_id=template_id,
+            source_registry_hash=runtime.bundle.manifest.source_registry_hash,
+            mapping_registry_hash=runtime.bundle.manifest.mapping_registry_hash,
+            feature_registry_hash=runtime.bundle.manifest.feature_registry_hash,
+            registry_manifest_hash=runtime.bundle.manifest.manifest_hash,
+            source_snapshot_ids=snapshot_ids,
+            refresh_generation=generation,
+        )
+        spec = FormalTaskSpec.from_payload(payload)
+        enqueue = getattr(store, "enqueue_formal_task", None)
+        if not callable(enqueue):
+            raise ValueError("formal feature rebuild requires formal task persistence")
+        if before_mutation is not None:
+            before_mutation()
+        task_ids.append(
+            enqueue(
+                spec.kind,
+                spec.idempotency_key,
+                spec.refresh_generation,
+                spec.payload,
+                spec.prerequisite_task_ids,
+            )
+        )
+        supersede = getattr(store, "supersede_formal_tasks", None)
+        if not callable(supersede):
+            raise ValueError("formal feature rebuild requires task supersession persistence")
+        if before_mutation is not None:
+            before_mutation()
+        supersede(
+            {
+                "as_of_utc": as_of,
+                "security_id": security,
+                "template_id": template_id,
+            },
+            spec.refresh_generation,
+        )
+    return tuple(task_ids)
+
+
+def _execute_statement_task(
+    dependencies: FormalWorkerDependencies,
+    task: dict[str, object],
+    *,
+    worker_id: str,
+) -> tuple[int, str]:
+    """Execute a single leased statement task; return remote attempts and security."""
+
+    task_id, payload = _decode_leased_statement_task(task)
+    runtime, request, config = _validated_statement_runtime(dependencies, payload)
+    receipt_getter = getattr(dependencies.store, "get_formal_task_snapshot_receipt", None)
+    if not callable(receipt_getter):
+        raise ValueError("formal statement worker requires task receipt persistence")
+    receipt = receipt_getter(task_id)
+    remote_attempts = 0
+    if receipt is None:
+        retry_after = _active_source_circuit_retry_after(
+            dependencies.store,
+            payload.source,
+        )
+        if retry_after is not None:
+            _fail_statement_retryable(
+                dependencies.store,
+                task_id,
+                worker_id,
+                code="source_circuit_open",
+                next_retry_at=retry_after,
+                remote_attempts=remote_attempts,
+            )
+            raise _RetryableFormalTask(0, payload.source, circuit_open=True)
+        remote_attempts = 1
+        try:
+            fetch, verification, _ignored_document = runtime.source_adapter.fetch_verified(
+                request,
+                refresh_generation=payload.refresh_generation,
+                calendar_binding=payload.calendar_binding,
+            )
+        except FormalSourceBlocked:
+            retry_after = _open_source_circuit(
+                dependencies.store,
+                payload.source,
+                cooldown_seconds=config.challenge_cooldown_seconds,
+                code="source_blocked",
+            )
+            _fail_statement_retryable(
+                dependencies.store,
+                task_id,
+                worker_id,
+                code="source_blocked",
+                next_retry_at=retry_after,
+                remote_attempts=remote_attempts,
+            )
+            raise _RetryableFormalTask(remote_attempts, payload.source, circuit_open=True)
+        except FormalRetryableSourceError:
+            _opened_at, retry_after = _retry_window(config.retry_base_seconds)
+            _fail_statement_retryable(
+                dependencies.store,
+                task_id,
+                worker_id,
+                code="source_retryable_failed",
+                next_retry_at=retry_after,
+                remote_attempts=remote_attempts,
+            )
+            raise _RetryableFormalTask(remote_attempts, payload.source, circuit_open=False)
+        except FormalTerminalSourceError as error:
+            raise _TerminalFormalTask(
+                remote_attempts, "statement_terminal_source_error"
+            ) from error
+        try:
+            dependencies.snapshots.persist_verified(
+                fetch,
+                verification,
+                producing_task_id=task_id,
+                worker_id=worker_id,
+            )
+        except FormalTerminalSourceError as error:
+            raise _TerminalFormalTask(
+                remote_attempts, "statement_terminal_source_error"
+            ) from error
+        except ValueError as error:
+            if _is_lost_formal_task_lease_error(error):
+                raise _LostFormalTaskLease(remote_attempts) from error
+            raise _TerminalFormalTask(
+                remote_attempts, "statement_validation_failed"
+            ) from error
+        receipt = receipt_getter(task_id)
+    try:
+        if type(receipt) is not dict or type(receipt.get("manifest_sha256")) is not str:
+            raise ValueError("formal statement source receipt is missing after persistence")
+        snapshot = _require_statement_snapshot_identity(
+            receipt,
+            dependencies.snapshots.get_verified_by_manifest(receipt["manifest_sha256"]),
+            task_id=task_id,
+            payload=payload,
+            request=request,
+        )
+        raw_bytes = dependencies.snapshots.read_verified_raw(snapshot)
+        document = runtime.source_adapter.parse_verified_snapshot(
+            snapshot,
+            raw_bytes,
+            calendar_binding=payload.calendar_binding,
+        )
+        _renew_statement_lease(
+            dependencies.store,
+            task_id,
+            worker_id,
+            remote_attempts=remote_attempts,
+        )
+        extraction = extract_formal_financial_facts(
+            document,
+            snapshot,
+            runtime.mapping_registry,
+            datetime.now(timezone.utc).isoformat(),
+        )
+        if not extraction.facts:
+            raise ValueError("formal statement extraction produced no usable facts")
+        _renew_statement_lease(
+            dependencies.store,
+            task_id,
+            worker_id,
+            remote_attempts=remote_attempts,
+        )
+        dependencies.store.insert_formal_financial_facts(extraction.facts)
+        _renew_statement_lease(
+            dependencies.store,
+            task_id,
+            worker_id,
+            remote_attempts=remote_attempts,
+        )
+        current_facts = dependencies.store.list_formal_financial_facts(
+            security_id=payload.security_id
+        )
+
+        def renew_for_feature_mutation() -> None:
+            _renew_statement_lease(
+                dependencies.store,
+                task_id,
+                worker_id,
+                remote_attempts=remote_attempts,
+            )
+
+        feature_task_ids = enqueue_formal_feature_build(
+            dependencies.store,
+            security_id=payload.security_id,
+            as_of_utc=payload.as_of_utc,
+            runtime=runtime,
+            facts=current_facts,
+            before_mutation=renew_for_feature_mutation,
+        )
+        _renew_statement_lease(
+            dependencies.store,
+            task_id,
+            worker_id,
+            remote_attempts=remote_attempts,
+        )
+        dependencies.store.complete_formal_task(
+            task_id,
+            worker_id,
+            {
+                "fact_ids": [fact.to_dict()["id"] for fact in extraction.facts],
+                "feature_task_ids": list(feature_task_ids),
+                "kind": "formal_statement",
+                "manifest_sha256": snapshot.manifest_sha256,
+                "refresh_generation": payload.refresh_generation,
+                "registry_manifest_hash": payload.registry_manifest_hash,
+                "security_id": payload.security_id,
+                "snapshot_id": snapshot.snapshot_id,
+            },
+        )
+    except FormalTerminalSourceError as error:
+        raise _TerminalFormalTask(remote_attempts, "statement_terminal_source_error") from error
+    except FormalSourceBlocked:
+        retry_after = _open_source_circuit(
+            dependencies.store,
+            payload.source,
+            cooldown_seconds=config.challenge_cooldown_seconds,
+            code="source_blocked",
+        )
+        _fail_statement_retryable(
+            dependencies.store,
+            task_id,
+            worker_id,
+            code="source_blocked",
+            next_retry_at=retry_after,
+            remote_attempts=remote_attempts,
+        )
+        raise _RetryableFormalTask(remote_attempts, payload.source, circuit_open=True)
+    except FormalRetryableSourceError:
+        _opened_at, retry_after = _retry_window(config.retry_base_seconds)
+        _fail_statement_retryable(
+            dependencies.store,
+            task_id,
+            worker_id,
+            code="source_retryable_failed",
+            next_retry_at=retry_after,
+            remote_attempts=remote_attempts,
+        )
+        raise _RetryableFormalTask(remote_attempts, payload.source, circuit_open=False)
+    except ValueError as error:
+        raise _TerminalFormalTask(remote_attempts, "statement_validation_failed") from error
+    return remote_attempts, payload.security_id
+
+
+def _retry_window(seconds: object) -> tuple[str, str]:
+    if type(seconds) not in {int, float} or isinstance(seconds, bool) or seconds <= 0:
+        raise ValueError("signed retry interval must be a positive finite number")
+    now = datetime.now(timezone.utc)
+    return now.isoformat(), (now + timedelta(seconds=float(seconds))).isoformat()
+
+
+def _open_source_circuit(
+    store: object,
+    source: str,
+    *,
+    cooldown_seconds: object,
+    code: str,
+) -> str:
+    opened_at, retry_after = _retry_window(cooldown_seconds)
+    existing = store.get_formal_source_circuit(source)
+    failures = 1
+    if type(existing) is dict and existing.get("state") == "open":
+        count = existing.get("failure_count")
+        if type(count) is int and count > 0:
+            failures = count + 1
+    store.set_formal_source_circuit(
+        source,
+        state="open",
+        failure_count=failures,
+        reason={"code": code},
+        opened_at_utc=opened_at,
+        retry_after_utc=retry_after,
+    )
+    return retry_after
+
+
+def _active_source_circuit_retry_after(store: object, source: str) -> str | None:
+    circuit = store.get_formal_source_circuit(source)
+    if circuit is None:
+        return None
+    if type(circuit) is not dict:
+        raise ValueError("formal source circuit state is invalid")
+    if circuit.get("state") != "open":
+        return None
+    retry_after = _require_timestamp(circuit.get("retry_after_utc"), "circuit retry time")
+    if datetime.fromisoformat(retry_after) > datetime.now(timezone.utc):
+        return retry_after
+    store.set_formal_source_circuit(
+        source,
+        state="closed",
+        failure_count=0,
+        reason={},
+        opened_at_utc=None,
+        retry_after_utc=None,
+    )
+    return None
+
+
+def _fail_statement_retryable(
+    store: object,
+    task_id: str,
+    worker_id: str,
+    *,
+    code: str,
+    next_retry_at: str,
+    remote_attempts: int,
+) -> None:
+    try:
+        store.fail_formal_task(
+            task_id,
+            worker_id,
+            {"code": code},
+            "retryable_failed",
+            next_retry_at,
+        )
+    except ValueError as error:
+        if _is_lost_formal_task_lease_error(error):
+            raise _LostFormalTaskLease(remote_attempts) from error
+        raise
+
+
+def _is_lost_formal_task_lease_error(error: ValueError) -> bool:
+    message = str(error)
+    return (
+        "not held by the current unexpired lease owner" in message
+        or "lease expired or ownership changed" in message
+    )
+
+
+def _renew_statement_lease(
+    store: object,
+    task_id: str,
+    worker_id: str,
+    *,
+    remote_attempts: int,
+) -> None:
+    try:
+        store.renew_formal_task_lease(
+            task_id,
+            worker_id,
+            _STATEMENT_LEASE_SECONDS,
+        )
+    except ValueError as error:
+        if _is_lost_formal_task_lease_error(error):
+            raise _LostFormalTaskLease(remote_attempts) from error
+        raise
+
+
+def _fail_statement_terminal(
+    store: object,
+    task_id: str,
+    worker_id: str,
+    *,
+    code: str,
+) -> bool:
+    """Record a deterministic terminal result unless ownership was lost."""
+
+    try:
+        store.fail_formal_task(
+            task_id,
+            worker_id,
+            {"code": code},
+            "terminal_failed",
+            None,
+        )
+    except ValueError as error:
+        if _is_lost_formal_task_lease_error(error):
+            return False
+        raise
+    return True
+
+
+def execute_queued_formal_work(
+    dependencies: FormalWorkerDependencies,
+    *,
+    worker_id: str,
+    max_jobs: int | None = None,
+) -> FormalCollectionSummary:
+    """Run the currently implemented safe subset: leased formal statements only."""
+
+    if type(dependencies) is not FormalWorkerDependencies:
+        raise ValueError("formal worker dependencies must have exact type")
+    owner = _require_text(worker_id, "worker_id")
+    if max_jobs is not None and (
+        type(max_jobs) is not int or isinstance(max_jobs, bool) or max_jobs < 0
+    ):
+        raise ValueError("max_jobs must be a nonnegative integer or None")
+    resolver = getattr(dependencies.store, "resolve_formal_task_dependencies", None)
+    lease_next = getattr(dependencies.store, "lease_next_formal_task", None)
+    if not callable(resolver) or not callable(lease_next):
+        raise ValueError("formal worker requires formal task lease persistence")
+    resolver()
+    remote_attempts = 0
+    verified_statement_count = 0
+    retryable_failed = 0
+    terminal_failed = 0
+    open_circuits: set[str] = set()
+    rebuilt_security_ids: set[str] = set()
+    processed = 0
+    while max_jobs is None or processed < max_jobs:
+        task = lease_next(_STATEMENT_EXECUTION_KINDS, owner, _STATEMENT_LEASE_SECONDS)
+        if task is None:
+            break
+        if type(task) is not dict:
+            raise ValueError("formal task lease returned an invalid task")
+        try:
+            attempts, security_id = _execute_statement_task(
+                dependencies, task, worker_id=owner
+            )
+        except _LostFormalTaskLease as error:
+            remote_attempts += error.remote_attempts
+            processed += 1
+            continue
+        except _RetryableFormalTask as error:
+            remote_attempts += error.remote_attempts
+            retryable_failed += 1
+            if error.circuit_open:
+                open_circuits.add(error.source)
+            processed += 1
+            continue
+        except _TerminalFormalTask as error:
+            remote_attempts += error.remote_attempts
+            task_id = _require_text(task.get("id"), "formal statement task id")
+            if _fail_statement_terminal(
+                dependencies.store,
+                task_id,
+                owner,
+                code=error.code,
+            ):
+                terminal_failed += 1
+            processed += 1
+            continue
+        except FormalTerminalSourceError:
+            task_id = _require_text(task.get("id"), "formal statement task id")
+            if _fail_statement_terminal(
+                dependencies.store,
+                task_id,
+                owner,
+                code="statement_terminal_source_error",
+            ):
+                terminal_failed += 1
+            processed += 1
+            continue
+        except ValueError:
+            task_id = _require_text(task.get("id"), "formal statement task id")
+            if _fail_statement_terminal(
+                dependencies.store,
+                task_id,
+                owner,
+                code="statement_validation_failed",
+            ):
+                terminal_failed += 1
+            processed += 1
+            continue
+        remote_attempts += attempts
+        verified_statement_count += 1
+        rebuilt_security_ids.add(security_id)
+        processed += 1
+    return FormalCollectionSummary(
+        remote_attempts=remote_attempts,
+        verified_statement_count=verified_statement_count,
+        frozen_universe_snapshot_ids=(),
+        retryable_failed=retryable_failed,
+        terminal_failed=terminal_failed,
+        feature_bundles_written=0,
+        open_circuits=tuple(sorted(open_circuits)),
+        rebuilt_security_ids=tuple(sorted(rebuilt_security_ids)),
+    )
 
 
 __all__ = [

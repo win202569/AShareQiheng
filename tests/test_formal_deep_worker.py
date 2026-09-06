@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -17,20 +18,29 @@ from ashare_pipeline.formal_deep_worker import (
     FormalRegistryRuntimeLoader,
     FormalStatementTaskPayload,
     FormalTaskSpec,
+    FormalWorkerDependencies,
     FormalUniverseFinalizeTaskPayload,
     FormalUniverseSourceTaskPayload,
     derive_collection_refresh_generation,
+    execute_queued_formal_work,
     formal_context_task_specs,
     formal_statement_task_specs,
 )
-from ashare_pipeline.formal_evidence import OfficialRequest, VerifiedCalendarBinding
+from ashare_pipeline.formal_evidence import OfficialRequest, SourcePolicy, VerifiedCalendarBinding
 from ashare_pipeline.formal_registry_manifest import (
     FormalRegistryBundleLoader,
     FormalRegistryManifest,
     VerifiedRegistryBlob,
 )
 from ashare_pipeline.formal_context_schema import FormalContextRequest, SignedContextRequestResolver
+from ashare_pipeline.formal_snapshot_repository import FormalSnapshotRepository
 from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore
+from ashare_pipeline.formal_sources import (
+    CalendarSelector,
+    FormalRetryableSourceError,
+    FormalSourceBlocked,
+    FormalTerminalSourceError,
+)
 from ashare_pipeline.state_store import StateStore
 import tests.test_formal_sources as _formal_source_tests
 
@@ -71,12 +81,132 @@ class NoTransport:
         raise AssertionError("runtime construction must not use transport")
 
 
+class CountingTransport:
+    def __init__(self, response: object, error: Exception | None = None) -> None:
+        self.response = response
+        self.error = error
+        self.requests: list[object] = []
+
+    def send(self, request: object) -> object:
+        self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+class ReplayErrorParser(_formal_source_tests.FixtureParser):
+    """Allow a verified fetch, then fail the mandated persisted-raw reparse."""
+
+    def __init__(self, document: object, error: Exception) -> None:
+        super().__init__(document)
+        self._error = error
+
+    def parse(self, raw_bytes: object, *, request: object, config: object) -> object:
+        document = super().parse(raw_bytes, request=request, config=config)
+        if len(self.calls) == 2:
+            raise self._error
+        return document
+
+
+class InitialErrorParser(_formal_source_tests.FixtureParser):
+    """Raise only after the source adapter has performed its real transport."""
+
+    def __init__(self, document: object, error: Exception) -> None:
+        super().__init__(document)
+        self._error = error
+
+    def parse(self, raw_bytes: object, *, request: object, config: object) -> object:
+        super().parse(raw_bytes, request=request, config=config)
+        raise self._error
+
+
+class LeaseLossStore:
+    """Delegate real persistence but make the worker lose its next renewal."""
+
+    def __init__(self, store: StateStore) -> None:
+        self._store = store
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._store, name)
+
+    def renew_formal_task_lease(self, *_args: object, **_kwargs: object) -> str:
+        raise ValueError("formal task is not held by the current unexpired lease owner")
+
+
+class PostExtractionLeaseLossStore:
+    """Let parsing begin, then lose ownership immediately before fact persistence."""
+
+    def __init__(self, store: StateStore) -> None:
+        self._store = store
+        self._renewal_count = 0
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._store, name)
+
+    def renew_formal_task_lease(self, *args: object, **kwargs: object) -> str:
+        self._renewal_count += 1
+        if self._renewal_count == 2:
+            raise ValueError("formal task is not held by the current unexpired lease owner")
+        return self._store.renew_formal_task_lease(*args, **kwargs)
+
+
+class PostFactLeaseLossStore:
+    """Make facts durable, then prove no stale feature side effects are possible."""
+
+    def __init__(self, store: StateStore) -> None:
+        self._store = store
+        self._renewal_count = 0
+        self.feature_enqueue_calls = 0
+        self.feature_supersede_calls = 0
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._store, name)
+
+    def renew_formal_task_lease(self, *args: object, **kwargs: object) -> str:
+        self._renewal_count += 1
+        if self._renewal_count == 3:
+            raise ValueError("formal task is not held by the current unexpired lease owner")
+        return self._store.renew_formal_task_lease(*args, **kwargs)
+
+    def enqueue_formal_task(self, *args: object, **kwargs: object) -> str:
+        if args and args[0] == "formal_feature_build":
+            self.feature_enqueue_calls += 1
+        return self._store.enqueue_formal_task(*args, **kwargs)
+
+    def supersede_formal_tasks(self, *args: object, **kwargs: object) -> int:
+        self.feature_supersede_calls += 1
+        return self._store.supersede_formal_tasks(*args, **kwargs)
+
+
 class EffectiveTimeResolver:
     def next_exchange_close(self, *_args: object, **_kwargs: object) -> str:
         return AS_OF
 
 
-def fixture_bundle_loader(*, scoring_schema: str = "fixture-v1") -> FormalRegistryBundleLoader:
+class ExactCalendarBindingRepository:
+    def __init__(self, binding: VerifiedCalendarBinding) -> None:
+        self.binding = binding
+        self.calls: list[tuple[object, object, object, object]] = []
+
+    def resolve_verified_calendar_binding(
+        self,
+        selector: object,
+        exchange: object,
+        as_of_utc: object,
+        registry_manifest_hash: object,
+    ) -> VerifiedCalendarBinding:
+        self.calls.append((selector, exchange, as_of_utc, registry_manifest_hash))
+        return self.binding
+
+
+def fixture_bundle_loader(
+    *,
+    scoring_schema: str = "fixture-v1",
+    purpose: str = "test",
+    source_configs: list[dict[str, object]] | None = None,
+    statement_dataset: str = "annual_report",
+    statement_exchange: str = "BJ",
+) -> FormalRegistryBundleLoader:
     """Make a real, test-purpose verified root from signed child bytes."""
     roles = ("source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event")
     raw = {
@@ -85,14 +215,18 @@ def fixture_bundle_loader(*, scoring_schema: str = "fixture-v1") -> FormalRegist
     }
     raw["scoring"] = canonical_bytes({"registry_role": "scoring", "schema_version": scoring_schema})
     raw["source"] = canonical_bytes(
-        {"configs": [], "registry_role": "source", "schema_version": "formal-source-registry-v1"}
+        {
+            "configs": [] if source_configs is None else source_configs,
+            "registry_role": "source",
+            "schema_version": "formal-source-registry-v1",
+        }
     )
     raw["mapping"] = canonical_bytes(
         {
             "bindings": [
                 {
-                    "dataset": "annual_report",
-                    "exchange_scope": "BJ",
+                    "dataset": statement_dataset,
+                    "exchange_scope": statement_exchange,
                     "mapping_ids": ["operating_profit"],
                     "mapping_version": "fixture-map-v1",
                     "parser_id": "fixture-parser",
@@ -141,8 +275,8 @@ def fixture_bundle_loader(*, scoring_schema: str = "fixture-v1") -> FormalRegist
     hashes = {f"{role}_registry_hash": hashlib.sha256(value).hexdigest() for role, value in raw.items()}
     root = canonical_bytes(
         {
-            "approval_id": None,
-            "purpose": "test",
+            "approval_id": "fixture-approval" if purpose == "official" else None,
+            "purpose": purpose,
             "schema_version": "formal-registry-manifest-v1",
             **hashes,
         }
@@ -167,7 +301,7 @@ def fixture_bundle_loader(*, scoring_schema: str = "fixture-v1") -> FormalRegist
             canonical_json=value,
             signature=child_hash,
             key_id="fixture-key",
-            approval_id=None,
+            approval_id="fixture-approval" if purpose == "official" else None,
             declared_registry_manifest_hash=manifest.manifest_hash,
             binding_signature=hashlib.sha256(binding).hexdigest(),
             binding_key_id="fixture-key",
@@ -301,7 +435,1294 @@ def thin_context_resolver(
     return SignedContextRequestResolver(store, verifier), manifest.manifest_hash
 
 
+def statement_execution_fixture(
+    case: unittest.TestCase,
+    *,
+    transport_error: Exception | None = None,
+    replay_parse_error: Exception | None = None,
+    initial_parse_error: Exception | None = None,
+) -> tuple[
+    StateStore,
+    FormalSnapshotRepository,
+    FormalRegistryRuntimeLoader,
+    CountingTransport,
+    _formal_source_tests.FixtureParser,
+    str,
+    FormalStatementTaskPayload,
+]:
+    """Create one real signed official statement task with local-only evidence."""
+    temporary = tempfile.TemporaryDirectory()
+    case.addCleanup(temporary.cleanup)
+    root = Path(temporary.name)
+    raw_store = FormalSnapshotStore(root / "raw")
+    store = StateStore(
+        root / "state.sqlite",
+        formal_snapshot_store=raw_store,
+        registry_signature_verifier=AcceptingVerifier(),
+    )
+    store.initialize()
+    bundle_loader = fixture_bundle_loader(
+        purpose="official",
+        source_configs=[_formal_source_tests.config(dataset="profit_sheet")],
+        statement_dataset="profit_sheet",
+        statement_exchange="SZ",
+    )
+    manifest_hash = bundle_loader._repository.manifest.manifest_hash
+    document = _formal_source_tests.timestamp_document(
+        declared_security_id="SZ000001",
+        declared_period="2025-12-31",
+        accounting_basis="consolidated",
+        rows=({"ITEM": "OPERATING_PROFIT", "VALUE": 100},),
+    )
+    transport = CountingTransport(
+        _formal_source_tests.response(raw=b'{"statement":true}'),
+        transport_error,
+    )
+    if initial_parse_error is not None:
+        parser = InitialErrorParser(document, initial_parse_error)
+    elif replay_parse_error is not None:
+        parser = ReplayErrorParser(document, replay_parse_error)
+    else:
+        parser = _formal_source_tests.FixtureParser(document)
+    runtime_loader = FormalRegistryRuntimeLoader(
+        bundle_loader,
+        transport=transport,
+        policies={"cninfo": SourcePolicy.cninfo()},
+        parsers={"fixture-parser": parser},
+        effective_time_resolver=EffectiveTimeResolver(),
+    )
+    runtime = runtime_loader.load(manifest_hash)
+    generation = derive_collection_refresh_generation(
+        upstream_generation="statement-upstream-v1",
+        registry_manifest_hash=manifest_hash,
+        relevant_registry_hashes={
+            "mapping": runtime.bundle.manifest.mapping_registry_hash,
+            "source": runtime.bundle.manifest.source_registry_hash,
+        },
+    )
+    payload = FormalStatementTaskPayload(
+        security_id="SZ000001",
+        dataset="profit_sheet",
+        report_period="2025-12-31",
+        as_of_utc=AS_OF,
+        source="cninfo",
+        request_version="formal-v5",
+        source_registry_hash=runtime.bundle.manifest.source_registry_hash,
+        mapping_registry_hash=runtime.bundle.manifest.mapping_registry_hash,
+        upstream_generation="statement-upstream-v1",
+        refresh_generation=generation,
+        registry_manifest_hash=manifest_hash,
+        relevant_registry_hashes=(
+            ("mapping", runtime.bundle.manifest.mapping_registry_hash),
+            ("source", runtime.bundle.manifest.source_registry_hash),
+        ),
+        calendar_prerequisite_task_id=None,
+        calendar_binding=None,
+    )
+    return (
+        store,
+        FormalSnapshotRepository(root / "raw", store),
+        runtime_loader,
+        transport,
+        parser,
+        manifest_hash,
+        payload,
+    )
+
+
+def replay_receipt_fixture(
+    case: unittest.TestCase,
+    error: Exception,
+) -> tuple[
+    StateStore,
+    FormalSnapshotRepository,
+    FormalRegistryRuntimeLoader,
+    CountingTransport,
+    ReplayErrorParser,
+    FormalStatementTaskPayload,
+    str,
+]:
+    """Persist a real receipt, then arrange exactly its replay parse to fail."""
+
+    (
+        store,
+        snapshots,
+        runtime_loader,
+        transport,
+        parser,
+        manifest_hash,
+        payload,
+    ) = statement_execution_fixture(case, replay_parse_error=error)
+    case.assertIsInstance(parser, ReplayErrorParser)
+    spec = FormalTaskSpec.from_payload(payload)
+    task_id = store.enqueue_formal_task(
+        spec.kind,
+        spec.idempotency_key,
+        spec.refresh_generation,
+        spec.payload,
+        spec.prerequisite_task_ids,
+    )
+    case.assertIsNotNone(
+        store.lease_next_formal_task(("formal_statement",), "crashed-owner", 120)
+    )
+    runtime = runtime_loader.load(manifest_hash)
+    fetch, verification, _ = runtime.source_adapter.fetch_verified(
+        OfficialRequest("cninfo", "profit_sheet", "SZ000001", "2025-12-31", "SZ"),
+        refresh_generation=payload.refresh_generation,
+        calendar_binding=None,
+    )
+    snapshots.persist_verified(
+        fetch,
+        verification,
+        producing_task_id=task_id,
+        worker_id="crashed-owner",
+    )
+    store.fail_formal_task(
+        task_id,
+        "crashed-owner",
+        {"code": "simulated_crash"},
+        "retryable_failed",
+        datetime.now(timezone.utc).isoformat(),
+    )
+    return store, snapshots, runtime_loader, transport, parser, payload, task_id
+
+
+def date_only_statement_execution_fixture(
+    case: unittest.TestCase,
+) -> tuple[
+    StateStore,
+    FormalSnapshotRepository,
+    FormalRegistryRuntimeLoader,
+    CountingTransport,
+    str,
+    FormalStatementTaskPayload,
+    ExactCalendarBindingRepository,
+]:
+    """Create a canonical UTC date-only statement plus a verified calendar edge."""
+
+    temporary = tempfile.TemporaryDirectory()
+    case.addCleanup(temporary.cleanup)
+    root = Path(temporary.name)
+    binding_holder: dict[str, VerifiedCalendarBinding] = {}
+
+    def resolve_snapshot_binding(_request: object) -> VerifiedCalendarBinding | None:
+        return binding_holder.get("binding")
+
+    raw_store = FormalSnapshotStore(
+        root / "raw", calendar_binding_resolver=resolve_snapshot_binding
+    )
+    store = StateStore(
+        root / "state.sqlite",
+        formal_snapshot_store=raw_store,
+        registry_signature_verifier=AcceptingVerifier(),
+    )
+    store.initialize()
+    selector = CalendarSelector(
+        "trading_calendar", "fixture-calendar-SZ", "SZ", "visible_at_freeze"
+    )
+    source_config = _formal_source_tests.config(
+        dataset="profit_sheet",
+        exchange_scope="SZ",
+        calendar_selector={
+            "as_of_rule": selector.as_of_rule,
+            "context_kind": selector.context_kind,
+            "exchange": selector.exchange,
+            "scope_key": selector.scope_key,
+        },
+    )
+    bundle_loader = fixture_bundle_loader(
+        purpose="official",
+        source_configs=[source_config],
+        statement_dataset="profit_sheet",
+        statement_exchange="SZ",
+    )
+    manifest_hash = bundle_loader._repository.manifest.manifest_hash
+    document = _formal_source_tests.timestamp_document(
+        declared_security_id="SZ000001",
+        declared_period="2025-12-31",
+        published_at_utc="2026-08-20T00:00:00+00:00",
+        published_precision="date_only",
+        accounting_basis="consolidated",
+        rows=({"ITEM": "OPERATING_PROFIT", "VALUE": 100},),
+    )
+    transport = CountingTransport(_formal_source_tests.response(raw=b'{"date-only":true}'))
+    runtime_loader = FormalRegistryRuntimeLoader(
+        bundle_loader,
+        transport=transport,
+        policies={"cninfo": SourcePolicy.cninfo()},
+        parsers={"fixture-parser": _formal_source_tests.FixtureParser(document)},
+        effective_time_resolver=EffectiveTimeResolver(),
+    )
+    runtime = runtime_loader.load(manifest_hash)
+    prerequisite_payload = FormalFeatureBuildTaskPayload(
+        security_id="SZ000001",
+        as_of_utc=AS_OF,
+        template_id="general_nonfinancial",
+        source_registry_hash=runtime.bundle.manifest.source_registry_hash,
+        mapping_registry_hash=runtime.bundle.manifest.mapping_registry_hash,
+        feature_registry_hash=runtime.bundle.manifest.feature_registry_hash,
+        registry_manifest_hash=manifest_hash,
+        source_snapshot_ids=("fixture-calendar-snapshot",),
+        refresh_generation="a" * 64,
+    )
+    prerequisite_spec = FormalTaskSpec.from_payload(prerequisite_payload)
+    prerequisite_task_id = store.enqueue_formal_task(
+        prerequisite_spec.kind,
+        prerequisite_spec.idempotency_key,
+        prerequisite_spec.refresh_generation,
+        prerequisite_spec.payload,
+        prerequisite_spec.prerequisite_task_ids,
+    )
+    case.assertIsNotNone(
+        store.lease_next_formal_task(("formal_feature_build",), "calendar-owner", 120)
+    )
+    store.complete_formal_task(prerequisite_task_id, "calendar-owner", {"fixture": "verified"})
+    binding = VerifiedCalendarBinding(
+        snapshot_id="fixture-calendar-snapshot",
+        manifest_sha256="f" * 64,
+        exchange="SZ",
+        freeze_at_utc=AS_OF,
+        registry_manifest_hash=manifest_hash,
+        selector_hash=selector.selector_hash,
+        prerequisite_task_id=prerequisite_task_id,
+    )
+    binding_holder["binding"] = binding
+    request = OfficialRequest("cninfo", "profit_sheet", "SZ000001", "2025-12-31", "SZ")
+    config = runtime.source_adapter.registry.select(request)
+    case.assertEqual(config.calendar_selector, selector)
+    generation = derive_collection_refresh_generation(
+        upstream_generation="date-only-upstream-v1",
+        registry_manifest_hash=manifest_hash,
+        relevant_registry_hashes={
+            "mapping": runtime.bundle.manifest.mapping_registry_hash,
+            "source": runtime.bundle.manifest.source_registry_hash,
+        },
+        calendar_selector=config.calendar_selector,
+        calendar_binding=binding,
+    )
+    payload = FormalStatementTaskPayload(
+        security_id="SZ000001",
+        dataset="profit_sheet",
+        report_period="2025-12-31",
+        as_of_utc=AS_OF,
+        source="cninfo",
+        request_version="formal-v5",
+        source_registry_hash=runtime.bundle.manifest.source_registry_hash,
+        mapping_registry_hash=runtime.bundle.manifest.mapping_registry_hash,
+        upstream_generation="date-only-upstream-v1",
+        refresh_generation=generation,
+        registry_manifest_hash=manifest_hash,
+        relevant_registry_hashes=(
+            ("mapping", runtime.bundle.manifest.mapping_registry_hash),
+            ("source", runtime.bundle.manifest.source_registry_hash),
+        ),
+        calendar_prerequisite_task_id=prerequisite_task_id,
+        calendar_binding=binding,
+    )
+    return (
+        store,
+        FormalSnapshotRepository(root / "raw", store),
+        runtime_loader,
+        transport,
+        manifest_hash,
+        payload,
+        ExactCalendarBindingRepository(binding),
+    )
+
+
 class FormalDeepWorkerContractTests(unittest.TestCase):
+    def test_statement_receipt_replay_reparses_persisted_raw_without_second_fetch(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            parser,
+            manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        leased = store.lease_next_formal_task(
+            ("formal_statement",), "crashed-owner", 120
+        )
+        self.assertIsNotNone(leased)
+        runtime = runtime_loader.load(manifest_hash)
+        fetch, verification, _ = runtime.source_adapter.fetch_verified(
+            OfficialRequest("cninfo", "profit_sheet", "SZ000001", "2025-12-31", "SZ"),
+            refresh_generation=payload.refresh_generation,
+            calendar_binding=None,
+        )
+        snapshot = snapshots.persist_verified(
+            fetch,
+            verification,
+            producing_task_id=task_id,
+            worker_id="crashed-owner",
+        )
+        store.fail_formal_task(
+            task_id,
+            "crashed-owner",
+            {"code": "simulated_crash"},
+            "retryable_failed",
+            datetime.now(timezone.utc).isoformat(),
+        )
+        parser_calls_before_recovery = len(parser.calls)
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        try:
+            summary = execute_queued_formal_work(
+                dependencies, worker_id="recovery-worker", max_jobs=1
+            )
+        except NotImplementedError:
+            summary = None
+
+        self.assertIsNotNone(
+            summary,
+            "a statement receipt must be replayed rather than left as an unimplemented worker path",
+        )
+        assert summary is not None
+        self.assertEqual(summary.remote_attempts, 0)
+        self.assertEqual(summary.verified_statement_count, 1)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertEqual(len(parser.calls), parser_calls_before_recovery + 1)
+        self.assertEqual(store.get_formal_task(task_id)["status"], "verified")
+        facts = store.list_formal_financial_facts(security_id="SZ000001")
+        self.assertEqual(len(facts), 1)
+        self.assertEqual(facts[0].source_snapshot_id, snapshot.snapshot_id)
+        feature_tasks = store.list_formal_tasks(kinds=("formal_feature_build",))
+        self.assertEqual(len(feature_tasks), 1)
+        self.assertEqual(feature_tasks[0]["payload"]["security_id"], "SZ000001")
+
+    def test_statement_receipt_replay_rejects_a_valid_snapshot_for_another_request(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            parser,
+            manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        self.assertIsNotNone(
+            store.lease_next_formal_task(("formal_statement",), "crashed-owner", 120)
+        )
+        parser.document = replace(parser.document, declared_security_id="SZ000002")
+        runtime = runtime_loader.load(manifest_hash)
+        fetch, verification, _ = runtime.source_adapter.fetch_verified(
+            OfficialRequest("cninfo", "profit_sheet", "SZ000002", "2025-12-31", "SZ"),
+            refresh_generation=payload.refresh_generation,
+            calendar_binding=None,
+        )
+        snapshots.persist_verified(
+            fetch,
+            verification,
+            producing_task_id=task_id,
+            worker_id="crashed-owner",
+        )
+        store.fail_formal_task(
+            task_id,
+            "crashed-owner",
+            {"code": "simulated_crash"},
+            "retryable_failed",
+            datetime.now(timezone.utc).isoformat(),
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="wrong-receipt-recovery-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.remote_attempts, 0)
+        self.assertEqual(summary.terminal_failed, 1)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertIsNotNone(store.get_formal_task_snapshot_receipt(task_id))
+        self.assertEqual(store.list_formal_financial_facts(security_id="SZ000001"), ())
+        self.assertEqual(store.list_formal_financial_facts(security_id="SZ000002"), ())
+        self.assertEqual(store.list_formal_tasks(kinds=("formal_feature_build",)), [])
+        task = store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "terminal_failed")
+        self.assertEqual(task["error"]["code"], "statement_validation_failed")
+
+    def test_statement_replay_retryable_parser_error_keeps_receipt_and_pass_continues(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            parser,
+            payload,
+            replay_task_id,
+        ) = replay_receipt_fixture(self, FormalRetryableSourceError("fixture replay timeout"))
+        parser.document = replace(parser.document, declared_security_id="SZ000002")
+        other_spec = FormalTaskSpec.from_payload(
+            replace(payload, security_id="SZ000002")
+        )
+        other_task_id = store.enqueue_formal_task(
+            other_spec.kind,
+            other_spec.idempotency_key,
+            other_spec.refresh_generation,
+            other_spec.payload,
+            other_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        transport_before_recovery = len(transport.requests)
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="retryable-replay-worker", max_jobs=2
+        )
+
+        self.assertEqual(summary.retryable_failed, 1)
+        self.assertEqual(summary.verified_statement_count, 1)
+        self.assertEqual(summary.remote_attempts, 1)
+        self.assertEqual(len(transport.requests), transport_before_recovery + 1)
+        self.assertIsNotNone(store.get_formal_task_snapshot_receipt(replay_task_id))
+        replay_task = store.get_formal_task(replay_task_id)
+        self.assertEqual(replay_task["status"], "retryable_failed")
+        self.assertEqual(replay_task["error"]["code"], "source_retryable_failed")
+        self.assertEqual(store.get_formal_task(other_task_id)["status"], "verified")
+        self.assertEqual(store.list_formal_financial_facts(security_id="SZ000001"), ())
+        self.assertEqual(len(store.list_formal_financial_facts(security_id="SZ000002")), 1)
+
+    def test_statement_replay_blocked_parser_opens_circuit_and_pass_continues(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            parser,
+            payload,
+            replay_task_id,
+        ) = replay_receipt_fixture(self, FormalSourceBlocked("fixture replay challenge"))
+        parser.document = replace(parser.document, declared_security_id="SZ000002")
+        other_spec = FormalTaskSpec.from_payload(
+            replace(payload, security_id="SZ000002")
+        )
+        other_task_id = store.enqueue_formal_task(
+            other_spec.kind,
+            other_spec.idempotency_key,
+            other_spec.refresh_generation,
+            other_spec.payload,
+            other_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        transport_before_recovery = len(transport.requests)
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="blocked-replay-worker", max_jobs=2
+        )
+
+        self.assertEqual(summary.retryable_failed, 2)
+        self.assertEqual(summary.verified_statement_count, 0)
+        self.assertEqual(summary.remote_attempts, 0)
+        self.assertEqual(summary.open_circuits, ("cninfo",))
+        self.assertEqual(len(transport.requests), transport_before_recovery)
+        self.assertIsNotNone(store.get_formal_task_snapshot_receipt(replay_task_id))
+        replay_task = store.get_formal_task(replay_task_id)
+        self.assertEqual(replay_task["status"], "retryable_failed")
+        self.assertEqual(replay_task["error"]["code"], "source_blocked")
+        other_task = store.get_formal_task(other_task_id)
+        self.assertEqual(other_task["status"], "retryable_failed")
+        self.assertEqual(other_task["error"]["code"], "source_circuit_open")
+        self.assertEqual(store.get_formal_source_circuit("cninfo")["state"], "open")
+
+    def test_statement_lost_lease_after_receipt_never_writes_facts_or_completion(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=LeaseLossStore(store),
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        try:
+            summary = execute_queued_formal_work(
+                dependencies, worker_id="lost-lease-worker", max_jobs=1
+            )
+        except ValueError:
+            summary = None
+
+        self.assertIsNotNone(
+            summary,
+            "lost ownership after a raw receipt must stop safely rather than propagate into writes",
+        )
+        self.assertEqual(len(transport.requests), 1)
+        self.assertIsNotNone(store.get_formal_task_snapshot_receipt(task_id))
+        self.assertEqual(store.list_formal_financial_facts(security_id="SZ000001"), ())
+        self.assertNotEqual(store.get_formal_task(task_id)["status"], "verified")
+
+    def test_statement_lost_lease_after_extraction_never_writes_facts_or_feature_task(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=PostExtractionLeaseLossStore(store),
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="post-extraction-loss-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.verified_statement_count, 0)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertIsNotNone(store.get_formal_task_snapshot_receipt(task_id))
+        self.assertEqual(store.list_formal_financial_facts(security_id="SZ000001"), ())
+        self.assertEqual(store.list_formal_tasks(kinds=("formal_feature_build",)), [])
+        self.assertNotEqual(store.get_formal_task(task_id)["status"], "verified")
+
+    def test_statement_lost_lease_after_fact_write_never_schedules_or_supersedes_features(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        lease_loss_store = PostFactLeaseLossStore(store)
+        dependencies = FormalWorkerDependencies(
+            store=lease_loss_store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="post-fact-loss-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.verified_statement_count, 0)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertEqual(len(store.list_formal_financial_facts(security_id="SZ000001")), 1)
+        self.assertEqual(lease_loss_store.feature_enqueue_calls, 0)
+        self.assertEqual(lease_loss_store.feature_supersede_calls, 0)
+        self.assertEqual(store.list_formal_tasks(kinds=("formal_feature_build",)), [])
+        self.assertNotEqual(store.get_formal_task(task_id)["status"], "verified")
+
+    def test_statement_runtime_root_mismatch_fails_terminally_before_transport(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        forged_source_hash = "0" * 64
+        forged_generation = derive_collection_refresh_generation(
+            upstream_generation=payload.upstream_generation,
+            registry_manifest_hash=manifest_hash,
+            relevant_registry_hashes={
+                "mapping": payload.mapping_registry_hash,
+                "source": forged_source_hash,
+            },
+        )
+        forged_payload = replace(
+            payload,
+            source_registry_hash=forged_source_hash,
+            relevant_registry_hashes=(
+                ("mapping", payload.mapping_registry_hash),
+                ("source", forged_source_hash),
+            ),
+            refresh_generation=forged_generation,
+        )
+        spec = FormalTaskSpec.from_payload(forged_payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        try:
+            summary = execute_queued_formal_work(
+                dependencies, worker_id="invalid-root-worker", max_jobs=1
+            )
+        except ValueError:
+            summary = None
+
+        self.assertIsNotNone(
+            summary,
+            "runtime/root disagreement must become a terminal task result rather than escape the worker",
+        )
+        assert summary is not None
+        self.assertEqual(summary.terminal_failed, 1)
+        self.assertEqual(transport.requests, [])
+        task = store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "terminal_failed")
+        self.assertEqual(task["error"]["code"], "statement_validation_failed")
+
+    def test_statement_stale_refresh_generation_fails_before_receipt_or_transport(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        stale_payload = replace(payload, refresh_generation="f" * 64)
+        spec = FormalTaskSpec.from_payload(stale_payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="stale-generation-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.terminal_failed, 1)
+        self.assertEqual(transport.requests, [])
+        self.assertIsNone(store.get_formal_task_snapshot_receipt(task_id))
+        task = store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "terminal_failed")
+        self.assertEqual(task["error"]["code"], "statement_validation_failed")
+
+    def test_date_only_statement_uses_canonical_task_freeze_and_rejects_binding_mismatch(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            manifest_hash,
+            payload,
+            context_repository,
+        ) = date_only_statement_execution_fixture(self)
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=context_repository,
+        )
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="date-only-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.verified_statement_count, 1)
+        self.assertEqual(summary.remote_attempts, 1)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertEqual(store.get_formal_task(task_id)["status"], "verified")
+        self.assertEqual(len(context_repository.calls), 1)
+        runtime = runtime_loader.load(manifest_hash)
+        request = OfficialRequest("cninfo", "profit_sheet", "SZ000001", "2025-12-31", "SZ")
+        config = runtime.source_adapter.registry.select(request)
+        bad_binding = replace(payload.calendar_binding, manifest_sha256="e" * 64)
+        bad_payload = replace(
+            payload,
+            calendar_binding=bad_binding,
+            refresh_generation=derive_collection_refresh_generation(
+                upstream_generation=payload.upstream_generation,
+                registry_manifest_hash=manifest_hash,
+                relevant_registry_hashes={
+                    "mapping": payload.mapping_registry_hash,
+                    "source": payload.source_registry_hash,
+                },
+                calendar_selector=config.calendar_selector,
+                calendar_binding=bad_binding,
+            ),
+        )
+        bad_spec = FormalTaskSpec.from_payload(bad_payload)
+        bad_task_id = store.enqueue_formal_task(
+            bad_spec.kind,
+            bad_spec.idempotency_key,
+            bad_spec.refresh_generation,
+            bad_spec.payload,
+            bad_spec.prerequisite_task_ids,
+        )
+
+        mismatch_summary = execute_queued_formal_work(
+            dependencies, worker_id="date-only-mismatch-worker", max_jobs=1
+        )
+
+        self.assertEqual(mismatch_summary.terminal_failed, 1)
+        self.assertEqual(len(transport.requests), 1)
+        bad_task = store.get_formal_task(bad_task_id)
+        self.assertEqual(bad_task["status"], "terminal_failed")
+        self.assertEqual(bad_task["error"]["code"], "statement_validation_failed")
+
+    def test_date_only_statement_receipt_replay_uses_the_same_canonical_freeze(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            manifest_hash,
+            payload,
+            context_repository,
+        ) = date_only_statement_execution_fixture(self)
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        self.assertIsNotNone(
+            store.lease_next_formal_task(("formal_statement",), "crashed-owner", 120)
+        )
+        runtime = runtime_loader.load(
+            manifest_hash, adapter_freeze_at_utc=payload.as_of_utc
+        )
+        fetch, verification, _ = runtime.source_adapter.fetch_verified(
+            OfficialRequest("cninfo", "profit_sheet", "SZ000001", "2025-12-31", "SZ"),
+            refresh_generation=payload.refresh_generation,
+            calendar_binding=payload.calendar_binding,
+        )
+        snapshots.persist_verified(
+            fetch,
+            verification,
+            producing_task_id=task_id,
+            worker_id="crashed-owner",
+        )
+        store.fail_formal_task(
+            task_id,
+            "crashed-owner",
+            {"code": "simulated_crash"},
+            "retryable_failed",
+            datetime.now(timezone.utc).isoformat(),
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=context_repository,
+        )
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="date-only-recovery-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.remote_attempts, 0)
+        self.assertEqual(summary.verified_statement_count, 1)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertEqual(store.get_formal_task(task_id)["status"], "verified")
+        self.assertEqual(len(store.list_formal_financial_facts(security_id="SZ000001")), 1)
+
+    def test_statement_success_rebuilds_only_its_own_security(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            _transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        foreign_payload = replace(payload, security_id="SZ000002")
+        foreign_spec = FormalTaskSpec.from_payload(foreign_payload)
+        foreign_task_id = store.enqueue_formal_task(
+            foreign_spec.kind,
+            foreign_spec.idempotency_key,
+            foreign_spec.refresh_generation,
+            foreign_spec.payload,
+            foreign_spec.prerequisite_task_ids,
+        )
+        self.assertEqual(
+            store.lease_next_formal_task(("formal_statement",), "other-worker", 120)["id"],
+            foreign_task_id,
+        )
+        source_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            source_spec.kind,
+            source_spec.idempotency_key,
+            source_spec.refresh_generation,
+            source_spec.payload,
+            source_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="source-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.rebuilt_security_ids, ("SZ000001",))
+        self.assertEqual(store.list_formal_financial_facts(security_id="SZ000002"), ())
+        self.assertEqual(store.get_formal_task(foreign_task_id)["status"], "leased")
+        feature_tasks = store.list_formal_tasks(kinds=("formal_feature_build",))
+        self.assertEqual(
+            tuple(task["payload"]["security_id"] for task in feature_tasks),
+            ("SZ000001",),
+        )
+
+    def test_changed_statement_generation_supersedes_only_unfinished_feature_generation(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        first_spec = FormalTaskSpec.from_payload(payload)
+        store.enqueue_formal_task(
+            first_spec.kind,
+            first_spec.idempotency_key,
+            first_spec.refresh_generation,
+            first_spec.payload,
+            first_spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+        execute_queued_formal_work(dependencies, worker_id="first-worker", max_jobs=1)
+        first_feature = store.list_formal_tasks(kinds=("formal_feature_build",))[0]
+        self.assertEqual(first_feature["status"], "pending")
+
+        transport.response = _formal_source_tests.response(
+            raw=b'{"statement":"corrected"}',
+            captured_at_utc="2026-09-04T01:00:00+00:00",
+        )
+        next_generation = derive_collection_refresh_generation(
+            upstream_generation="statement-upstream-v2",
+            registry_manifest_hash=manifest_hash,
+            relevant_registry_hashes={
+                "mapping": payload.mapping_registry_hash,
+                "source": payload.source_registry_hash,
+            },
+        )
+        corrected_payload = replace(
+            payload,
+            upstream_generation="statement-upstream-v2",
+            refresh_generation=next_generation,
+        )
+        corrected_spec = FormalTaskSpec.from_payload(corrected_payload)
+        store.enqueue_formal_task(
+            corrected_spec.kind,
+            corrected_spec.idempotency_key,
+            corrected_spec.refresh_generation,
+            corrected_spec.payload,
+            corrected_spec.prerequisite_task_ids,
+        )
+
+        execute_queued_formal_work(dependencies, worker_id="second-worker", max_jobs=1)
+
+        feature_tasks = store.list_formal_tasks(kinds=("formal_feature_build",))
+        self.assertEqual(len(feature_tasks), 2)
+        by_id = {task["id"]: task for task in feature_tasks}
+        self.assertEqual(by_id[first_feature["id"]]["status"], "superseded")
+        self.assertEqual(
+            [task["status"] for task in feature_tasks if task["id"] != first_feature["id"]],
+            ["pending"],
+        )
+
+    def test_statement_source_block_opens_signed_circuit_and_retries_without_fact_write(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(
+            self,
+            transport_error=FormalSourceBlocked("fixture challenge"),
+        )
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        try:
+            summary = execute_queued_formal_work(
+                dependencies, worker_id="blocked-source-worker", max_jobs=1
+            )
+        except FormalSourceBlocked:
+            summary = None
+
+        self.assertIsNotNone(
+            summary,
+            "a blocked signed source must become a retryable task and circuit state",
+        )
+        assert summary is not None
+        self.assertEqual(summary.retryable_failed, 1)
+        self.assertEqual(summary.open_circuits, ("cninfo",))
+        self.assertEqual(len(transport.requests), 1)
+        self.assertEqual(store.list_formal_financial_facts(security_id="SZ000001"), ())
+        task = store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "retryable_failed")
+        self.assertEqual(task["error"]["code"], "source_blocked")
+        circuit = store.get_formal_source_circuit("cninfo")
+        self.assertEqual(circuit["state"], "open")
+        self.assertEqual(circuit["failure_count"], 1)
+
+    def test_statement_retryable_source_error_uses_signed_delay_without_opening_circuit(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(
+            self,
+            transport_error=FormalRetryableSourceError("fixture timeout"),
+        )
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="retryable-source-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.retryable_failed, 1)
+        self.assertEqual(summary.open_circuits, ())
+        self.assertEqual(len(transport.requests), 1)
+        task = store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "retryable_failed")
+        self.assertEqual(task["error"]["code"], "source_retryable_failed")
+        self.assertIsNone(store.get_formal_source_circuit("cninfo"))
+
+    def test_statement_open_circuit_retries_without_transport(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        opened_at = datetime.now(timezone.utc)
+        store.set_formal_source_circuit(
+            "cninfo",
+            state="open",
+            failure_count=1,
+            reason={"code": "prior_challenge"},
+            opened_at_utc=opened_at.isoformat(),
+            retry_after_utc=(opened_at.replace(microsecond=0) + timedelta(minutes=5)).isoformat(),
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="open-circuit-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.retryable_failed, 1)
+        self.assertEqual(summary.open_circuits, ("cninfo",))
+        self.assertEqual(transport.requests, [])
+        task = store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "retryable_failed")
+        self.assertEqual(task["error"]["code"], "source_circuit_open")
+
+    def test_statement_terminal_replay_error_retains_receipt_and_terminalizes(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            parser,
+            manifest_hash,
+            payload,
+        ) = statement_execution_fixture(self)
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        leased = store.lease_next_formal_task(
+            ("formal_statement",), "crashed-owner", 120
+        )
+        self.assertIsNotNone(leased)
+        runtime = runtime_loader.load(manifest_hash)
+        fetch, verification, _ = runtime.source_adapter.fetch_verified(
+            OfficialRequest("cninfo", "profit_sheet", "SZ000001", "2025-12-31", "SZ"),
+            refresh_generation=payload.refresh_generation,
+            calendar_binding=None,
+        )
+        snapshots.persist_verified(
+            fetch,
+            verification,
+            producing_task_id=task_id,
+            worker_id="crashed-owner",
+        )
+        store.fail_formal_task(
+            task_id,
+            "crashed-owner",
+            {"code": "simulated_crash"},
+            "retryable_failed",
+            datetime.now(timezone.utc).isoformat(),
+        )
+        parser.document = replace(parser.document, declared_security_id="SZ000002")
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        try:
+            summary = execute_queued_formal_work(
+                dependencies, worker_id="terminal-replay-worker", max_jobs=1
+            )
+        except FormalTerminalSourceError:
+            summary = None
+
+        self.assertIsNotNone(
+            summary,
+            "a terminal reparse error must retain its receipt and terminalize the leased task",
+        )
+        assert summary is not None
+        self.assertEqual(summary.terminal_failed, 1)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertIsNotNone(store.get_formal_task_snapshot_receipt(task_id))
+        task = store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "terminal_failed")
+        self.assertEqual(task["error"]["code"], "statement_terminal_source_error")
+
+    def test_statement_terminal_reparse_after_fetch_retains_remote_attempt_count(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(
+            self,
+            replay_parse_error=FormalTerminalSourceError("fixture replay parse failure"),
+        )
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="terminal-attempt-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.remote_attempts, 1)
+        self.assertEqual(summary.terminal_failed, 1)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertIsNotNone(store.get_formal_task_snapshot_receipt(task_id))
+        self.assertEqual(store.list_formal_financial_facts(security_id="SZ000001"), ())
+        task = store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "terminal_failed")
+        self.assertEqual(task["error"]["code"], "statement_terminal_source_error")
+
+    def test_statement_initial_terminal_parser_error_counts_actual_transport_attempt(self) -> None:
+        (
+            store,
+            snapshots,
+            runtime_loader,
+            transport,
+            _parser,
+            _manifest_hash,
+            payload,
+        ) = statement_execution_fixture(
+            self,
+            initial_parse_error=FormalTerminalSourceError("fixture initial parser failure"),
+        )
+        spec = FormalTaskSpec.from_payload(payload)
+        task_id = store.enqueue_formal_task(
+            spec.kind,
+            spec.idempotency_key,
+            spec.refresh_generation,
+            spec.payload,
+            spec.prerequisite_task_ids,
+        )
+        dependencies = FormalWorkerDependencies(
+            store=store,
+            snapshots=snapshots,
+            registry_runtime_loader=runtime_loader,
+            feature_store=object(),
+            context_repository=object(),
+        )
+
+        summary = execute_queued_formal_work(
+            dependencies, worker_id="initial-terminal-attempt-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.remote_attempts, 1)
+        self.assertEqual(summary.terminal_failed, 1)
+        self.assertEqual(len(transport.requests), 1)
+        self.assertIsNone(store.get_formal_task_snapshot_receipt(task_id))
+        self.assertEqual(store.list_formal_financial_facts(security_id="SZ000001"), ())
+        task = store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "terminal_failed")
+        self.assertEqual(task["error"]["code"], "statement_terminal_source_error")
+
     def test_thin_context_resolver_mints_a_sealed_canonical_request(self) -> None:
         resolver, root = thin_context_resolver(self)
         request = resolver.resolve(
