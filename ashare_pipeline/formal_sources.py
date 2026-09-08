@@ -1340,11 +1340,9 @@ class FormalOfficialSourceAdapter:
         except ValueError as error:
             raise FormalTerminalSourceError(str(error)) from error
         config = SignedSourceRegistry._trusted_config_snapshot(record.registry, request)
-        if config.bootstrap_calendar and (
-            request.exchange is not None or request.security_id is not None
-        ):
+        if config.bootstrap_calendar and request.security_id is not None:
             raise FormalTerminalSourceError(
-                "bootstrap calendar request must be a global request without an exchange"
+                "bootstrap calendar request must not carry a security_id"
             )
         if config.dataset == "universe_listing" and (
             request.security_id is not None

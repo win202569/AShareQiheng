@@ -1643,6 +1643,7 @@ def _execute_context_task(
         raw_bytes = dependencies.snapshots.read_verified_raw(snapshot)
         if type(raw_bytes) is not bytes or hashlib.sha256(raw_bytes).hexdigest() != snapshot.content_sha256:
             raise ValueError("Context verified raw bytes differ from source hash")
+        fence()
         source_call(lambda: runtime.source_adapter.parse_verified_snapshot(snapshot, raw_bytes,
             calendar_binding=request.calendar_binding))
         fence()

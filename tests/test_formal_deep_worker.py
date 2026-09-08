@@ -1298,12 +1298,14 @@ def date_only_context_fixture(case):
             request_security="none", period_rule="none", exchange_rule="fixed_exchange", fixed_exchange="SZ",
             dataset="trading_calendar", bootstrap_calendar=True),
         context_descriptor(calendar_selector=selector),
-    ], configs=[_formal_source_tests.config(dataset="trading_calendar", bootstrap_calendar=True),
+    ], configs=[_formal_source_tests.config(dataset="trading_calendar", bootstrap_calendar=True,
+                    request_template={"query": {"exchange": "{exchange}"},
+                                      "headers": {"accept": "application/json"}, "body": None}),
                 _formal_source_tests.config(dataset="fixture-state", exchange_scope="SZ", calendar_selector=selector)])
     fixture.transport.response = _formal_source_tests.response(raw=canonical_bytes(dict(no_coverage=False,
         value=dict(exchange="SZ", calendar_version="fixture-v1", trading_days=["2026-08-21", "2026-08-31"]))))
     fixture.parser.document = _formal_source_tests.timestamp_document(declared_security_id=None, declared_period=None,
-        published_at_utc="2026-08-19T07:00:00+00:00", source_updated_at_utc=None)
+        published_at_utc="2026-08-19T07:00:00+00:00", source_updated_at_utc=None, bootstrap_calendar=True)
     return fixture
 
 
@@ -1438,6 +1440,59 @@ class FormalContextWorkerExecutionTests(unittest.TestCase):
                 self.assertEqual(len(facts), 1)
                 if persisted:
                     self.assertEqual(facts[0].id, receipt.facts[0].id)
+
+    def test_context_receipt_replay_lease_loss_after_raw_read_skips_parser_and_recovers(self):
+        fixture = context_execution_fixture(self)
+        task_id, request = enqueue_context(fixture)
+        fixture.store.lease_next_formal_task(("formal_context",), "old-worker", 120)
+        runtime = fixture.dependencies.registry_runtime_loader.load(fixture.registry_root, adapter_freeze_at_utc=AS_OF)
+        fetch, verification, _ = runtime.source_adapter.fetch_verified(request.official_request,
+            refresh_generation=request.refresh_generation, calendar_binding=None)
+        snapshot = fixture.snapshots.persist_verified(fetch, verification,
+            producing_task_id=task_id, worker_id="old-worker")
+        receipt = fixture.store.get_formal_task_snapshot_receipt(task_id)
+        expire_feature_lease_for_next_owner(self, fixture.store, task_id)
+        fixture.transport.requests.clear()
+        fixture.parser.calls.clear()
+        read_verified_raw = fixture.snapshots.read_verified_raw
+
+        def expire_after_read(candidate):
+            raw_bytes = read_verified_raw(candidate)
+            self.assertEqual(candidate.snapshot_id, snapshot.snapshot_id)
+            self.assertEqual(raw_bytes, fetch.raw_bytes)
+            expire_feature_lease_for_next_owner(self, fixture.store, task_id)
+            return raw_bytes
+
+        with patch.object(fixture.snapshots, "read_verified_raw", side_effect=expire_after_read):
+            summary = execute_queued_formal_work(fixture.dependencies, worker_id="old-worker", max_jobs=1)
+
+        task = fixture.store.get_formal_task(task_id)
+        self.assertEqual((task["status"], task["result"], task["error"]), ("leased", None, None))
+        self.assertEqual(task["lease_worker"], "old-worker")
+        self.assertEqual(task["lease_expires_at"], "2000-01-01T00:00:00+00:00")
+        self.assertIsNone(task["next_retry_at"])
+        self.assertEqual((summary.remote_attempts, summary.retryable_failed, summary.terminal_failed,
+                          summary.open_circuits), (0, 0, 0, ()))
+        self.assertIsNone(fixture.store.get_formal_source_circuit("cninfo"))
+        self.assertEqual(fixture.store.list_formal_context_facts(registry_manifest_hash=fixture.registry_root), ())
+        self.assertEqual(fixture.store.get_formal_task_snapshot_receipt(task_id), receipt)
+        self.assertEqual(len(fixture.transport.requests), 0)
+        self.assertEqual(len(fixture.parser.calls), 0)
+
+        recovered = execute_queued_formal_work(fixture.dependencies, worker_id="new-worker", max_jobs=1)
+        task = fixture.store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "verified")
+        self.assertIsNone(task["error"])
+        self.assertEqual((recovered.remote_attempts, len(fixture.transport.requests)), (0, 0))
+        self.assertEqual(len(fixture.parser.calls), 1)
+        self.assertEqual(fixture.store.get_formal_task_snapshot_receipt(task_id), receipt)
+        self.assertEqual(read_verified_raw(snapshot), fetch.raw_bytes)
+        facts = fixture.store.list_formal_context_facts(registry_manifest_hash=fixture.registry_root)
+        self.assertEqual(len(facts), 1)
+        self.assertEqual(facts[0].value, fixture.value)
+        self.assertEqual(facts[0].source_snapshot_id, snapshot.snapshot_id)
+        self.assertEqual((task["result"]["snapshot_id"], task["result"]["fact_id"]),
+            (snapshot.snapshot_id, facts[0].id))
 
     def test_context_malformed_payload_spec_and_stale_generation_fail_before_transport(self):
         for field, value in (("source", "sse"), ("scope_key", "missing"), ("request_version", "wrong"),
@@ -1592,9 +1647,43 @@ class FormalContextWorkerExecutionTests(unittest.TestCase):
         fixture = date_only_context_fixture(self)
         task_id, request = enqueue_context(fixture, context_kind="trading_calendar", scope_key="fixture-calendar-SZ", security_id=None)
         self.assertEqual(request.official_request.exchange, "SZ")
+        self.assertIsNone(request.official_request.security_id)
+        self.assertIsNone(request.official_request.period_or_date)
+        self.assertIsNone(request.calendar_binding)
         summary = execute_queued_formal_work(fixture.dependencies, worker_id="calendar-worker", max_jobs=1)
-        self.assertEqual(fixture.store.get_formal_task(task_id)["status"], "verified")
+        task = fixture.store.get_formal_task(task_id)
+        self.assertEqual(task["status"], "verified")
         self.assertEqual((summary.remote_attempts, len(fixture.transport.requests)), (1, 1))
+        self.assertEqual(fixture.transport.requests[0].url,
+            "https://www.cninfo.com.cn/fixture/annual.json?exchange=SZ")
+        self.assertEqual(len(fixture.parser.calls), 2)
+        for raw_bytes, parsed_request, config in fixture.parser.calls:
+            self.assertEqual(raw_bytes, fixture.transport.response.raw_bytes)
+            self.assertEqual(parsed_request, request.official_request)
+            self.assertTrue(config.bootstrap_calendar)
+        receipt = fixture.store.get_formal_task_snapshot_receipt(task_id)
+        snapshot = fixture.snapshots.get_verified_by_manifest(receipt["manifest_sha256"])
+        self.assertEqual((snapshot.snapshot_id, snapshot.producing_task_id, snapshot.verification_status),
+            (receipt["snapshot_id"], task_id, "verified"))
+        self.assertEqual((snapshot.dataset, snapshot.exchange, snapshot.security_id, snapshot.period_or_date),
+            ("trading_calendar", "SZ", None, None))
+        self.assertEqual(snapshot.request_fingerprint, request.official_request.request_fingerprint)
+        self.assertEqual(snapshot.published_precision, "timestamp")
+        self.assertIsNone(snapshot.effective_time_evidence_hash)
+        self.assertEqual(fixture.snapshots.read_verified_raw(snapshot), fixture.transport.response.raw_bytes)
+        facts = fixture.store.list_formal_context_facts(registry_manifest_hash=fixture.registry_root)
+        self.assertEqual(len(facts), 1)
+        fact = facts[0]
+        self.assertEqual((fact.context_kind, fact.scope_key, fact.security_id),
+            ("trading_calendar", "fixture-calendar-SZ", None))
+        self.assertEqual(fact.value, dict(exchange="SZ", calendar_version="fixture-v1",
+            trading_days=["2026-08-21", "2026-08-31"]))
+        self.assertEqual((fact.source_snapshot_id, fact.source_content_sha256, fact.refresh_generation),
+            (snapshot.snapshot_id, snapshot.content_sha256, request.refresh_generation))
+        self.assertEqual(fact.effective_at_utc, "2026-08-19T07:00:00+00:00")
+        self.assertIsNone(fact.evidence["calendar_binding"])
+        self.assertEqual((task["result"]["snapshot_id"], task["result"]["fact_id"]),
+            (snapshot.snapshot_id, fact.id))
 
     def test_context_date_only_dependent_requires_exact_binding_and_raw_bridge(self):
         from dataclasses import asdict

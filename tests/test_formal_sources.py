@@ -1130,7 +1130,80 @@ class FormalSourceTests(unittest.TestCase):
             )
         self.assertEqual(len(transport.requests), 1)
 
-    def test_bootstrap_calendar_config_and_request_cannot_carry_an_exchange_scope(self):
+    def test_bootstrap_calendar_preserves_explicit_request_exchange(self):
+        bootstrap = config(
+            dataset="trading_calendar",
+            bootstrap_calendar=True,
+            request_template={"query": {}, "headers": {}, "body": None},
+        )
+        document = timestamp_document(
+            declared_security_id=None,
+            declared_period=None,
+            bootstrap_calendar=True,
+        )
+        adapter, transport, parser = self.make_adapter([bootstrap], document)
+        fingerprints = []
+        for exchange in ("SZ", "SH", "SZ", None):
+            with self.subTest(exchange=exchange):
+                request = OfficialRequest("cninfo", "trading_calendar", None, None, exchange)
+                fetch, verification, parsed = adapter.fetch_verified(
+                    request,
+                    refresh_generation="calendar-bootstrap",
+                    calendar_binding=None,
+                )
+
+                self.assertEqual(fetch.request.exchange, exchange)
+                self.assertIsNone(fetch.request.security_id)
+                self.assertEqual(fetch.request.request_fingerprint, request.request_fingerprint)
+                self.assertEqual(fetch.effective_at_utc, document.published_at_utc)
+                self.assertIsNone(fetch.effective_time_evidence_hash)
+                self.assertTrue(parsed.bootstrap_calendar)
+                self.assertEqual(verification.status, "verified")
+                self.assertEqual(
+                    transport.requests[-1].url,
+                    "https://www.cninfo.com.cn/fixture/annual.json",
+                )
+                self.assertEqual(parser.calls[-1][1].exchange, exchange)
+                self.assertIsNone(parser.calls[-1][2].exchange_scope)
+                fingerprints.append(fetch.request.request_fingerprint)
+
+        self.assertEqual(len(transport.requests), 4)
+        self.assertNotEqual(fingerprints[0], fingerprints[1])
+        self.assertEqual(fingerprints[0], fingerprints[2])
+        self.assertNotIn(fingerprints[3], fingerprints[:3])
+
+    def test_bootstrap_calendar_template_uses_each_explicit_exchange(self):
+        bootstrap = config(
+            dataset="trading_calendar",
+            bootstrap_calendar=True,
+            request_template={"query": {"exchange": "{exchange}"}, "headers": {}, "body": None},
+        )
+        document = timestamp_document(
+            declared_security_id=None,
+            declared_period=None,
+            bootstrap_calendar=True,
+        )
+        adapter, transport, parser = self.make_adapter([bootstrap], document)
+        for exchange in ("SZ", "SH", "SZ"):
+            with self.subTest(exchange=exchange):
+                fetch, verification, _ = adapter.fetch_verified(
+                    OfficialRequest("cninfo", "trading_calendar", None, None, exchange),
+                    refresh_generation="calendar-bootstrap",
+                    calendar_binding=None,
+                )
+                self.assertEqual(fetch.request.exchange, exchange)
+                self.assertEqual(verification.status, "verified")
+                self.assertIsNone(parser.calls[-1][2].exchange_scope)
+        self.assertEqual(
+            [sent.url for sent in transport.requests],
+            [
+                "https://www.cninfo.com.cn/fixture/annual.json?exchange=SZ",
+                "https://www.cninfo.com.cn/fixture/annual.json?exchange=SH",
+                "https://www.cninfo.com.cn/fixture/annual.json?exchange=SZ",
+            ],
+        )
+
+    def test_bootstrap_calendar_config_cannot_carry_an_exchange_scope(self):
         invalid = config(
             dataset="trading_calendar",
             bootstrap_calendar=True,
@@ -1142,6 +1215,7 @@ class FormalSourceTests(unittest.TestCase):
                 registry_bytes([invalid]), "fixture-signature", "fixture-key", AcceptingVerifier()
             )
 
+    def test_bootstrap_calendar_rejects_security_identity_before_transport_or_parser(self):
         bootstrap = config(
             dataset="trading_calendar",
             bootstrap_calendar=True,
@@ -1152,13 +1226,46 @@ class FormalSourceTests(unittest.TestCase):
             declared_period=None,
             bootstrap_calendar=True,
         )
-        adapter, transport, _ = self.make_adapter([bootstrap], document)
-        with self.assertRaises(FormalTerminalSourceError):
-            adapter.fetch_verified(
-                OfficialRequest("cninfo", "trading_calendar", None, None, "SZ"),
-                refresh_generation="calendar-bootstrap",
-                calendar_binding=None,
-            )
+        adapter, transport, parser = self.make_adapter([bootstrap], document)
+        for exchange in ("SZ", None):
+            with self.subTest(exchange=exchange):
+                with self.assertRaises(FormalTerminalSourceError):
+                    adapter.fetch_verified(
+                        OfficialRequest("cninfo", "trading_calendar", "SZ000001", None, exchange),
+                        refresh_generation="calendar-bootstrap",
+                        calendar_binding=None,
+                    )
+        self.assertEqual(transport.requests, [])
+        self.assertEqual(parser.calls, [])
+
+    def test_bootstrap_calendar_replay_rejects_changed_exchange_before_parser(self):
+        bootstrap = config(
+            dataset="trading_calendar",
+            bootstrap_calendar=True,
+            request_template={"query": {}, "headers": {}, "body": None},
+        )
+        document = timestamp_document(
+            declared_security_id=None,
+            declared_period=None,
+            bootstrap_calendar=True,
+        )
+        adapter, transport, parser = self.make_adapter([bootstrap], document)
+        request = OfficialRequest("cninfo", "trading_calendar", None, None, "SZ")
+        raw = b"bootstrap-calendar"
+        ref = snapshot_ref(request, raw, document)
+
+        parsed = adapter.parse_verified_snapshot(ref, raw, calendar_binding=None)
+        self.assertTrue(parsed.bootstrap_calendar)
+        self.assertEqual(parsed.rows, document.rows)
+        self.assertEqual(len(parser.calls), 1)
+
+        for exchange in ("SH", None):
+            with self.subTest(exchange=exchange):
+                with self.assertRaisesRegex(FormalTerminalSourceError, "fingerprint"):
+                    adapter.parse_verified_snapshot(
+                        replace(ref, exchange=exchange), raw, calendar_binding=None
+                    )
+        self.assertEqual(len(parser.calls), 1)
         self.assertEqual(transport.requests, [])
 
     def test_universe_listing_requires_global_explicit_typed_status_rows(self):
