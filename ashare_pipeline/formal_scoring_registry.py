@@ -19,6 +19,7 @@ from typing import Literal
 import weakref
 
 from .formal_feature_contract import FormalFeatureSlot, SignedFormalFeatureRegistry
+from .formal_context_schema import _canonical as _context_canonical, _descriptor
 from .formal_registry_manifest import VerifiedRegistryBundle
 
 
@@ -308,10 +309,67 @@ def _metric(wire, template_id, dimension, metric_id, weight, slots, policies, co
     return MetricDefinition(**values)
 
 
+def _consensus_links(wrapper, templates):
+    descriptors = wrapper["descriptors"]
+    seen = set()
+    by_hash = {}
+    for descriptor in descriptors:
+        _descriptor(descriptor)
+        identity = (descriptor["context_kind"], descriptor["scope_key"], descriptor["security_scope"])
+        if identity in seen:
+            raise RegistryValidationError("duplicate Context descriptor")
+        seen.add(identity)
+        digest = hashlib.sha256(_context_canonical(descriptor)).hexdigest()
+        if digest in by_hash:
+            raise RegistryValidationError("ambiguous Context descriptor hash")
+        by_hash[digest] = descriptor
+    alternatives = wrapper["input_alternatives"]
+    if type(alternatives) is not list:
+        raise RegistryValidationError("input_alternatives must be an explicit array")
+    result = {}
+    template_ids = []
+    for alternative in alternatives:
+        _keys(alternative, ("rule_id", "template_id", "metric_id", "feature_key", "descriptor_id"), "input alternative")
+        for field in ("rule_id", "template_id", "metric_id", "feature_key", "descriptor_id"):
+            _text(alternative[field], f"input alternative {field}")
+        template_id = alternative["template_id"]
+        template_ids.append(template_id)
+        if alternative["rule_id"] != "consensus-no-coverage-neutral-v1":
+            raise RegistryValidationError("unsupported input alternative rule_id")
+        if template_id not in templates:
+            raise RegistryValidationError("input alternative template_id is not a V3 template")
+        if alternative["metric_id"] != "T.expectation_change":
+            raise RegistryValidationError("input alternative metric_id must be T.expectation_change")
+        expectation = next(metric for metric in templates[template_id].metrics["T"]
+            if metric.metric_id == "expectation_change")
+        feature_key = alternative["feature_key"]
+        if expectation.required_feature_keys != (feature_key,) or expectation.formula != {
+                "op": "feature", "feature_key": feature_key} or expectation.field_map != {"value": feature_key}:
+            raise RegistryValidationError("input alternative feature_key differs from the sole expectation_change adapter")
+        if any(feature_key in metric.required_feature_keys for dimension in templates[template_id].metrics.values()
+                for metric in dimension if metric is not expectation):
+            raise RegistryValidationError("input alternative feature_key is shared by another metric")
+        descriptor_id = _hash(alternative["descriptor_id"], "input alternative descriptor_id")
+        linked = by_hash.get(descriptor_id)
+        if linked is None:
+            raise RegistryValidationError("input alternative descriptor_id is absent")
+        if (linked["context_kind"], linked["security_scope"], linked["request_security"], linked["period_rule"]) != (
+                "consensus_snapshot", "security", "input_security", "freeze_date_cn"):
+            raise RegistryValidationError("input alternative descriptor has incompatible Context semantics")
+        result[template_id] = _freeze(dict(alternative, context_kind=linked["context_kind"], scope_key=linked["scope_key"]))
+    if template_ids != sorted(template_ids) or len(set(template_ids)) != len(template_ids):
+        raise RegistryValidationError("input alternatives must be unique and sorted by template_id")
+    return MappingProxyType(result)
+
+
 def _parse(raw, approval, bundle, feature_registry):
     wrapper = _load(raw)
-    _keys(wrapper, ("registry_role", "schema_version", "descriptors", "scoring"), "scoring wrapper")
-    if wrapper["registry_role"] != "scoring" or wrapper["schema_version"] != "formal-scoring-registry-v1":
+    version = wrapper.get("schema_version")
+    expected_wrapper = ("registry_role", "schema_version", "descriptors", "scoring")
+    if version == "formal-scoring-registry-v2":
+        expected_wrapper += ("input_alternatives",)
+    _keys(wrapper, expected_wrapper, "scoring wrapper")
+    if wrapper["registry_role"] != "scoring" or version not in ("formal-scoring-registry-v1", "formal-scoring-registry-v2"):
         raise RegistryValidationError("unsupported scoring wrapper")
     if type(wrapper["descriptors"]) is not list:
         raise RegistryValidationError("descriptors must be an array")
@@ -381,6 +439,8 @@ def _parse(raw, approval, bundle, feature_registry):
             metrics[d] = tuple(_metric(w, t, d, m, weight, slots[t], policies, contracts)
                 for w, m, weight in zip(values, metric_ids, internal[d]))
         templates[t] = TemplateDefinition(t, MappingProxyType(metrics))
+    consensus_links = (_consensus_links(wrapper, templates) if version == "formal-scoring-registry-v2"
+        else MappingProxyType({}))
     cyclic = _rule(scoring["cyclic_rule"], policies, contracts, ("cyclic",))
     cyclic_wire = policies["cyclic"]["rules"][cyclic.rule_id]
     _keys(cyclic_wire, ("secondary_industries",), "cyclic classification")
@@ -399,7 +459,7 @@ def _parse(raw, approval, bundle, feature_registry):
         cyclic_secondary_industries=industries, cyclic_rule=cyclic, market_liquidity_rule=market,
         policy_contracts=_freeze(contracts), approval=RegistryApproval(approval.purpose, approval.approved_content_sha256, approval.approval_id),
         registry_manifest_hash=bundle.manifest.manifest_hash if bundle is not None else None,
-        role_hashes=MappingProxyType(role_hashes), **references)
+        role_hashes=MappingProxyType(role_hashes), consensus_no_coverage_links=consensus_links, **references)
 
 
 def _trusted_registry():
@@ -442,6 +502,7 @@ def _trusted_registry():
         approval: RegistryApproval
         registry_manifest_hash: str | None
         role_hashes: Mapping[str, str]
+        consensus_no_coverage_links: Mapping[str, Mapping[str, str]]
 
         def __init__(self, *args, **kwargs):
             raise RegistryValidationError("FormalScoringRegistry requires load_formal_registry")

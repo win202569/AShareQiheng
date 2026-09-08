@@ -65,7 +65,19 @@ class FixtureNormalizer:
 
 
 class ScoringWrapperIntegrationTests(unittest.TestCase):
-    def load_wrapper(self, mutate=None):
+    @staticmethod
+    def v2(documents):
+        wrapper = documents["scoring"]
+        linked = descriptor("consensus_snapshot", scope_key="fixture-consensus")
+        descriptor_id = hashlib.sha256(canonical(linked)).hexdigest()
+        metric = wrapper["scoring"]["templates"]["bank"]["metrics"]["T"][2]
+        wrapper.update(schema_version="formal-scoring-registry-v2",
+            input_alternatives=[dict(rule_id="consensus-no-coverage-neutral-v1", template_id="bank",
+                metric_id="T.expectation_change", feature_key=metric["required_feature_keys"][0],
+                descriptor_id=descriptor_id)])
+        wrapper["descriptors"].append(linked)
+
+    def load_wrapper(self, mutate=None, *, context_kind="security_state", scope_key="fixture-state"):
         from tests.test_formal_scoring_registry import signed_graph
         from ashare_pipeline.formal_context_schema import FormalContextRegistry, SignedContextRequestResolver
         bundle, _, repository, verifier = signed_graph(context=True, mutate=mutate)
@@ -78,7 +90,7 @@ class ScoringWrapperIntegrationTests(unittest.TestCase):
         store.put_formal_registry_manifest(repository.manifest)
         registry = FormalContextRegistry.load(store, verifier, bundle.manifest.manifest_hash)
         resolver = SignedContextRequestResolver(store, verifier)
-        request = resolver.resolve(context_kind="security_state", scope_key="fixture-state", security_id="SZ000001",
+        request = resolver.resolve(context_kind=context_kind, scope_key=scope_key, security_id="SZ000001",
             as_of_utc=FREEZE, registry_manifest_hash=bundle.manifest.manifest_hash, upstream_generation="wrapper-test")
         return registry.descriptor_for(request), request
 
@@ -87,18 +99,33 @@ class ScoringWrapperIntegrationTests(unittest.TestCase):
             docs["scoring"].pop("scoring")
             docs["scoring"]["schema_version"] = "formal-context-registry-v1"
         old_descriptor, old_request = self.load_wrapper(legacy)
+        v1_descriptor, v1_request = self.load_wrapper()
         try:
-            new_descriptor, new_request = self.load_wrapper()
+            v2_descriptor, v2_request = self.load_wrapper(self.v2)
         except ValueError as error:
-            self.fail(f"the explicitly versioned combined wrapper must be accepted: {error}")
-        self.assertEqual(old_descriptor, new_descriptor)
-        self.assertEqual(old_request.descriptor_id, new_request.descriptor_id)
-        self.assertEqual(new_request.official_request.dataset, "fixture-state")
+            self.fail(f"the explicitly versioned combined wrappers must be accepted: {error}")
+        self.assertEqual(old_descriptor, v1_descriptor)
+        self.assertEqual(v1_descriptor, v2_descriptor)
+        self.assertEqual(old_request.descriptor_id, v1_request.descriptor_id)
+        self.assertEqual(v1_request.descriptor_id, v2_request.descriptor_id)
+        self.assertEqual(v2_request.official_request.dataset, "fixture-state")
+
+    def test_v2_linked_consensus_descriptor_resolves_with_canonical_entry_id(self):
+        linked_descriptor, request = self.load_wrapper(self.v2,
+            context_kind="consensus_snapshot", scope_key="fixture-consensus")
+        self.assertEqual(linked_descriptor, descriptor("consensus_snapshot", scope_key="fixture-consensus"))
+        self.assertEqual(request.descriptor_id, hashlib.sha256(canonical(linked_descriptor)).hexdigest())
+        self.assertEqual(request.official_request.dataset, "fixture-state")
 
     def test_combined_wrapper_rejects_unknown_keys_versions_and_invalid_descriptors(self):
+        def v2_non_list(documents):
+            self.v2(documents)
+            documents["scoring"]["input_alternatives"] = {}
+
         for mutation in (lambda d: d["scoring"].update(extra=True),
-            lambda d: d["scoring"].update(schema_version="formal-scoring-registry-v2"),
+            lambda d: d["scoring"].update(schema_version="formal-scoring-registry-v999"),
             lambda d: d["scoring"].update(scoring=[]),
+            v2_non_list,
             lambda d: d["scoring"]["descriptors"][0].update(extra=True)):
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 self.load_wrapper(mutation)
