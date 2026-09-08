@@ -2309,8 +2309,16 @@ class OrchestratorTestCase(unittest.TestCase):
         self.assertEqual(changed_deep_jobs, initial_deep_jobs + 1)
 
     def test_relative_root_online_run_persists_resolvable_snapshot_paths_and_rebuilds_curated(self):
-        relative_root = Path(os.path.relpath(self.root, Path.cwd()))
-        relative_db = Path(os.path.relpath(self.db, Path.cwd()))
+        # Windows cannot express a relative path across the system-temp and
+        # project drives. Keep this fixture on the actual working directory's drive.
+        temporary = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name) / "data"
+        db = Path(temporary.name) / "state.sqlite3"
+        relative_root = Path(os.path.relpath(root, Path.cwd()))
+        relative_db = Path(os.path.relpath(db, Path.cwd()))
+        self.assertFalse(relative_root.is_absolute())
+        self.assertFalse(relative_db.is_absolute())
 
         status, code = orchestrator.run_command(
             relative_root,
@@ -2323,8 +2331,8 @@ class OrchestratorTestCase(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(status["curated"]["universe"]["universe_count"], 2)
-        self.assertTrue((self.root / "curated" / "performance.json").exists())
-        with closing(sqlite3.connect(self.db)) as connection:
+        self.assertTrue((root / "curated" / "performance.json").exists())
+        with closing(sqlite3.connect(db)) as connection:
             paths = [row[0] for row in connection.execute("SELECT payload_path FROM source_snapshot")]
         self.assertTrue(paths)
         self.assertTrue(

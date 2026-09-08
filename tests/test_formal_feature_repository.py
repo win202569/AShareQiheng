@@ -45,6 +45,9 @@ class FormalFeatureRepositoryApiTests(unittest.TestCase):
 
 class FormalFeatureRepositoryTests(unittest.TestCase):
     install_fact = state_store_tests.FormalV6PersistenceTests.install_fact
+    install_eligible_bundle_facts = (
+        state_store_tests.FormalV6PersistenceTests.install_eligible_bundle_facts
+    )
 
     def setUp(self):
         self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_feature_repository"))
@@ -55,17 +58,18 @@ class FormalFeatureRepositoryTests(unittest.TestCase):
         self.db_path = self.root / "state.sqlite"
         self.store = StateStore(self.db_path)
         self.store.initialize()
-        earlier = tuple(self.install_fact(report_period=period, value=value) for period, value in (
-            ("2025-03-31", 20.0), ("2025-06-30", 45.0), ("2025-09-30", 75.0),
-        ))
-        self.fact = self.install_fact()
-        self.store.insert_formal_financial_facts((*earlier, self.fact))
+        facts = self.install_eligible_bundle_facts()
+        self.fact = next(fact for fact in facts if fact.period_end == "2025-12-31")
+        self.store.insert_formal_financial_facts(facts)
         self.verifier = DigestVerifier()
         self.files = FormalFeatureBundleStore(self.root)
         self.install_registry()
         self.bundle = self.build()
         self.assertEqual(self.bundle.blockers, ())
-        self.assertEqual(self.bundle.comparable_quarter_keys, ("2025Q1", "2025Q2", "2025Q3", "2025Q4"))
+        self.assertEqual(self.bundle.comparable_quarter_keys, (
+            "2024Q1", "2024Q2", "2024Q3", "2024Q4", "2025Q1",
+            "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2",
+        ))
         self.store.put_formal_feature_bundle(self.bundle, self.files.write(self.bundle))
         self.repo = self.repository()
 
@@ -74,14 +78,15 @@ class FormalFeatureRepositoryTests(unittest.TestCase):
         args.update(changes)
         return self.api.FormalFeatureRepository(self.store, FormalFeatureBundleStore(self.root), **args)
 
-    def install_registry(self, *, required=True, templates=TEMPLATES, purpose="official", wrong_binding=False):
+    def install_registry(self, *, required=True, templates=TEMPLATES, purpose="official", wrong_binding=False,
+                         period_key="FY2025"):
         roles = ("source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event")
         raw = {role: canonical_bytes({"registry_role": role, "schema_version": "fixture-v1"}) for role in roles}
         raw["source"] = canonical_bytes({"registry_role": "source", "schema_version": "formal-source-registry-v1", "configs": []})
         raw["feature"] = feature_registry_bytes(template_ids=templates,
             source_registry_hash="f" * 64 if wrong_binding else hashlib.sha256(raw["source"]).hexdigest(),
             mapping_registry_hash=hashlib.sha256(raw["mapping"]).hexdigest(),
-            slots=sorted([slot_wire(t, required=required, unit="CNY", formula={"op": "fact", "fact_key": "revenue", "period_key": "FY2025"}) for t in templates], key=lambda s: s["slot_id"]))
+            slots=sorted([slot_wire(t, required=required, unit="CNY", formula={"op": "fact", "fact_key": "revenue", "period_key": period_key}) for t in templates], key=lambda s: s["slot_id"]))
         hashes = {f"{role}_registry_hash": hashlib.sha256(value).hexdigest() for role, value in raw.items()}
         approval = "test-approval" if purpose == "official" else None
         root_bytes = canonical_bytes({"schema_version": "formal-registry-manifest-v1", "purpose": purpose, "approval_id": approval, **hashes})
@@ -358,8 +363,15 @@ class FormalFeatureRepositoryTests(unittest.TestCase):
                 self.select(repo)
 
     def test_optional_missing_slot_is_readable_with_empty_evidence(self):
-        self.install_registry(required=False)
-        bundle = self.build(facts=())
+        # An optional unobserved period must not erase the universal history gate.
+        self.install_registry(required=False, period_key="FY2021")
+        immature = self.build(facts=())
+        self.assertIn("pending_evidence/history_not_mature", immature.blockers)
+        self.store.put_formal_feature_bundle(immature, self.files.write(immature))
+        with self.assertRaisesRegex(ValueError, "blocked"):
+            self.repository().get_verified_formal_feature_bundle(input_hash=immature.input_hash)
+        bundle = self.build()
+        self.assertEqual(bundle.blockers, ())
         self.store.put_formal_feature_bundle(bundle, self.files.write(bundle))
         result = self.repository().get_verified_formal_feature_bundle(input_hash=bundle.input_hash)
         self.assertEqual(result.values[0].status, "missing")
@@ -527,11 +539,17 @@ class FormalFeatureRepositoryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.api.FormalFeatureRepository(store, files, registry_signature_verifier=self.verifier)
 
-    def test_fy_only_duration_remains_audit_only_despite_derived_annual_slot(self):
+    def test_fy_only_duration_remains_audit_only_despite_available_annual_fact(self):
         audit = self.build(facts=(self.fact,))
-        self.assertEqual(audit.blockers, ("quarter_missing_prerequisite",))
-        self.assertEqual(audit.values[0].value, 100.0)
-        self.assertEqual(audit.values[0].status, "derived")
+        self.assertEqual(audit.blockers, (
+            "history_annual_window_incomplete", "history_quarter_window_incomplete",
+            "pending_evidence/history_not_mature", "quarter_missing_prerequisite",
+        ))
+        self.assertEqual(self.fact.value, 100.0)
+        self.assertIsNone(audit.values[0].value)
+        self.assertEqual(audit.values[0].status, "blocked")
+        self.assertEqual(audit.values[0].evidence, ())
+        self.assertEqual(audit.values[0].missing_reason, "feature_input_not_trustworthy")
         self.store.put_formal_feature_bundle(audit, self.files.write(audit))
         with self.assertRaisesRegex(ValueError, "blocked"):
             self.repo.get_verified_formal_feature_bundle(input_hash=audit.input_hash)
