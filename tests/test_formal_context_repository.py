@@ -216,6 +216,52 @@ class ContextIntegrationTests(unittest.TestCase):
         args.update(changes)
         return self.repo.get_verified(**args)
 
+    def test_batch_selection_preserves_single_result_and_actual_absence(self):
+        self.assertTrue(callable(getattr(self.repo, "get_verified_many", None)), "verified batch selection is required")
+        fact, _, _ = self.put()
+        result = self.repo.get_verified_many("security_state", "fixture-state",
+            ("SH600000", "SZ000001"), FREEZE, self.manifest.manifest_hash)
+        self.assertEqual(tuple(result), ("SH600000", "SZ000001"))
+        self.assertIsNone(result["SH600000"])
+        self.assertEqual(result["SZ000001"].canonical_bytes(), self.get().canonical_bytes())
+        self.assertEqual(result["SZ000001"].id, fact.id)
+        with self.assertRaises(TypeError):
+            result["SH600000"] = fact
+
+    def test_batch_rejects_invalid_identity_instead_of_absence(self):
+        for ids in ((), ["SZ000001"], (None,), ("sz000001",), ("SZ000001", "SH600000"),
+                ("SZ000001", "SZ000001")):
+            with self.subTest(ids=ids), self.assertRaises(ValueError):
+                self.repo.get_verified_many("security_state", "fixture-state", ids, FREEZE, self.manifest.manifest_hash)
+        for kind in ("trading_calendar", "unknown", None):
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                self.repo.get_verified_many(kind, "fixture-state", ("SZ000001",), FREEZE, self.manifest.manifest_hash)
+
+    def test_batch_corruption_does_not_become_absence(self):
+        _, ref, _ = self.put()
+        self.sql("DELETE FROM formal_task_snapshot_receipt WHERE task_id=?", (ref.producing_task_id,))
+        with self.assertRaises(ValueError):
+            self.repo.get_verified_many("security_state", "fixture-state", ("SZ000001",), FREEZE, self.manifest.manifest_hash)
+
+    def test_batch_detects_correction_between_scope_snapshots(self):
+        self.put()
+        original = self.store.list_formal_context_facts
+        calls = []
+        def read(**kwargs):
+            result = original(**kwargs)
+            calls.append(1)
+            if len(calls) == 1:
+                self.put(request=self.request(upstream_generation="correction"), published="2026-08-25T07:00:00+00:00")
+            return result
+        with patch.object(self.store, "list_formal_context_facts", read), self.assertRaisesRegex(ValueError, "race"):
+            self.repo.get_verified_many("security_state", "fixture-state", ("SZ000001",), FREEZE, self.manifest.manifest_hash)
+
+    def test_batch_preserves_leading_tie_failure(self):
+        self.put()
+        self.put(request=self.request(upstream_generation="batch-tie"))
+        with self.assertRaisesRegex(ValueError, "leading"):
+            self.repo.get_verified_many("security_state", "fixture-state", ("SZ000001",), FREEZE, self.manifest.manifest_hash)
+
     def test_signed_descriptor_exact_identity_and_no_direct_trust_minting(self):
         request = self.request()
         self.assertEqual(request.official_request.period_or_date, "2026-08-31")

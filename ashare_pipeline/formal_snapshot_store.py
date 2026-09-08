@@ -12,6 +12,8 @@ import re
 import tempfile
 from typing import Callable
 
+from .formal_repository_identity import _track_repository_constructor
+
 from .formal_evidence import (
     EvidenceVerification,
     OfficialFetch,
@@ -102,6 +104,7 @@ def _unique_manifest_object(pairs: list[tuple[str, object]]) -> dict[str, object
 class FormalSnapshotStore:
     """Persist verified official fetches without decoding or re-encoding their bytes."""
 
+    @_track_repository_constructor
     def __init__(
         self,
         root: str | Path,

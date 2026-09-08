@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .formal_repository_identity import _track_repository_constructor
+
 from .formal_evidence import (
     EvidenceVerification,
     OfficialFetch,
@@ -45,6 +47,7 @@ _REF_FIELDS = (
 class FormalSnapshotRepository:
     """The sole application boundary for verified formal snapshot references."""
 
+    @_track_repository_constructor
     def __init__(self, root: str | Path, state_store: StateStore) -> None:
         if type(state_store) is not StateStore:
             raise ValueError("state_store must have exact type StateStore")

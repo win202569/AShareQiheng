@@ -3,8 +3,10 @@
 from dataclasses import asdict
 from datetime import datetime, date, time
 import weakref
+from types import MappingProxyType
 
 from .formal_context_schema import (FormalContextFact, FormalContextNormalization, FormalContextRegistry,
+    CONTEXT_KINDS,
     FormalContextVersionView, SignedContextRequestResolver, _canonical, _load, _verify_context_fact,
     _timestamp, _selector, _security, _text, _exchange, _hash)
 from .formal_evidence import VerifiedCalendarBinding
@@ -360,6 +362,57 @@ class FormalContextRepository:
             raise ValueError("trading calendars require an exchange selector")
         return self._select(kind, scope_key, security_id, as_of_utc, registry_manifest_hash)
 
+    def get_verified_many(self, kind, scope_key, security_ids, as_of_utc, registry_manifest_hash):
+        """Verify a complete scope twice, selecting each requested security once.
+
+        None denotes actual absence; malformed evidence and selection races raise.
+        This detached snapshot does not promise indefinite latest-state validity.
+        """
+        if type(kind) is not str or kind not in CONTEXT_KINDS:
+            raise ValueError("invalid Context kind")
+        if kind == "trading_calendar":
+            raise ValueError("trading calendars require an exchange selector")
+        if (type(security_ids) is not tuple or not security_ids
+                or any(type(item) is not str for item in security_ids)
+                or tuple(sorted(set(security_ids))) != security_ids):
+            raise ValueError("Context batch requires a nonempty sorted unique exact tuple")
+        for security_id in security_ids:
+            _security(security_id)
+        _timestamp(as_of_utc)
+        _text(scope_key)
+        _hash(registry_manifest_hash)
+        self._load(registry_manifest_hash)
+        def snapshot():
+            return self._state_store.list_formal_context_facts(registry_manifest_hash=registry_manifest_hash,
+                context_kind=kind, scope_key=scope_key, as_of_utc=as_of_utc)
+        before = snapshot()
+        grouped = {security_id: [] for security_id in security_ids}
+        for fact in before:
+            if fact.security_id in grouped:
+                grouped[fact.security_id].append(fact)
+        selected = {}
+        for security_id, candidates in grouped.items():
+            if not candidates:
+                selected[security_id] = None
+                continue
+            for fact in candidates:
+                with self._state_store._transaction() as connection:
+                    _validate_stored_fact(self._state_store, connection, fact, self._verifier,
+                        snapshot_repository=self._snapshots)
+                for field in ("published_at_utc", "effective_at_utc", "source_updated_at_utc"):
+                    if getattr(fact, field) is not None and _timestamp(getattr(fact, field)) > _timestamp(as_of_utc):
+                        raise ValueError("Context future source time")
+            ordered = sorted(candidates, key=lambda fact: formal_version_sort_key(FormalContextVersionView.from_fact(fact)))
+            key = formal_version_sort_key(FormalContextVersionView.from_fact(ordered[0]))
+            if sum(formal_version_sort_key(FormalContextVersionView.from_fact(fact)) == key for fact in candidates) != 1:
+                raise ValueError("multiple equal leading Context versions")
+            selected[security_id] = FormalContextFact.from_dict(ordered[0].to_dict())
+        self._load(registry_manifest_hash)
+        after = snapshot()
+        if tuple(fact.canonical_bytes() for fact in before) != tuple(fact.canonical_bytes() for fact in after):
+            raise ValueError("Context correction race during verification")
+        return MappingProxyType(selected)
+
     def resolve_verified_calendar_binding(self, selector, exchange, as_of_utc, registry_manifest_hash):
         self._load(registry_manifest_hash)
         if type(selector) is not CalendarSelector:
@@ -382,6 +435,37 @@ class FormalContextRepository:
         return VerifiedCalendarBinding(snapshot_id=ref.snapshot_id, manifest_sha256=ref.manifest_sha256,
             exchange=exchange, freeze_at_utc=as_of_utc, registry_manifest_hash=registry_manifest_hash,
             selector_hash=copied.selector_hash, prerequisite_task_id=ref.producing_task_id)
+
+
+def _context_repository_identity():
+    """Only genuine constructor calls register Context dependencies for metrics.
+
+    Existing single-Context read semantics remain unchanged. Copies have no
+    registration and cannot become a metric prerequisite merely by copying fields.
+    """
+    initialized = {}
+    original_init = FormalContextRepository.__init__
+
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        identity = id(self)
+        initialized[identity] = (weakref.ref(self, lambda _: initialized.pop(identity, None)),
+            self._state_store, self._snapshots, self._verifier)
+
+    def require(repository):
+        record = initialized.get(id(repository))
+        if type(repository) is not FormalContextRepository or record is None or record[0]() is not repository:
+            raise ValueError("Context repository is uninitialized or copied")
+        if any(actual is not expected for actual, expected in zip(
+                (repository._state_store, repository._snapshots, repository._verifier), record[1:], strict=True)):
+            raise ValueError("Context repository initialized dependencies changed")
+
+    FormalContextRepository.__init__ = init
+    return require
+
+
+_require_authentic_context_repository = _context_repository_identity()
+del _context_repository_identity
 
 
 def build_effective_time_resolver(repository):

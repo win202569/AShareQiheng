@@ -1054,15 +1054,20 @@ class StateStoreTestCase(unittest.TestCase):
         *,
         label: str = "universe",
         db_path: Path | None = None,
+        registry_manifest_hash: str = "7" * 64,
+        source_registry_hash: str = "8" * 64,
+        registry_signature_verifier=None,
+        formal_snapshot_store=None,
+        exchange_rows=None,
     ) -> tuple[StateStore, FormalFrozenUniverseInput, dict[str, str]]:
         path = db_path or self.db_path
         if path != self.db_path:
             StateStore(path).initialize()
-        raw_store = FormalSnapshotStore(
+        raw_store = formal_snapshot_store or FormalSnapshotStore(
             Path(self.tempdir.name) / f"formal-universe-raw-{label}"
         )
-        store = StateStore(path, formal_snapshot_store=raw_store)
-        registry_manifest_hash = "7" * 64
+        store = StateStore(path, formal_snapshot_store=raw_store,
+            registry_signature_verifier=registry_signature_verifier)
         as_of_utc = "2026-08-31T15:00:00+08:00"
         exchange_values = {
             "BJ": ("bse", "https://www.bse.cn/listing", "430001"),
@@ -1098,7 +1103,7 @@ class StateStoreTestCase(unittest.TestCase):
                 ),
                 "refresh_generation": generation,
                 "registry_manifest_hash": registry_manifest_hash,
-                "relevant_registry_hashes": [["source_registry", "8" * 64]],
+                "relevant_registry_hashes": [["source_registry", source_registry_hash]],
                 "request_version": "universe-listing-v1",
                 "source": source,
                 "upstream_generation": "9" * 64,
@@ -1128,6 +1133,8 @@ class StateStoreTestCase(unittest.TestCase):
                     "security_id": "BJ899001",
                     "security_type": "bond",
                 },)
+            if exchange_rows is not None:
+                rows = tuple(exchange_rows[exchange])
             raw_bytes = json.dumps(
                 list(rows),
                 ensure_ascii=False,

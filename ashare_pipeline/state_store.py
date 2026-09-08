@@ -13,6 +13,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
+from .formal_repository_identity import _track_repository_constructor
+
 from ashare_pipeline.feature_contract import (
     DIMENSIONS,
     FINANCIAL_DIMENSIONS,
@@ -1530,6 +1532,7 @@ def _validate_and_bind_reconciliation_issue(
 
 
 class StateStore:
+    @_track_repository_constructor
     def __init__(
         self,
         db_path: str | Path,
@@ -3598,6 +3601,22 @@ class StateStore:
                 return None
             self._formal_universe_from_connection(connection, row)
             return dict(row)
+
+    def get_verified_formal_frozen_universe(
+        self, frozen_input_hash: str
+    ) -> FormalFrozenUniverseInput | None:
+        """Replay the entire persisted source/member/status graph in one read."""
+        self._require_formal_snapshot_store()
+        _require_formal_sha256(frozen_input_hash, "universe frozen input hash")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM formal_universe_snapshot WHERE frozen_input_hash = ?",
+                (frozen_input_hash,),
+            ).fetchone()
+            if row is None:
+                return None
+            frozen, _ = self._formal_universe_from_connection(connection, row)
+            return frozen
 
     def list_formal_universe_sources(
         self, universe_snapshot_id: str
