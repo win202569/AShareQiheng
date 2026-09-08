@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
@@ -17,7 +18,13 @@ from ashare_pipeline.formal_time import FORMAL_FREEZE_AT_CN, is_visible_at
 Exchange = Literal["SH", "SZ", "BJ"]
 UniverseStatus = Literal["out_of_scope", "pending_evidence", "pool_vetoed", "formal_scored"]
 _EXCHANGES = frozenset({"SH", "SZ", "BJ"})
-_OFFICIAL_LISTING_DATASETS = frozenset({"official_security_listing"})
+_OFFICIAL_LISTING_DATASETS = frozenset({"official_security_listing", "universe_listing"})
+# Keep historical +08:00 input hashes stable while accepting the worker's
+# canonical UTC representation of the very same, fixed market close.
+_FORMAL_FREEZE_REPRESENTATIONS = frozenset({
+    FORMAL_FREEZE_AT_CN,
+    datetime.fromisoformat(FORMAL_FREEZE_AT_CN).astimezone(timezone.utc).isoformat(),
+})
 _SECURITY_ID = re.compile(r"^(?:SH|SZ|BJ)[0-9]{6}$")
 _SECURITY_TYPES = frozenset({
     "ordinary_a", "b_share", "fund", "etf", "bond", "convertible",
@@ -389,8 +396,8 @@ def _frozen_input_hash(
 
 
 def _validate_frozen_universe_input(frozen: FormalFrozenUniverseInput) -> None:
-    if frozen.as_of_utc != FORMAL_FREEZE_AT_CN:
-        raise ValueError(f"formal universe freeze must be exactly {FORMAL_FREEZE_AT_CN}")
+    if type(frozen.as_of_utc) is not str or frozen.as_of_utc not in _FORMAL_FREEZE_REPRESENTATIONS:
+        raise ValueError(f"formal universe freeze must be exactly {FORMAL_FREEZE_AT_CN} or its canonical UTC representation")
     _nonempty_text(frozen.registry_manifest_hash, "registry_manifest_hash")
     if not isinstance(frozen.sources, tuple) or len(frozen.sources) != 3:
         raise ValueError("formal frozen universe requires three verified SH/SZ/BJ sources")
@@ -449,8 +456,8 @@ class FormalUniverseIngestor:
         registry_manifest_hash: str,
         documents: Sequence[FormalUniverseSourceDocument],
     ) -> FormalFrozenUniverseInput:
-        if as_of_utc != FORMAL_FREEZE_AT_CN:
-            raise ValueError(f"formal universe freeze must be exactly {FORMAL_FREEZE_AT_CN}")
+        if type(as_of_utc) is not str or as_of_utc not in _FORMAL_FREEZE_REPRESENTATIONS:
+            raise ValueError(f"formal universe freeze must be exactly {FORMAL_FREEZE_AT_CN} or its canonical UTC representation")
         _nonempty_text(registry_manifest_hash, "registry_manifest_hash")
         materialized = tuple(documents)
         if len(materialized) != 3 or {document.exchange for document in materialized if isinstance(document, FormalUniverseSourceDocument)} != _EXCHANGES:

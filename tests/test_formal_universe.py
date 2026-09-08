@@ -84,6 +84,41 @@ def verified_listing_documents(*exchanges: str) -> tuple[FormalUniverseSourceDoc
 
 
 class FormalUniverseTests(unittest.TestCase):
+    def test_ingestor_accepts_signed_universe_listing_without_rewriting_snapshot_identity(self):
+        documents = tuple(
+            replace(document, snapshot=replace(document.snapshot, dataset="universe_listing"))
+            for document in verified_listing_documents("SZ", "BJ", "SH")
+        )
+        frozen = FormalUniverseIngestor().build(FORMAL_FREEZE_AT_CN, "a" * 64, documents)
+        self.assertEqual(tuple(member.security_id for member in frozen.members),
+                         ("BJ430001", "SH600000", "SZ000001"))
+        for source in frozen.sources:
+            original = next(document.snapshot for document in documents if document.exchange == source.exchange)
+            self.assertIs(source.snapshot, original)
+            self.assertEqual(source.snapshot.dataset, "universe_listing")
+
+    def test_ingestor_accepts_canonical_utc_freeze_and_preserves_task_lineage_representation(self):
+        documents = verified_listing_documents("SH", "SZ", "BJ")
+        frozen = FormalUniverseIngestor().build("2026-08-31T07:00:00+00:00", "a" * 64, documents)
+        self.assertEqual(frozen.as_of_utc, "2026-08-31T07:00:00+00:00")
+        self.assertEqual(tuple(member.security_id for member in frozen.members),
+                         ("BJ430001", "SH600000", "SZ000001"))
+        legacy = FormalUniverseIngestor().build(FORMAL_FREEZE_AT_CN, "a" * 64, documents)
+        self.assertEqual(legacy.as_of_utc, FORMAL_FREEZE_AT_CN)
+        self.assertEqual(legacy.universe_hash, frozen.universe_hash)
+        # Captured from the pre-compatibility HEAD implementation with this fixture.
+        self.assertEqual(legacy.frozen_input_hash,
+                         "ac8575dab15f28a9c9d032463704565c01ae9ce49f723eac55bd57ebbd2868c9")
+        self.assertNotEqual(legacy.frozen_input_hash, frozen.frozen_input_hash)
+
+    def test_ingestor_freeze_remains_exact_and_rejects_other_dates_or_ambiguous_forms(self):
+        documents = verified_listing_documents("SH", "SZ", "BJ")
+        for invalid in ("2026-08-31T07:00:01+00:00", "2026-08-31T06:59:59+00:00",
+                        "2026-09-01T07:00:00+00:00", "2026-08-31T07:00:00",
+                        "2026-08-31T07:00:00Z", "2026-08-31T08:00:00+01:00"):
+            with self.subTest(freeze=invalid), self.assertRaisesRegex(ValueError, "freeze"):
+                FormalUniverseIngestor().build(invalid, "a" * 64, documents)
+
     def test_bj_identity_uses_ascii_digits_and_status_priority(self):
         self.assertEqual(canonical_security_id(" bj430001 "), "BJ430001")
         with self.assertRaisesRegex(ValueError, "six digits"):

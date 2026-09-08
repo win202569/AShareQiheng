@@ -24,12 +24,15 @@ from ashare_pipeline.formal_deep_worker import (
     FormalTaskSpec,
     FormalWorkerDependencies,
     FormalUniverseFinalizeTaskPayload,
+    SignedUniverseRequestResolver,
     FormalUniverseSourceTaskPayload,
     derive_collection_refresh_generation,
     enqueue_formal_feature_build,
+    enqueue_frozen_formal_universe,
     execute_queued_formal_work,
     formal_context_task_specs,
     formal_statement_task_specs,
+    formal_universe_task_specs,
 )
 from ashare_pipeline.formal_evidence import OfficialFetch, OfficialRequest, SourcePolicy, VerifiedCalendarBinding, verify_official_fetch
 from ashare_pipeline.formal_feature_store import FormalFeatureBundleStore
@@ -134,6 +137,19 @@ class CountingTransport:
         return self.response
 
 
+class UniverseTransport:
+    def __init__(self, *, blocked_host: str | None = None) -> None:
+        self.blocked_host = blocked_host
+        self.requests: list[object] = []
+
+    def send(self, request: object) -> object:
+        self.requests.append(request)
+        url = getattr(request, "url")
+        if self.blocked_host is not None and self.blocked_host in url:
+            raise FormalSourceBlocked("fixture challenge")
+        return _formal_source_tests.response(raw=b'{"listings":true}', url=url)
+
+
 class PeriodDocumentParser:
     """Return a real parsed statement document for each frozen report period."""
 
@@ -144,6 +160,29 @@ class PeriodDocumentParser:
     def parse(self, raw_bytes: object, *, request: object, config: object) -> object:
         self.calls.append((raw_bytes, request, config))
         return self.documents[getattr(request, "period_or_date")]
+
+
+class UniverseDocumentParser:
+    """Emit one explicit ordinary-A listing row for each signed exchange."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, object, object]] = []
+
+    def parse(self, raw_bytes: object, *, request: object, config: object) -> object:
+        self.calls.append((raw_bytes, request, config))
+        exchange = getattr(request, "exchange")
+        security_id = {"BJ": "BJ430001", "SH": "SH600001", "SZ": "SZ000001"}[exchange]
+        date_only = getattr(config, "calendar_selector") is not None
+        return _formal_source_tests.timestamp_document(
+            declared_security_id=None,
+            declared_period=getattr(request, "period_or_date"),
+            published_at_utc=(
+                "2026-08-20T00:00:00+00:00" if date_only else "2026-08-20T07:00:00+00:00"
+            ),
+            published_precision="date_only" if date_only else "timestamp",
+            source_updated_at_utc=None,
+            rows=({"security_id": security_id, "security_type": "ordinary_a", "listing_status": "listed"},),
+        )
 
 
 class ReplayErrorParser(_formal_source_tests.FixtureParser):
@@ -1220,7 +1259,7 @@ def date_only_statement_execution_fixture(
     )
 
 
-def context_execution_fixture(case, *, descriptors=None, configs=None):
+def context_execution_fixture(case, *, descriptors=None, configs=None, parser_override=None):
     """A complete signed runtime, real Context store, and hermetic transport."""
     temporary = project_temporary_directory()
     case.addCleanup(temporary.cleanup)
@@ -1262,7 +1301,7 @@ def context_execution_fixture(case, *, descriptors=None, configs=None):
     store.put_formal_registry_manifest(manifest)
     value = dict(is_st=False, is_star_st=False, listing_status="listed", forced_delist_risk=False, suspended=False)
     transport = CountingTransport(_formal_source_tests.response(raw=canonical_bytes(dict(value=value, no_coverage=False))))
-    parser = _formal_source_tests.FixtureParser(_formal_source_tests.timestamp_document(
+    parser = parser_override or _formal_source_tests.FixtureParser(_formal_source_tests.timestamp_document(
         declared_security_id="SZ000001", declared_period="2026-08-31"))
     snapshots = FormalSnapshotRepository(raw.root, store)
     context_repository = FormalContextRepository(store, snapshots, verifier)
@@ -1328,6 +1367,357 @@ def seed_verified_context_calendar(case, fixture):
     fixture.store.put_formal_context_facts(normalization)
     fixture.store.complete_formal_task(task_id, "fixture-worker", {"snapshot_id": snapshot.snapshot_id})
     return task_id
+
+
+def universe_execution_fixture(
+    case, *, request_template=None, http_method="GET", transport_error=None,
+    per_exchange_sources=False,
+):
+    """A real signed three-exchange universe runtime with local-only transport."""
+    temporary = project_temporary_directory()
+    case.addCleanup(temporary.cleanup)
+    root = Path(temporary.name)
+    verifier = AcceptingVerifier()
+    raw = FormalSnapshotStore(root / "raw")
+    store = StateStore(root / "state.sqlite", formal_snapshot_store=raw,
+                       registry_signature_verifier=verifier)
+    store.initialize()
+    source_by_exchange = {"BJ": "bse", "SH": "sse", "SZ": "szse"}
+    endpoint_by_exchange = {
+        "BJ": "https://www.bse.cn/fixture/listing.json",
+        "SH": "https://www.sse.com.cn/fixture/listing.json",
+        "SZ": "https://www.szse.cn/fixture/listing.json",
+    }
+    configs = [
+        _formal_source_tests.config(
+            dataset="universe_listing", exchange_scope=exchange,
+            source=source_by_exchange[exchange] if per_exchange_sources else "cninfo",
+            endpoint_url=(endpoint_by_exchange[exchange] if per_exchange_sources
+                          else "https://www.cninfo.com.cn/fixture/listing.json"),
+            http_method=http_method,
+            request_template=request_template or {
+                "query": {"exchange": "{exchange}", "date": "{period_or_date}"},
+                "headers": {"accept": "application/json"}, "body": None,
+            },
+        )
+        for exchange in ("BJ", "SH", "SZ")
+    ]
+    loader = fixture_bundle_loader(purpose="official", source_configs=configs)
+    for blob in loader._repository.blobs.values():
+        store.put_formal_registry_blob(blob)
+    store.put_formal_registry_manifest(loader._repository.manifest)
+    snapshots = FormalSnapshotRepository(raw.root, store)
+    context_repository = FormalContextRepository(store, snapshots, verifier)
+    transport = (
+        UniverseTransport(blocked_host="www.bse.cn" if transport_error is not None else None)
+        if per_exchange_sources
+        else CountingTransport(_formal_source_tests.response(raw=b'{"listings":true}'), transport_error)
+    )
+    parser = UniverseDocumentParser()
+    runtime_loader = FormalRegistryRuntimeLoader(
+        FormalRegistryBundleLoader(store, verifier), transport=transport,
+        policies=(
+            {"bse": SourcePolicy.bse(), "sse": SourcePolicy.sse(), "szse": SourcePolicy.szse()}
+            if per_exchange_sources else {"cninfo": SourcePolicy.cninfo()}
+        ), parsers={"fixture-parser": parser},
+        effective_time_resolver=EffectiveTimeResolver(),
+    )
+    dependencies = FormalWorkerDependencies(
+        store, snapshots, runtime_loader, None, context_repository
+    )
+    return SimpleNamespace(
+        store=store, snapshots=snapshots, runtime_loader=runtime_loader,
+        registry_root=loader._repository.manifest.manifest_hash,
+        transport=transport, parser=parser, dependencies=dependencies,
+        resolver=SignedUniverseRequestResolver(context_repository),
+    )
+
+
+def date_only_universe_execution_fixture(case):
+    from dataclasses import asdict
+
+    selector = asdict(CalendarSelector(
+        "trading_calendar", "fixture-calendar-SZ", "SZ", "visible_at_freeze"
+    ))
+    universe_template = {
+        "query": {"exchange": "{exchange}", "date": "{period_or_date}"},
+        "headers": {"accept": "application/json"}, "body": None,
+    }
+    configs = [
+        _formal_source_tests.config(
+            dataset="trading_calendar", bootstrap_calendar=True,
+            request_template={"query": {"exchange": "{exchange}"},
+                              "headers": {"accept": "application/json"}, "body": None},
+        ),
+        _formal_source_tests.config(
+            dataset="fixture-state", exchange_scope="SZ", calendar_selector=selector
+        ),
+        *[
+            _formal_source_tests.config(
+                dataset="universe_listing", exchange_scope=exchange,
+                calendar_selector=selector if exchange == "SZ" else None,
+                request_template=universe_template,
+            )
+            for exchange in ("BJ", "SH", "SZ")
+        ],
+    ]
+    fixture = context_execution_fixture(
+        case,
+        descriptors=[
+            context_descriptor(
+                kind="trading_calendar", scope_key="fixture-calendar-SZ",
+                security_scope="none", request_security="none", period_rule="none",
+                exchange_rule="fixed_exchange", fixed_exchange="SZ",
+                dataset="trading_calendar", bootstrap_calendar=True,
+            ),
+            context_descriptor(calendar_selector=selector),
+        ],
+        configs=configs,
+        parser_override=UniverseDocumentParser(),
+    )
+    fixture.transport.response = _formal_source_tests.response(raw=canonical_bytes({
+        "no_coverage": False,
+        "value": {
+            "exchange": "SZ", "calendar_version": "fixture-v1",
+            "trading_days": ["2026-08-21", "2026-08-31"],
+        },
+    }))
+    calendar_task_id = seed_verified_context_calendar(case, fixture)
+    bound_request = fixture.resolver.resolve(
+        context_kind="security_state", scope_key="fixture-state", security_id="SZ000001",
+        as_of_utc=AS_OF, registry_manifest_hash=fixture.registry_root,
+        upstream_generation="fixture-upstream-v1",
+    )
+    universe_request = OfficialRequest(
+        "cninfo", "universe_listing", None, "2026-08-31", "SZ"
+    )
+    fixture.calendar_requests[universe_request.canonical_json_bytes()] = bound_request
+    fixture.transport.response = _formal_source_tests.response(raw=b'{"listings":true}')
+    dependencies = replace(
+        fixture.dependencies, context_repository=fixture.context_repository
+    )
+    result = dict(fixture.__dict__)
+    result.update(
+        dependencies=dependencies,
+        runtime_loader=dependencies.registry_runtime_loader,
+        resolver=SignedUniverseRequestResolver(fixture.context_repository),
+        calendar_task_id=calendar_task_id,
+    )
+    return SimpleNamespace(**result)
+
+
+class FormalUniverseWorkerExecutionTests(unittest.TestCase):
+    def test_signed_sources_freeze_bj_sh_sz_then_finalize_without_fourth_transport(self) -> None:
+        fixture = universe_execution_fixture(self)
+        runtime = fixture.runtime_loader.load(
+            fixture.registry_root, adapter_freeze_at_utc=AS_OF
+        )
+        specs = formal_universe_task_specs(
+            as_of_utc=AS_OF, upstream_generation="listing-v1", runtime=runtime,
+            universe_request_resolver=fixture.resolver,
+        )
+        self.assertEqual(tuple(spec.payload["exchange"] for spec in specs), ("BJ", "SH", "SZ"))
+        self.assertEqual(tuple(spec.kind for spec in specs), ("formal_universe_source",) * 3)
+
+        finalizer_id = enqueue_frozen_formal_universe(
+            fixture.store, as_of_utc=AS_OF, upstream_generation="listing-v1",
+            registry_manifest_hash=fixture.registry_root,
+            registry_runtime_loader=fixture.runtime_loader,
+            universe_request_resolver=fixture.resolver,
+        )
+        summary = execute_queued_formal_work(
+            fixture.dependencies, worker_id="universe-worker"
+        )
+
+        self.assertEqual(summary.remote_attempts, 3)
+        self.assertEqual(len(fixture.transport.requests), 3)
+        self.assertEqual(len(summary.frozen_universe_snapshot_ids), 1)
+        frozen = fixture.store.get_formal_universe_snapshot_from_task(finalizer_id)
+        self.assertIsNotNone(frozen)
+        self.assertEqual(
+            tuple(row["exchange"] for row in fixture.store.list_formal_universe_sources(frozen["id"])),
+            ("BJ", "SH", "SZ"),
+        )
+
+    def test_signed_body_key_period_placeholder_uses_freeze_china_date(self) -> None:
+        fixture = universe_execution_fixture(
+            self, http_method="POST",
+            request_template={
+                "query": {"exchange": "{exchange}"},
+                "headers": {"x-as-of": "{period_or_date}"},
+                "body": {"listing_{period_or_date}": {"exchange": "{exchange}"}},
+            },
+        )
+        runtime = fixture.runtime_loader.load(
+            fixture.registry_root, adapter_freeze_at_utc=AS_OF
+        )
+        specs = formal_universe_task_specs(
+            as_of_utc=AS_OF, upstream_generation="listing-v1", runtime=runtime,
+            universe_request_resolver=fixture.resolver,
+        )
+        self.assertEqual(
+            tuple(spec.payload["official_request"]["period_or_date"] for spec in specs),
+            ("2026-08-31",) * 3,
+        )
+
+    def test_self_consistent_unsigned_period_tamper_is_terminal_before_transport(self) -> None:
+        fixture = universe_execution_fixture(self)
+        runtime = fixture.runtime_loader.load(
+            fixture.registry_root, adapter_freeze_at_utc=AS_OF
+        )
+        source_spec = formal_universe_task_specs(
+            as_of_utc=AS_OF, upstream_generation="listing-v1", runtime=runtime,
+            universe_request_resolver=fixture.resolver,
+        )[0]
+        payload = _formal_deep_worker._universe_source_payload_from_wire(
+            json.loads(canonical_bytes(source_spec.payload))
+        )
+        tampered = replace(
+            payload,
+            official_request=OfficialRequest(
+                payload.source, "universe_listing", None, "2026-08-30", payload.exchange
+            ),
+        )
+        spec = FormalTaskSpec.from_payload(tampered)
+        task_id = fixture.store.enqueue_formal_task(
+            spec.kind, spec.idempotency_key, spec.refresh_generation, spec.payload,
+            prerequisite_task_ids=spec.prerequisite_task_ids,
+        )
+
+        summary = execute_queued_formal_work(
+            fixture.dependencies, worker_id="universe-worker", max_jobs=1
+        )
+
+        self.assertEqual(summary.remote_attempts, 0)
+        self.assertEqual(fixture.transport.requests, [])
+        self.assertEqual(fixture.store.get_formal_task(task_id)["status"], "terminal_failed")
+
+    def test_new_generation_supersedes_old_pending_finalizer_but_keeps_verified_sources(self) -> None:
+        fixture = universe_execution_fixture(self)
+        old_finalizer_id = enqueue_frozen_formal_universe(
+            fixture.store, as_of_utc=AS_OF, upstream_generation="listing-v1",
+            registry_manifest_hash=fixture.registry_root,
+            registry_runtime_loader=fixture.runtime_loader,
+            universe_request_resolver=fixture.resolver,
+        )
+        old_finalizer = fixture.store.get_formal_task(old_finalizer_id)
+        old_source_ids = tuple(old_finalizer["payload"]["source_task_ids"])
+        execute_queued_formal_work(
+            fixture.dependencies, worker_id="universe-v1-worker", max_jobs=3
+        )
+        self.assertEqual(
+            tuple(fixture.store.get_formal_task(task_id)["status"] for task_id in old_source_ids),
+            ("verified",) * 3,
+        )
+        self.assertEqual(fixture.store.get_formal_task(old_finalizer_id)["status"], "pending")
+
+        new_finalizer_id = enqueue_frozen_formal_universe(
+            fixture.store, as_of_utc=AS_OF, upstream_generation="listing-v2",
+            registry_manifest_hash=fixture.registry_root,
+            registry_runtime_loader=fixture.runtime_loader,
+            universe_request_resolver=fixture.resolver,
+        )
+
+        self.assertNotEqual(new_finalizer_id, old_finalizer_id)
+        self.assertEqual(fixture.store.get_formal_task(old_finalizer_id)["status"], "superseded")
+        self.assertEqual(
+            tuple(fixture.store.get_formal_task(task_id)["status"] for task_id in old_source_ids),
+            ("verified",) * 3,
+        )
+
+    def test_blocked_bj_source_opens_only_bse_circuit_and_sh_sz_continue(self) -> None:
+        fixture = universe_execution_fixture(
+            self, per_exchange_sources=True,
+            transport_error=FormalSourceBlocked("fixture challenge"),
+        )
+        finalizer_id = enqueue_frozen_formal_universe(
+            fixture.store, as_of_utc=AS_OF, upstream_generation="listing-v1",
+            registry_manifest_hash=fixture.registry_root,
+            registry_runtime_loader=fixture.runtime_loader,
+            universe_request_resolver=fixture.resolver,
+        )
+        source_ids = tuple(
+            fixture.store.get_formal_task(finalizer_id)["payload"]["source_task_ids"]
+        )
+
+        summary = execute_queued_formal_work(
+            fixture.dependencies, worker_id="universe-worker", max_jobs=3
+        )
+
+        self.assertEqual(summary.remote_attempts, 3)
+        self.assertEqual(summary.retryable_failed, 1)
+        self.assertEqual(summary.open_circuits, ("bse",))
+        self.assertEqual(
+            tuple(fixture.store.get_formal_task(task_id)["status"] for task_id in source_ids),
+            ("retryable_failed", "verified", "verified"),
+        )
+        self.assertEqual(fixture.store.get_formal_source_circuit("bse")["state"], "open")
+        self.assertIsNone(fixture.store.get_formal_source_circuit("sse"))
+        self.assertIsNone(fixture.store.get_formal_source_circuit("szse"))
+
+    def test_date_only_sz_source_replays_with_its_verified_calendar_binding(self) -> None:
+        fixture = date_only_universe_execution_fixture(self)
+        finalizer_id = enqueue_frozen_formal_universe(
+            fixture.store, as_of_utc=AS_OF, upstream_generation="listing-v1",
+            registry_manifest_hash=fixture.registry_root,
+            registry_runtime_loader=fixture.runtime_loader,
+            universe_request_resolver=fixture.resolver,
+        )
+        source_ids = tuple(
+            fixture.store.get_formal_task(finalizer_id)["payload"]["source_task_ids"]
+        )
+
+        summary = execute_queued_formal_work(
+            fixture.dependencies, worker_id="universe-worker"
+        )
+
+        self.assertEqual(summary.remote_attempts, 3)
+        self.assertEqual(fixture.store.get_formal_task(finalizer_id)["status"], "verified")
+        sz_task = fixture.store.get_formal_task(source_ids[2])
+        self.assertEqual(sz_task["prerequisite_task_ids"], [fixture.calendar_task_id])
+        self.assertEqual(
+            sz_task["result"]["effective_time_evidence_hash"],
+            sz_task["payload"]["calendar_binding"]["manifest_sha256"],
+        )
+
+    def test_lost_lease_after_universe_raw_receipt_replays_without_second_transport(self) -> None:
+        fixture = universe_execution_fixture(self)
+        finalizer_id = enqueue_frozen_formal_universe(
+            fixture.store, as_of_utc=AS_OF, upstream_generation="listing-v1",
+            registry_manifest_hash=fixture.registry_root,
+            registry_runtime_loader=fixture.runtime_loader,
+            universe_request_resolver=fixture.resolver,
+        )
+        source_task_id = fixture.store.get_formal_task(finalizer_id)["payload"]["source_task_ids"][0]
+        original_persist = fixture.snapshots.persist_verified
+
+        def persist_then_expire(*args, **kwargs):
+            ref = original_persist(*args, **kwargs)
+            with fixture.store._transaction(immediate=True) as connection:
+                connection.execute(
+                    "UPDATE formal_collection_task SET lease_expires_at=? WHERE id=?",
+                    ("2000-01-01T00:00:00+00:00", kwargs["producing_task_id"]),
+                )
+            return ref
+
+        with patch.object(fixture.snapshots, "persist_verified", side_effect=persist_then_expire):
+            first = execute_queued_formal_work(
+                fixture.dependencies, worker_id="first-owner", max_jobs=1
+            )
+
+        self.assertEqual(first.remote_attempts, 1)
+        receipt = fixture.store.get_formal_task_snapshot_receipt(source_task_id)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(fixture.store.get_formal_task(source_task_id)["status"], "leased")
+
+        second = execute_queued_formal_work(
+            fixture.dependencies, worker_id="next-owner", max_jobs=1
+        )
+
+        self.assertEqual(second.remote_attempts, 0)
+        self.assertEqual(len(fixture.transport.requests), 1)
+        self.assertEqual(fixture.store.get_formal_task(source_task_id)["status"], "verified")
+        self.assertEqual(fixture.store.get_formal_task_snapshot_receipt(source_task_id), receipt)
 
 
 class FormalContextWorkerExecutionTests(unittest.TestCase):
@@ -4771,6 +5161,109 @@ class FormalDeepWorkerContractTests(unittest.TestCase):
                 registry_manifest_hash=ROOT_A, relevant_registry_hashes=(("mapping", "e" * 64), ("source", SOURCE_A)),
                 calendar_prerequisite_task_id=None, calendar_binding=None,
             )
+
+
+class FormalUniverseFinalizerTests(unittest.TestCase):
+    def _ready(self):
+        fixture = universe_execution_fixture(self)
+        finalizer_id = enqueue_frozen_formal_universe(
+            fixture.store, as_of_utc=AS_OF, upstream_generation="listing-v1",
+            registry_manifest_hash=fixture.registry_root,
+            registry_runtime_loader=fixture.runtime_loader,
+            universe_request_resolver=fixture.resolver,
+        )
+        sources = execute_queued_formal_work(fixture.dependencies, worker_id="sources", max_jobs=3)
+        self.assertEqual((sources.remote_attempts, sources.terminal_failed), (3, 0))
+        return fixture, finalizer_id
+
+    def _universe_count(self, fixture):
+        with fixture.store._transaction() as connection:
+            return connection.execute("SELECT count(*) FROM formal_universe_snapshot").fetchone()[0]
+
+    def test_finalizer_rejects_date_only_raw_replay_when_calendar_bridge_is_missing(self):
+        fixture = date_only_universe_execution_fixture(self)
+        task_id = enqueue_frozen_formal_universe(
+            fixture.store, as_of_utc=AS_OF, upstream_generation="listing-v1",
+            registry_manifest_hash=fixture.registry_root,
+            registry_runtime_loader=fixture.runtime_loader,
+            universe_request_resolver=fixture.resolver,
+        )
+        sources = execute_queued_formal_work(fixture.dependencies, worker_id="sources", max_jobs=3)
+        self.assertEqual((sources.remote_attempts, sources.terminal_failed), (3, 0))
+        with patch.object(fixture.raw, "_calendar_binding_resolver", None):
+            result = execute_queued_formal_work(fixture.dependencies, worker_id="finalizer", max_jobs=1)
+        task = fixture.store.get_formal_task(task_id)
+        self.assertEqual((result.remote_attempts, result.terminal_failed), (0, 1))
+        self.assertEqual(task["error"]["code"], "universe_raw_parser_binding")
+        self.assertEqual(self._universe_count(fixture), 0)
+        self.assertEqual(len(fixture.transport.requests), 3)
+
+    def test_finalizer_rejects_parser_row_drift_including_excluded_rows(self):
+        for security_type in ("ordinary_a", "bond"):
+            with self.subTest(security_type=security_type):
+                fixture, task_id = self._ready()
+                original = fixture.parser.parse
+                def drift(*args, **kwargs):
+                    document = original(*args, **kwargs)
+                    if kwargs["request"].exchange == "BJ":
+                        document = replace(document, rows=(*document.rows, {
+                            "security_id": "BJ899999", "security_type": security_type,
+                            "listing_status": "listed",
+                        }))
+                    return document
+                with patch.object(fixture.parser, "parse", side_effect=drift):
+                    summary = execute_queued_formal_work(fixture.dependencies, worker_id="finalizer", max_jobs=1)
+                task = fixture.store.get_formal_task(task_id)
+                self.assertEqual(summary.remote_attempts, 0)
+                self.assertEqual(summary.terminal_failed, 1)
+                self.assertEqual(task["error"]["code"], "universe_raw_parser_binding")
+                self.assertEqual(self._universe_count(fixture), 0)
+                self.assertEqual(len(fixture.transport.requests), 3)
+
+    def test_finalizer_lease_loss_at_raw_parse_insert_and_completion_recovers(self):
+        for stage in ("raw_read", "parse", "insert", "completion"):
+            with self.subTest(stage=stage):
+                fixture, task_id = self._ready()
+                parser_calls = len(fixture.parser.calls)
+                def expire():
+                    expire_feature_lease_for_next_owner(self, fixture.store, task_id)
+                target, method = {
+                    "raw_read": (fixture.snapshots, "read_verified_raw"),
+                    "parse": (fixture.parser, "parse"),
+                    "insert": (fixture.store, "put_formal_universe_snapshot"),
+                    "completion": (fixture.store, "complete_formal_task"),
+                }[stage]
+                original = getattr(target, method)
+                def lose(*args, **kwargs):
+                    if stage == "completion":
+                        expire()
+                    value = original(*args, **kwargs)
+                    if stage != "completion":
+                        expire()
+                    return value
+                with patch.object(target, method, side_effect=lose):
+                    summary = execute_queued_formal_work(fixture.dependencies, worker_id="old-owner", max_jobs=1)
+                task = fixture.store.get_formal_task(task_id)
+                self.assertEqual((task["status"], task["result"], task["error"]), ("leased", None, None))
+                self.assertEqual((summary.remote_attempts, summary.terminal_failed, summary.retryable_failed), (0, 0, 0))
+                self.assertEqual(self._universe_count(fixture), int(stage in ("insert", "completion")))
+                with fixture.store._transaction() as connection:
+                    persisted = connection.execute(
+                        "SELECT id,frozen_input_hash,universe_hash FROM formal_universe_snapshot"
+                    ).fetchone()
+                if stage == "raw_read":
+                    self.assertEqual(len(fixture.parser.calls), parser_calls)
+                recovered = execute_queued_formal_work(fixture.dependencies, worker_id="new-owner", max_jobs=1)
+                self.assertEqual(recovered.remote_attempts, 0)
+                frozen = fixture.store.get_formal_universe_snapshot_from_task(task_id)
+                self.assertIsNotNone(frozen)
+                if persisted is not None:
+                    self.assertEqual(
+                        (frozen["id"], frozen["frozen_input_hash"], frozen["universe_hash"]),
+                        tuple(persisted),
+                    )
+                self.assertEqual(self._universe_count(fixture), 1)
+                self.assertEqual(len(fixture.transport.requests), 3)
 
 
 if __name__ == "__main__":

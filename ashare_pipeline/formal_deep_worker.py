@@ -1,9 +1,7 @@
-"""Typed, fail-closed Task 6A formal collection contracts.
+"""Typed formal collection, receipt recovery and frozen evidence rebuilding.
 
-Execution, receipt recovery, context normalization, universe finalization, and
-feature rebuilding intentionally belong to later Task 6 deliveries.  This
-module establishes the immutable task boundary and the only supported way to
-construct a runtime from a verified registry bundle.
+Signed runtimes bind statement, Context and universe work to immutable tasks.
+Universe finalization and financial feature rebuilding replay stored evidence.
 """
 
 from __future__ import annotations
@@ -16,7 +14,7 @@ import hashlib
 import json
 import re
 from types import MappingProxyType
-from typing import Literal, Protocol
+from typing import Literal
 
 from .formal_evidence import OfficialRequest, OfficialSnapshotRef, VerifiedCalendarBinding
 from .formal_context_schema import (
@@ -25,7 +23,14 @@ from .formal_context_schema import (
     FormalContextRequest,
     SignedContextRequestResolver,
 )
+from .formal_context_repository import FormalContextRepository
+from .formal_time import FORMAL_FREEZE_AT_CN
 from .formal_snapshot_repository import FormalSnapshotRepository
+from .formal_universe import (
+    FormalUniverseIngestor,
+    FormalUniverseSourceDocument,
+    extract_formal_universe_members,
+)
 from .state_store import StateStore
 from .formal_feature_contract import (
     FormalFeatureBundle,
@@ -54,6 +59,7 @@ from .formal_sources import (
     OfficialDocumentParser,
     OfficialTransport,
     SignedSourceRegistry,
+    SourceAdapterConfig,
     SourcePolicy,
 )
 
@@ -73,6 +79,8 @@ _FORMAL_KINDS = frozenset(
 _STATEMENT_EXECUTION_KINDS = ("formal_statement",)
 _CONTEXT_EXECUTION_KINDS = ("formal_context",)
 _FEATURE_EXECUTION_KINDS = ("formal_feature_build",)
+_UNIVERSE_SOURCE_EXECUTION_KINDS = ("formal_universe_source",)
+_UNIVERSE_FINALIZE_EXECUTION_KINDS = ("formal_universe_finalize",)
 _STATEMENT_LEASE_SECONDS = 120
 _FEATURE_SOURCE_PENDING_HOLD_SECONDS = 30
 # D1 seals this exact non-cyclic baseline into formal-feature-input-v2.  Keep
@@ -489,7 +497,9 @@ class FormalUniverseSourceTaskPayload:
         _require_text(self.upstream_generation, "upstream_generation")
         _require_hash(self.refresh_generation, "refresh_generation")
         root = _require_hash(self.registry_manifest_hash, "registry_manifest_hash")
-        _canonical_roles(self.relevant_registry_hashes)
+        roles = _canonical_roles(self.relevant_registry_hashes)
+        if len(roles) != 1 or roles[0][0] != "source":
+            raise ValueError("universe relevant registry hashes must contain only the signed source role")
         _validate_calendar_pair(
             registry_manifest_hash=root, exchange=self.exchange, as_of_utc=self.as_of_utc,
             calendar_prerequisite_task_id=self.calendar_prerequisite_task_id,
@@ -814,7 +824,126 @@ class FormalUniverseSourceResolution:
             raise ValueError("universe resolution prerequisite edge does not match payload calendar binding")
 
 
-class SignedUniverseRequestResolver(Protocol):
+def _template_uses_placeholder(value: object, placeholder: str, *, mapping_keys: bool = False) -> bool:
+    if type(value) is str:
+        return "{" + placeholder + "}" in value
+    if isinstance(value, Mapping):
+        return any(
+            (mapping_keys and type(key) is str and "{" + placeholder + "}" in key)
+            or _template_uses_placeholder(item, placeholder, mapping_keys=mapping_keys)
+            for key, item in value.items()
+        )
+    if type(value) in {tuple, list}:
+        return any(_template_uses_placeholder(item, placeholder, mapping_keys=mapping_keys) for item in value)
+    return False
+
+
+def _request_template_uses_placeholder(config: SourceAdapterConfig, placeholder: str) -> bool:
+    template = config.request_template
+    return (
+        _template_uses_placeholder(template["query"], placeholder)
+        or _template_uses_placeholder(template["headers"], placeholder)
+        or _template_uses_placeholder(template["body"], placeholder, mapping_keys=True)
+    )
+
+
+def _signed_universe_config(
+    runtime: FormalRegistryRuntime, exchange: Literal["SH", "SZ", "BJ"], as_of_utc: str,
+) -> SourceAdapterConfig:
+    if type(runtime) is not FormalRegistryRuntime:
+        raise ValueError("universe resolver requires an exact formal runtime")
+    runtime.bundle.require_official()
+    record = FormalOfficialSourceAdapter._trusted_operation_record(runtime.source_adapter)
+    if (
+        record.registry_manifest_hash != runtime.bundle.manifest.manifest_hash
+        or record.source_registry_hash != runtime.bundle.manifest.source_registry_hash
+        or record.freeze_at_utc != as_of_utc
+    ):
+        raise ValueError("universe runtime adapter does not match signed root, source, or freeze")
+    configs = tuple(
+        config for config in SignedSourceRegistry._trusted_config_snapshots(record.registry)
+        if config.dataset == "universe_listing" and config.exchange_scope == exchange
+    )
+    if len(configs) != 1 or type(configs[0]) is not SourceAdapterConfig:
+        raise ValueError("signed universe source config is absent or ambiguous")
+    return configs[0]
+
+
+def _universe_request_from_config(
+    config: SourceAdapterConfig, exchange: Literal["SH", "SZ", "BJ"], as_of_utc: str,
+) -> OfficialRequest:
+    if _request_template_uses_placeholder(config, "security_id"):
+        raise ValueError("signed universe request template cannot require a security identity")
+    # The signed source schema has no separate period rule. Only an explicit
+    # template placeholder requests the China calendar date of the fixed freeze.
+    uses_period = _request_template_uses_placeholder(config, "period_or_date")
+    period = None
+    if uses_period:
+        period = datetime.fromisoformat(as_of_utc).astimezone(timezone(timedelta(hours=8))).date().isoformat()
+    return OfficialRequest(config.source, "universe_listing", None, period, exchange)
+
+
+def _mint_universe_source_resolution(
+    *, exchange: Literal["SH", "SZ", "BJ"], as_of_utc: str,
+    upstream_generation: str, runtime: FormalRegistryRuntime,
+    context_repository: FormalContextRepository,
+) -> FormalUniverseSourceResolution:
+    if type(context_repository) is not FormalContextRepository:
+        raise ValueError("universe resolution requires an exact Context repository")
+    if (
+        type(context_repository._state_store) is not StateStore
+        or type(context_repository._snapshots) is not FormalSnapshotRepository
+        or context_repository._snapshots._state_store is not context_repository._state_store
+        or context_repository._snapshots._raw_store
+        is not context_repository._state_store._configured_formal_snapshot_store_for_repository()
+        or context_repository._verifier is not context_repository._state_store._require_registry_verifier()
+    ):
+        raise ValueError("universe Context repository does not match its StateStore and raw root")
+    as_of = _require_timestamp(as_of_utc, "universe as_of_utc")
+    if as_of != datetime.fromisoformat(FORMAL_FREEZE_AT_CN).astimezone(timezone.utc).isoformat():
+        raise ValueError("universe freeze must be the fixed 2026-08-31 market close")
+    upstream = _require_text(upstream_generation, "universe upstream_generation")
+    config = _signed_universe_config(runtime, exchange, as_of)
+    request = _universe_request_from_config(config, exchange, as_of)
+    binding = None
+    prerequisites: tuple[str, ...] = ()
+    if config.calendar_selector is not None:
+        try:
+            binding = context_repository.resolve_verified_calendar_binding(
+                config.calendar_selector, exchange, as_of, runtime.bundle.manifest.manifest_hash
+            )
+        except ValueError as error:
+            raise CalendarBindingPending("signed universe calendar binding is pending") from error
+        prerequisites = (binding.prerequisite_task_id,)
+    roles = (("source", runtime.bundle.manifest.source_registry_hash),)
+    generation = derive_collection_refresh_generation(
+        upstream_generation=upstream,
+        registry_manifest_hash=runtime.bundle.manifest.manifest_hash,
+        relevant_registry_hashes=dict(roles),
+        calendar_selector=config.calendar_selector,
+        calendar_binding=binding,
+    )
+    payload = FormalUniverseSourceTaskPayload(
+        exchange=exchange, as_of_utc=as_of, official_request=request,
+        # Version the request by its signed source registry, never by caller text.
+        source=config.source, request_version=runtime.bundle.manifest.source_registry_hash,
+        upstream_generation=upstream, refresh_generation=generation,
+        registry_manifest_hash=runtime.bundle.manifest.manifest_hash,
+        relevant_registry_hashes=roles,
+        calendar_prerequisite_task_id=None if binding is None else binding.prerequisite_task_id,
+        calendar_binding=binding,
+    )
+    return FormalUniverseSourceResolution(payload, prerequisites)
+
+
+class SignedUniverseRequestResolver:
+    """Mint exchange-scoped universe requests only from a verified signed runtime."""
+
+    def __init__(self, context_repository: FormalContextRepository) -> None:
+        if type(context_repository) is not FormalContextRepository:
+            raise ValueError("universe resolver requires an exact Context repository")
+        self._context_repository = context_repository
+
     def resolve(
         self,
         *,
@@ -822,7 +951,14 @@ class SignedUniverseRequestResolver(Protocol):
         as_of_utc: str,
         upstream_generation: str,
         runtime: FormalRegistryRuntime,
-    ) -> FormalUniverseSourceResolution: ...
+    ) -> FormalUniverseSourceResolution:
+        if exchange not in {"SH", "SZ", "BJ"}:
+            raise ValueError("universe exchange must be SH, SZ, or BJ")
+        return _mint_universe_source_resolution(
+            exchange=exchange, as_of_utc=as_of_utc,
+            upstream_generation=upstream_generation, runtime=runtime,
+            context_repository=self._context_repository,
+        )
 
 
 @dataclass(frozen=True)
@@ -911,13 +1047,122 @@ def formal_context_task_specs(request: FormalContextRequest) -> tuple[FormalTask
     return (FormalTaskSpec.from_payload(FormalContextTaskPayload.from_request(request)),)
 
 
-def formal_universe_task_specs(*_args: object, **_kwargs: object) -> tuple[FormalTaskSpec, ...]:
-    """Reserved for Task 6D's persisted source/finalizer edge construction."""
-    raise NotImplementedError("formal universe task construction is owned by Task 6D")
+def formal_universe_task_specs(
+    *, as_of_utc: str, upstream_generation: str, runtime: FormalRegistryRuntime,
+    universe_request_resolver: SignedUniverseRequestResolver,
+) -> tuple[FormalTaskSpec, ...]:
+    """Return only the three signed BJ/SH/SZ source specs in lexical order."""
+    if type(universe_request_resolver) is not SignedUniverseRequestResolver:
+        raise ValueError("universe task construction requires the signed resolver")
+    specs: list[FormalTaskSpec] = []
+    for exchange in ("BJ", "SH", "SZ"):
+        expected = _mint_universe_source_resolution(
+            exchange=exchange, as_of_utc=as_of_utc, upstream_generation=upstream_generation,
+            runtime=runtime, context_repository=universe_request_resolver._context_repository,
+        )
+        actual = universe_request_resolver.resolve(
+            exchange=exchange, as_of_utc=as_of_utc, upstream_generation=upstream_generation,
+            runtime=runtime,
+        )
+        # Re-enter the adapter seal after the resolver callback, then compare the
+        # complete immutable wire rather than trusting a self-consistent callback.
+        _signed_universe_config(runtime, exchange, _require_timestamp(as_of_utc, "universe as_of_utc"))
+        if (
+            type(actual) is not FormalUniverseSourceResolution
+            or actual.prerequisite_task_ids != expected.prerequisite_task_ids
+            or _canonical_bytes(_payload_mapping(actual.payload))
+            != _canonical_bytes(_payload_mapping(expected.payload))
+        ):
+            raise ValueError("universe resolver result differs from signed configuration")
+        specs.append(FormalTaskSpec.from_payload(actual.payload, prerequisite_task_ids=actual.prerequisite_task_ids))
+    return tuple(specs)
 
 
-def enqueue_frozen_formal_universe(*_args: object, **_kwargs: object) -> str:
-    raise NotImplementedError("formal universe enqueue is owned by Task 6D")
+def _universe_finalize_generation(
+    root: str, as_of_utc: str, source_specs_and_ids: tuple[tuple[FormalTaskSpec, str], ...],
+) -> str:
+    return hashlib.sha256(_canonical_bytes({
+        "as_of_utc": as_of_utc,
+        "registry_manifest_hash": root,
+        "sources": sorted(
+            ({"task_id": task_id, "refresh_generation": spec.refresh_generation}
+             for spec, task_id in source_specs_and_ids),
+            key=lambda item: item["task_id"],
+        ),
+    })).hexdigest()
+
+
+def enqueue_frozen_formal_universe(
+    store: StateStore, *, as_of_utc: str, upstream_generation: str,
+    registry_manifest_hash: str, registry_runtime_loader: FormalRegistryRuntimeLoader,
+    universe_request_resolver: SignedUniverseRequestResolver,
+) -> str:
+    if type(store) is not StateStore:
+        raise ValueError("universe enqueue requires exact StateStore")
+    verifier = store._require_registry_verifier()
+    raw_store = store._configured_formal_snapshot_store_for_repository()
+    if (
+        type(registry_runtime_loader) is not FormalRegistryRuntimeLoader
+        or type(registry_runtime_loader._bundle_loader) is not FormalRegistryBundleLoader
+        or registry_runtime_loader._bundle_loader._repository is not store
+        or registry_runtime_loader._bundle_loader._verifier is not verifier
+        or registry_runtime_loader._verifier is not verifier
+        or type(universe_request_resolver) is not SignedUniverseRequestResolver
+        or type(universe_request_resolver._context_repository) is not FormalContextRepository
+        or universe_request_resolver._context_repository._state_store is not store
+        or universe_request_resolver._context_repository._snapshots._raw_store is not raw_store
+        or universe_request_resolver._context_repository._verifier is not verifier
+    ):
+        raise ValueError("universe enqueue dependencies must share the exact StateStore, verifier, and raw root")
+    root = _require_hash(registry_manifest_hash, "registry_manifest_hash")
+    as_of = _require_timestamp(as_of_utc, "as_of_utc")
+    runtime = registry_runtime_loader.load(root, adapter_freeze_at_utc=as_of)
+    if runtime.bundle.manifest.manifest_hash != root:
+        raise ValueError("universe runtime root mismatch")
+    runtime.bundle.require_official()
+    specs = formal_universe_task_specs(
+        as_of_utc=as_of, upstream_generation=upstream_generation, runtime=runtime,
+        universe_request_resolver=universe_request_resolver,
+    )
+    persisted: list[tuple[FormalTaskSpec, str]] = []
+    for spec in specs:
+        task_id = store.enqueue_formal_task(
+            spec.kind, spec.idempotency_key, spec.refresh_generation, spec.payload,
+            prerequisite_task_ids=spec.prerequisite_task_ids,
+        )
+        persisted.append((spec, task_id))
+    ordered = tuple(persisted)
+    source_ids = tuple(task_id for _, task_id in ordered)
+    generation = _universe_finalize_generation(root, as_of, ordered)
+    payload = FormalUniverseFinalizeTaskPayload(
+        as_of_utc=as_of, registry_manifest_hash=root,
+        source_task_ids=source_ids, refresh_generation=generation,
+    )
+    finalizer = FormalTaskSpec.from_payload(payload)
+    finalizer_id = store.enqueue_formal_task(
+        finalizer.kind, finalizer.idempotency_key, finalizer.refresh_generation,
+        finalizer.payload, prerequisite_task_ids=finalizer.prerequisite_task_ids,
+    )
+    # Only retire the prior unfinished cohort after all four new tasks exist.
+    # Full old payloads make each supersession precise despite the store's
+    # deliberately generic payload-scope API. Verified evidence stays intact.
+    new_generations = {spec.payload["exchange"]: spec.refresh_generation for spec in specs}
+    for old in store.list_formal_tasks(
+        kinds=["formal_universe_source", "formal_universe_finalize"],
+        statuses=["pending", "leased", "retryable_failed"],
+    ):
+        old_payload = old["payload"]
+        if old_payload.get("as_of_utc") != as_of:
+            continue
+        if old["kind"] == "formal_universe_source":
+            current_generation = new_generations.get(old_payload.get("exchange"))
+            if current_generation is None:
+                continue
+        else:
+            current_generation = finalizer.refresh_generation
+        if old["refresh_generation"] != current_generation:
+            store.supersede_formal_tasks(old_payload, current_generation)
+    return finalizer_id
 
 
 def _statement_payload_from_wire(value: object) -> FormalStatementTaskPayload:
@@ -959,6 +1204,58 @@ def _statement_payload_from_wire(value: object) -> FormalStatementTaskPayload:
         calendar_prerequisite_task_id=value["calendar_prerequisite_task_id"],
         calendar_binding=binding,
     )
+
+
+def _universe_source_payload_from_wire(value: object) -> FormalUniverseSourceTaskPayload:
+    """Restore only the exact persisted JSON shape for a universe source task."""
+    if type(value) is not dict or set(value) != {item.name for item in fields(FormalUniverseSourceTaskPayload)}:
+        raise ValueError("formal universe source payload fields are invalid")
+    request_wire = value["official_request"]
+    if type(request_wire) is not dict or set(request_wire) != {
+        "source", "dataset", "security_id", "period_or_date", "exchange"
+    }:
+        raise ValueError("formal universe official request fields are invalid")
+    roles_wire = value["relevant_registry_hashes"]
+    if type(roles_wire) is not list or any(type(pair) is not list or len(pair) != 2 for pair in roles_wire):
+        raise ValueError("formal universe registry roles are invalid")
+    binding_wire = value["calendar_binding"]
+    if binding_wire is not None and (
+        type(binding_wire) is not dict or set(binding_wire) != {
+            "exchange", "freeze_at_utc", "manifest_sha256", "prerequisite_task_id",
+            "registry_manifest_hash", "selector_hash", "snapshot_id",
+        }
+    ):
+        raise ValueError("formal universe calendar binding fields are invalid")
+    try:
+        return FormalUniverseSourceTaskPayload(
+            exchange=value["exchange"], as_of_utc=value["as_of_utc"],
+            official_request=OfficialRequest(**request_wire), source=value["source"],
+            request_version=value["request_version"], upstream_generation=value["upstream_generation"],
+            refresh_generation=value["refresh_generation"], registry_manifest_hash=value["registry_manifest_hash"],
+            relevant_registry_hashes=tuple(tuple(pair) for pair in roles_wire),
+            calendar_prerequisite_task_id=value["calendar_prerequisite_task_id"],
+            calendar_binding=None if binding_wire is None else VerifiedCalendarBinding(**binding_wire),
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("formal universe source payload is invalid") from error
+
+
+def _decode_leased_universe_source_task(
+    task: object,
+) -> tuple[str, FormalUniverseSourceTaskPayload]:
+    if type(task) is not dict or task.get("kind") != "formal_universe_source" or task.get("status") != "leased":
+        raise ValueError("leased task is not a formal universe source")
+    task_id = _require_text(task.get("id"), "formal universe source task id")
+    payload = _universe_source_payload_from_wire(task.get("payload"))
+    spec = FormalTaskSpec.from_payload(payload)
+    if (
+        task.get("idempotency_key") != spec.idempotency_key
+        or task.get("refresh_generation") != spec.refresh_generation
+        or _canonical_bytes(task.get("prerequisite_task_ids")) != _canonical_bytes(list(spec.prerequisite_task_ids))
+        or _canonical_bytes(task.get("payload")) != _canonical_bytes(spec.payload)
+    ):
+        raise ValueError("leased universe source task differs from canonical payload")
+    return task_id, payload
 
 
 def _feature_payload_from_wire(value: object) -> FormalFeatureBuildTaskPayload:
@@ -1583,6 +1880,187 @@ def _require_context_snapshot_identity(
         if type(actual) is not type(expected) or actual != expected:
             raise ValueError("Context snapshot request or source lineage mismatch")
     return snapshot
+
+
+def _validated_universe_source_runtime(
+    dependencies: FormalWorkerDependencies, payload: FormalUniverseSourceTaskPayload,
+) -> tuple[FormalRegistryRuntime, SourceAdapterConfig]:
+    store = dependencies.store
+    if type(store) is not StateStore:
+        raise ValueError("universe source execution requires exact StateStore")
+    verifier = store._require_registry_verifier()
+    raw_store = store._configured_formal_snapshot_store_for_repository()
+    loader = dependencies.registry_runtime_loader
+    snapshots = dependencies.snapshots
+    context = dependencies.context_repository
+    if (
+        type(loader) is not FormalRegistryRuntimeLoader
+        or type(loader._bundle_loader) is not FormalRegistryBundleLoader
+        or loader._bundle_loader._repository is not store
+        or loader._bundle_loader._verifier is not verifier
+        or loader._verifier is not verifier
+        or type(snapshots) is not FormalSnapshotRepository
+        or snapshots._state_store is not store
+        or snapshots._raw_store is not raw_store
+        or snapshots.root != raw_store.root
+        or type(context) is not FormalContextRepository
+        or context._state_store is not store
+        or type(context._snapshots) is not FormalSnapshotRepository
+        or context._snapshots._state_store is not store
+        or context._snapshots._raw_store is not raw_store
+        or context._snapshots.root != raw_store.root
+        or context._verifier is not verifier
+    ):
+        raise ValueError("universe source dependencies do not share the exact store, verifier, and raw root")
+    runtime = loader.load(payload.registry_manifest_hash, adapter_freeze_at_utc=payload.as_of_utc)
+    config = _signed_universe_config(runtime, payload.exchange, payload.as_of_utc)
+    expected = _mint_universe_source_resolution(
+        exchange=payload.exchange, as_of_utc=payload.as_of_utc,
+        upstream_generation=payload.upstream_generation, runtime=runtime,
+        context_repository=context,
+    )
+    if (
+        _canonical_bytes(_payload_mapping(payload)) != _canonical_bytes(_payload_mapping(expected.payload))
+        or payload.request_version != runtime.bundle.manifest.source_registry_hash
+    ):
+        raise ValueError("universe source payload differs from the current signed configuration")
+    FormalOfficialSourceAdapter._preflight(runtime.source_adapter, payload.official_request,
+        payload.refresh_generation, payload.calendar_binding)
+    return runtime, config
+
+
+def _require_universe_source_snapshot_identity(
+    receipt: object, snapshot: object, *, task_id: str,
+    payload: FormalUniverseSourceTaskPayload, config: SourceAdapterConfig,
+) -> OfficialSnapshotRef:
+    if type(receipt) is not dict or type(snapshot) is not OfficialSnapshotRef:
+        raise ValueError("invalid universe source receipt or snapshot")
+    for name, expected in {
+        "task_id": task_id, "snapshot_id": snapshot.snapshot_id,
+        "manifest_sha256": snapshot.manifest_sha256,
+        "refresh_generation": payload.refresh_generation,
+    }.items():
+        if type(receipt.get(name)) is not str or receipt[name] != expected:
+            raise ValueError("universe source receipt lineage mismatch")
+    request = payload.official_request
+    expected_fields = {
+        "source": request.source, "dataset": "universe_listing", "security_id": None,
+        "period_or_date": request.period_or_date, "exchange": payload.exchange,
+        "request_fingerprint": request.request_fingerprint, "producing_task_id": task_id,
+        "refresh_generation": payload.refresh_generation, "parser_id": config.parser_id,
+        "parser_version": config.parser_version, "mapping_version": config.mapping_version,
+        "verification_status": "verified",
+        "published_precision": "date_only" if payload.calendar_binding is not None else "timestamp",
+        "effective_time_evidence_hash": (
+            payload.calendar_binding.manifest_sha256 if payload.calendar_binding is not None else None
+        ),
+    }
+    for name, expected in expected_fields.items():
+        actual = getattr(snapshot, name)
+        if type(actual) is not type(expected) or actual != expected:
+            raise ValueError("universe source snapshot lineage mismatch")
+    return snapshot
+
+
+def _execute_universe_source_task(
+    dependencies: FormalWorkerDependencies, task: dict[str, object], *, worker_id: str,
+) -> int:
+    task_id = _require_text(task.get("id"), "universe source task id")
+    store = dependencies.store
+    remote_attempts = 0
+
+    def fence() -> None:
+        _renew_statement_lease(store, task_id, worker_id, remote_attempts=remote_attempts)
+
+    def source_call(callback: Callable[[], object]) -> object:
+        try:
+            return callback()
+        except FormalSourceBlocked:
+            fence()
+            retry_after = _open_source_circuit(store, payload.source,
+                cooldown_seconds=config.challenge_cooldown_seconds,
+                code="source_blocked", before_mutation=fence)
+            fence()
+            _fail_statement_retryable(store, task_id, worker_id, code="source_blocked",
+                next_retry_at=retry_after, remote_attempts=remote_attempts)
+            raise _RetryableFormalTask(remote_attempts, payload.source, circuit_open=True)
+        except FormalRetryableSourceError:
+            fence()
+            _, retry_after = _retry_window(config.retry_base_seconds)
+            _fail_statement_retryable(store, task_id, worker_id, code="source_retryable_failed",
+                next_retry_at=retry_after, remote_attempts=remote_attempts)
+            raise _RetryableFormalTask(remote_attempts, payload.source, circuit_open=False)
+        except FormalTerminalSourceError as error:
+            fence()
+            raise _TerminalFormalTask(remote_attempts, "universe_raw_parser_binding") from error
+
+    try:
+        fence()
+        task_id, payload = _decode_leased_universe_source_task(task)
+        runtime, config = _validated_universe_source_runtime(dependencies, payload)
+        receipt = store.get_formal_task_snapshot_receipt(task_id)
+        if receipt is None:
+            fence()
+            retry_after = _active_source_circuit_retry_after(store, payload.source, before_mutation=fence)
+            if retry_after is not None:
+                _fail_statement_retryable(
+                    store, task_id, worker_id, code="source_circuit_open",
+                    next_retry_at=retry_after, remote_attempts=0,
+                )
+                raise _RetryableFormalTask(0, payload.source, circuit_open=True)
+            fence()
+            remote_attempts = 1
+            fetch, verification, _ = source_call(lambda: runtime.source_adapter.fetch_verified(
+                payload.official_request, refresh_generation=payload.refresh_generation,
+                calendar_binding=payload.calendar_binding))
+            fence()
+            dependencies.snapshots.persist_verified(
+                fetch, verification, producing_task_id=task_id, worker_id=worker_id
+            )
+            fence()
+            receipt = store.get_formal_task_snapshot_receipt(task_id)
+        if type(receipt) is not dict or type(receipt.get("manifest_sha256")) is not str:
+            raise ValueError("universe source receipt missing after raw persistence")
+        snapshot = _require_universe_source_snapshot_identity(
+            receipt, dependencies.snapshots.get_verified_by_manifest(receipt["manifest_sha256"]),
+            task_id=task_id, payload=payload, config=config,
+        )
+        raw_bytes = dependencies.snapshots.read_verified_raw(snapshot)
+        if type(raw_bytes) is not bytes or hashlib.sha256(raw_bytes).hexdigest() != snapshot.content_sha256:
+            raise ValueError("universe verified raw bytes differ from source hash")
+        fence()
+        document = source_call(lambda: runtime.source_adapter.parse_verified_snapshot(
+            snapshot, raw_bytes, calendar_binding=payload.calendar_binding))
+        fence()
+        if document.declared_security_id is not None or document.declared_period != payload.official_request.period_or_date:
+            raise ValueError("universe parsed identity differs from global signed request")
+        extraction = extract_formal_universe_members(FormalUniverseSourceDocument(
+            payload.exchange, snapshot, document.parser_id, document.parser_version, document.rows
+        ))
+        fence()
+        store.complete_formal_task(task_id, worker_id, {
+            "exchange": payload.exchange,
+            "manifest_sha256": snapshot.manifest_sha256,
+            "parsed_rows_hash": extraction.audit.parsed_rows_hash,
+            "parser_id": snapshot.parser_id,
+            "parser_version": snapshot.parser_version,
+            "refresh_generation": payload.refresh_generation,
+            "registry_manifest_hash": payload.registry_manifest_hash,
+            "snapshot_id": snapshot.snapshot_id,
+            "source_content_sha256": snapshot.content_sha256,
+            "effective_time_evidence_hash": snapshot.effective_time_evidence_hash,
+        })
+        return remote_attempts
+    except (_LostFormalTaskLease, _RetryableFormalTask, _TerminalFormalTask):
+        raise
+    except FormalTerminalSourceError as error:
+        fence()
+        raise _TerminalFormalTask(remote_attempts, "universe_raw_parser_binding") from error
+    except Exception as error:
+        if isinstance(error, ValueError) and _is_lost_formal_task_lease_error(error):
+            raise _LostFormalTaskLease(remote_attempts) from error
+        fence()
+        raise _TerminalFormalTask(remote_attempts, "universe_source_validation_failed") from error
 
 
 def _execute_context_task(
@@ -2218,13 +2696,138 @@ def _execute_feature_task(
         raise _TerminalFormalTask(0, "feature_persistence_failed") from error
 
 
+def _decode_leased_universe_finalize_task(task: object) -> tuple[str, FormalUniverseFinalizeTaskPayload]:
+    if type(task) is not dict or task.get("kind") != "formal_universe_finalize" or task.get("status") != "leased":
+        raise ValueError("universe finalizer requires a leased finalizer task")
+    wire = task.get("payload")
+    if type(wire) is not dict or set(wire) != {item.name for item in fields(FormalUniverseFinalizeTaskPayload)}:
+        raise ValueError("universe finalizer payload fields mismatch")
+    if type(wire["source_task_ids"]) is not list:
+        raise ValueError("universe finalizer source IDs must be a JSON array")
+    payload = FormalUniverseFinalizeTaskPayload(**{**wire, "source_task_ids": tuple(wire["source_task_ids"])})
+    spec = FormalTaskSpec.from_payload(payload)
+    edges = task.get("prerequisite_task_ids")
+    if (type(edges) is not list or any(type(edge) is not str for edge in edges)
+            or len(edges) != 3 or sorted(edges) != sorted(payload.source_task_ids)
+            or task.get("idempotency_key") != spec.idempotency_key
+            or task.get("refresh_generation") != spec.refresh_generation
+            or _canonical_bytes(wire) != _canonical_bytes(spec.payload)):
+        raise ValueError("universe finalizer canonical task or prerequisite mismatch")
+    return _require_text(task.get("id"), "universe finalizer ID"), payload
+
+
+def _execute_universe_finalize_task(
+    dependencies: FormalWorkerDependencies, task: dict[str, object], *, worker_id: str,
+) -> str:
+    """Rebuild from three verified receipts and atomically recover or store one graph."""
+    task_id = _require_text(task.get("id"), "universe finalizer ID")
+    store = dependencies.store
+    error_code = "universe_incomplete"
+
+    def fence() -> None:
+        _renew_statement_lease(store, task_id, worker_id, remote_attempts=0)
+
+    try:
+        fence()
+        task_id, payload = _decode_leased_universe_finalize_task(task)
+        loader = dependencies.registry_runtime_loader
+        if type(store) is not StateStore or type(loader) is not FormalRegistryRuntimeLoader:
+            raise ValueError("universe finalizer requires exact store and runtime loader")
+        runtime = loader.load(payload.registry_manifest_hash, adapter_freeze_at_utc=payload.as_of_utc)
+        if type(runtime) is not FormalRegistryRuntime or runtime.bundle.manifest.manifest_hash != payload.registry_manifest_hash:
+            raise ValueError("universe finalizer runtime root mismatch")
+        runtime.bundle.require_official()
+        if store.get_formal_task_snapshot_receipt(task_id) is not None:
+            raise ValueError("universe finalizer cannot own a source receipt")
+        source_records = []
+        source_specs_and_ids = []
+        for exchange, source_id in zip(("BJ", "SH", "SZ"), payload.source_task_ids):
+            fence()
+            source = store.get_formal_task(source_id)
+            if (type(source) is not dict or source.get("id") != source_id
+                    or source.get("kind") != "formal_universe_source" or source.get("status") != "verified"
+                    or any(source.get(key) is not None for key in ("error", "lease_worker", "lease_expires_at", "next_retry_at"))):
+                raise ValueError("universe prerequisite is not an immutable verified source")
+            source_payload = _universe_source_payload_from_wire(source.get("payload"))
+            if (source_payload.exchange != exchange or source_payload.as_of_utc != payload.as_of_utc
+                    or source_payload.registry_manifest_hash != payload.registry_manifest_hash):
+                raise ValueError("universe prerequisite exchange, root, or freeze mismatch")
+            spec = FormalTaskSpec.from_payload(source_payload)
+            if (source.get("idempotency_key") != spec.idempotency_key
+                    or source.get("refresh_generation") != spec.refresh_generation
+                    or source.get("prerequisite_task_ids") != list(spec.prerequisite_task_ids)
+                    or _canonical_bytes(source["payload"]) != _canonical_bytes(spec.payload)):
+                raise ValueError("universe source canonical task mismatch")
+            # This also verifies the shared StateStore, verifier, raw root,
+            # signed request and complete current calendar binding before replay.
+            source_runtime, config = _validated_universe_source_runtime(dependencies, source_payload)
+            result = source.get("result")
+            if type(result) is not dict or set(result) != {
+                "exchange", "manifest_sha256", "parsed_rows_hash", "parser_id", "parser_version",
+                "refresh_generation", "registry_manifest_hash", "snapshot_id", "source_content_sha256",
+                "effective_time_evidence_hash",
+            }:
+                raise ValueError("universe source result fields mismatch")
+            source_records.append((source_id, source_payload, result, source_runtime, config))
+            source_specs_and_ids.append((spec, source_id))
+        if _universe_finalize_generation(payload.registry_manifest_hash, payload.as_of_utc,
+                                        tuple(source_specs_and_ids)) != payload.refresh_generation:
+            raise ValueError("universe finalizer generation mismatch")
+        error_code = "universe_raw_parser_binding"
+        documents = []
+        for source_id, source_payload, result, source_runtime, config in source_records:
+            fence()
+            receipt = store.get_formal_task_snapshot_receipt(source_id)
+            if type(receipt) is not dict:
+                raise ValueError("universe source receipt missing")
+            manifest = _require_hash(receipt.get("manifest_sha256"), "universe source manifest")
+            snapshot = _require_universe_source_snapshot_identity(receipt,
+                dependencies.snapshots.get_verified_by_manifest(manifest),
+                task_id=source_id, payload=source_payload, config=config)
+            raw = dependencies.snapshots.read_verified_raw(snapshot)
+            fence()
+            parsed = source_runtime.source_adapter.parse_verified_snapshot(snapshot, raw,
+                calendar_binding=source_payload.calendar_binding)
+            fence()
+            document = FormalUniverseSourceDocument(source_payload.exchange, snapshot,
+                parsed.parser_id, parsed.parser_version, parsed.rows)
+            extraction = extract_formal_universe_members(document)
+            expected_result = {
+                "exchange": source_payload.exchange, "manifest_sha256": snapshot.manifest_sha256,
+                "parsed_rows_hash": extraction.audit.parsed_rows_hash, "parser_id": snapshot.parser_id,
+                "parser_version": snapshot.parser_version, "refresh_generation": source_payload.refresh_generation,
+                "registry_manifest_hash": source_payload.registry_manifest_hash,
+                "snapshot_id": snapshot.snapshot_id, "source_content_sha256": snapshot.content_sha256,
+                "effective_time_evidence_hash": snapshot.effective_time_evidence_hash,
+            }
+            if _canonical_bytes(result) != _canonical_bytes(expected_result):
+                raise ValueError("universe parsed rows differ from immutable source result")
+            documents.append(document)
+        frozen = FormalUniverseIngestor().build(payload.as_of_utc, payload.registry_manifest_hash, tuple(documents))
+        fence()
+        snapshot_id = store.put_formal_universe_snapshot(frozen)
+        fence()
+        store.complete_formal_task(task_id, worker_id, {
+            "universe_snapshot_id": snapshot_id, "frozen_input_hash": frozen.frozen_input_hash,
+            "universe_hash": frozen.universe_hash, "registry_manifest_hash": payload.registry_manifest_hash,
+        })
+        return snapshot_id
+    except _LostFormalTaskLease:
+        raise
+    except Exception as error:
+        if isinstance(error, ValueError) and _is_lost_formal_task_lease_error(error):
+            raise _LostFormalTaskLease(0) from error
+        fence()
+        raise _TerminalFormalTask(0, error_code) from error
+
+
 def execute_queued_formal_work(
     dependencies: FormalWorkerDependencies,
     *,
     worker_id: str,
     max_jobs: int | None = None,
 ) -> FormalCollectionSummary:
-    """Run statements, Context, and frozen features in that priority order."""
+    """Run statements, Context, universe collection/finalization, then features."""
 
     if type(dependencies) is not FormalWorkerDependencies:
         raise ValueError("formal worker dependencies must have exact type")
@@ -2245,17 +2848,42 @@ def execute_queued_formal_work(
     open_circuits: set[str] = set()
     rebuilt_security_ids: set[str] = set()
     feature_bundles_written = 0
+    frozen_universe_snapshot_ids: set[str] = set()
     processed = 0
     while max_jobs is None or processed < max_jobs:
         task = lease_next(_STATEMENT_EXECUTION_KINDS, owner, _STATEMENT_LEASE_SECONDS)
         if task is None:
             task = lease_next(_CONTEXT_EXECUTION_KINDS, owner, _STATEMENT_LEASE_SECONDS)
         if task is None:
+            task = lease_next(_UNIVERSE_SOURCE_EXECUTION_KINDS, owner, _STATEMENT_LEASE_SECONDS)
+        if task is None:
+            task = lease_next(_UNIVERSE_FINALIZE_EXECUTION_KINDS, owner, _STATEMENT_LEASE_SECONDS)
+        if task is None:
             task = lease_next(_FEATURE_EXECUTION_KINDS, owner, _STATEMENT_LEASE_SECONDS)
         if task is None:
             break
         if type(task) is not dict:
             raise ValueError("formal task lease returned an invalid task")
+        if task.get("kind") in {"formal_universe_source", "formal_universe_finalize"}:
+            try:
+                if task["kind"] == "formal_universe_source":
+                    remote_attempts += _execute_universe_source_task(dependencies, task, worker_id=owner)
+                else:
+                    frozen_universe_snapshot_ids.add(_execute_universe_finalize_task(dependencies, task, worker_id=owner))
+            except _LostFormalTaskLease as error:
+                remote_attempts += error.remote_attempts
+            except _RetryableFormalTask as error:
+                remote_attempts += error.remote_attempts
+                retryable_failed += 1
+                if error.circuit_open:
+                    open_circuits.add(error.source)
+            except _TerminalFormalTask as error:
+                remote_attempts += error.remote_attempts
+                if _fail_statement_terminal(dependencies.store, task["id"], owner, code=error.code):
+                    terminal_failed += 1
+            processed += 1
+            resolver()
+            continue
         if task.get("kind") == "formal_context":
             try:
                 remote_attempts += _execute_context_task(dependencies, task, worker_id=owner)
@@ -2385,7 +3013,7 @@ def execute_queued_formal_work(
     return FormalCollectionSummary(
         remote_attempts=remote_attempts,
         verified_statement_count=verified_statement_count,
-        frozen_universe_snapshot_ids=(),
+        frozen_universe_snapshot_ids=tuple(sorted(frozen_universe_snapshot_ids)),
         retryable_failed=retryable_failed,
         terminal_failed=terminal_failed,
         feature_bundles_written=feature_bundles_written,
