@@ -146,6 +146,71 @@ class MetricProjectionTests(unittest.TestCase):
         self.correction()
         self.assertIsNone(self.project())
 
+    def state(self, *, snapshot=None):
+        repo = self.repository(fixtures.SnapshotProvider(snapshot or self.snapshot()))
+        endpoint = getattr(repo, "select_current_verified_metric_feature_state", None)
+        self.assertTrue(callable(endpoint), "authenticated absence endpoint is missing")
+        return endpoint("SZ000001", "2026-08-31T07:00:00+00:00",
+            template_id="general_nonfinancial", registry_manifest_hash=self.manifest.manifest_hash,
+            required_feature_keys=("general_nonfinancial.growth",))
+
+    def test_still_unpersisted_inputs_need_distinct_authenticated_markers(self):
+        self.correction()
+        self.assertIsNone(self.project())
+        first = self.state()
+        first.require_verified()
+        self.assertEqual(first.status, "current_receipt_absent")
+        self.assertEqual(first.canonical_bytes(), self.state().canonical_bytes())
+        self.add_fact(value=300.0, generation="later-absent",
+            source_overrides={"source_updated_at_utc": "2026-05-01T00:00:00+00:00"})
+        self.assertIsNone(self.project())  # Bare None equality misses the correction.
+        second = self.state()
+        self.assertNotEqual(first.absence_hash, second.absence_hash)
+        self.assertNotEqual(first.fact_snapshot_hash, second.fact_snapshot_hash)
+
+    def test_absence_binds_issues_and_logical_provider_identity(self):
+        self.correction()
+        first = self.state()
+        issue = FormalFactIssue("unknown_source_field", None, "OTHER", {})
+        self.assertNotEqual(first.absence_hash, self.state(snapshot=self.snapshot(issues=(issue,))).absence_hash)
+        self.assertNotEqual(first.absence_hash, self.state(snapshot=self.snapshot(batch_id="next-batch")).absence_hash)
+
+    def test_absent_receipt_becomes_present_without_changing_projection_bytes(self):
+        self.correction()
+        self.assertEqual(self.state().status, "current_receipt_absent")
+        self.persist()
+        self.assertEqual(self.state().canonical_bytes(), self.project().canonical_bytes())
+
+    def test_absence_proof_cannot_be_constructed_copied_or_mutated(self):
+        self.correction()
+        proof = self.state()
+        with self.assertRaises(TypeError):
+            type(proof)()
+        for copier in (copy.copy, copy.deepcopy):
+            with self.assertRaises((TypeError, ValueError)):
+                copier(proof)
+        with self.assertRaises((AttributeError, TypeError, ValueError)):
+            object.__setattr__(proof, "input_hash", "f" * 64)
+        with self.assertRaises(ValueError):
+            object.__new__(type(proof)).require_verified()
+
+    def test_absence_does_not_hide_invalid_provider_or_raw_source(self):
+        self.correction()
+        with self.assertRaises(ValueError):
+            self.state(snapshot=self.snapshot(complete=False))
+        captured = self.snapshot()
+        path = Path(self.store.get_formal_snapshot(self.fact.source_snapshot_id).content_path)
+        path.write_bytes(b"invalid absence source")
+        with self.assertRaises(ValueError):
+            self.state(snapshot=captured)
+
+    def test_absence_rejects_invalid_child_signature(self):
+        self.correction()
+        captured = self.snapshot()
+        self.sql("UPDATE formal_registry_blob SET signature='invalid' WHERE registry_role='feature'")
+        with self.assertRaises(ValueError):
+            self.state(snapshot=captured)
+
     def test_proof_constructor_copy_and_low_level_mutation_reject(self):
         original = self.project()
         with self.assertRaises(TypeError):

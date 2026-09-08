@@ -306,6 +306,7 @@ def _install_metric_projection():
     builder = build_formal_feature_bundle
     evaluator = evaluate_selected_features
     repositories, proofs = {}, {}
+    absences = {}
     fields = ("security_id", "as_of_utc", "template_id", "registry_manifest_hash",
         "feature_registry_hash", "input_hash", "bundle_hash", "required_feature_keys",
         "slots", "values", "blockers", "fact_snapshot_hash", "issue_snapshot_hash",
@@ -374,6 +375,38 @@ def _install_metric_projection():
         def __deepcopy__(self, memo):
             raise TypeError("metric projection proof cannot be copied")
 
+    class VerifiedMetricFeatureAbsence:
+        """Authenticated current inputs whose exact expected receipt is absent."""
+        __slots__ = ("__weakref__",)
+
+        def __init__(self, *args, **kwargs):
+            raise TypeError("metric absence requires verified current repository reads")
+
+        def canonical_bytes(self):
+            record = absences.get(id(self))
+            if type(self) is not VerifiedMetricFeatureAbsence or record is None or record[0]() is not self:
+                raise ValueError("metric absence proof is forged or copied")
+            return record[1]
+
+        def require_verified(self):
+            self.canonical_bytes()
+
+        def to_dict(self):
+            return json.loads(self.canonical_bytes())
+
+        def __getattr__(self, name):
+            payload = self.to_dict()
+            if name not in payload:
+                raise AttributeError(name)
+            value = payload[name]
+            return tuple(value) if type(value) is list else value
+
+        def __copy__(self):
+            raise TypeError("metric absence proof cannot be copied")
+
+        def __deepcopy__(self, memo):
+            raise TypeError("metric absence proof cannot be copied")
+
     def dependency_state(self):
         store, files = self._store, self._bundle_store
         source = store._formal_snapshot_store
@@ -429,8 +462,8 @@ def _install_metric_projection():
         if any(vars(module).get(name) is not value for module, name, value in checked_calculations):
             raise ValueError("metric repository calculation dependency changed")
 
-    def select(self, security_id: str, as_of_utc: str, *, template_id: str,
-               registry_manifest_hash: str, required_feature_keys: tuple[str, ...]) -> VerifiedMetricFeatureProjection | None:
+    def select_state(self, security_id: str, as_of_utc: str, *, template_id: str,
+               registry_manifest_hash: str, required_feature_keys: tuple[str, ...]):
         """Authenticate a current stored bundle and project required signed V6 slots."""
         request = _request(security_id, as_of_utc, template_id, registry_manifest_hash)
         if as_of_utc != "2026-08-31T07:00:00+00:00":
@@ -477,7 +510,38 @@ def _install_metric_projection():
             raise ValueError("metric feature stored bundle differs from rebuilt inputs")
         check_current()
         if stored is None:
-            return None
+            # A bare None cannot distinguish two unpersisted generations. Recheck
+            # the provider's logical generation, full source facts and signed root
+            # before sealing an explicit marker for these exact current inputs.
+            graph_after, registry_after = read_registry(self, registry_manifest_hash)
+            if (graph_after.manifest.manifest_hash != graph.manifest.manifest_hash
+                    or registry_after.registry_hash != registry.registry_hash):
+                raise ValueError("metric absence registry changed during selection")
+            try:
+                current = provider.resolve_current_inputs(**request)
+            except Exception as error:
+                raise ValueError("formal feature current input provider failed") from error
+            if (snapshot_identity(current, request) != identity
+                    or _fact_snapshot(current.facts, security_id)[1] != fact_records
+                    or _issue_snapshot(current.issues)[1] != issue_records):
+                raise ValueError("metric absence provider generation changed during selection")
+            check_current()
+            if read_bundle(self, input_hash=expected.input_hash, require_complete=False) is not None:
+                raise ValueError("metric absence receipt appeared during selection")
+            check_current()
+            payload = dict(request, feature_registry_hash=registry.registry_hash,
+                input_hash=expected.input_hash, bundle_hash=expected.bundle_hash(),
+                required_feature_keys=list(required_feature_keys),
+                fact_snapshot_hash=hashlib.sha256(_canonical_json_bytes([json.loads(r) for r in fact_records])).hexdigest(),
+                issue_snapshot_hash=hashlib.sha256(_canonical_json_bytes([json.loads(r) for r in issue_records])).hexdigest(),
+                batch_id=identity[-1], status="current_receipt_absent",
+                algorithm_version="formal-metric-feature-absence-v1")
+            payload["absence_hash"] = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+            result = object.__new__(VerifiedMetricFeatureAbsence)
+            proof_id = id(result)
+            absences[proof_id] = (weakref.ref(result, lambda _, proof_id=proof_id: absences.pop(proof_id, None)),
+                _canonical_json_bytes(payload))
+            return result
         values, blockers = evaluator(slots=slots, facts=facts, issues=issues, as_of_utc=as_of_utc)
         # Re-read source lineage, root and the exact receipt after calculation:
         # a correct early read cannot bless a late SQL/file/source mutation.
@@ -507,12 +571,20 @@ def _install_metric_projection():
         proofs[proof_id] = (weakref.ref(result, lambda _, proof_id=proof_id: proofs.pop(proof_id, None)), _canonical_json_bytes(payload))
         return result
 
+    def select(self, *args, **kwargs):
+        result = select_state(self, *args, **kwargs)
+        return None if type(result) is VerifiedMetricFeatureAbsence else result
+
     repository_type.__init__ = init
     repository_type.select_current_verified_metric_features = select
-    return VerifiedMetricFeatureProjection
+    repository_type.select_current_verified_metric_feature_state = select_state
+    checked_methods += ((repository_type, "select_current_verified_metric_features", select),
+        (repository_type, "select_current_verified_metric_feature_state", select_state))
+    return VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence, dependencies
 
 
-VerifiedMetricFeatureProjection = _install_metric_projection()
+(VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence,
+ _require_authentic_metric_feature_repository) = _install_metric_projection()
 del _install_metric_projection
 
-__all__ = ["FormalFeatureRepository", "FormalFeatureCurrentInput", "FormalFeatureCurrentInputProvider", "VerifiedMetricFeatureProjection"]
+__all__ = ["FormalFeatureRepository", "FormalFeatureCurrentInput", "FormalFeatureCurrentInputProvider", "VerifiedMetricFeatureProjection", "VerifiedMetricFeatureAbsence"]

@@ -39,8 +39,8 @@ def update_mapping_digest(doc):
 class MetricFixture:
     """A plain helper; no imported/inherited TestCase can duplicate suite discovery."""
 
-    def __init__(self, *, mutate=None, exchange_rows=None):
-        self.tempdir = tempfile.TemporaryDirectory()
+    def __init__(self, *, mutate=None, exchange_rows=None, tempdir=None):
+        self.tempdir = tempdir or tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
         self.db_path = self.root / "metric.sqlite"
         StateStore(self.db_path).initialize()
