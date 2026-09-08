@@ -30,7 +30,7 @@ def configuration(docs):
 
 
 class FinancialFixture(MetricFixture):
-    def __init__(self, *, population=False, missing_memberships=False):
+    def __init__(self, *, population=False, missing_memberships=False, mutate=None, calendar_binding_resolver=None):
         rows = None
         def configure(docs):
             configuration(docs)
@@ -38,6 +38,8 @@ class FinancialFixture(MetricFixture):
                 docs["industry"]["memberships"] = [dict(security_id="SH600099", template_id="bank",
                     primary_industry="banks", secondary_industry="banks")]
                 update_mapping_digest(docs["industry"])
+            if mutate:
+                mutate(docs)
             if population:
                 ids = ["BJ430001"] + [f"SH{600000 + i}" for i in range(20)] + ["SZ000001"]
                 docs["industry"]["memberships"] = [dict(security_id=sid,
@@ -48,7 +50,8 @@ class FinancialFixture(MetricFixture):
         if population:
             rows = {exchange: [dict(security_id=sid, listing_status="listed", security_type="ordinary_a") for sid in ids]
                 for exchange, ids in {"BJ": ["BJ430001"], "SH": [f"SH{600000+i}" for i in range(20)], "SZ": ["SZ000001"]}.items()}
-        super().__init__(mutate=configure, exchange_rows=rows, tempdir=project_temporary_directory())
+        super().__init__(mutate=configure, exchange_rows=rows, tempdir=project_temporary_directory(),
+            calendar_binding_resolver=calendar_binding_resolver)
         self.files = FormalFeatureBundleStore(self.root / "features")
         self.store._formal_feature_bundle_store = self.files
         self.issues = {}
@@ -81,21 +84,25 @@ class FinancialFixture(MetricFixture):
         self.issues[sid] = issues
         self.publish_current(sid)
 
-    def put_financial(self, sid, values, *, generation="financial-1", updated=None, publish=True):
+    def put_financial(self, sid, values, *, generation="financial-1", updated=None, publish=True,
+                      period_end="2025-12-31", period_kind="FY", nature="duration"):
         raw = canonical(values)
         task = self.store.enqueue_formal_task("formal_statement", sid + generation, generation, {})
         leased = self.store.lease_next_formal_task(("formal_statement",), "financial-fixture", 300)
         self.assertEqual(leased["id"], task)
-        fetch = OfficialFetch(request=OfficialRequest("cninfo", "annual_report", sid, "2025-12-31", sid[:2]),
+        fetch = OfficialFetch(request=OfficialRequest("cninfo", "annual_report", sid, period_end, sid[:2]),
             raw_bytes=raw, original_url="https://www.cninfo.com.cn/fixture/annual.json",
             published_at_utc="2026-03-20T08:00:00+00:00", published_precision="timestamp",
             source_updated_at_utc=updated, captured_at_utc="2026-09-04T07:00:00+00:00",
             effective_at_utc="2026-03-20T08:00:00+00:00", effective_time_evidence_hash=None,
             refresh_generation=generation, parser_id="fixture-annual", parser_version="fixture-annual-v1",
-            mapping_version="fixture-annual-map-v1", declared_security_id=sid, declared_period="2025-12-31")
+            mapping_version="fixture-annual-map-v1", declared_security_id=sid, declared_period=period_end)
         verification = verify_official_fetch(fetch, SourcePolicy.cninfo())
         ref = self.snapshots.persist_verified(fetch, verification, producing_task_id=task, worker_id="financial-fixture")
         facts = tuple(formal_fact(security_id=sid, metric_key=key, value=float(value), source_field=key,
+            period_end=period_end, period_kind=period_kind, nature=nature,
+            statement="income" if nature == "duration" else "balance",
+            period_start=period_end[:4] + "-01-01" if nature == "duration" else None,
             raw_value_sha256=hashlib.sha256(canonical(value)).hexdigest(), source_snapshot_id=ref.snapshot_id,
             source_content_sha256=ref.content_sha256, source_refresh_generation=ref.refresh_generation,
             source_producing_task_id=ref.producing_task_id, parser_id=ref.parser_id, parser_version=ref.parser_version,

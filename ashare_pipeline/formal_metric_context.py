@@ -293,10 +293,11 @@ def _metric_context_types():
         def __deepcopy__(self, memo):
             raise TypeError("metric Context repository cannot be copied")
 
-    return FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch
+    return FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch, dependencies
 
 
-FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch = _metric_context_types()
+(FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch,
+ _require_authentic_metric_context_repository) = _metric_context_types()
 del _metric_context_types
 
 __all__ = ["FormalMetricContextRepository", "VerifiedMetricUniverse", "VerifiedMetricIndustryBatch"]
