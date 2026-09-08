@@ -556,8 +556,15 @@ def _trusted_context_types():
             bundle.require_official()
             scoring = bundle.blob("scoring")
             wire = _load(scoring.canonical_json)
-            _keys(wire, ("registry_role", "schema_version", "descriptors"))
-            if wire["registry_role"] != "scoring" or wire["schema_version"] != "formal-context-registry-v1":
+            if wire.get("schema_version") == "formal-scoring-registry-v1":
+                _keys(wire, ("registry_role", "schema_version", "descriptors", "scoring"))
+                if type(wire["scoring"]) is not dict:
+                    raise ValueError("Context scoring wrapper must contain a scoring object")
+            else:
+                _keys(wire, ("registry_role", "schema_version", "descriptors"))
+            if wire["registry_role"] != "scoring" or wire["schema_version"] not in (
+                "formal-context-registry-v1", "formal-scoring-registry-v1"
+            ):
                 raise ValueError("unsupported Context registry wrapper")
             if type(wire["descriptors"]) is not list:
                 raise ValueError("Context descriptors must be a canonical array")

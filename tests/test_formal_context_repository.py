@@ -64,6 +64,46 @@ class FixtureNormalizer:
         return (FormalContextFact.create(**wire),)
 
 
+class ScoringWrapperIntegrationTests(unittest.TestCase):
+    def load_wrapper(self, mutate=None):
+        from tests.test_formal_scoring_registry import signed_graph
+        from ashare_pipeline.formal_context_schema import FormalContextRegistry, SignedContextRequestResolver
+        bundle, _, repository, verifier = signed_graph(context=True, mutate=mutate)
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        store = StateStore(Path(temp.name) / "context.sqlite", registry_signature_verifier=verifier)
+        store.initialize()
+        for blob in repository.blobs.values():
+            store.put_formal_registry_blob(blob)
+        store.put_formal_registry_manifest(repository.manifest)
+        registry = FormalContextRegistry.load(store, verifier, bundle.manifest.manifest_hash)
+        resolver = SignedContextRequestResolver(store, verifier)
+        request = resolver.resolve(context_kind="security_state", scope_key="fixture-state", security_id="SZ000001",
+            as_of_utc=FREEZE, registry_manifest_hash=bundle.manifest.manifest_hash, upstream_generation="wrapper-test")
+        return registry.descriptor_for(request), request
+
+    def test_combined_scoring_wrapper_preserves_legacy_descriptor_identity(self):
+        def legacy(docs):
+            docs["scoring"].pop("scoring")
+            docs["scoring"]["schema_version"] = "formal-context-registry-v1"
+        old_descriptor, old_request = self.load_wrapper(legacy)
+        try:
+            new_descriptor, new_request = self.load_wrapper()
+        except ValueError as error:
+            self.fail(f"the explicitly versioned combined wrapper must be accepted: {error}")
+        self.assertEqual(old_descriptor, new_descriptor)
+        self.assertEqual(old_request.descriptor_id, new_request.descriptor_id)
+        self.assertEqual(new_request.official_request.dataset, "fixture-state")
+
+    def test_combined_wrapper_rejects_unknown_keys_versions_and_invalid_descriptors(self):
+        for mutation in (lambda d: d["scoring"].update(extra=True),
+            lambda d: d["scoring"].update(schema_version="formal-scoring-registry-v2"),
+            lambda d: d["scoring"].update(scoring=[]),
+            lambda d: d["scoring"]["descriptors"][0].update(extra=True)):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                self.load_wrapper(mutation)
+
+
 class ContextIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_context_repository"))
