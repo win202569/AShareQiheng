@@ -109,7 +109,9 @@ def digest(wire):
 - Consumes: 精确现有 FormalFeatureRepository、FormalMetricCurrentInputProvider、genuine FormalPolicyRegistry。
 - 新内部 `select_current_verified_policy_feature_state(security_id, as_of_utc, *, template_id, registry_manifest_hash, policy_registry, rule_ids: tuple[str,...]) -> PolicyFeatureState`。方法从这些活动规则解析需要的签名槽位，不接收任意 feature_key 列表。允许其中 required=false，不改变旧 metric 方法。
 - `FormalPolicyFinancialRepository(feature_repository, *, current_input_provider)`；`.select(security_id, as_of_utc, *, template_id, policy_registry, industry_batch: VerifiedMetricIndustryBatch) -> PolicyFinancialSelection`。消费现有真实类型，先 require_verified，再比较 root/frozen/universe 身份及 entries[security_id]；行业 unresolved 不按清单外处理。W3 负责对应同库 Context repository 的 recheck_batch，不接受自由 bool 授予 not_applicable 资格。
-- 内部 PolicyFeatureState 提供 `values,blockers,slots,facts,issues,source_refs,input_hash,bundle_hash,projection_hash,batch_id` 只读属性及 `.to_dict()`、`.recheck()`；同时保存所选 rule_ids/selector 身份及当前 absence 标记。它只能由新增安装器铸造，供本仓库消费，不是公开结果 proof。
+- 内部 PolicyFeatureState 提供 `values,blockers,slots,facts,issues,slot_issues,source_refs,input_hash,bundle_hash,projection_hash,batch_id` 只读属性及 `.to_dict()`、`.recheck()`；同时保存所选 rule_ids/selector 身份及当前 absence 标记。它只能由新增安装器铸造，供本仓库消费，不是公开结果 proof。
+- 完整 issues 始终参与身份和重验，`slot_issues` 仅表示已证明的依赖影响范围。只允许同根真实 financial mapping 的 mapping_id、source_field 与交易所绑定，将指定字段级提取问题关联到 AST metric；不以自由 details 或字段名猜事实键/年份。不能定位的问题仍整体阻断；不改旧 V6/metric 全局门槛。季度标量也必须按每个实际 period_key 解析 V6 季度组成事实，版本同领先歧义保持完整性失败。
+- 政策路径按实际受支持的 financial v1 loader 验证映射，未知版本或畸形已声明映射失败；生产逻辑不特判 `fixture-v1`。本任务把 `PolicyRuntimeFixture` 默认 mapping 提升为真实结构的合成签名 financial v1，仍在最终 rehash/sign 前配置，保持数值、成员和旧夹具行为；F1 的 policy_values 消费者纳入最终联合回归。
 - PolicyFinancialSelection 是内部闭包登记对象，提供 `.values`（selector hash→PolicyValue）、`.annual`（series selector hash→五条年度记录）、`.lineage`、`.selection_hash`、`.recheck()`，无公开正式证据工厂。
 - 年度记录字段固定 `fy_end,selector_hash,slot_hash,formula_hash,formula_version,value,unit,facts,issues,source_refs,visibility,bridge_version,projection_hash`；facts 每个叶子保存真实 fact ID、AST 路径、完整期间、会计口径；缺失记录保留目标年份及待补，不伪造有效 value。
 - 为独立 F2 单测增加 fixture `.financial_selection(security_id)`：内部先用真实 industry Context 及 FormalMetricContextRepository 取得归属，再调用上述仓库，不接收能改变适用性的布尔参数。`PolicyRuntimeFixture` 在本任务扩展构造参数 `cyclic=True`（exact bool），在签名前配置合成行业成员；非周期场景使用签名周期清单外的行业，默认行为保持不变。可增加仅测试用 `mutate=None` 接点，在默认图配置后、最终重哈希和签名前修改 AST/选择器；不得在读取时更改已签名图。
@@ -151,7 +153,7 @@ def annual_targets(series_selector):
 
 对于每个目标，遍历签名 AST 的每个 fact 叶子，而不是数引用；按叶子的 period_key 和事实完整期间匹配，保存实际 AST 路径和 fact ID。期间解析仅使用已有财务期间语义；不从 slot 名字猜年份。target年度必须与声明的观察一致，合法期初余额不被“所有事实年末必须相同”误杀。
 
-执行重验序列：provider 完整身份及 facts/issues 脱离快照 → 与全部持久化 facts/issues 对比 → 同根验证 → 原 V6 builder 重建 → `_read_authenticated_bundle` 认证真实收据且 require_complete=False → 逐项政策投影 → 逐年 actual leaf 核验 → bridge_v6 → 重读 provider/事实/问题/收据/来源。保存原投影 hash、原有限数的精确表示、bridge_version 和转换后字符串进入 selection_hash。仅“真实当前收据不存在”可产生 current_receipt_absent；任何可信读取异常不翻译成缺失。
+执行重验序列：provider 完整身份及 facts/issues 脱离快照 → 与全部持久化 facts 对比并保留完整 provider-owned issues（既有 StateStore 无全量正式 issue 列表 API） → 同根验证 → 原 V6 builder 重建 → `_read_authenticated_bundle` 认证真实收据且 require_complete=False → 逐项政策投影 → 逐年 actual leaf 核验 → bridge_v6 → 重读 provider/事实/问题/收据/来源。保存原投影 hash、原有限数的精确表示、bridge_version 和转换后字符串进入 selection_hash。仅“真实当前收据不存在”可产生 current_receipt_absent；任何可信读取异常不翻译成缺失。
 
 `.recheck()` 重复实际依赖选择并比对规范身份，历史 selection 仅可审计；未进入 W3 publication 的 selection 不对外提供 require_official 方法。
 

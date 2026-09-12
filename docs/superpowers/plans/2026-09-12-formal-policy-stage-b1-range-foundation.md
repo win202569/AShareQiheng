@@ -122,6 +122,7 @@ def require_pair(market, calendar, selector, exchange):
 - `fetch_verified(request: FormalRangeRequestV1) -> RangeFetch`；`parse_verified_snapshot(request, *, raw_bytes: bytes, manifest: dict) -> ParsedRangeDocumentV1` 重跑已登记实现，不接收已算好的政策结论。
 - `formal_range_request.py` 只依赖纯格式/标准库，持有真实请求类型、私有 mint 与闭包登记校验；来源模块在初始化时封存这些真实接口，不提供可抢先劫持的注册回调。`formal_range_source.py` 在 mint/fetch 前后重验真实 binding/config/root，兼容重导出请求类型。W1 增加行情 request 工厂时复用该私有 mint；R2 不提供公开 arbitrary range request 构造器。
 - `RangeBinding.source_registry_hash` 从已验证父记录的 source 角色哈希读取，不更改绑定 wire/hash。来源封存真实 getter，将该值保存在请求私有记录中，固定 request wire 不增字段。`select_range` 除 ENTRY/锚点外比较完整 source blob 哈希；`SignedSourceRegistry` 本身没有 manifest-root 身份，同一个完整 source blob 被多个真实根引用可以复用，但不同 source blob 不能仅凭所选 ENTRY 相同混用。请求的 manifest-root 仍由真实 binding 绑定及重验。
+- 区间文档保留独立文档级 publication/precision/source_updated/effective/evidence_hash/captured/upstream_generation，并区分来源总 `record_count` 与本页 `page_record_count`；`pagination_evidence` 由实际执行的注册解析合同核对，采用 `signed_single_response_v1` 或 `source_declared_numbered_pages_v1`。抓取或公开晚于冻结时点仍可保存来源观察，不因此声称可见；date_only 未证明时明确保留空生效时间/依据，后续证据层判待补。每行时点独立，不从文档默认继承。upstream_generation 是不透明的一致性身份，不能按其字符串猜新旧。fetch manifest 保存来源版本字段，快照重跑须一致。
 - 新测试 `RangeSourceFixture`：构造真实 range_graph/RangeBinding、捕获请求的 FakeTransport、已登记 JSON fixture parser；属性 `.source/.transport/.binding`，方法 `.reply(wire:dict)`、`.close()`。仅临时原始内容，不创建生产文件。
 
 - [ ] **写失败测试。**
