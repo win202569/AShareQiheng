@@ -177,6 +177,7 @@ def page_successor(document, max_pages):
 **Interfaces:**
 
 - Consumes: R2 genuine request/fetch；精确已初始化 StateStore。
+- RangeObservation 只证明来源观察、重跑规范化、收据和当前来源版本，不证明冻结日可见。date_only 的有效时间/hash 非空但尚未认证时仍是来源断言，不能仅凭非空 hash 授权；空对也保留。W1 独立认证其依据或记录 visibility_unproven，不借旧单日 Context 引导绑定伪造区间证明。
 - store 模块先定义 builder/helpers，末尾导入 source 但不读取部分初始化的 source 属性；source 工厂在真实 Source/Observation 闭包建立后调用 store builder，封存返回的精确 Store 与私有认证重读函数，再向两模块发布同一类型并移除临时 builder/mint。两种导入顺序均须通过，外部重复 builder 不得制造原闭包接受的类型或观察；禁止调用者注册/首次调用捕获。
 - `root` 为原始快照存储路径，签名图从精确 StateStore/verifier 重新加载。重启逐项验证真实绑定及已保存父收据链，不能由任意 wire/ordinal 授权请求；历史链可审计但不能授予新执行或 current 资格。
 - Produces: `FormalRangeStore(state_store, *, root, signature_verifier, source_factory)`；`source_factory(binding) -> FormalRangeSource` 是构造时捕获的受信任依赖，不是调用者临时 parser。

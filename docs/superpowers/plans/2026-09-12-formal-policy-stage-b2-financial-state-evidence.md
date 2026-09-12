@@ -167,6 +167,7 @@ def annual_targets(series_selector):
 **Interfaces:**
 
 - Consumes: `FormalContextRepository.get_verified_many(kind, scope_key, security_ids, as_of_utc, registry_manifest_hash)`、genuine FormalPolicyRegistry。
+- 内部 lineage 的完整引用为所选 Context Fact 原文加精确签名 descriptor/selector/读取身份；normalization_input_hash 绑定完整请求及 manifest/content，genuine get_verified_many 重验生产者、收据、原始字节和历史日历关系。这不是内嵌完整 OfficialSnapshotRef/receipt 导出或可独立授信的序列化证明；收据/文件丢失撤销 selection，W3 必须重新认证，不增加破坏历史读取的 current-only 快照读取。
 - 可构造内部真实 FormalMetricContextRepository companion，仅复用既有同库 Context/raw/verifier 的 captured authenticity guard；不读取 universe/industry，不增加其证据前置条件，实际状态读取仍使用封存的 get_verified_many。
 - Produces: `FormalPolicyStateRepository(context_repository)`；`.select(security_id, as_of_utc, *, template_id, policy_registry) -> PolicyStateSelection`；selection 提供 `.values/.lineage/.selection_hash/.recheck()`，内部身份边界与 F2 相同。
 - `read_flag(flags: tuple[dict,...], flag_id: str) -> bool | None` 为纯内部辅助；显式 false 返回 false，实际缺条目返回 None，重复 ID/非 bool 返回错误。
