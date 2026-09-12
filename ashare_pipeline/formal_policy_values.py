@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
+from types import MappingProxyType
 from decimal import (
     Context,
     Decimal,
@@ -23,7 +25,7 @@ _STATES = frozenset(("value", "missing", "domain_conflict"))
 _VALUE_TYPES = frozenset((
     "decimal", "bool", "enum", "event_record", "calendar_record", "market_window",
 ))
-_COMPOUND_TYPES = frozenset(("event_record", "calendar_record", "market_window"))
+_COMPOUND_TYPES = frozenset(("calendar_record", "market_window"))
 _RUNTIME_REASONS = frozenset((
     "applicability_unresolved",
     "current_receipt_absent",
@@ -145,6 +147,18 @@ def _decimal(value: object) -> Decimal:
     return parsed
 
 
+def _event_record(value: object):
+    """Closed Context event value shape, deliberately without proof authority."""
+    if type(value) is not dict or set(value) != {"event_id", "event_date", "quantified_value", "unit"}:
+        raise ValueError("event record requires exactly the four Context event fields")
+    event_date = value["event_date"]
+    if type(event_date) is not str or date.fromisoformat(event_date).isoformat() != event_date:
+        raise ValueError("event date must be a canonical ISO date")
+    return MappingProxyType(dict(event_id=_controlled_text(value["event_id"], "event ID"),
+        event_date=event_date, quantified_value=_decimal(value["quantified_value"]),
+        unit=_controlled_text(value["unit"], "event unit")))
+
+
 @dataclass(frozen=True, slots=True)
 class _Pending:
     origin: str
@@ -182,10 +196,10 @@ class _Pending:
 
 @dataclass(frozen=True, slots=True)
 class PolicyValue:
-    """Detached scalar value or typed evidence-shortfall record."""
+    """Detached scalar/event value or typed evidence-shortfall record."""
 
     state: str
-    value: Decimal | bool | str | None
+    value: Decimal | bool | str | MappingProxyType | None
     value_type: str
     unit: str | None
     evidence_hashes: tuple[str, ...]
@@ -211,7 +225,9 @@ class PolicyValue:
                 raise ValueError("a present policy value cannot be pending")
             if value_type in _COMPOUND_TYPES:
                 raise ValueError("compound policy values require their closed producer validator")
-            if value_type == "decimal":
+            if value_type == "event_record":
+                value = _event_record(wire["value"])
+            elif value_type == "decimal":
                 value: Decimal | bool | str | None = _decimal(wire["value"])
             elif value_type == "bool":
                 if type(wire["value"]) is not bool:
@@ -241,6 +257,9 @@ class PolicyValue:
         value: object = self.value
         if self.value_type == "decimal" and value is not None:
             value = _decimal_text(value)
+        elif self.value_type == "event_record" and value is not None:
+            value = dict(value)
+            value["quantified_value"] = _decimal_text(value["quantified_value"])
         return {
             "state": self.state,
             "value": value,
@@ -249,6 +268,43 @@ class PolicyValue:
             "evidence_hashes": list(self.evidence_hashes),
             "pending": [item.to_dict() for item in self._pending],
         }
+
+
+def _install_value_operations():
+    """Retain owner-initialized DTO operations without granting evidence authority."""
+    owner = globals()
+    value_type, pending_type = PolicyValue, _Pending
+    parse, serialize = value_type.from_dict, value_type.to_dict
+    bindings = tuple((name, owner[name]) for name in (
+        "PolicyValue", "_Pending", "_unit", "_identifier", "_controlled_text", "_hashes",
+        "_decimal", "_decimal_text", "_event_record", "_FIELDS", "_PENDING_FIELDS", "_STATES",
+        "_VALUE_TYPES", "_COMPOUND_TYPES", "_RUNTIME_REASONS", "_SHA256", "_IDENTIFIER",
+        "Decimal", "date", "MappingProxyType"))
+    classes = tuple((cls, dict(vars(cls)), cls.__bases__, cls.__mro__)
+                    for cls in (value_type, pending_type))
+
+    def check():
+        if (owner.get("_policy_value_operations") is not operations
+                or any(owner.get(name) is not original for name, original in bindings)):
+            raise PolicyIntegrityError("policy value owned validation dependency changed")
+        for cls, members, bases, mro in classes:
+            # copyreg may cache slots on a detached DTO; that cache is not used
+            # by validation, serialization, attribute lookup or evidence reads.
+            current = {name: value for name, value in vars(cls).items() if name != "__slotnames__"}
+            if (cls.__bases__ != bases or cls.__mro__ != mro or set(current) != set(members)
+                    or any(current[name] is not original for name, original in members.items())):
+                raise PolicyIntegrityError("policy value owned class interface changed")
+
+    def operations():
+        # The private original authority, like other internal owner readers,
+        # is part of the trusted implementation boundary, never registration.
+        return parse, serialize, check
+
+    return operations
+
+
+_policy_value_operations = _install_value_operations()
+del _install_value_operations
 
 
 __all__ = [

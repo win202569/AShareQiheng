@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 import hashlib
 import math
 
@@ -19,7 +19,8 @@ from ashare_pipeline.formal_universe import canonical_security_id
 from tests.formal_metric_feature_fixtures import FinancialFixture
 from tests.formal_metric_fixtures import FREEZE, update_mapping_digest
 from tests.formal_policy_fixtures import add_policy_documents, rehash_documents
-from tests.test_formal_context_repository import descriptor
+from tests.test_formal_context_repository import descriptor, FixtureNormalizer
+from ashare_pipeline.formal_context_schema import FormalContextRegistry
 from tests.test_formal_feature_contract import formal_fact
 from tests.test_formal_scoring_registry import TEMPLATES, canonical
 from tests.test_formal_sources import config
@@ -166,6 +167,54 @@ class PolicyRuntimeFixture(FinancialFixture):
         self.policy_financial_repository = FormalPolicyFinancialRepository(self.feature_repository,
             current_input_provider=self.provider)
         self._policy_industry_ids = set()
+        self._policy_context_generations = {}
+
+    def put_policy_context(self, security_id, kind, value, *, generation="g1"):
+        """Persist only this temporary graph's signed Context producer chain."""
+        if (type(security_id) is not str or canonical_security_id(security_id) != security_id
+                or security_id not in {member.security_id for member in self.frozen.members}):
+            raise ValueError("policy Context security must be a canonical frozen-universe member")
+        if kind not in ("security_state", "regulatory_state", "event_calendar"):
+            raise ValueError("policy Context fixture supports only state and event kinds")
+        if type(generation) is not str or not generation or generation.strip() != generation:
+            raise ValueError("generation must be canonical text")
+        scope = "fixture-state" if kind == "security_state" else "fixture-policy-" + kind
+        request = self.resolver.resolve(context_kind=kind, scope_key=scope, security_id=security_id,
+            as_of_utc=FREEZE, registry_manifest_hash=self.bundle.manifest.manifest_hash,
+            upstream_generation=generation)
+        # New generations represent later corrections, with deterministic fixture times.
+        generations = self._policy_context_generations.setdefault((security_id, kind), {})
+        if generation not in generations:
+            generations[generation] = len(generations)
+        published = (date(2026, 8, 20) + timedelta(days=generations[generation])).isoformat() + "T07:00:00+00:00"
+        raw = canonical(dict(value=value, no_coverage=False))
+        task = self.store.enqueue_formal_task("formal_context",
+            hashlib.sha256(request.canonical_bytes() + raw).hexdigest(), request.refresh_generation, {})
+        worker = "policy-context-fixture"
+        leased = self.store.lease_next_formal_task(("formal_context",), worker, 300)
+        self.assertEqual(leased["id"], task)
+        fetch = OfficialFetch(request=request.official_request, raw_bytes=raw,
+            original_url="https://www.cninfo.com.cn/fixture/context.json",
+            published_at_utc=published, published_precision="timestamp", source_updated_at_utc=None,
+            captured_at_utc="2026-09-04T07:00:00+00:00", effective_at_utc=published,
+            effective_time_evidence_hash=None, refresh_generation=request.refresh_generation,
+            parser_id=request.parser_id, parser_version=request.parser_version, mapping_version=request.mapping_version,
+            declared_security_id=security_id, declared_period=request.official_request.period_or_date)
+        verification = verify_official_fetch(fetch, SourcePolicy.cninfo())
+        self.assertEqual(verification.status, "verified")
+        ref = self.snapshots.persist_verified(fetch, verification, producing_task_id=task, worker_id=worker)
+        receipt = FormalContextRegistry.load(self.store, self.verifier,
+            self.bundle.manifest.manifest_hash).normalize_verified(request, ref, raw,
+            FixtureNormalizer(), task_id=task, worker_id=worker)
+        self.store.put_formal_context_facts(receipt)
+        self.store.complete_formal_task(task, worker, {"snapshot": ref.snapshot_id})
+        return receipt.facts[0], ref
+
+    def state_selection(self, security_id):
+        from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
+        member = next(m for m in self.industry["memberships"] if m["security_id"] == security_id)
+        return FormalPolicyStateRepository(self.context).select(security_id, FREEZE,
+            template_id=member["template_id"], policy_registry=self.policy_registry)
 
     def financial_selection(self, security_id):
         if security_id not in self._policy_industry_ids:

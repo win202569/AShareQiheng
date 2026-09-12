@@ -371,7 +371,8 @@ def _install_policy_registry():
         if any(owner.get(name) is not expected for owner, name, expected in bindings):
             raise ValueError("policy proof dependency changed")
         if (module_globals.get("FormalPolicyRegistry") is not proof_type
-                or module_globals.get("load_formal_policy_registry") is not load):
+                or module_globals.get("load_formal_policy_registry") is not load
+                or module_globals.get("_read_authenticated_policy_registry") is not read):
             raise ValueError("policy proof entry point changed")
         if (any(resolved_member(cls, name) is not expected for cls, name, expected in source_members)
                 or any(cls.__bases__ != bases or cls.__mro__ != mro for cls, bases, mro in source_bases)):
@@ -499,11 +500,17 @@ def _install_policy_registry():
             bundle, scoring_registry, feature_registry, root_hash, hashes)
         return result
 
+    def read(proof):
+        """Internal consumer read anchored in this owner's original proof record."""
+        record = proof_record(proof)
+        return dict(loads(record[2]), contract_hash=record[1]["contract_hash"])
+
     own_members = class_snapshot((ProofMeta, Proof, proof_type))
-    return proof_type, load
+    return proof_type, load, read
 
 
-FormalPolicyRegistry, load_formal_policy_registry = _install_policy_registry()
+(FormalPolicyRegistry, load_formal_policy_registry,
+ _read_authenticated_policy_registry) = _install_policy_registry()
 del _install_policy_registry
 
 

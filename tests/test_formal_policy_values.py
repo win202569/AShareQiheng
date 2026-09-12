@@ -159,12 +159,53 @@ class PolicyValueTests(unittest.TestCase):
             with self.subTest(wire=wire), self.assertRaises(ValueError):
                 PolicyValue.from_dict(wire)
 
-    def test_nonmissing_compound_records_wait_for_closed_producer_validators(self):
-        for value_type in ("event_record", "calendar_record", "market_window"):
+    def test_nonmissing_remaining_compound_records_wait_for_closed_producer_validators(self):
+        for value_type in ("calendar_record", "market_window"):
             with self.subTest(value_type=value_type), self.assertRaises(ValueError):
                 PolicyValue.from_dict(value_wire(
                     value_type=value_type, value={"apparently": "valid"}, unit=None
                 ))
+
+    def test_event_record_preserves_four_fields_without_evidence_authority(self):
+        record = dict(event_id="fixture_quantified_event", event_date="2026-08-31",
+                      quantified_value="4.2", unit="ratio")
+        try:
+            value = PolicyValue.from_dict(value_wire(value_type="event_record", value=record, unit=None))
+        except ValueError as error:
+            self.fail(f"the closed event record must preserve actual Context fields: {error}")
+        self.assertEqual(value.to_dict()["value"], record)
+        self.assertEqual(value.value["quantified_value"], Decimal("4.2"))
+        record["quantified_value"] = "9"
+        self.assertEqual(value.to_dict()["value"]["quantified_value"], "4.2")
+        with self.assertRaises(TypeError):
+            value.value["event_id"] = "other"
+        self.assertFalse(hasattr(value, "require_verified"))
+
+    def test_event_record_rejects_malformed_dates_units_or_quantities(self):
+        record = dict(event_id="fixture_quantified_event", event_date="2026-08-31",
+                      quantified_value="4.2", unit="ratio")
+        invalid = ["4.2", {"apparently": "valid"}, {**record, "extra": True},
+            {key: value for key, value in record.items() if key != "event_date"}]
+        invalid.extend({**record, **change} for change in (
+            {"event_date": "2026-02-30"}, {"event_date": "20260831"},
+            {"event_date": 20260831}, {"event_id": ""}, {"unit": ""},
+            {"quantified_value": None}, {"quantified_value": False},
+            {"quantified_value": 4.2}, {"quantified_value": "NaN"},
+            {"quantified_value": "4.20"}))
+        for record in invalid:
+            with self.subTest(record=record), self.assertRaises(ValueError):
+                PolicyValue.from_dict(value_wire(value_type="event_record", value=record, unit=None))
+
+    def test_event_dto_preserves_context_unit_text_without_claiming_visibility(self):
+        for unit in ("%", "CNY/share"):
+            record = dict(event_id="fixture_quantified_event", event_date="2026-09-30",
+                          quantified_value="-2.5", unit=unit)
+            try:
+                value = PolicyValue.from_dict(value_wire(value_type="event_record", value=record, unit=None))
+            except ValueError as error:
+                self.fail(f"Context unit text and scheduled date must be retained by the DTO: {error}")
+            self.assertEqual(value.to_dict()["value"], record)
+            self.assertFalse(hasattr(value, "recheck"))
 
     def test_runtime_and_signed_policy_pending_reasons_are_strict(self):
         runtime_codes = (
