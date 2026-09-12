@@ -162,13 +162,14 @@ def annual_targets(series_selector):
 
 ## F3：证券、监管与事件的显式状态证据
 
-**Files:** Create `ashare_pipeline/formal_policy_state.py`, `tests/test_formal_policy_state.py`; Modify `tests/formal_policy_runtime_fixtures.py`。
+**Files:** Create `ashare_pipeline/formal_policy_state.py`, `tests/test_formal_policy_state.py`; Modify `tests/formal_policy_runtime_fixtures.py`, `ashare_pipeline/formal_policy_values.py`, `tests/test_formal_policy_values.py`（仅接通 F1 留给 F3 的封闭 event_record 值格式及其测试）。
 
 **Interfaces:**
 
 - Consumes: `FormalContextRepository.get_verified_many(kind, scope_key, security_ids, as_of_utc, registry_manifest_hash)`、genuine FormalPolicyRegistry。
 - Produces: `FormalPolicyStateRepository(context_repository)`；`.select(security_id, as_of_utc, *, template_id, policy_registry) -> PolicyStateSelection`；selection 提供 `.values/.lineage/.selection_hash/.recheck()`，内部身份边界与 F2 相同。
 - `read_flag(flags: tuple[dict,...], flag_id: str) -> bool | None` 为纯内部辅助；显式 false 返回 false，实际缺条目返回 None，重复 ID/非 bool 返回错误。
+- F1 对 present compound 的拒绝在本任务仅为 event_record 接通封闭校验：保留实际 Context 的 event_id/event_date/quantified_value/unit 四字段、已签名选择器单位和有效日期，不用裸 decimal 代替事件。普通值 DTO 不授予证据资格，来源与时点仍保存在 selection.lineage；calendar_record/market_window 留给 W1，不引入动态验证器注册。
 - 测试 fixture `.put_policy_context(security_id, kind, value, *, generation="g1")` 通过已签名 resolver→task→snapshot→FixtureNormalizer→Context receipt 写入；`.state_selection(security_id)` 调用 genuine 仓库。不得用 `.sql()` 直接制造正常的 proof；`.sql()` 仅负例篡改测试使用。
 
 - [ ] **写失败测试。**
@@ -199,8 +200,8 @@ def read_flag(flags, flag_id):
 
 旧规范 regulatory flags 的实际字段就是 flag_id/active，保持原样。selection.values 以 selector_hash 为键，完整请求/来源引用保存在 lineage 中，不向 F1 封闭 PolicyValue 偷加字段。真正缺条目使用 runtime/state_entry_missing，错误单位用 unsupported_unit，时点未证明用 visibility_unproven。已登记原始来源文件不存在则整次失败，不 pending。
 
-- [ ] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_state tests.test_formal_context_schema tests.test_formal_context_repository -v`。
-- [ ] **审查并提交白名单。** 本任务三个文件；提交信息 `feat: preserve explicit policy state coverage and missing entries`。
+- [ ] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_state tests.test_formal_policy_values tests.test_formal_context_schema tests.test_formal_context_repository -v`。
+- [ ] **审查并提交白名单。** 本任务五个文件；提交信息 `feat: preserve explicit policy state coverage and missing entries`。
 
 ## B2 交接
 
