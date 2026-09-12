@@ -28,7 +28,7 @@
 
 ## F1：政策值结构、Decimal 桥与真实运行夹具
 
-**Files:** Create `ashare_pipeline/formal_policy_values.py`, `tests/test_formal_policy_values.py`, `tests/formal_policy_runtime_fixtures.py`。
+**Files:** Create `ashare_pipeline/formal_policy_values.py`, `tests/test_formal_policy_values.py`, `tests/formal_policy_runtime_fixtures.py`; Modify `tests/formal_metric_feature_fixtures.py`（仅给 FinancialFixture 增加可选 exchange_rows 转发，默认行为不变）。
 
 **Interfaces:**
 
@@ -37,6 +37,7 @@
 - 非正式 `PolicyValue.from_dict(wire)` / `.to_dict()` / `.state` / `.value`：wire 严格字段 `state,value,value_type,unit,evidence_hashes,pending`。state 为 value/missing/domain_conflict；value_type 为 decimal/bool/enum/event_record/calendar_record/market_window；非 value 分支 value=null。pending 为 `origin,code,rule_id,evidence_hashes` 四字段条目；runtime 白名单完全复制规格 §9.2；signed_policy 由 W2 对具体规则二次核验。
 - decimal 值 wire 用有限规范十进制字符串；bool 为 exact bool；enum 为明确字符串；复杂记录由对应 F3/W1 封闭解析，不允许任意 JSON 当作已证实输入。evidence_hashes 排序去重但不删除底层来源记录。
 - `PolicyRuntimeFixture(*, range_enabled=False, templates=None)`：继承 plain `FinancialFixture`，不是 TestCase；保留 `.bundle/.scoring/.vocabulary/.provider/.feature_repository/.context/.store/.root/.frozen` 和原 `.publish_current/.persist_features/.put_industry/.close`；增加 `.policy_registry`。
+- templates 明确为 `dict[canonical_security_id, template_id]`，指定时其键就是实际冻结清单，并在签名前构造对应 industry memberships 和 SH/SZ/BJ exchange_rows。FinancialFixture 新增 keyword exchange_rows=None 并将它作为非 population 场景的 rows；原 population=True 及默认三个证券行为保持不变，不复制整套基类初始化。
 - `.put_policy_financial(security_id, values, *, fy_end, units, generation="g1", persist=True)` 以真实财务任务/快照/事实/feature 收据生成证据；values 为 fact_key→原数值，units 必须逐 key 提供；fy_end 无默认，不推测 FY0。
 - `.policy_financial_values(security_id, *, current_equity=1.0, current_roe=5.0, current_margin=5.0, current_profit=5.0, annual_roe=(1.,2.,3.,4.,5.), annual_margin=(1.,2.,3.,4.,5.), annual_profit=(1.,2.,3.,4.,5.))` 写 FY2021–2025 真实事实及当期 FY2025、发布并保存对应 feature bundle。它只用于合成测试，不证明真实经济意义。
 
@@ -59,7 +60,9 @@ def test_bridge_preserves_v6_float_not_original_decimal(self):
             bridge_v6(bad)
 ```
 
-增加未知 reason、signed_policy 非当前规则、decimal 非规范串、复制 wire 之后修改原容器不改变 DTO、错误 value_type、缺失分支偷偷携带 value 等测试。真实夹具签名后的改动必须失败；测试图修改必须在签名前完成。
+增加未知 runtime reason、signed_policy 缺少/错误类型的 rule_id/code、decimal 非规范串、复制 wire 之后修改原容器不改变 DTO、错误 value_type、缺失分支偷偷携带 value 等测试。F1 是无证明资格的 DTO，只验证 signed_policy 语法；非当前规则和未签名 reason 的授权拒绝测试在拥有具体规则的 W2 执行，不改变 from_dict(wire) 签名。真实夹具签名后的改动必须失败；测试图修改必须在签名前完成。
+
+F1 的非缺失值先支持 decimal/bool/enum；复杂 value_type 可表达有原因的 missing/domain_conflict，但不得接受非缺失任意 dict。event/calendar/market 的非缺失封闭解析由 F3/W1 的生产者合同负责实现；届时对 values 模块的修改由协调者串行分配。
 
 - [ ] **运行 RED。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_values -v`。
 - [ ] **实现数值内核和夹具。**
@@ -88,12 +91,14 @@ def digest(wire):
     return hashlib.sha256(canonical_bytes(wire)).hexdigest()
 ```
 
-夹具配置顺序固定：现有 FinancialFixture 的基础 industry/metrics → 新增 security_state descriptor 和三个旧 config → `add_policy_documents` → 将当期 selector 和 AST 的 FY0 同时改为 FY2025 → 如果 range_enabled 则调用 R1 `add_range_documents` → `rehash_documents` → 构造真实签名 bundle。逐年槽位保持各自 FY2021–2025。保存 financial fact 时沿用原真实 fetch/task 路径，但使用明确 units：权益/利润 CNY，ROE/利润率 ratio；不得直接把默认 CNY 的事实当 ratio。
+夹具配置顺序固定：现有 FinancialFixture 的基础 industry/metrics → 新增 security_state descriptor 和三个旧 config → `add_policy_documents` → 将当期 selector 和 AST 的 FY0 同时改为 FY2025 → 如果 range_enabled 则调用 R1 `add_range_documents` → `rehash_documents` → 构造真实签名 bundle。逐年槽位保持各自 FY2021–2025；当期 ROE/利润率/利润使用独立 `fixture.policy.current.*` 事实键，年度序列保留 `fixture.policy.*`，不因同为 FY2025 而混淆独立输入。保存 financial fact 时沿用原真实 fetch/task 路径，但使用明确 units：权益/利润 CNY，ROE/利润率 ratio；不得直接把默认 CNY 的事实当 ratio。
+
+仅提供政策事实时，旧 V6 全指标历史门槛仍使 feature bundle 处于 blocked；F1 不放宽旧门槛。F1 测试核对签名 AST、实际事实值/期间/单位，并经既有 `require_complete=False` 认证路径读取真实保存的 blocked 收据。独立政策派生值由 F2 的可选投影负责验证。
 
 默认 fixture 用三个证券和小数据集；五模板组合测试传 templates 明确映射，不把每条格式单测扩大到全体证券。旧 `tests/formal_policy_fixtures.py` 的 FY0 静态用例不改。
 
 - [ ] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_values tests.test_formal_policy_registry tests.test_formal_metric_features -v`。
-- [ ] **审查并提交白名单。** 本任务三个文件；提交信息 `feat: define policy values and explicit V6 decimal bridge`。
+- [ ] **审查并提交白名单。** 本任务四个文件；提交信息 `feat: define policy values and explicit V6 decimal bridge`。
 
 ## F2：独立财务投影和年度实际叶子认证
 

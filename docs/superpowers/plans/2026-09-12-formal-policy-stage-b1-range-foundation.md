@@ -34,10 +34,10 @@ source 子项改变意味着根和所有依赖身份更新、重新签名。新�
 
 **Interfaces:**
 
-- Consumes: `SignedSourceRegistry.from_signed_bytes(raw, signature, key_id, verifier)`、`VerifiedRegistryBundle.blob(role)`、`FormalPolicyRegistry.require_official`，旧 Context `_descriptor`。
+- Consumes: `SignedSourceRegistry.from_signed_bytes(raw, signature, key_id, verifier)`、`VerifiedRegistryBundle.blob(role)`、`FormalPolicyRegistry.require_verified`，旧 Context `_descriptor`。
 - Produces: `parse_range_entry(wire: dict) -> RangeConfig`；只读 RangeConfig 提供 `to_dict()`、`entry_id`，字段严格按规格 §5.1；`load_policy_range_bindings(bundle, *, scoring_registry, policy_registry) -> RangeBindings`。
 - `RangeBindings.for_rule(rule_id: str, exchange: str) -> RangeBinding`；RangeBinding 提供 `market_config`、`calendar_config`、`policy_calendar_selector`、`registry_manifest_hash`、`binding_hash`、`require_current()`。调用该方法重验实际九角色来源和版本。它不声明覆盖任何日期。
-- 新 `SignedSourceRegistry.range_configs` 为不可变 tuple，v1 为 empty tuple；`select_range(request)` 只检索新区间项并验证全部身份，旧 `select` 只检索旧 configs。
+- 新 `SignedSourceRegistry.range_configs` 为不可变 tuple，v1 为 empty tuple；旧 `select` 只检索旧 configs。`select_range(request)` 在 R2 与真实新区间请求类型一起实现，届时只检索新区间项并验证全部身份；R1 不造可接受自由 dict 的请求旁路或未实现桩。
 - 测试帮助函数 `range_entry(**changes) -> dict`、`add_range_documents(documents: dict) -> None`、`range_graph(*, mutate=None)`；add_range_documents 仅向已有政策图添加 Bx/configs/range_configs，不重复添加政策。range_graph 使用 policy_graph 的 mutate 接点，返回与 `policy_graph()` 相同五元组，修改图后调用 `rehash_documents`，不得使用 AcceptingVerifier。
 
 - [ ] **写失败测试。** 在夹具中先实现以下纯配置生成器；固定哈希只是独立格式测试值，整图测试必须替换为真实 ENTRY 哈希。
@@ -110,12 +110,13 @@ def require_pair(market, calendar, selector, exchange):
 
 ## R2：独立请求、可信传输和有来源依据的分页
 
-**Files:** Create `ashare_pipeline/formal_range_source.py`, `tests/test_formal_range_source.py`; Modify `tests/formal_range_fixtures.py`。
+**Files:** Create `ashare_pipeline/formal_range_source.py`, `tests/test_formal_range_source.py`; Modify `tests/formal_range_fixtures.py`, `ashare_pipeline/formal_sources.py`（genuine select_range 接点）。
 
 **Interfaces:**
 
 - Consumes: R1 RangeBinding；原 `OfficialTransport`/来源主机安全与响应分类函数，仅复用其安全职责。
 - Produces: `FormalRangeRequestV1`（规格 §5.2 全部字段）和 `RangeFetch`，均禁止外部铸造；`ParsedRangeDocumentV1.from_dict(wire)` 是无权 DTO；`.to_dict()` 返回脱离副本。
+- 在本任务向 `SignedSourceRegistry` 新增 `select_range(request: FormalRangeRequestV1) -> RangeConfig`，仅接受 genuine 新请求、检索 range_configs 并核验其完整配置/根/锚点身份；不调用旧 `select`。相应 `formal_sources.py` 修改由同一 B1 负责人执行，并进入 R2 白名单。
 - `FormalRangeSource(binding, *, transport, implementations)` 构造时封闭精确传输及实现注册表依赖；实现键为 `(parser_id,parser_version,mapping_version,normalizer_version,request_version)`，变化即失败。
 - `first_calendar_request(as_of_utc: str) -> FormalRangeRequestV1`；本任务实现下文的纯 `backward_interval` 和 `page_successor`，不声明可接受已持久化观察的外部后续请求入口。R3 在真实收据类型可用后一次性新增后续请求方法，R2 不留抛 NotImplementedError 的桩。
 - `fetch_verified(request: FormalRangeRequestV1) -> RangeFetch`；`parse_verified_snapshot(request, *, raw_bytes: bytes, manifest: dict) -> ParsedRangeDocumentV1` 重跑已登记实现，不接收已算好的政策结论。
@@ -165,7 +166,7 @@ def page_successor(document, max_pages):
 `page_successor` 只在请求身份、实际来源分页声明和 R3 收据已认证后调用；超过上限保留未完成，不能调用本函数截断。无后续合法自然日时返回有原因的采集终止，不日期下溢。单页合同只允许 page_count=page_index=1；空响应不自动满足 coverage。
 
 - [ ] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_range_source tests.test_formal_sources -v`。
-- [ ] **审查并提交白名单。** 本任务三个文件，提交信息 `feat: authenticate bounded calendar range requests`。
+- [ ] **审查并提交白名单。** 本任务四个文件，提交信息 `feat: authenticate bounded calendar range requests`。
 
 ## R3：V7 四表、租约、快照与收据读取
 

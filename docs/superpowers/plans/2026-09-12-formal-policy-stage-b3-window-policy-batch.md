@@ -189,7 +189,7 @@ def combine_caps(caps):
 
 - Consumes: same-store feature/context/range 仓库、FormalMetricCurrentInputProvider、FormalMetricContextRepository、`_metric_batch_guard(provider, store)`、genuine scoring/policy registry；F2/F3/W1 的 current selections。
 - Produces: `FormalPolicyRepository(feature_repository, context_repository, range_store, *, registry_signature_verifier)`；`.build_batch(frozen_input_hash, *, scoring_registry, policy_registry) -> VerifiedPolicyResultBatch`。
-- 新闭包私有 proof 类型 `VerifiedPolicyEvidenceBatch`、`PolicyDecision`、`PolicyResult`、`VerifiedPolicyResultBatch`：构造器拒绝；`.require_official()`、`.to_dict()`、`.canonical_bytes()`；子结果含所属 batch identity，跨批次组合拒绝。最终 batch 属性 `.security_ids/.results/.evidence_batch/.batch_hash`，results 按 security_ids 顺序 tuple。
+- 新闭包私有 proof 类型 `VerifiedPolicyEvidenceBatch`、`PolicyDecision`、`PolicyResult`、`VerifiedPolicyResultBatch`：构造器拒绝；按规格提供 `.require_verified()`，`.require_official()` 只可作为同一验证路径的兼容别名；另有 `.to_dict()`、`.canonical_bytes()`；子结果含所属 batch identity，跨批次组合拒绝。最终 batch 属性 `.security_ids/.results/.evidence_batch/.batch_hash`，results 按 security_ids 顺序 tuple。
 - 单证券 PolicyResult 属性 `.security_id/.decisions/.pending_requirements/.dimension_caps/.pool_prohibitions/.states/.normalization_basis/.evidence_state`，纯 W2 字典不能通过其 require_official。
 - `PolicyRuntimeFixture(range_enabled=True)` 新增 `.policy_repository`；`.build_policy_batch()` 使用 fixture 当前真实 frozen/scoring/policy；`.populate_policy_evidence()` 为每个冻结成员写 industry、显式清晰状态、F2 财务及 W1 日历/行情，真实小规模 producer receipts；默认不省略证券。
 
