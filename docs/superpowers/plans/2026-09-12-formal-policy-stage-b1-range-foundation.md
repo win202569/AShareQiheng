@@ -22,7 +22,7 @@ source 子项改变意味着根和所有依赖身份更新、重新签名。新�
 
 ## 文件图与交接
 
-新建 `ashare_pipeline/formal_range_contract.py`（封闭格式和签名配置绑定）、`formal_range_source.py`（请求资格/安全传输/分页文档）、`formal_range_store.py`（原始内容寻址、收据与读取）、`formal_range_worker.py`（有限任务执行）。仅修改 `formal_sources.py` 的 v2 解析和封闭快照、`state_store.py` 的 V7 迁移及范围记录接点。不要重构这两个大文件。
+新建 `ashare_pipeline/formal_range_format.py`（无政策依赖的封闭格式）、`formal_range_contract.py`（签名配置绑定，兼容重导出格式接口）、`formal_range_source.py`（请求资格/安全传输/分页文档）、`formal_range_store.py`（原始内容寻址、收据与读取）、`formal_range_worker.py`（有限任务执行）。仅修改 `formal_sources.py` 的 v2 解析和封闭快照、`state_store.py` 的 V7 迁移及范围记录接点。不要重构这两个大文件。格式与绑定分离，避免循环导入迫使信任方法延迟至首次调用才捕获。
 
 新建 `tests/formal_range_fixtures.py`，以及四个对应 `test_formal_range_*.py`。`tests/test_state_store.py` 增加单独的 `FormalV7RangePersistenceTests`，不替换旧断言。
 
@@ -30,7 +30,7 @@ source 子项改变意味着根和所有依赖身份更新、重新签名。新�
 
 ## R1：source v2 与活动政策的签名区间绑定
 
-**Files:** Create `ashare_pipeline/formal_range_contract.py`, `tests/formal_range_fixtures.py`, `tests/test_formal_range_contract.py`; Modify `ashare_pipeline/formal_sources.py`（`configs_from_canonical`、`_RegistryRecord`、配置指纹和 `SignedSourceRegistry`）。
+**Files:** Create `ashare_pipeline/formal_range_format.py`, `ashare_pipeline/formal_range_contract.py`, `tests/formal_range_fixtures.py`, `tests/test_formal_range_contract.py`; Modify `ashare_pipeline/formal_sources.py`（`configs_from_canonical`、`_RegistryRecord`、配置指纹和 `SignedSourceRegistry`）。
 
 **Interfaces:**
 
@@ -106,7 +106,7 @@ def require_pair(market, calendar, selector, exchange):
 上述为配对内核，不取代原文要求的格式/来源/完整图检查。`range_graph` 先加旧 security_state/configs，再调用 `add_policy_documents`；增加三个 Bx、独立旧 bootstrap config 和六个区间项。最后重哈希 feature 的 source/mapping 依赖、policy_contracts 及九角色根，之后才签名。旧 M/C 不变，policy fixture 的 FY0 此时仍保持静态；F1 创建运行变体。
 
 - [ ] **运行 GREEN 与兼容。** 运行 `tests.test_formal_range_contract tests.test_formal_sources tests.test_formal_policy_registry tests.test_formal_policy_registry_guards`；记录真实结果。
-- [ ] **审查并提交白名单。** 四个本任务文件；提交信息 `feat: bind signed policy range source configurations`。
+- [ ] **审查并提交白名单。** 五个本任务文件；提交信息 `feat: bind signed policy range source configurations`。
 
 ## R2：独立请求、可信传输和有来源依据的分页
 
