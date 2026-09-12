@@ -510,6 +510,33 @@ RangeBinding, RangeBindings, load_policy_range_bindings = _build_range_bindings_
 del _build_range_bindings_contract
 
 
+def _make_range_binding_authority():
+    """Expose immutable genuine anchors to the range source during module init."""
+
+    binding_type = RangeBinding
+    require_current = RangeBinding.require_current
+    calendar_config_get = RangeBinding.calendar_config.fget
+    manifest_hash_get = RangeBinding.registry_manifest_hash.fget
+    source_hash_get = RangeBinding.source_registry_hash.fget
+    assert calendar_config_get is not None and manifest_hash_get is not None
+    assert source_hash_get is not None
+
+    def authority():
+        return (
+            binding_type,
+            require_current,
+            calendar_config_get,
+            manifest_hash_get,
+            source_hash_get,
+        )
+
+    return authority
+
+
+_range_binding_authority = _make_range_binding_authority()
+del _make_range_binding_authority
+
+
 __all__ = [
     "RangeBinding",
     "RangeBindings",

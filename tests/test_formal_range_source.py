@@ -141,6 +141,45 @@ class FormalRangeSourceTests(unittest.TestCase):
         with self.assertRaises(FormalTerminalSourceError):
             fixture.source.fetch_verified(request)
 
+    def test_module_private_mint_cannot_authorize_arbitrary_bounds_or_boolean_page(self):
+        import ashare_pipeline.formal_range_request as request_module
+
+        fixture = self.fixture()
+        config = fixture.binding.calendar_config
+        genuine = fixture.source.first_calendar_request(FREEZE)
+        wire = genuine.to_dict()
+        wire.update(
+            as_of_utc="9999-12-31T23:59:59+00:00",
+            start_date="0001-01-01",
+            end_date="9999-12-31",
+            page_index=True,
+        )
+        mint = getattr(request_module, "_mint_range_request", None)
+        if not callable(mint):
+            return
+        with self.assertRaises((ValueError, FormalTerminalSourceError)):
+            forged = mint(
+                wire,
+                config.to_dict(),
+                source_registry_hash=fixture.binding.source_registry_hash,
+                root_guard=lambda: True,
+            )
+            fixture.registry.select_range(forged)
+
+    def test_genuine_request_seal_rejects_every_out_of_contract_bound(self):
+        fixture = self.fixture()
+        mutations = (
+            ("page_index", True),
+            ("as_of_utc", "2026-09-01T07:00:00+00:00"),
+            ("start_date", "0001-01-01"),
+            ("end_date", "9999-12-31"),
+        )
+        for field, value in mutations:
+            request = fixture.source.first_calendar_request(FREEZE)
+            object.__setattr__(request, field, value)
+            with self.subTest(field=field), self.assertRaises(FormalTerminalSourceError):
+                fixture.source.fetch_verified(request)
+
     def test_select_range_accepts_only_matching_genuine_request(self):
         fixture = self.fixture()
         request = fixture.source.first_calendar_request(FREEZE)
@@ -195,9 +234,53 @@ class FormalRangeSourceTests(unittest.TestCase):
         selected = other.registry.select_range(request)
         self.assertEqual(selected.entry_id, fixture.binding.calendar_config.entry_id)
 
+    def test_source_instance_rejects_other_manifest_root_even_for_shared_source_blob(self):
+        fixture = self.fixture()
+        request = fixture.source.first_calendar_request(FREEZE)
+        fixture.reply(document_wire(request))
+        fetch = fixture.source.fetch_verified(request)
+
+        def changed_other_role(documents):
+            documents["event"]["rules"]["event"]["evidence_kind"] = "fixture-event-v2"
+
+        other = self.fixture(mutate=changed_other_role)
+        self.assertEqual(other.registry.registry_hash, fixture.registry.registry_hash)
+        other.reply(document_wire(request))
+        with self.subTest(operation="fetch"), self.assertRaises(FormalTerminalSourceError):
+            other.source.fetch_verified(request)
+        self.assertEqual(other.transport.requests, [])
+        with self.subTest(operation="replay"), self.assertRaises(FormalTerminalSourceError):
+            other.source.parse_verified_snapshot(
+                request, raw_bytes=fetch.raw_bytes, manifest=fetch.to_manifest()
+            )
+
+    def test_source_instance_rejects_other_complete_source_blob_with_same_selected_entry(self):
+        fixture = self.fixture()
+        request = fixture.source.first_calendar_request(FREEZE)
+        fixture.reply(document_wire(request))
+        fetch = fixture.source.fetch_verified(request)
+
+        def changed_unrelated_entry(documents):
+            entry = next(item for item in documents["source"]["range_configs"]
+                         if item["kind"] == "calendar_range" and item["exchange_scope"] == "SZ")
+            entry["endpoint_url"] = "https://www.cninfo.com.cn/fixture/changed-sz.json"
+
+        other = self.fixture(mutate=changed_unrelated_entry)
+        self.assertEqual(other.binding.calendar_config.entry_id,
+                         fixture.binding.calendar_config.entry_id)
+        other.reply(document_wire(request))
+        with self.subTest(operation="fetch"), self.assertRaises(FormalTerminalSourceError):
+            other.source.fetch_verified(request)
+        self.assertEqual(other.transport.requests, [])
+        with self.subTest(operation="replay"), self.assertRaises(FormalTerminalSourceError):
+            other.source.parse_verified_snapshot(
+                request, raw_bytes=fetch.raw_bytes, manifest=fetch.to_manifest()
+            )
+
     def test_import_orders_have_no_registration_hook_or_partial_cycle(self):
         modules = (
             "ashare_pipeline.formal_sources",
+            "ashare_pipeline.formal_range_request",
             "ashare_pipeline.formal_range_source",
             "ashare_pipeline.formal_range_contract",
             "ashare_pipeline.formal_context_schema",
@@ -220,6 +303,41 @@ class FormalRangeSourceTests(unittest.TestCase):
             result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
             with self.subTest(first=module):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_source_initialization_uses_genuine_registry_and_binding_anchors(self):
+        code = textwrap.dedent("""
+            import ashare_pipeline.formal_sources as sources
+            import ashare_pipeline.formal_range_contract as contract
+
+            genuine_registry = sources.SignedSourceRegistry
+            genuine_binding = contract.RangeBinding
+            sources.SignedSourceRegistry = type('FakeRegistry', (), {})
+            contract.RangeBinding = type('FakeBinding', (), {})
+            genuine_registry.select_range = lambda self, request: 'forged-selection'
+            genuine_binding.require_current = lambda self: None
+
+            import ashare_pipeline.formal_range_source
+
+            sources.SignedSourceRegistry = genuine_registry
+            contract.RangeBinding = genuine_binding
+            from tests.formal_range_fixtures import RangeSourceFixture
+            fixture = RangeSourceFixture()
+            try:
+                request = fixture.source.first_calendar_request(
+                    '2026-08-31T07:00:00+00:00')
+                selected = fixture.registry.select_range(request)
+                assert selected.entry_id == fixture.binding.calendar_config.entry_id
+                try:
+                    fixture.registry.select_range(object())
+                except Exception:
+                    pass
+                else:
+                    raise AssertionError('forged request accepted')
+            finally:
+                fixture.close()
+        """)
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_transport_request_uses_only_new_placeholders_and_signed_bounds(self):
         fixture = self.fixture()
@@ -426,11 +544,51 @@ class FormalRangeSourceTests(unittest.TestCase):
         with self.assertRaises(FormalTerminalSourceError):
             fixture.source.fetch_verified(request)
 
+    def test_instance_parse_shadow_cannot_bypass_registered_fetch_implementation(self):
+        fixture = self.fixture()
+        request = fixture.source.first_calendar_request(FREEZE)
+        fixture.reply(document_wire(request))
+        fixture.source._parse = lambda *args, **kwargs: None
+        fetch = fixture.source.fetch_verified(request)
+        self.assertEqual(fetch.request_fingerprint, request.request_fingerprint)
+        self.assertEqual(len(fixture.parser.calls), 1)
+        self.assertEqual(len(fixture.normalizer.calls), 1)
+
+    def test_instance_parse_shadow_cannot_bypass_registered_replay_implementation(self):
+        fixture = self.fixture()
+        request = fixture.source.first_calendar_request(FREEZE)
+        fixture.reply(document_wire(request))
+        fetch = fixture.source.fetch_verified(request)
+        fixture.parser.calls.clear()
+        fixture.normalizer.calls.clear()
+        fixture.source._parse = lambda *args, **kwargs: None
+        parsed = fixture.source.parse_verified_snapshot(
+            request, raw_bytes=fetch.raw_bytes, manifest=fetch.to_manifest()
+        )
+        self.assertEqual(parsed.to_dict(), document_wire(request))
+        self.assertEqual(len(fixture.parser.calls), 1)
+        self.assertEqual(len(fixture.normalizer.calls), 1)
+
     def test_range_fetch_cannot_be_externally_minted(self):
+        import ashare_pipeline.formal_range_source as source_module
         from ashare_pipeline.formal_range_source import RangeFetch
 
         with self.assertRaises(ValueError):
             RangeFetch()
+        self.assertFalse(callable(getattr(source_module, "_mint_fetch", None)))
+        self.assertFalse(
+            callable(getattr(source_module, "_mint_first_calendar_request", None))
+        )
+
+    def test_range_fetch_seal_distinguishes_boolean_from_every_integer_manifest_field(self):
+        fixture = self.fixture()
+        request = fixture.source.first_calendar_request(FREEZE)
+        fixture.reply(document_wire(request))
+        for field in ("record_count", "page_record_count", "page_count"):
+            fetch = fixture.source.fetch_verified(request)
+            object.__setattr__(fetch, field, True)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                fetch.to_manifest()
 
 
 if __name__ == "__main__":
