@@ -41,6 +41,22 @@ _POLICY_UNITS = {
 }
 
 
+def policy_financial_mapping_documents(documents):
+    """Add actual signed mapping capability before the graph is signed."""
+    mappings = []
+    for key, unit in sorted(_POLICY_UNITS.items()):
+        instant = key == "fixture.policy.current.equity"
+        mappings.append(dict(mapping_id="map." + key, statement="balance" if instant else "income",
+            metric_key=key, source_field=key, unit=unit, nature="instant" if instant else "duration",
+            period_kind="FY", accounting_basis="consolidated"))
+    documents["mapping"] = dict(schema_version="formal-financial-mapping-registry-v1",
+        registry_role="mapping", row_format="item_value_v1", mappings=mappings,
+        bindings=[dict(source="cninfo", dataset="annual_report", parser_id="fixture-annual",
+            parser_version="fixture-annual-v1", mapping_version="fixture-annual-map-v1",
+            exchange_scope=exchange, mapping_ids=sorted(m["mapping_id"] for m in mappings))
+            for exchange in ("BJ", "SH", "SZ")])
+
+
 def _templates(value):
     if value is None:
         return dict(_DEFAULT_TEMPLATES)
@@ -123,6 +139,7 @@ class PolicyRuntimeFixture(FinancialFixture):
             )
             add_policy_documents(documents)
             _patch_current_policy_periods(documents)
+            policy_financial_mapping_documents(documents)
             if range_enabled:
                 from tests.formal_range_fixtures import add_range_documents
                 add_range_documents(documents)

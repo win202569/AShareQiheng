@@ -595,6 +595,8 @@ def _install_policy_projection(provider_module):
     registration authenticates repositories created before this installation.
     """
     from types import MappingProxyType
+    from . import formal_financial_schema as mapping_module
+    from . import formal_metric_features as metric_module
     from .formal_policy_registry import FormalPolicyRegistry
     from .formal_policy_values import PolicyIntegrityError, PolicyPreconditionError
 
@@ -609,6 +611,12 @@ def _install_policy_projection(provider_module):
     identity_of = repository_type._snapshot_identity
     evaluator, builder = evaluate_selected_features, build_formal_feature_bundle
     require_policy, policy_wire = FormalPolicyRegistry.require_verified, FormalPolicyRegistry.to_dict
+    mapping_type = mapping_module.SignedFinancialMappingRegistry
+    load_mapping, select_mapping = mapping_type.from_signed_bytes, mapping_type.select
+    mapping_functions = tuple((name, value) for name, value in vars(mapping_module).items() if callable(value))
+    mapping_methods = tuple((cls, dict(vars(cls))) for cls in
+        (mapping_type, mapping_module.FormalFactMapping, mapping_module._FormalFactBinding))
+    metric_leaves = metric_module._leaves
     records = {}
 
     def freeze(value):
@@ -618,6 +626,11 @@ def _install_policy_projection(provider_module):
 
     def dependencies(repository, provider=None):
         authentic(repository)
+        if (any(vars(mapping_module).get(name) is not value for name, value in mapping_functions)
+                or any(set(vars(cls)) != set(methods)
+                    or any(vars(cls)[name] is not value for name, value in methods.items())
+                    for cls, methods in mapping_methods)):
+            raise PolicyIntegrityError("policy financial mapping validation dependency changed")
         actual = repository._current_input_provider
         if (type(actual) is not provider_type or (provider is not None and actual is not provider)
                 or provider_module.FormalMetricCurrentInputProvider is not provider_type
@@ -628,6 +641,39 @@ def _install_policy_projection(provider_module):
                 or "select_current_verified_policy_feature_state" in vars(repository)):
             raise PolicyIntegrityError("policy repository selector was replaced")
         return actual
+
+    def scoped_issues(graph, verifier, security_id, slots, issues):
+        """Prove only metric exclusion; issues contain no trusted year identity."""
+        blob = graph.blob("mapping")
+        mapping_index = {}
+        # Only the real supported financial contract is accepted. Unknown
+        # versions, placeholder graphs and invalid signatures fail the read.
+        mapping = load_mapping(blob.canonical_json, signature=blob.signature,
+            key_id=blob.key_id, verifier=verifier)
+        if type(mapping) is not mapping_type or mapping.registry_hash != graph.manifest.mapping_registry_hash:
+            raise PolicyIntegrityError("policy issue mapping differs from the authenticated root")
+        for binding in mapping.bindings:
+            if binding.exchange_scope != security_id[:2]:
+                continue
+            selected = select_mapping(mapping, source=binding.source, dataset=binding.dataset,
+                parser_id=binding.parser_id, parser_version=binding.parser_version,
+                mapping_version=binding.mapping_version, exchange=binding.exchange_scope)
+            mapping_index.update((entry.mapping_id, entry) for entry in selected)
+        # Free details/source-field text cannot add exclusion authority.
+        scopes = []
+        for issue in issues:
+            mapped = mapping_index.get(issue.mapping_id)
+            metric = None
+            if (issue.code in {"required_source_field_missing", "duplicate_source_field", "nonnumeric_value"}
+                    and mapped is not None and issue.source_field == mapped.source_field):
+                metric = mapped.metric_key
+            scopes.append((issue, metric))
+        result = {}
+        for slot in slots:
+            dependencies = {metric for metric, _ in metric_leaves(slot.formula)}
+            result[slot.slot_id] = tuple(issue for issue, metric in scopes
+                if metric is None or metric in dependencies)
+        return result
 
     def record(item):
         saved = records.get(id(item))
@@ -736,8 +782,16 @@ def _install_policy_projection(provider_module):
             stored = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
             if stored is not None and stored.canonical_bytes() != expected.canonical_bytes():
                 raise PolicyIntegrityError("policy receipt differs from complete rebuilt inputs")
-            values, blockers = ((), ("current_receipt_absent",)) if stored is None else evaluator(
-                slots=slots, facts=facts, issues=issues, as_of_utc=as_of_utc)
+            local_issues = scoped_issues(graph, self._verifier, security_id, slots, issues)
+            values, blockers = [], set()
+            if stored is None:
+                blockers.add("current_receipt_absent")
+            else:
+                for slot in slots:
+                    local_values, local_blockers = evaluator(slots=(slot,), facts=facts,
+                        issues=local_issues[slot.slot_id], as_of_utc=as_of_utc)
+                    values.extend(local_values)
+                    blockers.update(local_blockers)
             current()
             reread = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
             if ((reread is None) != (stored is None)
@@ -748,8 +802,9 @@ def _install_policy_projection(provider_module):
             payload = dict(request, rule_ids=list(rule_ids), selectors=selectors,
                 policy_contract_hash=policy["contract_hash"],
                 slots=[s.to_dict() for s in slots], values=[v.to_dict() for v in values],
-                blockers=list(blockers), facts=[f.to_dict() for f in facts],
+                blockers=sorted(blockers), facts=[f.to_dict() for f in facts],
                 issues=[i.to_dict() for i in issues],
+                slot_issues={key: [i.to_dict() for i in selected] for key, selected in local_issues.items()},
                 source_refs=[FormalEvidenceRef.from_formal_fact(f).to_dict() for f in facts],
                 input_hash=expected.input_hash, bundle_hash=expected.bundle_hash(),
                 batch_id=identity[-1], current_receipt_absent=stored is None,

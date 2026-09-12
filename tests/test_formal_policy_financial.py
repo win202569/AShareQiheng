@@ -5,7 +5,7 @@ from decimal import Decimal
 import unittest
 from unittest.mock import patch
 
-from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
+from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture, policy_financial_mapping_documents
 from tests.formal_metric_fixtures import FREEZE
 from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
 from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
@@ -27,6 +27,15 @@ def change_roe_formula(documents, *, wrong_year=False, repeated_leaf=False):
             slot["formula"]["right"] = dict(op="add", left=slot["formula"]["right"],
                 right=dict(op="fact", fact_key="fixture.policy.current.equity", period_key="FY2020"))
         current["period_keys"] = ["FY2020", "FY2021"]
+
+
+def quarter_equity_formula(documents, quarter="Q1"):
+    slot = next(s for s in documents["feature"]["slots"] if s["slot_id"] == "bank.policy.equity")
+    slot["formula"] = dict(op="add",
+        left=dict(op="fact", fact_key="fixture.quarter.cash", period_key="2024" + quarter),
+        right=dict(op="fact", fact_key="fixture.quarter.cash", period_key="2025" + quarter))
+    documents["redline"]["rules"]["bank_nonpositive_equity"]["inputs"]["value"]["period_keys"] = [
+        "2024" + quarter, "2025" + quarter]
 
 
 class PolicyFinancialTests(unittest.TestCase):
@@ -209,18 +218,145 @@ class PolicyFinancialTests(unittest.TestCase):
         pending = [r[0]["value"].to_dict()["pending"] for r in selected.annual.values()]
         self.assertTrue(any(p and p[0]["code"] == "invalid_denominator" for p in pending))
 
-    def test_full_issue_snapshot_blocks_values_and_recheck(self):
-        fixture = self.fixture()
+    def test_signed_local_issue_preserves_independent_equity_and_rechecks_full_snapshot(self):
+        fixture = self.fixture(mutate=policy_financial_mapping_documents)
         fixture.policy_financial_values("SH600000")
         selected = self.select(fixture)
-        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", None,
-            "fixture.policy.roe", {"period": "FY2021"}),)
+        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
+            "fixture.policy.roe", {"period": "FY2021", "metric_key": "fixture.policy.current.equity"}),)
         fixture.publish_current("SH600000")
         fixture.persist_features("SH600000")
         with self.assertRaises(ValueError):
             selected.recheck()
         current = fixture.financial_selection("SH600000")
-        self.assertTrue(all(v.state == "domain_conflict" for v in current.values.values()))
+        self.assertTrue(all(v.state == "value" for v in current.values.values()))
+        self.assertEqual(len(current.lineage["all_issues"]), 1)
+        self.assertEqual(current.lineage["all_issues"][0]["details"]["metric_key"], "fixture.policy.current.equity")
+        self.assertEqual(sorted(v.value for v in current.values.values()),
+            [Decimal("1"), Decimal("5"), Decimal("5"), Decimal("5")])
+        roe = next(records for records in current.annual.values()
+            if records[0]["facts"][0]["fact_key"] == "fixture.policy.roe")
+        self.assertTrue(all(r["value"].state == "domain_conflict" for r in roe))
+        self.assertEqual(sum(records[0]["value"].state == "value" for records in current.annual.values()), 2)
+        # Period detail is audited but cannot narrow an issue to one FY.
+        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
+            "fixture.policy.roe", {"period": "FY2022"}),)
+        fixture.publish_current("SH600000")
+        fixture.persist_features("SH600000")
+        with self.assertRaises(ValueError):
+            current.recheck()
+
+    def test_unscoped_issue_remains_global_despite_free_scope_details(self):
+        fixture = self.fixture(mutate=policy_financial_mapping_documents)
+        fixture.policy_financial_values("SH600000")
+        for mapping_id, source_field in ((None, "fixture.policy.roe"),
+                ("undeclared", "fixture.policy.roe"), ("map.fixture.policy.roe", "wrong_field")):
+            with self.subTest(mapping_id=mapping_id, source_field=source_field):
+                fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", mapping_id,
+                    source_field, {"metric_key": "fixture.policy.roe", "period": "FY2021"}),)
+                fixture.publish_current("SH600000")
+                fixture.persist_features("SH600000")
+                selected = self.select(fixture)
+                self.assertTrue(all(v.state == "domain_conflict" for v in selected.values.values()))
+
+    def test_unsupported_mapping_schema_is_a_contract_failure(self):
+        def unsupported(documents):
+            documents["mapping"] = dict(registry_role="mapping", schema_version="fixture-v1")
+        fixture = self.fixture(cyclic=False, mutate=unsupported)
+        fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": 1},
+            fy_end="2025-12-31", units={"fixture.policy.current.equity": "CNY"})
+        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
+            "fixture.policy.roe", {"period": "FY2021"}),)
+        fixture.publish_current("SH600000")
+        fixture.persist_features("SH600000")
+        with self.assertRaises(ValueError):
+            self.select(fixture)
+
+    def test_declared_financial_mapping_corruption_is_not_global_pending(self):
+        def malformed(documents):
+            policy_financial_mapping_documents(documents)
+            documents["mapping"]["bindings"][0]["mapping_ids"].append("unknown_mapping")
+        fixture = self.fixture(cyclic=False, mutate=malformed)
+        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
+            "fixture.policy.roe", {}),)
+        fixture.publish_current("SH600000")
+        fixture.persist_features("SH600000")
+        with self.assertRaises(ValueError):
+            self.select(fixture)
+
+    def test_unknown_mapping_version_cannot_downgrade_to_global_pending(self):
+        def unsupported(documents):
+            policy_financial_mapping_documents(documents)
+            documents["mapping"]["schema_version"] = "formal-financial-mapping-registry-v2"
+        fixture = self.fixture(cyclic=False, mutate=unsupported)
+        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
+            "fixture.policy.roe", {}),)
+        fixture.publish_current("SH600000")
+        fixture.persist_features("SH600000")
+        with self.assertRaises(ValueError):
+            self.select(fixture)
+
+    def test_missing_exchange_mapping_binding_cannot_scope_an_issue(self):
+        def other_exchanges(documents):
+            policy_financial_mapping_documents(documents)
+            documents["mapping"]["bindings"] = [b for b in documents["mapping"]["bindings"] if b["exchange_scope"] != "SH"]
+        fixture = self.fixture(cyclic=False, mutate=other_exchanges)
+        fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": 1},
+            fy_end="2025-12-31", units={"fixture.policy.current.equity": "CNY"})
+        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
+            "fixture.policy.roe", {}),)
+        fixture.publish_current("SH600000")
+        fixture.persist_features("SH600000")
+        self.assertTrue(all(v.state == "domain_conflict" for v in self.select(fixture).values.values()))
+
+    def test_mapping_type_and_parser_substitution_before_first_selection_fail(self):
+        from ashare_pipeline import formal_financial_schema as mapping_module
+        fixture = self.fixture(cyclic=False, mutate=policy_financial_mapping_documents)
+        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
+            "fixture.policy.roe", {}),)
+        fixture.publish_current("SH600000")
+        fixture.persist_features("SH600000")
+        for owner, name, replacement in ((mapping_module, "SignedFinancialMappingRegistry", object),
+                (mapping_module.SignedFinancialMappingRegistry, "from_signed_bytes", lambda *_a, **_k: None)):
+            with self.subTest(name=name), patch.object(owner, name, replacement), self.assertRaises(ValueError):
+                self.select(fixture)
+
+    def quarter_fixture(self, quarter="Q1"):
+        fixture = self.fixture(cyclic=False, mutate=lambda docs: quarter_equity_formula(docs, quarter))
+        for year, first, half in ((2024, 10, 30), (2025, 20, 50)):
+            fixture.put_financial("SH600000", {"fixture.quarter.cash": first},
+                generation=f"q1-{year}", period_end=f"{year}-03-31", period_kind="Q1")
+            if quarter == "Q2":
+                fixture.put_financial("SH600000", {"fixture.quarter.cash": half},
+                    generation=f"h1-{year}", period_end=f"{year}-06-30", period_kind="H1")
+        fixture.persist_features("SH600000")
+        return fixture
+
+    def test_quarter_scalar_leaves_bind_their_own_years_and_components(self):
+        for quarter, expected_value, expected_count in (("Q1", "30", 1), ("Q2", "50", 2)):
+            with self.subTest(quarter=quarter):
+                fixture = self.quarter_fixture(quarter)
+                selected = self.select(fixture)
+                scalar = next(iter(selected.lineage["scalar"].values()))
+                self.assertEqual(scalar["value"].value, Decimal(expected_value))
+                for path, year in (("formula.left", "2024"), ("formula.right", "2025")):
+                    leaves = [f for f in scalar["facts"] if f["ast_path"] == path]
+                    self.assertEqual(len(leaves), expected_count)
+                    self.assertEqual({f["period_end"][:4] for f in leaves}, {year})
+                    self.assertEqual({f["period_key"] for f in leaves}, {year + quarter})
+
+    def test_quarter_leading_version_conflict_is_integrity_failure(self):
+        fixture = self.quarter_fixture()
+        fact = next(f for f in fixture.store.list_formal_financial_facts(security_id="SH600000")
+            if f.period_end == "2024-03-31")
+        wire = fact.to_dict()
+        wire.pop("id")
+        wire["value"] = 99.0
+        fixture.store.insert_formal_financial_facts((FormalFinancialFact.create(**wire),))
+        fixture.publish_current("SH600000")
+        fixture.persist_features("SH600000")
+        with self.assertRaises(ValueError):
+            self.select(fixture)
 
     def test_mixed_accounting_basis_cannot_form_roe(self):
         fixture = self.fixture(mutate=change_roe_formula)

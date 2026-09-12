@@ -10,7 +10,7 @@ from types import MappingProxyType
 from . import formal_feature_repository as feature_module
 from . import formal_metric_batch_guard as provider_module
 from .formal_feature_contract import FormalEvidenceRef
-from .formal_financial_features import select_visible_formal_facts
+from .formal_financial_features import derive_comparable_quarters, select_visible_formal_facts
 from .formal_financial_schema import FormalFinancialFact
 from .formal_metric_context import VerifiedMetricIndustryBatch
 from .formal_policy_registry import FormalPolicyRegistry
@@ -77,15 +77,34 @@ def _observation(selector, slot, projected, state, fy_end=None):
                 diagnostics.append("financial_domain_conflict" if len(selected.facts) > 1 else "financial_input_missing")
                 continue
             actual = selected.facts
-        elif fy_end is None:
-            # Scalar quarter leaves retain the exact V6 component evidence; the
-            # evaluator already authenticated quarter arithmetic and its periods.
-            evidence_ids = {ref["formal_fact_id"] for ref in (projected or {}).get("evidence", [])}
-            actual = tuple(f for f in candidates if f.id in evidence_ids)
-            if not actual:
-                diagnostics.append("financial_input_missing")
+        elif (fy_end is None and len(period) == 6 and period[:4].isdigit()
+                and period[4] == "Q" and period[5] in "1234"):
+            # Use the original V6 endpoint/predecessor semantics for this exact
+            # AST occurrence, then retain only its derived quarter components.
+            year, quarter = period[:4], int(period[5])
+            ends = ("03-31", "06-30", "09-30", "12-31")
+            end = year + "-" + ends[quarter - 1]
+            predecessor = year + "-" + ends[quarter - 2] if quarter > 1 else None
+            selected = select_visible_formal_facts((f for f in candidates if f.period_end == end
+                or (f.nature == "duration" and f.period_end == predecessor)), _FREEZE)
+            if "fact_selection_tie_conflict" in selected.blockers:
+                raise PolicyIntegrityError("policy quarter selection has ambiguous leading versions")
+            diagnostics.extend(selected.blockers)
+            quarters = derive_comparable_quarters(selected.facts)
+            derived = tuple(q for q in quarters.facts if q.quarter_key == period)
+            quarter_blockers = set(quarters.blockers)
+            requested_ids = {f.id for f in selected.facts if f.period_end == end}
+            covered_ids = {identity for q in derived for identity in q.component_fact_ids}
+            if requested_ids and requested_ids <= covered_ids:
+                quarter_blockers.discard("quarter_missing_prerequisite")
+            diagnostics.extend(quarter_blockers)
+            if len(derived) != 1:
+                diagnostics.append("financial_domain_conflict" if len(derived) > 1 else "financial_input_missing")
+                continue
+            by_id = {f.id: f for f in selected.facts}
+            actual = tuple(by_id[identity] for identity in derived[0].component_fact_ids)
         else:
-            diagnostics.append("financial_domain_conflict")
+            diagnostics.append("financial_domain_conflict" if fy_end else "financial_input_missing")
             continue
         for fact in actual:
             wire = fact.to_dict()
@@ -108,9 +127,10 @@ def _observation(selector, slot, projected, state, fy_end=None):
     if len(bases) > 1 or (fy_end is not None and annual_ends and fy_end not in annual_ends):
         diagnostics.append("financial_domain_conflict")
     raw = projected["value"] if projected else None
+    slot_issues = state["slot_issues"][slot["slot_id"]]
     if state["current_receipt_absent"]:
         reason = "current_receipt_absent"
-    elif state["issues"] or "financial_domain_conflict" in diagnostics:
+    elif slot_issues or "financial_domain_conflict" in diagnostics:
         reason = "financial_domain_conflict"
     elif projected is None or projected["status"] != "derived":
         missing = (projected or {}).get("missing_reason")
@@ -130,7 +150,7 @@ def _observation(selector, slot, projected, state, fy_end=None):
         effective_at_utc=sorted({r["effective_at_utc"] for r in refs}))
     record = dict(selector_hash=digest(selector), slot_hash=digest(slot), formula_hash=digest(slot["formula"]),
         formula_version=slot["formula_version"], value=_policy_value(raw, slot["unit"], state["projection_hash"], reason),
-        unit=slot["unit"], facts=leaves, issues=[*state["issues"], *sorted(set(diagnostics))],
+        unit=slot["unit"], facts=leaves, issues=[*slot_issues, *sorted(set(diagnostics))],
         source_refs=refs, visibility=visibility, bridge_version=_BRIDGE, projection_hash=state["projection_hash"])
     if fy_end is not None:
         record = dict(fy_end=fy_end, **record)
@@ -276,6 +296,7 @@ def _install_financial():
             policy_contract_hash=policy["contract_hash"], frozen_input_hash=industry["frozen_input_hash"],
             universe_hash=industry["universe_hash"], industry_batch_hash=industry["batch_hash"], as_of_utc=as_of_utc,
             applicability=applicability, rule_ids=list(rule_ids), scalar=scalar, bridges=bridges,
+            all_issues=wire["issues"], slot_issues=wire["slot_issues"],
             projection_hash=wire["projection_hash"], input_hash=wire["input_hash"], bundle_hash=wire["bundle_hash"],
             batch_id=wire["batch_id"], current_receipt_absent=wire["current_receipt_absent"]))
         payload["selection_hash"] = digest(payload)
