@@ -30,8 +30,9 @@ def configuration(docs):
 
 
 class FinancialFixture(MetricFixture):
-    def __init__(self, *, population=False, missing_memberships=False, mutate=None, calendar_binding_resolver=None):
-        rows = None
+    def __init__(self, *, population=False, missing_memberships=False, mutate=None,
+                 calendar_binding_resolver=None, exchange_rows=None):
+        rows = exchange_rows
         def configure(docs):
             configuration(docs)
             if missing_memberships:
