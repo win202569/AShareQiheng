@@ -1,8 +1,15 @@
 """Closed signed range catalog and active-policy binding tests."""
 
 import copy
+import gc
 import hashlib
+import importlib
+import subprocess
+import sys
+import textwrap
 import unittest
+import weakref
+from contextlib import ExitStack
 from unittest.mock import patch
 
 from ashare_pipeline.formal_evidence import OfficialRequest
@@ -45,6 +52,122 @@ class FormalRangeContractTests(unittest.TestCase):
         ):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 parse_range_entry(range_entry(**changes))
+
+    def test_first_load_rejects_replaced_policy_verifiers_in_fresh_process(self):
+        result = subprocess.run([sys.executable, "-c", textwrap.dedent('''
+            import unittest
+            from unittest.mock import patch
+            from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+            from ashare_pipeline.formal_policy_registry import FormalPolicyRegistry, load_formal_policy_registry
+            from tests.formal_range_fixtures import range_graph
+
+            class FirstLoadTest(unittest.TestCase):
+                def test_unregistered_policy_cannot_gain_authority(self):
+                    bundle, feature, scoring, _, _ = range_graph()
+                    policy = load_formal_policy_registry(bundle, scoring_registry=scoring,
+                        feature_registry=feature)
+                    raw = policy.canonical_bytes()
+                    forged = object.__new__(FormalPolicyRegistry)
+                    bindings = None
+                    with patch.object(FormalPolicyRegistry, "require_verified", lambda self: None), \
+                            patch.object(FormalPolicyRegistry, "canonical_bytes", lambda self: raw):
+                        with self.subTest(phase="first load"), self.assertRaises(ValueError):
+                            bindings = load_policy_range_bindings(bundle,
+                                scoring_registry=scoring, policy_registry=forged)
+                    if bindings is not None:
+                        with self.subTest(phase="restored"), self.assertRaises(ValueError):
+                            bindings.for_rule("bank_no_effective_trade_20d", "SH").require_current()
+
+            unittest.main()
+        ''')], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_replaced_range_config_alias_cannot_mint_unsealed_source_configs(self):
+        from ashare_pipeline import formal_range_contract as contract
+
+        genuine_type = contract.RangeConfig
+        format_module = importlib.import_module(contract.parse_range_entry.__module__)
+        wire = dict(registry_role="source", schema_version="formal-source-registry-v2",
+            configs=[config()], range_configs=[range_entry()])
+        class Replacement:
+            pass
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(contract, "RangeConfig", Replacement))
+            if format_module is not contract:
+                stack.enter_context(patch.object(format_module, "RangeConfig", Replacement))
+            registry = self._registry(wire)
+            selected = registry.range_configs[0]
+            with self.subTest(phase="constructor"):
+                self.assertIs(type(selected), genuine_type)
+            object.__setattr__(selected, "dataset", "unsigned-dataset")
+            with self.subTest(phase="aliases replaced"), self.assertRaises(ValueError):
+                registry._require_verified()
+        with self.subTest(phase="aliases restored"), self.assertRaises(ValueError):
+            registry._require_verified()
+
+    def test_query_and_header_values_require_strings(self):
+        from ashare_pipeline.formal_range_contract import parse_range_entry
+
+        for part in ("query", "headers"):
+            for value in ([], {}, None, ["text"], {"nested": "text"}, 1, True):
+                wire = range_entry()
+                wire["request_template"][part]["unsafe"] = value
+                with self.subTest(part=part, value=value), self.assertRaises(ValueError):
+                    parse_range_entry(wire)
+
+    def test_query_keys_and_values_reject_raw_whitespace_and_controls(self):
+        from ashare_pipeline.formal_range_contract import parse_range_entry
+
+        for bad in ("two words", "a\nb", "a\rb", "a\tb", "a\x00b", "a\x7fb", "a\u00a0b"):
+            for position in ("key", "value"):
+                wire = range_entry()
+                wire["request_template"]["query"] = (
+                    {bad: "safe"} if position == "key" else {"safe": bad})
+                with self.subTest(position=position, bad=bad), self.assertRaises(ValueError):
+                    parse_range_entry(wire)
+
+    def test_request_templates_keep_safe_strings_and_nested_post_bodies(self):
+        from ashare_pipeline.formal_range_contract import parse_range_entry
+
+        wire = range_entry(http_method="POST", request_template={
+            "query": {"start": "{start_date}", "end": "{end_date}", "page": "{page_index}"},
+            "headers": {"accept": "application/json", "x-label": "two words"},
+            "body": {"exchange": "{exchange}", "items": ["{start_date}", None]},
+        })
+        parsed = parse_range_entry(wire)
+        self.assertEqual(parsed.to_dict(), wire)
+        with self.assertRaises(TypeError):
+            parsed.request_template["query"]["start"] = "unsigned"
+
+    def test_unreferenced_binding_set_and_children_are_collectible(self):
+        bindings, *_ = self._load()
+        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        parent_ref, child_ref = weakref.ref(bindings), weakref.ref(binding)
+        del binding, bindings
+        gc.collect()
+        self.assertIsNone(parent_ref())
+        self.assertIsNone(child_ref())
+
+    def test_live_child_retains_current_verification_after_parent_is_dropped(self):
+        bindings, bundle, *_ = self._load()
+        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        parent_ref, child_ref = weakref.ref(bindings), weakref.ref(binding)
+        del bindings
+        gc.collect()
+        binding.require_current()
+        source_blob = bundle.blob("source")
+        original = source_blob.canonical_json
+        try:
+            object.__setattr__(source_blob, "canonical_json", b"{}")
+            with self.assertRaises(ValueError):
+                binding.require_current()
+        finally:
+            object.__setattr__(source_blob, "canonical_json", original)
+        binding.require_current()
+        del binding
+        gc.collect()
+        self.assertIsNone(parent_ref())
+        self.assertIsNone(child_ref())
 
     def test_range_format_rejects_wrong_types_versions_templates_and_bridge_shapes(self):
         from ashare_pipeline.formal_range_contract import parse_range_entry

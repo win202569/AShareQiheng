@@ -19,7 +19,7 @@ from typing import Literal, Protocol
 import uuid
 import weakref
 
-from .formal_range_contract import RangeConfig, parse_range_entry
+from .formal_range_format import RangeConfig, parse_range_entry
 from .formal_evidence import (
     EvidenceVerification,
     OfficialFetch,
@@ -699,6 +699,8 @@ def _make_signed_source_registry_type() -> type[object]:
                 raise ValueError("source registry range_configs must be a list")
             for item in wire["range_configs"]:
                 config = parse_range_config(item)
+                if type(config) is not range_config_type:
+                    raise ValueError("range parser returned an unexpected config type")
                 identity = (
                     config.kind,
                     config.capability,
@@ -748,7 +750,7 @@ def _make_signed_source_registry_type() -> type[object]:
 
     def range_config_fingerprint(config: object) -> tuple[object, ...]:
         if type(config) is not range_config_type:
-            return ("invalid-range-config", type(config).__module__, type(config).__qualname__)
+            raise ValueError("exact RangeConfig required for source fingerprint")
         return tuple(
             (field, value_fingerprint(object.__getattribute__(config, field)))
             for field in range_config_fields
@@ -766,7 +768,7 @@ def _make_signed_source_registry_type() -> type[object]:
 
     def range_configs_fingerprint(configs: object) -> tuple[object, ...]:
         if type(configs) is not tuple:
-            return ("invalid-range-configs", type(configs).__module__, type(configs).__qualname__)
+            raise ValueError("range configs must be an exact tuple")
         return tuple(range_config_fingerprint(config) for config in configs)
 
     def remember_verified(registry: object) -> None:
