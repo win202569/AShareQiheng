@@ -112,7 +112,7 @@ def digest(wire):
 - 内部 PolicyFeatureState 提供 `values,blockers,slots,facts,issues,source_refs,input_hash,bundle_hash,projection_hash,batch_id` 只读属性及 `.to_dict()`、`.recheck()`；同时保存所选 rule_ids/selector 身份及当前 absence 标记。它只能由新增安装器铸造，供本仓库消费，不是公开结果 proof。
 - PolicyFinancialSelection 是内部闭包登记对象，提供 `.values`（selector hash→PolicyValue）、`.annual`（series selector hash→五条年度记录）、`.lineage`、`.selection_hash`、`.recheck()`，无公开正式证据工厂。
 - 年度记录字段固定 `fy_end,selector_hash,slot_hash,formula_hash,formula_version,value,unit,facts,issues,source_refs,visibility,bridge_version,projection_hash`；facts 每个叶子保存真实 fact ID、AST 路径、完整期间、会计口径；缺失记录保留目标年份及待补，不伪造有效 value。
-- 为独立 F2 单测增加 fixture `.financial_selection(security_id, *, cyclic=True)`：内部先用真实 industry Context 及 FormalMetricContextRepository 取得归属，再调用上述仓库，cyclic 参数只改变签名前的合成行业清单，不直接传入证明。
+- 为独立 F2 单测增加 fixture `.financial_selection(security_id)`：内部先用真实 industry Context 及 FormalMetricContextRepository 取得归属，再调用上述仓库，不接收能改变适用性的布尔参数。`PolicyRuntimeFixture` 在本任务扩展构造参数 `cyclic=True`（exact bool），在签名前配置合成行业成员；非周期场景使用签名周期清单外的行业，默认行为保持不变。可增加仅测试用 `mutate=None` 接点，在默认图配置后、最终重哈希和签名前修改 AST/选择器；不得在读取时更改已签名图。
 
 - [ ] **写失败测试。**
 
