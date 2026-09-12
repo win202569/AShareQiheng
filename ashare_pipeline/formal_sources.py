@@ -19,7 +19,11 @@ from typing import Literal, Protocol
 import uuid
 import weakref
 
-from .formal_range_format import RangeConfig, parse_range_entry
+from .formal_range_format import RangeConfig, parse_range_entry, _range_config_to_dict
+from .formal_range_request import (
+    FormalRangeRequestV1 as _FormalRangeRequestV1,
+    _trusted_range_request_snapshot as _range_request_snapshot,
+)
 from .formal_evidence import (
     EvidenceVerification,
     OfficialFetch,
@@ -604,6 +608,9 @@ def _make_signed_source_registry_type() -> type[object]:
     )
     range_config_type = RangeConfig
     parse_range_config = parse_range_entry
+    range_request_type = _FormalRangeRequestV1
+    range_request_snapshot = _range_request_snapshot
+    range_config_to_dict = _range_config_to_dict
     range_config_fields = (
         "schema_version",
         "capability",
@@ -907,6 +914,31 @@ def _make_signed_source_registry_type() -> type[object]:
 
         def select(self, request: OfficialRequest) -> SourceAdapterConfig:
             return trusted_config_snapshot(self, request)
+
+        def select_range(self, request) -> RangeConfig:
+            try:
+                if type(request) is not range_request_type:
+                    raise ValueError("range request must have exact genuine type")
+                wire, sealed_config, source_registry_hash = range_request_snapshot(request)
+                if source_registry_hash != verified_record(self).registry_hash:
+                    raise ValueError("range request source registry differs from this registry")
+                matches = [
+                    config for config in trusted_range_config_snapshots(self)
+                    if config.kind == wire["kind"]
+                    and config.source == wire["source"]
+                    and config.dataset == wire["dataset"]
+                    and config.exchange_scope == wire["exchange"]
+                    and config.entry_id == wire["range_config_id"]
+                    and config.anchor_descriptor_id == wire["anchor_descriptor_id"]
+                    and config.calendar_descriptor_id == wire["calendar_descriptor_id"]
+                ]
+                if len(matches) != 1 or range_config_to_dict(matches[0]) != sealed_config:
+                    raise ValueError("signed range config is absent, ambiguous, or differs from request")
+                return matches[0]
+            except FormalTerminalSourceError:
+                raise
+            except ValueError as error:
+                raise FormalTerminalSourceError(str(error)) from error
 
     return SignedSourceRegistry
 

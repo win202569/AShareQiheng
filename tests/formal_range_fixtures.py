@@ -1,7 +1,12 @@
 """Byte-sensitive signed range-catalog fixtures; never production mappings."""
 
 import hashlib
+import json
 
+from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
+from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+from ashare_pipeline.formal_range_source import FormalRangeSource
+from ashare_pipeline.formal_sources import SignedSourceRegistry, TransportResponse
 from tests.formal_policy_fixtures import policy_graph, rehash_documents
 from tests.test_formal_context_repository import descriptor
 from tests.test_formal_scoring_registry import canonical
@@ -160,3 +165,88 @@ def range_graph(*, mutate=None):
         rehash_documents(documents)
 
     return policy_graph(mutate=prepare)
+
+
+class _CapturingRangeTransport:
+    def __init__(self):
+        self.requests = []
+        self.response = None
+
+    def send(self, request):
+        self.requests.append(request)
+        if self.response is None:
+            raise RuntimeError("fixture transport has no reply")
+        return self.response
+
+
+class _JsonRangeParser:
+    def __init__(self):
+        self.calls = []
+
+    def parse(self, raw_bytes, *, request, config):
+        self.calls.append((raw_bytes, request, config))
+        return json.loads(raw_bytes.decode("utf-8"))
+
+
+class _IdentityRangeNormalizer:
+    def __init__(self):
+        self.calls = []
+
+    def normalize(self, wire, *, request, config):
+        self.calls.append((wire, request, config))
+        return wire
+
+
+class RangeSourceFixture:
+    """A genuine signed binding with only in-memory range bytes and transport."""
+
+    def __init__(self, *, mutate=None, implementations=None):
+        bundle, vocabulary, scoring, _, verifier = range_graph(mutate=mutate)
+        policy = load_formal_policy_registry(
+            bundle, scoring_registry=scoring, feature_registry=vocabulary
+        )
+        bindings = load_policy_range_bindings(
+            bundle, scoring_registry=scoring, policy_registry=policy
+        )
+        self.binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        source_blob = bundle.blob("source")
+        self.registry = SignedSourceRegistry.from_signed_bytes(
+            source_blob.canonical_json,
+            source_blob.signature,
+            source_blob.key_id,
+            verifier,
+        )
+        self.transport = _CapturingRangeTransport()
+        self.parser = _JsonRangeParser()
+        self.normalizer = _IdentityRangeNormalizer()
+        config = self.binding.calendar_config
+        key = (
+            config.parser_id,
+            config.parser_version,
+            config.mapping_version,
+            config.normalizer_version,
+            config.request_version,
+        )
+        registry = {key: (self.parser, self.normalizer)}
+        if implementations is not None:
+            registry = implementations
+        self.implementations = registry
+        self.source = FormalRangeSource(
+            self.binding,
+            transport=self.transport,
+            implementations=registry,
+        )
+
+    def reply(self, wire, *, status_code=200,
+              original_url="https://www.cninfo.com.cn/fixture/range-calendar.json",
+              headers=None, captured_at_utc="2026-08-31T06:59:00+00:00"):
+        self.transport.response = TransportResponse(
+            status_code=status_code,
+            original_url=original_url,
+            headers={} if headers is None else headers,
+            raw_bytes=canonical(wire),
+            captured_at_utc=captured_at_utc,
+        )
+
+    def close(self):
+        pass

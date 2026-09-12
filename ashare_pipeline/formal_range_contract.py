@@ -406,6 +406,10 @@ def _build_range_bindings_contract():
             return _bindings_record(_binding_record(self).parent()).root_hash
 
         @property
+        def source_registry_hash(self) -> str:
+            return _bindings_record(_binding_record(self).parent()).role_hashes["source"]
+
+        @property
         def binding_hash(self) -> str:
             return _binding_record(self).binding_hash
 
