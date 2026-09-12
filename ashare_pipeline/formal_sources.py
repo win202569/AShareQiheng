@@ -19,6 +19,7 @@ from typing import Literal, Protocol
 import uuid
 import weakref
 
+from .formal_range_contract import RangeConfig, parse_range_entry
 from .formal_evidence import (
     EvidenceVerification,
     OfficialFetch,
@@ -601,6 +602,34 @@ def _make_signed_source_registry_type() -> type[object]:
         "calendar_selector",
         "bootstrap_calendar",
     )
+    range_config_type = RangeConfig
+    parse_range_config = parse_range_entry
+    range_config_fields = (
+        "schema_version",
+        "capability",
+        "kind",
+        "anchor_descriptor_id",
+        "calendar_descriptor_id",
+        "source",
+        "dataset",
+        "endpoint_url",
+        "http_method",
+        "parser_id",
+        "parser_version",
+        "mapping_version",
+        "normalizer_version",
+        "request_version",
+        "exchange_scope",
+        "calendar_anchor_selector",
+        "request_template",
+        "pagination",
+        "max_pages",
+        "max_calendar_days_per_request",
+        "timeout_seconds",
+        "retry_base_seconds",
+        "retry_max_attempts",
+        "challenge_cooldown_seconds",
+    )
 
     @dataclass(frozen=True)
     class _RegistryRecord:
@@ -608,6 +637,8 @@ def _make_signed_source_registry_type() -> type[object]:
         registry_fingerprint: tuple[object, ...]
         configs: tuple[SourceAdapterConfig, ...]
         configs_fingerprint: tuple[object, ...]
+        range_configs: tuple[RangeConfig, ...]
+        range_configs_fingerprint: tuple[object, ...]
         canonical_json: bytes
         registry_hash: str
         signature: str
@@ -617,14 +648,20 @@ def _make_signed_source_registry_type() -> type[object]:
 
     def configs_from_canonical(
         canonical_json: bytes, registry_hash: str
-    ) -> tuple[SourceAdapterConfig, ...]:
+    ) -> tuple[tuple[SourceAdapterConfig, ...], tuple[RangeConfig, ...]]:
         wire = _load_canonical_object(canonical_json, label="source registry")
-        if set(wire) != {"configs", "registry_role", "schema_version"}:
+        version = wire.get("schema_version")
+        expected_keys = (
+            {"configs", "registry_role", "schema_version"}
+            if version == "formal-source-registry-v1"
+            else {"configs", "range_configs", "registry_role", "schema_version"}
+            if version == "formal-source-registry-v2"
+            else None
+        )
+        if expected_keys is None or set(wire) != expected_keys:
             raise ValueError("source registry has unknown or missing keys")
         if wire["registry_role"] != "source":
             raise ValueError("source registry role must be source")
-        if wire["schema_version"] != "formal-source-registry-v1":
-            raise ValueError("source registry schema_version is invalid")
         if type(wire["configs"]) is not list:
             raise ValueError("source registry configs must be a list")
         configs: list[SourceAdapterConfig] = []
@@ -655,7 +692,25 @@ def _make_signed_source_registry_type() -> type[object]:
                 raise ValueError("source registry has duplicate config identity")
             identities.add(identity)
             configs.append(config)
-        return tuple(configs)
+        range_configs: list[RangeConfig] = []
+        range_identities: set[tuple[str, str, str, str, str]] = set()
+        if version == "formal-source-registry-v2":
+            if type(wire["range_configs"]) is not list:
+                raise ValueError("source registry range_configs must be a list")
+            for item in wire["range_configs"]:
+                config = parse_range_config(item)
+                identity = (
+                    config.kind,
+                    config.capability,
+                    config.anchor_descriptor_id,
+                    config.calendar_descriptor_id,
+                    config.exchange_scope,
+                )
+                if identity in range_identities:
+                    raise ValueError("source registry has duplicate range config identity")
+                range_identities.add(identity)
+                range_configs.append(config)
+        return tuple(configs), tuple(range_configs)
 
     def value_fingerprint(value: object) -> object:
         """Preserve type, order, and nesting so mutation is never normalized away."""
@@ -691,6 +746,14 @@ def _make_signed_source_registry_type() -> type[object]:
             (field, value_fingerprint(getattr(config, field, object()))) for field in config_fields
         )
 
+    def range_config_fingerprint(config: object) -> tuple[object, ...]:
+        if type(config) is not range_config_type:
+            return ("invalid-range-config", type(config).__module__, type(config).__qualname__)
+        return tuple(
+            (field, value_fingerprint(object.__getattribute__(config, field)))
+            for field in range_config_fields
+        )
+
     def registry_fingerprint(registry: object) -> tuple[object, ...]:
         return tuple(
             (field, value_fingerprint(getattr(registry, field, object()))) for field in registry_fields
@@ -700,6 +763,11 @@ def _make_signed_source_registry_type() -> type[object]:
         if type(configs) is not tuple:
             return ("invalid-configs", type(configs).__module__, type(configs).__qualname__)
         return tuple(config_fingerprint(config) for config in configs)
+
+    def range_configs_fingerprint(configs: object) -> tuple[object, ...]:
+        if type(configs) is not tuple:
+            return ("invalid-range-configs", type(configs).__module__, type(configs).__qualname__)
+        return tuple(range_config_fingerprint(config) for config in configs)
 
     def remember_verified(registry: object) -> None:
         identity = id(registry)
@@ -711,12 +779,16 @@ def _make_signed_source_registry_type() -> type[object]:
 
         reference = weakref.ref(registry, discard)
         configs = getattr(registry, "configs")
+        range_configs = getattr(registry, "range_configs")
         assert type(configs) is tuple
+        assert type(range_configs) is tuple
         verified_registries[identity] = _RegistryRecord(
             reference,
             registry_fingerprint(registry),
             configs,
             configs_fingerprint(configs),
+            range_configs,
+            range_configs_fingerprint(range_configs),
             getattr(registry, "canonical_json"),
             getattr(registry, "registry_hash"),
             getattr(registry, "signature"),
@@ -729,8 +801,11 @@ def _make_signed_source_registry_type() -> type[object]:
             record is not None
             and record.reference() is registry
             and getattr(registry, "configs", None) is record.configs
+            and getattr(registry, "range_configs", None) is record.range_configs
             and registry_fingerprint(registry) == record.registry_fingerprint
             and configs_fingerprint(getattr(registry, "configs", None)) == record.configs_fingerprint
+            and range_configs_fingerprint(getattr(registry, "range_configs", None))
+            == record.range_configs_fingerprint
         ):
             raise ValueError("signed source registry was not verified by from_signed_bytes")
         return record
@@ -744,7 +819,11 @@ def _make_signed_source_registry_type() -> type[object]:
 
     def trusted_config_snapshots(registry: object) -> tuple[SourceAdapterConfig, ...]:
         record = verified_record(registry)
-        return configs_from_canonical(record.canonical_json, record.registry_hash)
+        return configs_from_canonical(record.canonical_json, record.registry_hash)[0]
+
+    def trusted_range_config_snapshots(registry: object) -> tuple[RangeConfig, ...]:
+        record = verified_record(registry)
+        return configs_from_canonical(record.canonical_json, record.registry_hash)[1]
 
     def trusted_config_snapshot(
         registry: object, request: OfficialRequest
@@ -776,6 +855,7 @@ def _make_signed_source_registry_type() -> type[object]:
         signature: str
         key_id: str
         configs: tuple[SourceAdapterConfig, ...]
+        range_configs: tuple[RangeConfig, ...]
 
         def __init__(self, *args: object, **kwargs: object) -> None:
             raise ValueError("SignedSourceRegistry must be loaded with from_signed_bytes")
@@ -787,6 +867,10 @@ def _make_signed_source_registry_type() -> type[object]:
         @staticmethod
         def _trusted_config_snapshots(registry: object) -> tuple[SourceAdapterConfig, ...]:
             return trusted_config_snapshots(registry)
+
+        @staticmethod
+        def _trusted_range_config_snapshots(registry: object) -> tuple[RangeConfig, ...]:
+            return trusted_range_config_snapshots(registry)
 
         @staticmethod
         def _trusted_config_snapshot(
@@ -808,13 +892,14 @@ def _make_signed_source_registry_type() -> type[object]:
                 registry_bytes, signature, key_id, verifier, label="source registry"
             )
             registry_hash = hashlib.sha256(registry_bytes).hexdigest()
-            configs = configs_from_canonical(registry_bytes, registry_hash)
+            configs, range_configs = configs_from_canonical(registry_bytes, registry_hash)
             registry = object.__new__(SignedSourceRegistry)
             object.__setattr__(registry, "canonical_json", registry_bytes)
             object.__setattr__(registry, "registry_hash", registry_hash)
             object.__setattr__(registry, "signature", signature_text)
             object.__setattr__(registry, "key_id", key_text)
             object.__setattr__(registry, "configs", configs)
+            object.__setattr__(registry, "range_configs", range_configs)
             remember_verified(registry)
             return registry
 
