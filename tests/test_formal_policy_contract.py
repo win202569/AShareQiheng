@@ -3,6 +3,7 @@
 import json
 import unittest
 
+from ashare_pipeline import formal_policy_contract as contract_module
 from ashare_pipeline.formal_policy_contract import (
     PolicyContractError,
     iter_rule_selectors,
@@ -11,11 +12,13 @@ from ashare_pipeline.formal_policy_contract import (
 )
 from tests.formal_policy_fixtures import (
     FY_ENDS,
+    annual_selector,
     boolean_rule,
     canonical,
     context_selector,
     cyclic_rule,
     enum_rule,
+    feature_selector,
     market_rule,
     numeric_rule,
     policy_children,
@@ -121,6 +124,71 @@ class PolicySelectorSyntaxTests(unittest.TestCase):
             parse_policy_rule("redline", "bank_equity", canonical(wire))
         self.assertEqual(caught.exception.code, "unsupported_contract")
         self.assertEqual(caught.exception.path, "redline.rules.bank_equity.inputs.value.kind")
+
+    def test_context_inputs_reject_feature_and_annual_selector_families(self):
+        cases = (
+            ("status", boolean_rule, "value"),
+            ("event", boolean_rule, "value"),
+            ("status", enum_rule, "value"),
+            ("event", enum_rule, "value"),
+            ("status", market_rule, "market"),
+            ("status", market_rule, "calendar"),
+        )
+        for role, factory, input_name in cases:
+            for replacement in (
+                feature_selector("bank", "equity", "FY0", "CNY"),
+                annual_selector("bank", "roe"),
+            ):
+                wire = factory()
+                wire["inputs"][input_name] = replacement
+                with self.subTest(role=role, rule=wire["kind"], input=input_name,
+                        selector=replacement["kind"]):
+                    with self.assertRaises(PolicyContractError) as caught:
+                        parse_policy_rule(role, "family", canonical(wire))
+                    self.assertEqual(caught.exception.code, "malformed_contract")
+                    self.assertEqual(caught.exception.path,
+                        f"{role}.rules.family.inputs.{input_name}.kind")
+
+    def test_unknown_selector_kind_remains_unsupported_for_each_input_type(self):
+        for role, factory, input_name in (
+            ("redline", numeric_rule, "value"),
+            ("cyclic", cyclic_rule, "annual_roe"),
+            ("status", boolean_rule, "value"),
+            ("status", enum_rule, "value"),
+            ("status", market_rule, "market"),
+            ("status", market_rule, "calendar"),
+        ):
+            wire = factory()
+            wire["inputs"][input_name] = {"kind": "jsonpath"}
+            with self.subTest(rule=wire["kind"], input=input_name):
+                with self.assertRaises(PolicyContractError) as caught:
+                    parse_policy_rule(role, "unknown", canonical(wire))
+                self.assertEqual(caught.exception.code, "unsupported_contract")
+                self.assertEqual(caught.exception.path,
+                    f"{role}.rules.unknown.inputs.{input_name}.kind")
+
+    def test_generic_selectors_and_valid_rule_families_remain_accepted(self):
+        for selector in (
+            feature_selector("bank", "equity", "FY0", "CNY"),
+            annual_selector("bank", "roe"),
+            context_selector(),
+            context_selector(field="listing_status", expected_type="enum"),
+            context_selector("event_calendar", "event", "event_record",
+                entry_id="fixture-event", expected_unit="CNY"),
+            context_selector("market_close", "record", "market_record"),
+            context_selector("trading_calendar", "record", "calendar_record"),
+        ):
+            with self.subTest(selector=selector):
+                contract_module._selector(selector, "selector", "bank")
+        for role, factory in (
+            ("redline", numeric_rule), ("cyclic", cyclic_rule),
+            ("status", boolean_rule), ("event", boolean_rule),
+            ("status", enum_rule), ("event", enum_rule),
+            ("status", market_rule),
+        ):
+            with self.subTest(role=role, rule=factory.__name__):
+                parsed = parse_policy_rule(role, "valid", canonical(factory()))
+                self.assertEqual(parsed.kind, factory()["kind"])
 
     def test_malformed_context_discriminators_raise_contract_errors(self):
         for field, value in (("context_kind", []), ("field", [])):

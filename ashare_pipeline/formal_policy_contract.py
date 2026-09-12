@@ -259,6 +259,18 @@ def _selector(value, path, template_id, *, expected_kind=None):
     if type(value) is not dict:
         raise PolicyContractError("selector object required", path=path)
     kind = value.get("kind")
+    if kind not in ("feature", "annual_series", "context"):
+        raise PolicyContractError(
+            "unsupported selector kind", code="unsupported_contract", path=f"{path}.kind"
+        )
+    if expected_kind is not None:
+        expected_family = (
+            expected_kind if expected_kind in ("feature", "annual_series") else "context"
+        )
+        if kind != expected_family:
+            raise PolicyContractError(
+                f"{expected_family} selector required", path=f"{path}.kind"
+            )
     if kind == "feature":
         _feature_selector(value, path, template_id)
     elif kind == "annual_series":
@@ -287,14 +299,6 @@ def _selector(value, path, template_id, *, expected_kind=None):
             raise PolicyContractError(
                 "Context selector has incompatible value type", path=f"{path}.expected_type"
             )
-    else:
-        raise PolicyContractError(
-            "unsupported selector kind", code="unsupported_contract", path=f"{path}.kind"
-        )
-    if expected_kind in ("feature", "annual_series") and kind != expected_kind:
-        raise PolicyContractError(
-            f"{expected_kind} selector required", path=f"{path}.kind"
-        )
 
 
 def _valuation_dependencies(value, path, semantic_id):

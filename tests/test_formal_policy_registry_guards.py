@@ -21,7 +21,9 @@ from ashare_pipeline.formal_policy_registry import (
     FormalPolicyRegistry, load_formal_policy_registry,
 )
 from ashare_pipeline.formal_scoring import calculate_pre_policy_score
-from tests.formal_policy_fixtures import policy_graph
+from tests.formal_policy_fixtures import (
+    annual_selector, boolean_rule, enum_rule, feature_selector, policy_graph,
+)
 
 
 class _PolicyGraphTestCase(unittest.TestCase):
@@ -34,6 +36,50 @@ class _PolicyGraphTestCase(unittest.TestCase):
             feature_registry=self.feature)
         arguments.update(overrides)
         return load_formal_policy_registry(**arguments)
+
+
+class PolicySignedSelectorFamilyTests(unittest.TestCase):
+    def assert_signed_input_rejected(self, rule_id, input_name, *, extra_factory=None):
+        for selector in (
+            feature_selector("bank", "equity", "FY0", "CNY"),
+            annual_selector("bank", "roe"),
+        ):
+            def change(documents):
+                rules = documents["status"]["rules"]
+                if extra_factory is not None:
+                    rules[rule_id] = extra_factory()
+                    rules[rule_id]["semantic_id"] = rule_id
+                    active = rules["execution_contract"]["rule_ids"]
+                    active.append(rule_id)
+                    active.sort()
+                rules[rule_id]["inputs"][input_name] = selector
+
+            with self.subTest(rule=rule_id, input=input_name, selector=selector["kind"]):
+                # Mutation precedes hashing/signing; A3 receives genuine same-root inputs.
+                bundle, feature, scoring, _, _ = policy_graph(mutate=change)
+                with self.assertRaises(contract_module.PolicyContractError) as caught:
+                    load_formal_policy_registry(bundle,
+                        scoring_registry=scoring, feature_registry=feature)
+                self.assertEqual(caught.exception.code, "malformed_contract")
+                self.assertEqual(caught.exception.path,
+                    f"status.rules.{rule_id}.inputs.{input_name}.kind")
+
+    def test_signed_market_input_rejects_financial_selector_substitution(self):
+        self.assert_signed_input_rejected("bank_no_effective_trade_20d", "market")
+
+    def test_signed_calendar_input_rejects_financial_selector_substitution(self):
+        self.assert_signed_input_rejected("bank_no_effective_trade_20d", "calendar")
+
+    def test_signed_extra_boolean_rule_rejects_financial_selector_substitution(self):
+        self.assert_signed_input_rejected("bank_extra_boolean", "value",
+            extra_factory=boolean_rule)
+
+    def test_signed_extra_enum_rule_rejects_financial_selector_substitution(self):
+        self.assert_signed_input_rejected("bank_extra_enum", "value",
+            extra_factory=enum_rule)
+
+    def test_signed_mandatory_st_rejects_substitution_with_contract_error(self):
+        self.assert_signed_input_rejected("bank_st", "value")
 
 
 class PolicyProofTests(_PolicyGraphTestCase):
