@@ -22,7 +22,7 @@ source 子项改变意味着根和所有依赖身份更新、重新签名。新�
 
 ## 文件图与交接
 
-新建 `ashare_pipeline/formal_range_format.py`（无政策依赖的封闭格式）、`formal_range_contract.py`（签名配置绑定，兼容重导出格式接口）、`formal_range_source.py`（请求资格/安全传输/分页文档）、`formal_range_store.py`（原始内容寻址、收据与读取）、`formal_range_worker.py`（有限任务执行）。仅修改 `formal_sources.py` 的 v2 解析和封闭快照、`state_store.py` 的 V7 迁移及范围记录接点。不要重构这两个大文件。格式与绑定分离，避免循环导入迫使信任方法延迟至首次调用才捕获。
+新建 `ashare_pipeline/formal_range_format.py`（无政策依赖的封闭格式）、`formal_range_contract.py`（签名配置绑定，兼容重导出格式接口）、`formal_range_request.py`（仅依赖纯格式的封闭请求身份）、`formal_range_source.py`（实时请求资格/安全传输/分页文档）、`formal_range_store.py`（原始内容寻址、收据与读取）、`formal_range_worker.py`（有限任务执行）。仅修改 `formal_sources.py` 的 v2 解析和封闭快照、`state_store.py` 的 V7 迁移及范围记录接点。不要重构这两个大文件。格式、请求身份与图绑定分离，避免循环导入迫使信任方法延迟至首次调用才捕获。
 
 新建 `tests/formal_range_fixtures.py`，以及四个对应 `test_formal_range_*.py`。`tests/test_state_store.py` 增加单独的 `FormalV7RangePersistenceTests`，不替换旧断言。
 
@@ -110,7 +110,7 @@ def require_pair(market, calendar, selector, exchange):
 
 ## R2：独立请求、可信传输和有来源依据的分页
 
-**Files:** Create `ashare_pipeline/formal_range_source.py`, `tests/test_formal_range_source.py`; Modify `tests/formal_range_fixtures.py`, `ashare_pipeline/formal_sources.py`（genuine select_range 接点）。
+**Files:** Create `ashare_pipeline/formal_range_request.py`, `ashare_pipeline/formal_range_source.py`, `tests/test_formal_range_source.py`; Modify `tests/formal_range_fixtures.py`, `ashare_pipeline/formal_sources.py`（genuine select_range 接点）、`ashare_pipeline/formal_range_contract.py`（仅增加只读 source_registry_hash）。
 
 **Interfaces:**
 
@@ -120,7 +120,8 @@ def require_pair(market, calendar, selector, exchange):
 - `FormalRangeSource(binding, *, transport, implementations)` 构造时封闭精确传输及实现注册表依赖；实现键为 `(parser_id,parser_version,mapping_version,normalizer_version,request_version)`，变化即失败。
 - `first_calendar_request(as_of_utc: str) -> FormalRangeRequestV1`；本任务实现下文的纯 `backward_interval` 和 `page_successor`，不声明可接受已持久化观察的外部后续请求入口。R3 在真实收据类型可用后一次性新增后续请求方法，R2 不留抛 NotImplementedError 的桩。
 - `fetch_verified(request: FormalRangeRequestV1) -> RangeFetch`；`parse_verified_snapshot(request, *, raw_bytes: bytes, manifest: dict) -> ParsedRangeDocumentV1` 重跑已登记实现，不接收已算好的政策结论。
-- W1 增加行情 request 工厂时使用同一模块私有 mint 闭包；R2 不提供公开 arbitrary range request 构造器。
+- `formal_range_request.py` 只依赖纯格式/标准库，持有真实请求类型、私有 mint 与闭包登记校验；来源模块在初始化时封存这些真实接口，不提供可抢先劫持的注册回调。`formal_range_source.py` 在 mint/fetch 前后重验真实 binding/config/root，兼容重导出请求类型。W1 增加行情 request 工厂时复用该私有 mint；R2 不提供公开 arbitrary range request 构造器。
+- `RangeBinding.source_registry_hash` 从已验证父记录的 source 角色哈希读取，不更改绑定 wire/hash。来源封存真实 getter，将该值保存在请求私有记录中，固定 request wire 不增字段。`select_range` 除 ENTRY/锚点外比较完整 source blob 哈希；`SignedSourceRegistry` 本身没有 manifest-root 身份，同一个完整 source blob 被多个真实根引用可以复用，但不同 source blob 不能仅凭所选 ENTRY 相同混用。请求的 manifest-root 仍由真实 binding 绑定及重验。
 - 新测试 `RangeSourceFixture`：构造真实 range_graph/RangeBinding、捕获请求的 FakeTransport、已登记 JSON fixture parser；属性 `.source/.transport/.binding`，方法 `.reply(wire:dict)`、`.close()`。仅临时原始内容，不创建生产文件。
 
 - [ ] **写失败测试。**
@@ -165,8 +166,8 @@ def page_successor(document, max_pages):
 
 `page_successor` 只在请求身份、实际来源分页声明和 R3 收据已认证后调用；超过上限保留未完成，不能调用本函数截断。无后续合法自然日时返回有原因的采集终止，不日期下溢。单页合同只允许 page_count=page_index=1；空响应不自动满足 coverage。
 
-- [ ] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_range_source tests.test_formal_sources -v`。
-- [ ] **审查并提交白名单。** 本任务四个文件，提交信息 `feat: authenticate bounded calendar range requests`。
+- [ ] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_range_source tests.test_formal_sources tests.test_formal_range_contract -v`。
+- [ ] **审查并提交白名单。** 本任务六个文件，提交信息 `feat: authenticate bounded calendar range requests`。
 
 ## R3：V7 四表、租约、快照与收据读取
 
