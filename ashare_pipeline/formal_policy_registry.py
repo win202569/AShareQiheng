@@ -1,12 +1,19 @@
-"""Static same-root policy definitions; returned bytes are not policy proofs."""
+"""Authenticated same-root policy definitions, without runtime policy authority."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import weakref
 from decimal import Decimal
 from types import MappingProxyType
 
+from . import formal_context_schema as context_module
+from . import formal_feature_contract as feature_module
+from . import formal_policy_contract as contract_module
+from . import formal_registry_manifest as manifest_module
+from . import formal_scoring_registry as scoring_module
+from . import formal_sources as sources_module
 from .formal_context_schema import _canonical as _context_canonical, _descriptor
 from .formal_feature_contract import SignedFormalFeatureRegistry
 from .formal_policy_contract import PolicyContractError, parse_policy_contract
@@ -277,3 +284,227 @@ def _install_binder():
 
 _bind_policy_contract = _install_binder()
 del _install_binder
+
+
+def _freeze(value):
+    if type(value) is dict:
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if type(value) is list:
+        return tuple(_freeze(item) for item in value)
+    if type(value) not in (str, int, bool, type(None)):
+        raise ValueError("policy definition contains a non-JSON value")
+    return value
+
+
+def _install_policy_registry():
+    records = {}
+    module_globals = globals()
+    bundle_type, scoring_type, feature_type = VerifiedRegistryBundle, FormalScoringRegistry, SignedFormalFeatureRegistry
+    require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
+    require_scoring, require_feature = scoring_type.require_official, feature_type.require_release_eligible
+    bind, encode, freeze = _bind_policy_contract, _canonical, _freeze
+    loads, sha256, weak_ref = json.loads, hashlib.sha256, weakref.ref
+    fields = frozenset(("schema_version", "contract_version", "registry_manifest_hash", "role_hashes",
+        "role_versions", "source_evidence_categories", "rules", "valuation_dependencies",
+        "cyclic_secondary_industries", "binding_manifest"))
+    public_fields = fields | {"contract_hash"}
+
+    # Explicit call-path inventory, without inferring a dependency graph or
+    # running a second policy parser. Check owner bindings and imported aliases.
+    binding_names = (
+        (module_globals, "context_module feature_module contract_module manifest_module scoring_module sources_module "
+            "VerifiedRegistryBundle FormalScoringRegistry SignedFormalFeatureRegistry PolicyContractError "
+            "parse_policy_contract _bind_policy_contract _canonical _freeze _signed_periods _context_index "
+            "_source_index _bind_context _bind_selectors _require_coverage _context_canonical _descriptor "
+            "_formula_requirements json hashlib weakref MappingProxyType Decimal _POLICY_ROLES _ROLES _TEMPLATES"),
+        (vars(contract_module), "parse_policy_contract parse_policy_rule _canonical _load _exact_keys _text "
+            "_identifier _decimal_parameter _algorithm_identifier _ordered_texts _text_array _feature_selector "
+            "_context_selector _selector _valuation_dependencies _validate_parameters _validate_effect "
+            "_validate_outcomes _frozen PolicyRule ParsedPolicyContract PolicyContractError Decimal InvalidOperation "
+            "MappingProxyType json _ROLES _TEMPLATES _FY_ENDS _RULE_KINDS _CONTEXT_FIELDS _SHA256 _IDENTIFIER "
+            "_DECIMAL _DIMENSIONS _LISTING_VALUES"),
+        (vars(scoring_module), "_graph _feature_slots _formula_requirements VerifiedRegistryBundle "
+            "SignedFormalFeatureRegistry FormalScoringRegistry RegistryApproval TemplateDefinition MetricDefinition "
+            "RedlineDefinition StatusRule RegistryValidationError fields Decimal MappingProxyType hashlib _ROLES _TEMPLATES"),
+        (vars(feature_module), "SignedFormalFeatureRegistry FormalFeatureSlot FormulaNode _parse_registry_bytes "
+            "_load_canonical_object _canonical_json_bytes _unique_json_object _reject_json_constant _DuplicateJsonKey "
+            "_require_text _require_hash _require_exact_keys _snapshot_json _parse_formula _formula_to_dict "
+            "_slot_to_dict _SHA256 _IDENTIFIER _TEMPLATES _DIMENSIONS _UNITS _FORMULA_OPS _REGISTRY_KEYS "
+            "_SLOT_KEYS json hashlib math"),
+        (vars(manifest_module), "VerifiedRegistryBundle FormalRegistryManifest VerifiedRegistryBlob "
+            "_require_trimmed_text _VERSION_IDENTIFIER _ROLE_FIELDS Mapping"),
+        (vars(context_module), "_descriptor _canonical _json_tree _keys _text _exchange _ordered _selector "
+            "CalendarSelector CONTEXT_KINDS _DESCRIPTOR_FIELDS _ROLES json math re"),
+        (vars(sources_module), "CalendarSelector _require_trimmed_text _require_exchange _VERSION_IDENTIFIER _EXCHANGES"),
+        (vars(json), "loads dumps"), (vars(hashlib), "sha256"), (vars(weakref), "ref"),
+        (vars(feature_module.math), "isfinite"), (vars(context_module.re), "fullmatch"),
+    )
+    bindings = tuple((owner, name, owner[name]) for owner, names in binding_names for name in names.split())
+    source_interfaces = (
+        (bundle_type, "require_official blob"), (scoring_type, "require_official"),
+        (feature_type, "require_release_eligible slots_for_template"),
+        (manifest_module.FormalRegistryManifest, ""), (manifest_module.VerifiedRegistryBlob, ""),
+        (feature_module.FormalFeatureSlot, "__init__ __post_init__ from_dict to_dict"),
+        (feature_module.FormulaNode, "__init__ __post_init__ from_dict"),
+        (scoring_module.RegistryApproval, ""), (scoring_module.TemplateDefinition, ""),
+        (scoring_module.MetricDefinition, ""), (scoring_module.RedlineDefinition, ""),
+        (scoring_module.StatusRule, ""), (contract_module.PolicyRule, "__init__"),
+        (contract_module.ParsedPolicyContract, "__init__"),
+        (sources_module.CalendarSelector, "__init__ __post_init__"),
+    )
+
+    def resolved_member(cls, name):
+        return next((vars(base)[name] for base in cls.__mro__ if name in vars(base)), None)
+
+    # Upstream records are inspected through these exact lookup methods and
+    # dataclass fields; unrelated convenience methods are not dependencies.
+    source_members = tuple((cls, name, resolved_member(cls, name))
+        for cls, methods in source_interfaces
+        for name in (*methods.split(), "__getattribute__", "__getattr__", "__dataclass_fields__",
+            *cls.__dataclass_fields__))
+    source_bases = tuple((cls, cls.__bases__, cls.__mro__) for cls, _ in source_interfaces)
+
+    def class_snapshot(classes):
+        return tuple((cls, tuple(vars(cls).items()), cls.__bases__, cls.__mro__) for cls in classes)
+
+    def dependencies():
+        if any(owner.get(name) is not expected for owner, name, expected in bindings):
+            raise ValueError("policy proof dependency changed")
+        if (module_globals.get("FormalPolicyRegistry") is not proof_type
+                or module_globals.get("load_formal_policy_registry") is not load):
+            raise ValueError("policy proof entry point changed")
+        if (any(resolved_member(cls, name) is not expected for cls, name, expected in source_members)
+                or any(cls.__bases__ != bases or cls.__mro__ != mro for cls, bases, mro in source_bases)):
+            raise ValueError("policy proof source interface changed")
+        for cls, expected, bases, mro in own_members:
+            current = vars(cls)
+            if (cls.__bases__ != bases or cls.__mro__ != mro
+                    or set(current) != {name for name, _ in expected}
+                    or any(current[name] is not value for name, value in expected)):
+                raise ValueError("policy proof class member or inheritance changed")
+
+    def verify_sources(bundle, scoring, feature):
+        if type(bundle) is not bundle_type or type(scoring) is not scoring_type or type(feature) is not feature_type:
+            raise ValueError("policy proof requires exact genuine registry sources")
+        require_bundle(bundle)
+        require_scoring(scoring, bundle)
+        require_feature(feature)
+        blobs = {role: blob_for(bundle, role) for role in _ROLES}
+        hashes = {role: sha256(blob.canonical_json).hexdigest() for role, blob in blobs.items()}
+        root_hash = sha256(bundle.manifest.canonical_json).hexdigest()
+        if (root_hash != bundle.manifest.manifest_hash
+                or any(hashes[role] != blobs[role].registry_hash
+                    or hashes[role] != getattr(bundle.manifest, role + "_registry_hash") for role in _ROLES)):
+            raise ValueError("policy proof actual root or child bytes changed")
+        # The original feature verifier just checked its complete sealed record.
+        # Read those actual fields without repeating its expensive slot reparse
+        # for each scalar. Scoring already checks all five template slot sets.
+        read = object.__getattribute__
+        if (read(feature, "canonical_json") != blobs["feature"].canonical_json
+                or read(feature, "registry_hash") != hashes["feature"]
+                or read(feature, "source_registry_hash") != hashes["source"]
+                or read(feature, "mapping_registry_hash") != hashes["mapping"]):
+            raise ValueError("policy proof feature/source/mapping differs from current root")
+        return root_hash, hashes
+
+    def proof_record(proof):
+        dependencies()
+        record = records.get(id(proof))
+        if type(proof) is not proof_type or record is None or record[0]() is not proof:
+            raise ValueError("policy proof is forged, copied or unregistered")
+        root_hash, hashes = verify_sources(record[3], record[4], record[5])
+        if root_hash != record[6] or hashes != record[7]:
+            raise ValueError("policy proof source identity changed")
+        return record
+
+    class ProofMeta(type):
+        def __setattr__(cls, name, value):
+            if name in ("__getattribute__", "__bases__"):
+                raise TypeError("policy proof lookup or inheritance cannot be replaced")
+            return super().__setattr__(name, value)
+
+        def __delattr__(cls, name):
+            if name in ("__getattribute__", "__bases__"):
+                raise TypeError("policy proof lookup or inheritance cannot be removed")
+            return super().__delattr__(name)
+
+    class Proof(metaclass=ProofMeta):
+        __slots__ = ("__weakref__",)
+
+        def __init__(self, *args, **kwargs):
+            raise TypeError("policy proofs require load_formal_policy_registry")
+
+        def __getattribute__(self, name):
+            proof_record(self)
+            return object.__getattribute__(self, name)
+
+        def __getattr__(self, name):
+            record = proof_record(self)
+            if name not in public_fields:
+                raise AttributeError(name)
+            return record[1][name]
+
+        def require_verified(self):
+            """Authenticate the definition and its historical registry sources."""
+            proof_record(self)
+
+        def canonical_bytes(self):
+            """Return A2's bound bytes, excluding the derived contract_hash."""
+            return proof_record(self)[2]
+
+        def to_dict(self):
+            record = proof_record(self)
+            return dict(loads(record[2]), contract_hash=record[1]["contract_hash"])
+
+        def __copy__(self):
+            raise TypeError("policy proofs cannot be copied")
+
+        def __deepcopy__(self, memo):
+            raise TypeError("policy proofs cannot be copied")
+
+        def __reduce__(self):
+            raise TypeError("policy proofs cannot be serialized for reconstruction")
+
+        def __reduce_ex__(self, protocol):
+            raise TypeError("policy proofs cannot be serialized for reconstruction")
+
+    class FormalPolicyRegistry(Proof):
+        """Immutable policy definitions; no security evidence or scoring readiness."""
+        __slots__ = ()
+
+    proof_type = FormalPolicyRegistry
+
+    def load(bundle: VerifiedRegistryBundle, *, scoring_registry: FormalScoringRegistry,
+            feature_registry: SignedFormalFeatureRegistry) -> FormalPolicyRegistry:
+        """Authenticate and bind one complete signed graph without executing it."""
+        dependencies()
+        root_hash, hashes = verify_sources(bundle, scoring_registry, feature_registry)
+        canonical = bind(bundle, scoring_registry=scoring_registry, feature_registry=feature_registry)
+        payload = loads(canonical)
+        if type(canonical) is not bytes or type(payload) is not dict or set(payload) != fields or encode(payload) != canonical:
+            raise ValueError("policy binder returned a noncanonical definition")
+        frozen_payload = freeze(dict(payload, contract_hash=sha256(canonical).hexdigest()))
+        dependencies()
+        if verify_sources(bundle, scoring_registry, feature_registry) != (root_hash, hashes):
+            raise ValueError("policy proof sources changed during loading")
+        result = object.__new__(proof_type)
+        identity = id(result)
+
+        def forget(reference):
+            record = records.get(identity)
+            if record is not None and record[0] is reference:
+                records.pop(identity, None)
+
+        records[identity] = (weak_ref(result, forget), frozen_payload, canonical,
+            bundle, scoring_registry, feature_registry, root_hash, hashes)
+        return result
+
+    own_members = class_snapshot((ProofMeta, Proof, proof_type))
+    return proof_type, load
+
+
+FormalPolicyRegistry, load_formal_policy_registry = _install_policy_registry()
+del _install_policy_registry
+
+
+__all__ = ["FormalPolicyRegistry", "load_formal_policy_registry"]
