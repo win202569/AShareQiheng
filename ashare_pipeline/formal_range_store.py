@@ -155,7 +155,7 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             raise ValueError("range task ID mismatch")
         return value
 
-    def request_for(store, row, seen, *, execution=False):
+    def request_for(store, row, seen, *, execution=False, evidence=None):
         payload = task_payload(row)
         binding, source = load_binding(store, payload)
         parent = payload["parent"]
@@ -163,7 +163,7 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
         if parent is not None:
             if type(parent) is not dict or set(parent) != {"task_id", "observation_hash", "mode"}:
                 raise ValueError("range parent identity invalid")
-            previous = read(store, parent["task_id"], historical=not execution, seen=seen)
+            previous = read(store, parent["task_id"], historical=not execution, seen=seen, evidence=evidence)
             if observation_wire(previous)[1] != parent["observation_hash"]:
                 raise ValueError("range parent changed")
         request = restore_request(source, payload["request"], previous, None if parent is None else parent["mode"])
@@ -195,7 +195,23 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             raise ValueError("range producer lease lost or expired")
         return row, attempt
 
-    def read(store, task_id, *, historical=False, seen=()):
+    def check_read_evidence(connection, root, authenticated):
+        task, snapshot, receipt, attempt, raw, manifest_bytes = authenticated
+        task_id = task["id"]
+        for table, key, expected in (("formal_range_task", "id", task),
+                                    ("formal_range_snapshot", "task_id", snapshot),
+                                    ("formal_range_normalization_receipt", "task_id", receipt)):
+            row = connection.execute(f"SELECT * FROM {table} WHERE {key}=?", (task_id,)).fetchone()
+            if row is None or dict(row) != expected:
+                raise ValueError("range records changed during verification")
+        producers = connection.execute("SELECT * FROM formal_range_attempt WHERE task_id=? AND outcome='verified'", (task_id,)).fetchall()
+        if len(producers) != 1 or dict(producers[0]) != attempt:
+            raise ValueError("range producer changed during verification")
+        if (_read_content(root, snapshot["content_path"], snapshot["content_sha256"], ".raw") != raw
+                or _read_content(root, snapshot["manifest_path"], snapshot["manifest_sha256"], ".json") != manifest_bytes):
+            raise ValueError("range raw files changed during verification")
+
+    def read(store, task_id, *, historical=False, seen=(), evidence=None):
         state, root, _, _, _ = record(store)
         _text(task_id)
         if task_id in seen:
@@ -241,7 +257,7 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                 raise ValueError("range manifest producer mismatch")
             task_copy, snapshot_copy, receipt_copy = dict(task), dict(snapshot), dict(receipt)
             attempt_copy = dict(attempt)
-        request, source = request_for(store, task_copy, (*seen, task_id))
+        request, source = request_for(store, task_copy, (*seen, task_id), evidence=evidence)
         document = source_parse(source, request, raw_bytes=raw, manifest=manifest["fetch"]).to_dict()
         expected_receipt = dict(schema_version="formal-range-normalization-receipt-v1", task_id=task_id,
             snapshot_id=snapshot_copy["id"], attempt_id=attempt["id"], worker_id=attempt["worker_id"],
@@ -252,18 +268,11 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             raise ValueError("range normalization receipt differs from actual output")
         if task_copy["result_json"] != _canonical(dict(snapshot_id=snapshot_copy["id"], receipt_hash=receipt_copy["payload_hash"])).decode():
             raise ValueError("range verified result differs")
+        authenticated = (task_copy, snapshot_copy, receipt_copy, attempt_copy, raw, manifest_bytes)
         with transaction(state) as connection:
-            for table, key, value in (("formal_range_task", "id", task_copy), ("formal_range_snapshot", "task_id", snapshot_copy),
-                                      ("formal_range_normalization_receipt", "task_id", receipt_copy)):
-                row = connection.execute(f"SELECT * FROM {table} WHERE {key}=?", (task_id,)).fetchone()
-                if row is None or dict(row) != value:
-                    raise ValueError("range records changed during verification")
-            current_attempts = connection.execute("SELECT * FROM formal_range_attempt WHERE task_id=? AND outcome='verified'", (task_id,)).fetchall()
-            if len(current_attempts) != 1 or dict(current_attempts[0]) != attempt_copy:
-                raise ValueError("range producer changed during verification")
-            if (_read_content(root, snapshot_copy["content_path"], snapshot_copy["content_sha256"], ".raw") != raw
-                    or _read_content(root, snapshot_copy["manifest_path"], snapshot_copy["manifest_sha256"], ".json") != manifest_bytes):
-                raise ValueError("range raw files changed during verification")
+            check_read_evidence(connection, root, authenticated)
+        if evidence is not None:
+            evidence.append(authenticated)
         wire = dict(request=payload["request"], document=document, receipt=dict(receipt_wire, recorded_at=receipt_copy["recorded_at"]),
             snapshot=dict(manifest, **{key: snapshot_copy[key] for key in ("id", "content_path", "manifest_path", "content_sha256", "manifest_sha256")}),
             task=public(task_copy, attempt), generation=dict(refresh_generation=task_copy["refresh_generation"], upstream_generation=document["upstream_generation"]))
@@ -436,9 +445,9 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             state, _, _, _, _ = record(self)
             if type(lease_seconds) is not int or lease_seconds <= 0:
                 raise ValueError("lease duration must be positive exact integer")
-            now = _utc_now()
-            expires = (_time(now) + timedelta(seconds=lease_seconds)).isoformat()
             with transaction(state, immediate=True) as connection:
+                now = _utc_now()
+                expires = (_time(now) + timedelta(seconds=lease_seconds)).isoformat()
                 _, attempt = owner(connection, task_id, worker_id, attempt_id, now)
                 connection.execute("UPDATE formal_range_task SET lease_expires_at=?,updated_at=? WHERE id=?", (expires, now, task_id))
                 connection.execute("UPDATE formal_range_attempt SET lease_expires_at=? WHERE id=?", (expires, attempt_id))
@@ -449,11 +458,11 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             _text(code)
             if type(retryable) is not bool or (retryable and next_retry_at is None) or (not retryable and next_retry_at is not None):
                 raise ValueError("range failure retry shape invalid")
-            now = _utc_now()
-            if retryable and _time(next_retry_at) <= _time(now):
-                raise ValueError("retry must be in future")
             status = "retryable_failed" if retryable else "terminal_failed"
             with transaction(state, immediate=True) as connection:
+                now = _utc_now()
+                if retryable and _time(next_retry_at) <= _time(now):
+                    raise ValueError("retry must be in future")
                 _, attempt = owner(connection, task_id, worker_id, attempt_id, now)
                 connection.execute("UPDATE formal_range_attempt SET outcome=?,finished_at=? WHERE id=?", (status, now, attempt_id))
                 connection.execute("UPDATE formal_range_task SET status=?,worker_id=NULL,lease_expires_at=NULL,next_retry_at=?,error_json=?,updated_at=? WHERE id=?",
@@ -478,7 +487,8 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                         or _canonical(wire["snapshot"]["fetch"]) != _canonical(fetch_wire)):
                     raise ValueError("range verified task cannot be claimed by another producer")
                 return replay
-            request, source = request_for(self, task, (), execution=True)
+            parent_evidence = []
+            request, source = request_for(self, task, (), execution=True, evidence=parent_evidence)
             document = source_parse(source, request, raw_bytes=raw_bytes, manifest=fetch_wire).to_dict()
             manifest = dict(schema_version="formal-range-snapshot-v1", task_payload=task_payload(task),
                 task_id=task_id, attempt_id=attempt_id, worker_id=worker_id, fetch=fetch_wire)
@@ -497,6 +507,8 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             with transaction(state, immediate=True) as connection:
                 owner(connection, task_id, worker_id, attempt_id, now)
                 check_candidate_snapshots(connection, parent_snapshots)
+                for authenticated in parent_evidence:
+                    check_read_evidence(connection, root, authenticated)
                 _read_content(root, content_path, content_hash, ".raw")
                 _read_content(root, manifest_path, manifest_hash, ".json")
                 insert(connection, "formal_range_snapshot", snapshot)

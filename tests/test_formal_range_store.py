@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 FREEZE = "2026-08-31T07:00:00+00:00"
@@ -15,6 +16,50 @@ NOW = "2026-09-01T00:00:00+00:00"
 
 
 class FormalRangeStoreTests(unittest.TestCase):
+    def test_writer_lock_wait_cannot_extend_expired_lease_or_retry_deadline(self):
+        for operation in ("renew", "fail", "retry_deadline"):
+            with self.subTest(operation=operation):
+                fixture = self.fixture()
+                _, task = self.task(fixture)
+                clock = [NOW]
+                sampled = Event()
+
+                def now():
+                    value = clock[0]
+                    sampled.set()
+                    return value
+
+                with patch("ashare_pipeline.formal_range_store._utc_now", side_effect=now):
+                    lease = fixture.range_store.lease_next("worker", lease_seconds=60)
+                    sampled.clear()
+
+                    def update():
+                        if operation == "renew":
+                            return fixture.range_store.renew(task["id"], "worker", lease["attempt_id"], lease_seconds=90)
+                        return fixture.range_store.fail(task["id"], "worker", lease["attempt_id"],
+                            code="timeout", retryable=operation == "retry_deadline",
+                            next_retry_at="2026-09-01T00:00:30+00:00" if operation == "retry_deadline" else None)
+
+                    with closing(sqlite3.connect(fixture.store.db_path)) as blocker:
+                        blocker.execute("BEGIN IMMEDIATE")
+                        with ThreadPoolExecutor(max_workers=1) as executor:
+                            future = executor.submit(update)
+                            # The real SQLite writer lock stays held while the
+                            # worker samples the old time (buggy version), or
+                            # waits before sampling at all (correct version).
+                            sampled.wait(0.2)
+                            self.assertFalse(future.done())
+                            clock[0] = ("2026-09-01T00:00:30+00:00" if operation == "retry_deadline"
+                                        else "2026-09-01T00:01:00+00:00")
+                            blocker.commit()
+                            with self.assertRaises(ValueError):
+                                future.result(timeout=10)
+                with closing(sqlite3.connect(fixture.store.db_path)) as connection:
+                    self.assertEqual(connection.execute("SELECT status,lease_expires_at,next_retry_at FROM formal_range_task WHERE id=?",
+                        (task["id"],)).fetchone(), ("leased", "2026-09-01T00:01:00+00:00", None))
+                    self.assertEqual(connection.execute("SELECT outcome,finished_at FROM formal_range_attempt WHERE id=?",
+                        (lease["attempt_id"],)).fetchone(), (None, None))
+
     def fixture(self, **kwargs):
         from tests import formal_range_fixtures
         self.assertTrue(hasattr(formal_range_fixtures, "RangeStoreFixture"))
@@ -375,6 +420,48 @@ with tempfile.TemporaryDirectory() as directory:
         with closing(sqlite3.connect(fixture.store.db_path)) as connection:
             self.assertEqual(connection.execute("SELECT status FROM formal_range_task WHERE id=?", (child_task["id"],)).fetchone()[0], "leased")
             self.assertEqual(connection.execute("SELECT count(*) FROM formal_range_snapshot WHERE task_id=?", (child_task["id"],)).fetchone()[0], 0)
+
+    def test_parent_raw_mutation_during_child_parse_cannot_commit_child(self):
+        import json
+        from ashare_pipeline.formal_sources import FormalTerminalSourceError
+        from tests.test_formal_range_source import document_wire
+
+        class InterleavingParser:
+            action = None
+            target = None
+
+            def parse(self, raw_bytes, *, request, config):
+                if self.action is not None and request["end_date"] == self.target:
+                    action, self.action = self.action, None
+                    action()
+                return json.loads(raw_bytes)
+
+        class Normalizer:
+            def normalize(self, value, *, request, config):
+                return value
+
+        parser = InterleavingParser()
+        key = ("fixture-range-parser", "fixture-range-v1", "fixture-range-map-v1", "fixture-range-normalizer-v1", "formal-range-request-v1")
+        fixture = self.fixture(implementations={key: (parser, Normalizer())})
+        parent = fixture.produce_calendar(days={"2026-08-31": True})[0]
+        request = fixture.source.previous_calendar_request(parent)
+        task = fixture.range_store.enqueue(request, refresh_generation="g1")
+        fixture.reply(document_wire(request))
+        lease = fixture.range_store.lease_next("worker", lease_seconds=3600)
+        fetch = fixture.source.fetch_verified(request)
+        path = Path(parent.snapshot["content_path"])
+        parent_bytes = path.read_bytes()
+        parser.target = request.end_date
+        parser.action = lambda: path.write_bytes(parent_bytes + b" ")
+        try:
+            fixture.range_store.persist(task["id"], "worker", lease["attempt_id"], fetch=fetch)
+        except (ValueError, FormalTerminalSourceError):
+            pass
+        with closing(sqlite3.connect(fixture.store.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT status FROM formal_range_task WHERE id=?", (task["id"],)).fetchone()[0], "leased")
+            self.assertEqual(connection.execute("SELECT count(*) FROM formal_range_snapshot WHERE task_id=?", (task["id"],)).fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT count(*) FROM formal_range_normalization_receipt WHERE task_id=?", (task["id"],)).fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT outcome FROM formal_range_attempt WHERE id=?", (lease["attempt_id"],)).fetchone()[0], None)
 
     def test_parent_correction_during_fetch_rejects_standalone_continuation(self):
         import json
