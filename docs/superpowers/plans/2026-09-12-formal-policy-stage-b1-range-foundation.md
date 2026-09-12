@@ -172,15 +172,18 @@ def page_successor(document, max_pages):
 
 ## R3：V7 四表、租约、快照与收据读取
 
-**Files:** Modify `ashare_pipeline/state_store.py`, `tests/test_state_store.py`; Create `ashare_pipeline/formal_range_store.py`, `tests/test_formal_range_store.py`; Modify `tests/formal_range_fixtures.py`, `ashare_pipeline/formal_range_source.py`（仅接通 genuine observation 消费入口）。
+**Files:** Modify `ashare_pipeline/state_store.py`, `tests/test_state_store.py`; Create `ashare_pipeline/formal_range_store.py`, `tests/test_formal_range_store.py`; Modify `tests/formal_range_fixtures.py`, `ashare_pipeline/formal_range_source.py`（闭包 observation 身份、genuine store 配对及后续请求入口；持久化逻辑仍在 store 模块）。
 
 **Interfaces:**
 
 - Consumes: R2 genuine request/fetch；精确已初始化 StateStore。
+- store 模块先定义 builder/helpers，末尾导入 source 但不读取部分初始化的 source 属性；source 工厂在真实 Source/Observation 闭包建立后调用 store builder，封存返回的精确 Store 与私有认证重读函数，再向两模块发布同一类型并移除临时 builder/mint。两种导入顺序均须通过，外部重复 builder 不得制造原闭包接受的类型或观察；禁止调用者注册/首次调用捕获。
+- `root` 为原始快照存储路径，签名图从精确 StateStore/verifier 重新加载。重启逐项验证真实绑定及已保存父收据链，不能由任意 wire/ordinal 授权请求；历史链可审计但不能授予新执行或 current 资格。
 - Produces: `FormalRangeStore(state_store, *, root, signature_verifier, source_factory)`；`source_factory(binding) -> FormalRangeSource` 是构造时捕获的受信任依赖，不是调用者临时 parser。
 - `.enqueue(request, *, refresh_generation: str) -> dict`；`.lease_next(worker_id: str, *, lease_seconds: int) -> dict | None`；`.renew(task_id, worker_id, attempt_id, *, lease_seconds) -> dict`；`.fail(task_id, worker_id, attempt_id, *, code, retryable, next_retry_at) -> dict`。
 - `.persist(task_id, worker_id, attempt_id, *, fetch: RangeFetch) -> RangeObservation` 原始文件已内容寻址落地后，在一个短事务内写 snapshot/receipt 并完成 verified 状态；`.read_verified(task_id: str) -> RangeObservation` 重验收据+原始 bytes；`.select_current(request_fingerprint: str) -> RangeObservation | None`；`.read_history(task_id: str) -> RangeObservation` 不宣称当前资格。
 - RangeObservation 只读 `request/document/receipt/snapshot/task/generation` 及 `observation_hash`，具有 `.to_dict()`、`.require_current()`；选择器必须比较来源版本，不按入库自增 ID 选“最新”。同领先版本不同内容失败。
+- 来源版本按已认证时点保守比较：双方都有 source_updated 时比较该字段并拒绝公开时点的反向变化；双方均无时才比较可兼容的公开时点。一方缺更新时点或精度不可比，不能为不同来源/内容猜出顺序；同领先版本内容冲突失败。抓取时间、入库顺序和不透明的 upstream/refresh 字符串不用于判新旧。
 - 新增 `FormalRangeSource.previous_calendar_request(previous: RangeObservation) -> FormalRangeRequestV1 | None` 和 `.next_page(previous: RangeObservation) -> FormalRangeRequestV1 | None`。只消费 genuine 当前观察，重验其 binding/request/receipt 后使用 R2 内核派生请求；自然日已到 ISO 下界时 previous 返回 None。解析 DTO 或旧观察不能直接派生。
 - `RangeStoreFixture(RangeSourceFixture)` 新增 `.range_store/.store/.root`，方法 `.produce_calendar(*, days:dict[str,bool], generation="g1", omit_pages=()) -> tuple[RangeObservation,...]`；必须真实 enqueue/lease/fetch/persist，不直接插入 proof。
 

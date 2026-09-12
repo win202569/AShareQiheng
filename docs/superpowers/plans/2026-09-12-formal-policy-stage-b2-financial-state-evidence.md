@@ -167,9 +167,11 @@ def annual_targets(series_selector):
 **Interfaces:**
 
 - Consumes: `FormalContextRepository.get_verified_many(kind, scope_key, security_ids, as_of_utc, registry_manifest_hash)`、genuine FormalPolicyRegistry。
+- 可构造内部真实 FormalMetricContextRepository companion，仅复用既有同库 Context/raw/verifier 的 captured authenticity guard；不读取 universe/industry，不增加其证据前置条件，实际状态读取仍使用封存的 get_verified_many。
 - Produces: `FormalPolicyStateRepository(context_repository)`；`.select(security_id, as_of_utc, *, template_id, policy_registry) -> PolicyStateSelection`；selection 提供 `.values/.lineage/.selection_hash/.recheck()`，内部身份边界与 F2 相同。
 - `read_flag(flags: tuple[dict,...], flag_id: str) -> bool | None` 为纯内部辅助；显式 false 返回 false，实际缺条目返回 None，重复 ID/非 bool 返回错误。
 - F1 对 present compound 的拒绝在本任务仅为 event_record 接通封闭校验：保留实际 Context 的 event_id/event_date/quantified_value/unit 四字段、已签名选择器单位和有效日期，不用裸 decimal 代替事件。普通值 DTO 不授予证据资格，来源与时点仍保存在 selection.lineage；calendar_record/market_window 留给 W1，不引入动态验证器注册。
+- 用户已选择本轮保持 v1：现有规则种类不能消费 event_record，量化事件消费明确留作缺口，本任务不新增规则/更改签名合同。事件 DTO 校验不等于运行取证支持；只消费实际活动规则的既有 bool/enum 事件旗标，不读取未请求的事件描述符，不制造不存在规则的待补结果。未来启用量化事件需要独立版本化规格。
 - 测试 fixture `.put_policy_context(security_id, kind, value, *, generation="g1")` 通过已签名 resolver→task→snapshot→FixtureNormalizer→Context receipt 写入；`.state_selection(security_id)` 调用 genuine 仓库。不得用 `.sql()` 直接制造正常的 proof；`.sql()` 仅负例篡改测试使用。
 
 - [ ] **写失败测试。**
@@ -183,7 +185,7 @@ def test_false_flag_is_not_missing_flag(self):
         read_flag(({"flag_id": "audit", "active": 0},), "audit")
 ```
 
-另测真实存储 factor 的 false 命中 expected=false、缺审计旗标待补、白名单外 ID 合同失败、量化事件的日期/单位及有效时点、未量化事件不填 0、suspended 不产生未签名否决；当前 factor 更正、来源失效、equal-leading conflict、复制和方法影子失败。
+另测真实存储 factor 的 false 命中 expected=false、缺审计旗标待补、白名单外 ID 合同失败、已有事件旗标不以缺失代替 false、suspended 不产生未签名否决；当前 factor 更正、来源失效、equal-leading conflict、复制和方法影子失败。量化事件的日期/单位/数值只作封闭 DTO 格式测试，并证明现有 v1 规则拒绝 event_record 输入，不伪造可消费该类型的签名规则。
 
 - [ ] **运行 RED。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_state -v`。
 - [ ] **实现。** 按 kind/scope 分组批量读取，security_ids 使用排序去重 tuple；保留所有 factor 来源再投影单个 entry。`get_verified_many` 返回 None 是有界的真实缺失信号，旧 `get_verified` 抛错不能当作这个信号。
