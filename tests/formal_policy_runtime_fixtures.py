@@ -13,6 +13,8 @@ from ashare_pipeline.formal_evidence import (
     verify_official_fetch,
 )
 from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
+from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
+from ashare_pipeline.formal_metric_context import FormalMetricContextRepository
 from ashare_pipeline.formal_universe import canonical_security_id
 from tests.formal_metric_feature_fixtures import FinancialFixture
 from tests.formal_metric_fixtures import FREEZE, update_mapping_digest
@@ -64,13 +66,13 @@ def _exchange_rows(templates):
     return result
 
 
-def _policy_memberships(templates):
+def _policy_memberships(templates, cyclic):
     return [
         {
             "security_id": security_id,
             "template_id": templates[security_id],
             "primary_industry": "fixture-policy",
-            "secondary_industry": "fixture-cyclic",
+            "secondary_industry": "fixture-cyclic" if cyclic else "fixture-noncyclic",
         }
         for security_id in sorted(templates)
     ]
@@ -106,13 +108,13 @@ def _patch_current_policy_periods(documents):
 class PolicyRuntimeFixture(FinancialFixture):
     """Small producer-backed graph; it does not confer production meaning."""
 
-    def __init__(self, *, range_enabled=False, templates=None):
-        if type(range_enabled) is not bool:
-            raise ValueError("range_enabled must be exact bool")
+    def __init__(self, *, range_enabled=False, templates=None, cyclic=True, mutate=None):
+        if type(range_enabled) is not bool or type(cyclic) is not bool:
+            raise ValueError("range_enabled and cyclic must be exact bool")
         selected_templates = _templates(templates)
 
         def configure(documents):
-            documents["industry"]["memberships"] = _policy_memberships(selected_templates)
+            documents["industry"]["memberships"] = _policy_memberships(selected_templates, cyclic)
             update_mapping_digest(documents["industry"])
             documents["scoring"]["descriptors"].append(descriptor("security_state"))
             documents["source"]["configs"].extend(
@@ -124,17 +126,42 @@ class PolicyRuntimeFixture(FinancialFixture):
             if range_enabled:
                 from tests.formal_range_fixtures import add_range_documents
                 add_range_documents(documents)
+            if mutate is not None:
+                mutate(documents)
             rehash_documents(documents)
 
-        super().__init__(
-            mutate=configure,
-            exchange_rows=_exchange_rows(selected_templates),
-        )
-        self.policy_registry = load_formal_policy_registry(
-            self.bundle,
-            scoring_registry=self.scoring,
-            feature_registry=self.vocabulary,
-        )
+        try:
+            super().__init__(
+                mutate=configure,
+                exchange_rows=_exchange_rows(selected_templates),
+            )
+            self.policy_registry = load_formal_policy_registry(
+                self.bundle,
+                scoring_registry=self.scoring,
+                feature_registry=self.vocabulary,
+            )
+        except Exception:
+            if hasattr(self, "tempdir"):
+                self.tempdir.cleanup()
+            raise
+        self.policy_context_repository = FormalMetricContextRepository(self.store, self.context,
+            registry_signature_verifier=self.verifier)
+        self.policy_financial_repository = FormalPolicyFinancialRepository(self.feature_repository,
+            current_input_provider=self.provider)
+        self._policy_industry_ids = set()
+
+    def financial_selection(self, security_id):
+        if security_id not in self._policy_industry_ids:
+            self.put_industry(security_id)
+            self._policy_industry_ids.add(security_id)
+        universe = self.policy_context_repository.load_universe(self.frozen.frozen_input_hash,
+            scoring_registry=self.scoring)
+        industry = self.policy_context_repository.resolve_industries(universe)
+        member = next(m for m in self.industry["memberships"] if m["security_id"] == security_id)
+        selected = self.policy_financial_repository.select(security_id, FREEZE,
+            template_id=member["template_id"], policy_registry=self.policy_registry, industry_batch=industry)
+        self.policy_context_repository.recheck_batch(universe, industry)
+        return selected
 
     def put_policy_financial(
         self,

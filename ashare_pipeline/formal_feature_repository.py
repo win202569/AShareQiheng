@@ -587,4 +587,186 @@ def _install_metric_projection():
  _require_authentic_metric_feature_repository) = _install_metric_projection()
 del _install_metric_projection
 
+
+def _install_policy_projection(provider_module):
+    """Install only after the owned provider module has completed initialization.
+
+    Kept independent from the required-only metric entry point. Existing metric
+    registration authenticates repositories created before this installation.
+    """
+    from types import MappingProxyType
+    from .formal_policy_registry import FormalPolicyRegistry
+    from .formal_policy_values import PolicyIntegrityError, PolicyPreconditionError
+
+    repository_type = FormalFeatureRepository
+    provider_type = provider_module.FormalMetricCurrentInputProvider
+    resolve = provider_type.resolve_current_inputs
+    guard = provider_module._metric_batch_guard
+    authentic = _require_authentic_metric_feature_repository
+    read_registry = repository_type._registry
+    persisted = repository_type._persisted_facts
+    read_bundle = repository_type._read_authenticated_bundle
+    identity_of = repository_type._snapshot_identity
+    evaluator, builder = evaluate_selected_features, build_formal_feature_bundle
+    require_policy, policy_wire = FormalPolicyRegistry.require_verified, FormalPolicyRegistry.to_dict
+    records = {}
+
+    def freeze(value):
+        if type(value) is dict:
+            return MappingProxyType({k: freeze(v) for k, v in value.items()})
+        return tuple(map(freeze, value)) if type(value) is list else value
+
+    def dependencies(repository, provider=None):
+        authentic(repository)
+        actual = repository._current_input_provider
+        if (type(actual) is not provider_type or (provider is not None and actual is not provider)
+                or provider_module.FormalMetricCurrentInputProvider is not provider_type
+                or provider_type.resolve_current_inputs is not resolve
+                or provider_module._metric_batch_guard is not guard):
+            raise PolicyIntegrityError("policy provider dependency changed or is not owned")
+        if (repository_type.select_current_verified_policy_feature_state is not select
+                or "select_current_verified_policy_feature_state" in vars(repository)):
+            raise PolicyIntegrityError("policy repository selector was replaced")
+        return actual
+
+    def record(item):
+        saved = records.get(id(item))
+        if type(item) is not PolicyFeatureState or saved is None or saved[0]() is not item:
+            raise PolicyIntegrityError("policy feature state is forged or copied")
+        if (set(vars(PolicyFeatureState)) != {k for k, _ in methods}
+                or any(vars(PolicyFeatureState).get(k) is not v for k, v in methods)):
+            raise PolicyIntegrityError("policy feature state interface changed")
+        return saved
+
+    class StateMeta(type):
+        def __setattr__(cls, name, value):
+            if name in {"__getattribute__", "__bases__"}:
+                raise TypeError("policy feature lookup and inheritance are immutable")
+            return super().__setattr__(name, value)
+
+        def __delattr__(cls, name):
+            if name in {"__getattribute__", "__bases__"}:
+                raise TypeError("policy feature lookup and inheritance are immutable")
+            return super().__delattr__(name)
+
+    class PolicyFeatureState(metaclass=StateMeta):
+        __slots__ = ("__weakref__",)
+
+        def __init__(self, *args, **kwargs):
+            raise TypeError("policy feature states require an authenticated repository selection")
+
+        def __getattribute__(self, name):
+            record(self)
+            return object.__getattribute__(self, name)
+
+        def __getattr__(self, name):
+            payload = json.loads(record(self)[1])
+            if name not in payload:
+                raise AttributeError(name)
+            return freeze(payload[name])
+
+        def to_dict(self):
+            return json.loads(record(self)[1])
+
+        def recheck(self):
+            saved = record(self)
+            current = select(saved[2], **saved[3])
+            if record(current)[1] != saved[1]:
+                raise PolicyIntegrityError("policy feature selection is no longer current")
+
+        def __copy__(self):
+            raise TypeError("policy feature states cannot be copied")
+
+        def __deepcopy__(self, memo):
+            raise TypeError("policy feature states cannot be copied")
+
+    methods = tuple(vars(PolicyFeatureState).items())
+
+    def select(self, security_id, as_of_utc, *, template_id, registry_manifest_hash,
+               policy_registry, rule_ids):
+        provider = dependencies(self)
+        request = _request(security_id, as_of_utc, template_id, registry_manifest_hash)
+        if as_of_utc != "2026-08-31T07:00:00+00:00":
+            raise PolicyPreconditionError("policy projection requires the fixed cutoff")
+        if type(policy_registry) is not FormalPolicyRegistry:
+            raise PolicyPreconditionError("genuine policy registry required")
+        require_policy(policy_registry)
+        policy = policy_wire(policy_registry)
+        if policy["registry_manifest_hash"] != registry_manifest_hash:
+            raise PolicyPreconditionError("policy projection root mismatch")
+        if (type(rule_ids) is not tuple or not rule_ids
+                or any(type(key) is not str for key in rule_ids)
+                or tuple(sorted(set(rule_ids))) != rule_ids):
+            raise PolicyPreconditionError("policy rule IDs must be distinct and ordered")
+        rules = [r for r in policy["rules"] if r["template_id"] == template_id and r["rule_id"] in rule_ids]
+        if len(rules) != len(rule_ids):
+            raise PolicyPreconditionError("policy rule is not active for the template")
+        selectors = []
+        for rule in rules:
+            for selector in rule["inputs"].values():
+                if selector["kind"] == "feature":
+                    selectors.append(selector)
+                elif selector["kind"] == "annual_series":
+                    selectors.extend(o["selector"] for o in selector["observations"])
+        graph, registry = read_registry(self, registry_manifest_hash)
+        index = {s.slot_id: s for s in registry.slots_for_template(template_id)}
+        keys = sorted({s["feature_key"] for s in selectors})
+        slots = tuple(index[key] for key in keys)
+        # The provider guard authenticates its closure-owned store registration;
+        # its epoch and database barrier also catch changes during this read.
+        with guard(provider, self._store) as barrier:
+            supplied = resolve(provider, **request)
+            identity = identity_of(supplied, request)
+            facts, fact_bytes = _fact_snapshot(supplied.facts, security_id)
+            issues, issue_bytes = _issue_snapshot(supplied.issues)
+
+            def current():
+                dependencies(self, provider)
+                latest = resolve(provider, **request)
+                if (identity_of(latest, request) != identity
+                        or _fact_snapshot(latest.facts, security_id)[1] != fact_bytes
+                        or _issue_snapshot(latest.issues)[1] != issue_bytes
+                        or persisted(self, security_id) != fact_bytes):
+                    raise PolicyIntegrityError("policy provider facts/issues or persisted sources changed")
+
+            current()
+            expected = builder(security_id=security_id, as_of_utc=as_of_utc,
+                template_id=template_id, facts=facts, issues=issues,
+                registry=registry, registry_manifest=graph.manifest)
+            stored = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+            if stored is not None and stored.canonical_bytes() != expected.canonical_bytes():
+                raise PolicyIntegrityError("policy receipt differs from complete rebuilt inputs")
+            values, blockers = ((), ("current_receipt_absent",)) if stored is None else evaluator(
+                slots=slots, facts=facts, issues=issues, as_of_utc=as_of_utc)
+            current()
+            reread = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+            if ((reread is None) != (stored is None)
+                    or (reread is not None and reread.canonical_bytes() != expected.canonical_bytes())):
+                raise PolicyIntegrityError("policy receipt changed during projection")
+            require_policy(policy_registry)
+            current()
+            payload = dict(request, rule_ids=list(rule_ids), selectors=selectors,
+                policy_contract_hash=policy["contract_hash"],
+                slots=[s.to_dict() for s in slots], values=[v.to_dict() for v in values],
+                blockers=list(blockers), facts=[f.to_dict() for f in facts],
+                issues=[i.to_dict() for i in issues],
+                source_refs=[FormalEvidenceRef.from_formal_fact(f).to_dict() for f in facts],
+                input_hash=expected.input_hash, bundle_hash=expected.bundle_hash(),
+                batch_id=identity[-1], current_receipt_absent=stored is None,
+                algorithm_version="formal-policy-feature-projection-v1")
+            payload["projection_hash"] = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+            encoded = _canonical_json_bytes(payload)
+
+            def mint():
+                result = object.__new__(PolicyFeatureState)
+                key = id(result)
+                records[key] = (weakref.ref(result, lambda _: records.pop(key, None)), encoded, self,
+                    dict(request, policy_registry=policy_registry, rule_ids=rule_ids))
+                return result
+
+            return barrier.finalize(mint)
+
+    repository_type.select_current_verified_policy_feature_state = select
+    return PolicyFeatureState, dependencies
+
 __all__ = ["FormalFeatureRepository", "FormalFeatureCurrentInput", "FormalFeatureCurrentInputProvider", "VerifiedMetricFeatureProjection", "VerifiedMetricFeatureAbsence"]
