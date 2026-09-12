@@ -1,4 +1,6 @@
-"""Synthetic policy rule declarations for pure grammar tests."""
+"""Synthetic policy declarations and byte-sensitive signed graphs, never production mappings."""
+
+import hashlib
 
 from tests.test_formal_scoring_registry import canonical
 
@@ -207,3 +209,139 @@ def policy_children():
         "event": policy_wrapper("event", {"bank_st": boolean_rule()}),
     }
     return {role: canonical(wrapper) for role, wrapper in wrappers.items()}
+
+
+REGULATORY_SEMANTICS = (
+    "audit_adverse", "audit_disclaimer", "audit_qualified", "crowding",
+    "governance_orange", "governance_red", "major_event",
+    "major_reduction_window", "major_unlock_window",
+)
+INDEPENDENT_SEMANTICS = (
+    "governance_orange", "crowding", "major_unlock_window",
+    "major_reduction_window", "major_event",
+)
+
+
+def rehash_documents(documents):
+    feature = documents["feature"]
+    for role in ("source", "mapping"):
+        feature[f"{role}_registry_hash"] = hashlib.sha256(canonical(documents[role])).hexdigest()
+    scoring = documents["scoring"]["scoring"]
+    for role in ("cyclic", "redline", "status", "event"):
+        child = documents[role]
+        scoring["policy_contracts"][role] = dict(
+            registry_hash=hashlib.sha256(canonical(child)).hexdigest(),
+            registry_version=child["registry_version"],
+            source_evidence_categories=child["source_evidence_categories"],
+        )
+
+
+def add_policy_documents(documents):
+    """Add static fixture contracts before signing, preserving original declarations."""
+    from tests.test_formal_context_repository import descriptor
+    from tests.test_formal_sources import config
+    from tests.test_formal_scoring_registry import TEMPLATES
+
+    configs = documents["source"]["configs"]
+    identities = {(c["source"], c["dataset"], c["exchange_scope"]) for c in configs}
+    for exchange in ("SH", "SZ", "BJ"):
+        added = config(dataset="fixture-state", exchange_scope=exchange)
+        if (added["source"], added["dataset"], exchange) not in identities:
+            configs.append(added)
+    wrapper = documents["scoring"]
+    descriptors = {"security_state": next(d for d in wrapper["descriptors"]
+        if d["context_kind"] == "security_state")}
+    for kind in ("regulatory_state", "event_calendar", "market_close", "trading_calendar"):
+        entry = descriptor(kind, scope_key=f"fixture-policy-{kind}")
+        if kind == "regulatory_state":
+            entry["allowed_regulatory_flags"] = list(REGULATORY_SEMANTICS)
+        if kind == "event_calendar":
+            entry["allowed_event_codes"] = ["fixture_quantified_event"]
+        wrapper["descriptors"].append(entry)
+        descriptors[kind] = entry
+
+    def bind_context(selector):
+        entry = descriptors[selector["context_kind"]]
+        selector.update(descriptor_id=hashlib.sha256(canonical(entry)).hexdigest(),
+            scope_key=entry["scope_key"])
+
+    active = {role: [] for role in ("cyclic", "redline", "status", "event")}
+    scoring = wrapper["scoring"]
+    for template in TEMPLATES:
+        for name, unit, dimension in (("equity", "CNY", "FS"), ("roe", "ratio", "M"),
+                ("margin", "ratio", "M"), ("profit", "CNY", "V")):
+            for year in ([None] if name == "equity" else [None, *range(2021, 2026)]):
+                suffix = name if year is None else f"{name}_{year}"
+                documents["feature"]["slots"].append(dict(
+                    slot_id=f"{template}.policy.{suffix}", template_id=template,
+                    dimension=dimension, required=False, unit=unit,
+                    formula_version="fixture-policy-v1",
+                    formula=dict(op="fact", fact_key=f"fixture.policy.{name}",
+                        period_key="FY0" if year is None else f"FY{year}")))
+        rules = [numeric_rule(template), cyclic_rule(template), market_rule(template), enum_rule(template)]
+        for semantic, field in (("st", "is_st"), ("star_st", "is_star_st"),
+                ("forced_delist_risk", "forced_delist_risk")):
+            rule = boolean_rule(template)
+            rule["semantic_id"] = semantic
+            rule["inputs"]["value"]["field"] = field
+            rules.append(rule)
+        for semantic in REGULATORY_SEMANTICS:
+            rule = boolean_rule(template)
+            rule["semantic_id"] = semantic
+            rule["inputs"]["value"] = context_selector("regulatory_state", "active", "bool", entry_id=semantic)
+            if semantic in INDEPENDENT_SEMANTICS:
+                rule["outcomes"]["on_match"] = sorted([
+                    dict(kind="independent_status", status_code=semantic),
+                    dict(kind="pool_prohibition", pool="strong")], key=canonical)
+            rules.append(rule)
+        for rule in rules:
+            semantic = rule["semantic_id"]
+            role = ("cyclic" if semantic == "cyclic_top" else "redline" if semantic == "nonpositive_equity"
+                else "event" if semantic == "major_event" else "status")
+            if role == "cyclic":
+                metric_ids = sorted("V." + m["metric_id"] for m in scoring["templates"][template]["metrics"]["V"])
+                rule["parameters"]["valuation_dependencies"] = [dict(
+                    metric_id=metric_id, policy_dependency="affected" if index == 0 else "unaffected",
+                    profit_semantic_id="cyclic_top" if index == 0 else None,
+                    adapter_id="fixture_profit_adapter" if index == 0 else None,
+                    adapter_version="fixture-v1" if index == 0 else None,
+                    definition_basis="fixture-only declared definition; no economic equivalence asserted")
+                    for index, metric_id in enumerate(metric_ids)]
+            for selector in rule["inputs"].values():
+                if selector["kind"] == "context":
+                    bind_context(selector)
+            rule_id = f"{template}_{semantic}"
+            documents[role]["rules"][rule_id] = rule
+            active[role].append(rule_id)
+        for metrics in scoring["templates"][template]["metrics"].values():
+            for metric in metrics:
+                metric["policy_refs"] = [dict(policy_role="redline", rule_id=f"{template}_nonpositive_equity")]
+    documents["feature"]["slots"].sort(key=lambda slot: slot["slot_id"])
+    for role, ids in active.items():
+        documents[role]["rules"]["execution_contract"] = dict(
+            schema_version="formal-policy-execution-contract-v1", role=role, rule_ids=sorted(ids))
+    scoring["redlines"] = [dict(policy_role="redline", rule_id=key) for key in sorted(active["redline"])]
+    scoring["status_rules"] = [dict(policy_role=role, rule_id=key)
+        for role in ("status", "event") for key in sorted(active[role])]
+    scoring["market_liquidity_rule"] = dict(policy_role="status", rule_id="general_nonfinancial_no_effective_trade_20d")
+
+
+def policy_graph(*, version="v1", mutate=None):
+    from ashare_pipeline.formal_scoring_registry import RegistryApproval, load_formal_registry
+    from tests.test_formal_scoring_registry import signed_graph
+    from tests.test_formal_scoring_consensus_registry import v2_graph
+
+    if version not in ("v1", "v2"):
+        raise ValueError("unknown fixture wrapper version")
+
+    def prepare(documents):
+        add_policy_documents(documents)
+        if mutate is not None:
+            mutate(documents)
+        rehash_documents(documents)
+
+    values = (signed_graph(context=True, mutate=prepare) if version == "v1" else v2_graph(mutate=prepare))
+    bundle, vocabulary, repository, verifier = values[:4]
+    approval = RegistryApproval("official", bundle.manifest.scoring_registry_hash, bundle.manifest.approval_id)
+    scoring = load_formal_registry(bundle, approval, feature_registry=vocabulary)
+    return bundle, vocabulary, scoring, repository, verifier
