@@ -722,7 +722,7 @@ class StateStoreTestCase(unittest.TestCase):
                 )
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,), (5,), (6,)],
+                [(2,), (3,), (4,), (5,), (6,), (7,)],
             )
             tables = {
                 row[0]
@@ -802,7 +802,7 @@ class StateStoreTestCase(unittest.TestCase):
                 connection.execute(
                     "SELECT version FROM schema_migration ORDER BY version"
                 ).fetchall(),
-                [(2,), (3,), (4,), (5,), (6,)],
+                [(2,), (3,), (4,), (5,), (6,), (7,)],
             )
             self.assertEqual(
                 connection.execute("SELECT * FROM source_snapshot").fetchall(),
@@ -851,7 +851,7 @@ class StateStoreTestCase(unittest.TestCase):
         with closing(sqlite3.connect(self.db_path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,), (5,), (6,)],
+                [(2,), (3,), (4,), (5,), (6,), (7,)],
             )
             counts = dict(
                 connection.execute(
@@ -960,7 +960,7 @@ class StateStoreTestCase(unittest.TestCase):
         with closing(sqlite3.connect(legacy_path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,), (5,), (6,)],
+                [(2,), (3,), (4,), (5,), (6,), (7,)],
             )
 
     def test_initialize_migrates_complete_v3_database_to_v5_preserving_issues(self) -> None:
@@ -987,7 +987,7 @@ class StateStoreTestCase(unittest.TestCase):
                 connection.execute(
                     "SELECT version FROM schema_migration ORDER BY version"
                 ).fetchall(),
-                [(2,), (3,), (4,), (5,), (6,)],
+                [(2,), (3,), (4,), (5,), (6,), (7,)],
             )
             self.assertEqual(
                 connection.execute("SELECT * FROM quality_issue").fetchall(),
@@ -8080,6 +8080,75 @@ class StateStoreTestCase(unittest.TestCase):
                 self.assertEqual(statuses_after, statuses_before)
 
 
+class FormalV7RangePersistenceTests(unittest.TestCase):
+    def test_v7_name_collision_rolls_back_preserving_legacy_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for object_name in ("formal_range_task", "formal_range_task_ready"):
+                with self.subTest(object_name=object_name):
+                    path = Path(directory) / (object_name + ".sqlite")
+                    with closing(sqlite3.connect(path)) as connection:
+                        StateStore._create_v2_schema(connection)
+                        connection.execute(state_store_module._MIGRATION_TABLE_DDL)
+                        connection.execute("INSERT INTO schema_migration VALUES(2, ?)", (utc_at(0),))
+                        for version in range(3, 7):
+                            getattr(StateStore, f"_apply_v{version}_migration")(connection)
+                        legacy = ("legacy", None, None, "error", "fixture", "{}", utc_at(0))
+                        connection.execute("INSERT INTO quality_issue VALUES (?,?,?,?,?,?,?)", legacy)
+                        connection.execute(f"CREATE TABLE {object_name}(foreign_payload TEXT)")
+                        connection.commit()
+                    with self.assertRaises(RuntimeError):
+                        StateStore(path).initialize()
+                    with closing(sqlite3.connect(path)) as connection:
+                        self.assertEqual(connection.execute("SELECT * FROM quality_issue").fetchall(), [legacy])
+                        self.assertEqual(connection.execute("SELECT max(version) FROM schema_migration").fetchone()[0], 6)
+
+    def test_all_continuous_entrances_and_reopen(self):
+        self.assertEqual(state_store_module.SCHEMA_VERSION, 7)
+        with tempfile.TemporaryDirectory() as directory:
+            for last in range(2, 8):
+                with self.subTest(last=last):
+                    path = Path(directory) / f"v{last}.sqlite"
+                    with closing(sqlite3.connect(path)) as connection:
+                        StateStore._create_v2_schema(connection)
+                        connection.execute(state_store_module._MIGRATION_TABLE_DDL)
+                        connection.execute("INSERT INTO schema_migration VALUES (2, ?)", (utc_at(0),))
+                        for version in range(3, last + 1):
+                            getattr(StateStore, f"_apply_v{version}_migration")(connection)
+                        before = connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall()
+                        connection.commit()
+                    store = StateStore(path)
+                    store.initialize()
+                    store.initialize()
+                    with closing(sqlite3.connect(path)) as connection:
+                        after = connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall()
+                        self.assertEqual([row[0] for row in after], [2, 3, 4, 5, 6, 7])
+                        self.assertEqual(after[:len(before)], before)
+                        self.assertEqual(connection.execute("SELECT count(*) FROM formal_range_task").fetchone()[0], 0)
+
+    def test_partial_and_premature_v7_objects_preserve_old_rows(self):
+        self.assertTrue(hasattr(state_store_module, "_V7_TABLE_DDL"))
+        with tempfile.TemporaryDirectory() as directory:
+            for kind, definitions in (("table", state_store_module._V7_TABLE_DDL),
+                                      ("index", state_store_module._V7_INDEX_DDL)):
+                for name in definitions:
+                    for premature in (True, False):
+                        with self.subTest(name=name, premature=premature):
+                            path = Path(directory) / f"{name}-{premature}.sqlite"
+                            store = StateStore(path)
+                            store.initialize()
+                            with closing(sqlite3.connect(path)) as connection:
+                                if premature:
+                                    connection.execute("DELETE FROM schema_migration WHERE version=7")
+                                else:
+                                    connection.execute(f"DROP {kind} {name}")
+                                before = connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall()
+                                connection.commit()
+                            with self.assertRaises(RuntimeError):
+                                store.initialize()
+                            with closing(sqlite3.connect(path)) as connection:
+                                self.assertEqual(connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall(), before)
+
+
 class FormalV6PersistenceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1])
@@ -8107,7 +8176,7 @@ class FormalV6PersistenceTests(unittest.TestCase):
                 with closing(sqlite3.connect(path)) as connection:
                     after = connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall()
                     tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                self.assertEqual([r[0] for r in after], [2, 3, 4, 5, 6])
+                self.assertEqual([r[0] for r in after], [2, 3, 4, 5, 6, 7])
                 self.assertEqual(after[:len(before)], before)
                 self.assertTrue({"formal_financial_fact", "formal_quarter_fact", "formal_feature_set", "formal_feature_value", "formal_context_fact", "formal_registry_manifest", "formal_registry_blob", "formal_source_circuit"} <= tables)
 

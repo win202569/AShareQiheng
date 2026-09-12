@@ -88,7 +88,62 @@ SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
 SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
 RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
 _OWNED_JOB_KINDS = frozenset({"deep_financial", "deep_statement", "feature_build"})
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+
+_V7_TABLE_DDL = {
+    "formal_range_task": """CREATE TABLE formal_range_task (
+ id TEXT PRIMARY KEY,
+ request_fingerprint TEXT NOT NULL,
+ registry_manifest_hash TEXT NOT NULL,
+ range_config_id TEXT NOT NULL,
+ refresh_generation TEXT NOT NULL CHECK(length(refresh_generation)>0),
+ payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('pending','leased','verified',
+   'retryable_failed','terminal_failed','superseded')),
+ worker_id TEXT, lease_expires_at TEXT, attempt_no INTEGER NOT NULL DEFAULT 0,
+ next_retry_at TEXT, result_json TEXT, error_json TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(request_fingerprint,registry_manifest_hash,range_config_id,refresh_generation),
+ CHECK(attempt_no>=0),
+ CHECK((status='leased' AND worker_id IS NOT NULL AND lease_expires_at IS NOT NULL)
+    OR (status<>'leased' AND worker_id IS NULL AND lease_expires_at IS NULL)),
+ CHECK((status='retryable_failed')=(next_retry_at IS NOT NULL)),
+ CHECK(status<>'verified' OR (result_json IS NOT NULL AND error_json IS NULL)),
+ CHECK(status NOT IN ('retryable_failed','terminal_failed') OR error_json IS NOT NULL)
+)""",
+    "formal_range_attempt": """CREATE TABLE formal_range_attempt (
+ id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES formal_range_task(id),
+ attempt_no INTEGER NOT NULL CHECK(attempt_no>0), worker_id TEXT NOT NULL,
+ leased_at TEXT NOT NULL, lease_expires_at TEXT NOT NULL, finished_at TEXT,
+ outcome TEXT CHECK(outcome IN ('verified','retryable_failed','terminal_failed','expired')),
+ payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ UNIQUE(task_id,attempt_no), CHECK((finished_at IS NULL)=(outcome IS NULL))
+)""",
+    "formal_range_snapshot": """CREATE TABLE formal_range_snapshot (
+ id TEXT PRIMARY KEY,
+ task_id TEXT NOT NULL UNIQUE REFERENCES formal_range_task(id),
+ request_fingerprint TEXT NOT NULL, registry_manifest_hash TEXT NOT NULL,
+ range_config_id TEXT NOT NULL, refresh_generation TEXT NOT NULL,
+ content_sha256 TEXT NOT NULL, content_path TEXT NOT NULL,
+ manifest_sha256 TEXT NOT NULL UNIQUE, manifest_path TEXT NOT NULL,
+ payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ created_at TEXT NOT NULL
+)""",
+    "formal_range_normalization_receipt": """CREATE TABLE formal_range_normalization_receipt (
+ task_id TEXT PRIMARY KEY REFERENCES formal_range_task(id),
+ snapshot_id TEXT NOT NULL UNIQUE REFERENCES formal_range_snapshot(id),
+ attempt_id TEXT NOT NULL REFERENCES formal_range_attempt(id),
+ request_fingerprint TEXT NOT NULL, registry_manifest_hash TEXT NOT NULL,
+ range_config_id TEXT NOT NULL, refresh_generation TEXT NOT NULL,
+ manifest_sha256 TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+ normalization_hash TEXT NOT NULL, payload_json TEXT NOT NULL,
+ payload_hash TEXT NOT NULL, recorded_at TEXT NOT NULL
+)""",
+}
+_V7_INDEX_DDL = {
+    "formal_range_task_ready": "CREATE INDEX formal_range_task_ready ON formal_range_task(status,next_retry_at,created_at,id)",
+    "formal_range_snapshot_request": "CREATE INDEX formal_range_snapshot_request ON formal_range_snapshot(request_fingerprint,refresh_generation)",
+}
 _EVIDENCE_QUERY_BATCH_SIZE = 256
 _STATEMENT_DATASETS = ("balance_sheet", "profit_sheet", "cash_flow_sheet")
 _SHANGHAI = timezone(timedelta(hours=8))
@@ -1600,6 +1655,7 @@ class StateStore:
                 4: (_V4_TABLE_DDL, _V4_INDEX_DDL),
                 5: (_V5_TABLE_DDL, _V5_INDEX_DDL),
                 6: (_V6_TABLE_DDL, _V6_INDEX_DDL),
+                7: (_V7_TABLE_DDL, _V7_INDEX_DDL),
             }
             if not tables:
                 self._create_v2_schema(connection)
@@ -1617,7 +1673,7 @@ class StateStore:
                 self._assert_schema_ddl(connection, {"schema_migration": _MIGRATION_TABLE_DDL}, {}, "migration ledger")
                 versions = {row[0] for row in connection.execute("SELECT version FROM schema_migration")}
                 if any(type(v) is not int for v in versions) or versions not in (
-                    {2}, {2, 3}, {2, 3, 4}, {2, 3, 4, 5}, {2, 3, 4, 5, 6}
+                    {2}, {2, 3}, {2, 3, 4}, {2, 3, 4, 5}, {2, 3, 4, 5, 6}, {2, 3, 4, 5, 6, 7}
                 ):
                     raise RuntimeError(f"unsupported migration versions: {sorted(versions, key=str)}")
             objects = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
@@ -1626,7 +1682,7 @@ class StateStore:
                     self._assert_schema_ddl(connection, table_ddl, index_ddl, f"v{version} schema")
                 elif objects & (set(table_ddl) | set(index_ddl)):
                     raise RuntimeError(f"unexpected v{version} schema before its migration ledger")
-            for version in range(max(versions) + 1, 7):
+            for version in range(max(versions) + 1, 8):
                 getattr(self, f"_apply_v{version}_migration")(connection)
 
     @contextmanager
@@ -1786,6 +1842,13 @@ class StateStore:
             connection.execute(statement)
         cls._assert_schema_ddl(connection, _V6_TABLE_DDL, _V6_INDEX_DDL, "v6 schema")
         connection.execute("INSERT INTO schema_migration VALUES (6, ?)", (_utc_now(),))
+
+    @classmethod
+    def _apply_v7_migration(cls, connection: sqlite3.Connection) -> None:
+        for statement in (*_V7_TABLE_DDL.values(), *_V7_INDEX_DDL.values()):
+            connection.execute(statement)
+        cls._assert_schema_ddl(connection, _V7_TABLE_DDL, _V7_INDEX_DDL, "v7 schema")
+        connection.execute("INSERT INTO schema_migration VALUES (7, ?)", (_utc_now(),))
 
     @staticmethod
     def _formal_insert_row(connection, table: str, row: dict[str, object]) -> None:
@@ -5751,3 +5814,17 @@ class StateStore:
             "next_retry_at": row["next_retry_at"],
             "created_at": row["created_at"], "updated_at": row["updated_at"],
         }
+
+
+def _make_range_state_store_authority():
+    anchors = (StateStore, StateStore._transaction, StateStore._formal_insert_row,
+               StateStore._assert_schema_ddl, StateStore._connect)
+
+    def authority():
+        return anchors
+
+    return authority
+
+
+_range_state_store_authority = _make_range_state_store_authority()
+del _make_range_state_store_authority

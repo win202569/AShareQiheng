@@ -168,6 +168,8 @@ def _build_request_authority():
         fingerprint: str
         config_wire: dict[str, object]
         source_registry_hash: str
+        previous: object = None
+        parent: object = None
 
     records: dict[int, _RequestRecord] = {}
 
@@ -236,7 +238,8 @@ def _build_request_authority():
             raise ValueError("formal range request binding, root, or config changed")
         return record
 
-    def mint_first_calendar(binding: object, as_of_utc: object) -> FormalRangeRequestV1:
+    def mint_first_calendar(binding: object, as_of_utc: object, *, prior=None, parent=None,
+                            previous=None, mode=None) -> FormalRangeRequestV1:
         if type(binding) is not RangeBinding:
             raise ValueError("range request requires an exact genuine RangeBinding")
         _require_range_binding(binding)
@@ -270,11 +273,27 @@ def _build_request_authority():
             "page_index": 1,
             "calendar_coverage_hash": None,
         }
-        if type(wire["page_index"]) is not int or wire["page_index"] != 1:
+        if prior is not None:
+            old_wire, document = prior
+            if mode == "previous_calendar":
+                old_start = _date(old_wire["start_date"], "previous start")
+                if old_start == date.min:
+                    return None
+                start, end = backward_interval((old_start - timedelta(days=1)).isoformat(),
+                                               config.max_calendar_days_per_request)
+                wire.update(start_date=start, end_date=end)
+            elif mode == "next_page":
+                page = page_successor(document, config.max_pages)
+                if page is None:
+                    return None
+                wire.update(start_date=old_wire["start_date"], end_date=old_wire["end_date"], page_index=page)
+            else:
+                raise ValueError("unknown range continuation mode")
+        if type(wire["page_index"]) is not int or not 1 <= wire["page_index"] <= config.max_pages:
             raise ValueError("first calendar request page must be exact integer one")
         if _date(wire["start_date"], "request start_date") > _date(
             wire["end_date"], "request end_date"
-        ) or wire["end_date"] != parsed.date().isoformat():
+        ) or wire["end_date"] > parsed.date().isoformat():
             raise ValueError("first calendar request interval is invalid")
         request = object.__new__(FormalRangeRequestV1)
         for field in _REQUEST_FIELDS:
@@ -294,6 +313,8 @@ def _build_request_authority():
             fingerprint,
             _range_config_to_dict(config),
             _source_hash_get(binding),
+            previous,
+            parent,
         )
         request_record(request)
         return request
@@ -302,13 +323,14 @@ def _build_request_authority():
         record = request_record(request)
         return dict(record.wire), dict(record.config_wire), record.source_registry_hash
 
-    return FormalRangeRequestV1, mint_first_calendar, snapshot
+    return FormalRangeRequestV1, mint_first_calendar, snapshot, request_record
 
 
 (
     FormalRangeRequestV1,
     _mint_first_calendar_request,
     _trusted_range_request_snapshot,
+    _range_request_record,
 ) = _build_request_authority()
 del _build_request_authority
 
@@ -644,6 +666,151 @@ def _build_source_type():
     manifest_hash_get = _manifest_hash_get
     mint_request = _mint_first_calendar_request
     mint_fetch = _mint_fetch
+    request_record = _range_request_record
+    binding_hash_get = RangeBinding.binding_hash.fget
+    request_snapshot = _trusted_range_request_snapshot
+    fetch_type = RangeFetch
+    fetch_require = RangeFetch._require
+    fetch_fields = RangeFetch.__slots__[:-1]
+    observation_records = {}
+
+    def fetch_snapshot(fetch):
+        # Detach both identities and bytes from the original producer registration
+        # before any parser callback can mutate the public fetch slots.
+        sealed = fetch_require(fetch)
+        fields = dict(zip(fetch_fields, sealed.fields))
+        manifest = dict(schema_version="formal-range-fetch-manifest-v1", **{
+            name: value for name, value in zip(fetch_fields, sealed.fields)
+            if name not in ("headers", "raw_bytes")})
+        return _canonical(manifest), fields["raw_bytes"]
+
+    def observation_record(value):
+        record = observation_records.get(id(value))
+        if type(value) is not RangeObservation or record is None or record[0]() is not value:
+            raise ValueError("range observation is forged, copied, or foreign")
+        store_record(record[1])
+        return record
+
+    def observation_wire(value):
+        record = observation_record(value)
+        return _thaw(record[2]), record[3]
+
+    def require_observation(value, *, current):
+        record = observation_record(value)
+        if current:
+            if record[4]:
+                raise ValueError("historical range observation cannot be current")
+            store_require_current(record[1], _thaw(record[2]), record[3])
+        else:
+            fresh = store_read(record[1], record[2]["task"]["id"], historical=True)
+            if observation_record(fresh)[3] != record[3]:
+                raise ValueError("range observation changed")
+        return _thaw(record[2])
+
+    class ObservationType(type):
+        def __new__(metaclass, name, bases, namespace):
+            if any(isinstance(base, ObservationType) for base in bases):
+                raise TypeError("range observation proof type cannot be subclassed")
+            return super().__new__(metaclass, name, bases, namespace)
+
+        def __setattr__(self, name, value):
+            raise TypeError("range observation proof type is immutable")
+
+        def __delattr__(self, name):
+            raise TypeError("range observation proof type is immutable")
+
+    class RangeObservation(metaclass=ObservationType):
+        __slots__ = ("__weakref__",)
+
+        def __init__(self, *args, **kwargs):
+            raise ValueError("range observations require persisted producer receipts")
+
+        def __setattr__(self, name, value):
+            raise AttributeError("range observation is immutable")
+
+        def __delattr__(self, name):
+            raise AttributeError("range observation is immutable")
+
+        def __getattr__(self, name):
+            record = observation_record(self)
+            if name == "observation_hash":
+                return record[3]
+            if name not in ("request", "document", "receipt", "snapshot", "task", "generation"):
+                raise AttributeError(name)
+            return record[2][name]
+
+        def to_dict(self):
+            wire, digest = observation_wire(self)
+            return dict(wire, observation_hash=digest)
+
+        def require_current(self):
+            require_observation(self, current=True)
+
+        def __copy__(self):
+            raise TypeError("range observations cannot be copied")
+
+        def __deepcopy__(self, memo):
+            raise TypeError("range observations cannot be copied")
+
+    def mint_observation(store, wire, historical):
+        store_record(store)
+        result = object.__new__(RangeObservation)
+        semantic = dict(wire)
+        semantic["task"] = {"id": wire["task"]["id"]}
+        semantic["receipt"] = {key: value for key, value in wire["receipt"].items() if key != "recorded_at"}
+        digest = hashlib.sha256(_canonical(semantic)).hexdigest()
+        identity = id(result)
+        observation_records[identity] = (weakref.ref(result, lambda _: observation_records.pop(identity, None)),
+            store, _freeze_json(wire), digest, historical)
+        return result
+
+    def describe_request(request):
+        sealed = request_record(request)
+        return dict(request=dict(sealed.wire), config=dict(sealed.config_wire),
+            source_registry_hash=sealed.source_registry_hash, binding_hash=binding_hash_get(sealed.binding),
+            parent=sealed.parent)
+
+    def require_execution(request, store):
+        sealed = request_record(request)
+        if sealed.previous is not None:
+            prior = observation_record(sealed.previous)
+            origin = store_record(prior[1])
+            destination = store_record(store)
+            if origin[0] is not destination[0] or origin[1] != destination[1]:
+                raise ValueError("range continuation cannot cross StateStore or raw root")
+            require_observation(sealed.previous, current=True)
+
+    def continuation(source, previous, mode, *, current):
+        record = source_record(source)
+        wire = require_observation(previous, current=current)
+        config = calendar_config_get(record.binding)
+        if (wire["request"]["registry_manifest_hash"] != manifest_hash_get(record.binding)
+                or wire["request"]["range_config_id"] != config.entry_id
+                or wire["snapshot"]["task_payload"]["source_registry_hash"] != source_hash_get(record.binding)):
+            raise ValueError("range continuation binding differs")
+        request = mint_request(record.binding, wire["request"]["as_of_utc"],
+            prior=(wire["request"], wire["document"]), previous=previous, mode=mode,
+            parent=dict(task_id=wire["task"]["id"], observation_hash=observation_record(previous)[3], mode=mode))
+        source_record(source)
+        return request
+
+    def restore_request(source, wire, previous, mode):
+        record = source_record(source)
+        # Parent was just reread by the captured store path. Avoid recursive reread.
+        if previous is None:
+            request = mint_request(record.binding, wire["as_of_utc"])
+        else:
+            prior = observation_record(previous)
+            old = _thaw(prior[2])
+            if (old["request"]["registry_manifest_hash"] != manifest_hash_get(record.binding)
+                    or old["request"]["range_config_id"] != calendar_config_get(record.binding).entry_id
+                    or old["snapshot"]["task_payload"]["source_registry_hash"] != source_hash_get(record.binding)):
+                raise ValueError("historical range parent binding differs")
+            request = mint_request(record.binding, wire["as_of_utc"], prior=(old["request"], old["document"]),
+                parent=dict(task_id=old["task"]["id"], observation_hash=prior[3], mode=mode), previous=previous, mode=mode)
+        if request is None or _canonical(request_record(request).wire) != _canonical(wire):
+            raise ValueError("stored range request lacks authentic derivation")
+        return request
 
     @dataclass(frozen=True)
     class _ImplementationRecord:
@@ -748,6 +915,12 @@ def _build_source_type():
             source_record(self)
             return request
 
+        def previous_calendar_request(self, previous: RangeObservation) -> FormalRangeRequestV1 | None:
+            return continuation(self, previous, "previous_calendar", current=True)
+
+        def next_page(self, previous: RangeObservation) -> FormalRangeRequestV1 | None:
+            return continuation(self, previous, "next_page", current=True)
+
         @staticmethod
         def _parse(record, request_wire, config, raw_bytes):
             if type(raw_bytes) is not bytes:
@@ -799,9 +972,12 @@ def _build_source_type():
 
         def fetch_verified(self, request: FormalRangeRequestV1) -> RangeFetch:
             record = source_record(self)
+            previous = request_record(request).previous
+            if previous is not None:
+                require_observation(previous, current=True)
             try:
                 request_wire, request_config, request_source_hash = (
-                    _trusted_range_request_snapshot(request)
+                    request_snapshot(request)
                 )
             except ValueError as error:
                 raise FormalTerminalSourceError(str(error)) from error
@@ -831,6 +1007,9 @@ def _build_source_type():
             if document.to_dict()["captured_at_utc"] != response.captured_at_utc:
                 raise FormalTerminalSourceError("document capture time differs from transport")
             source_record(self)
+            if previous is not None:
+                require_observation(previous, current=True)
+                source_record(self)
             return mint_fetch(request_wire, config, response, document)
 
         def parse_verified_snapshot(self, request: FormalRangeRequestV1, *, raw_bytes: bytes,
@@ -838,7 +1017,7 @@ def _build_source_type():
             record = source_record(self)
             try:
                 request_wire, request_config, request_source_hash = (
-                    _trusted_range_request_snapshot(request)
+                    request_snapshot(request)
                 )
             except ValueError as error:
                 raise FormalTerminalSourceError(str(error)) from error
@@ -897,15 +1076,31 @@ def _build_source_type():
             return document
 
     trusted_parse = FormalRangeSource._parse
-    return FormalRangeSource
+    from . import formal_range_store as store_module
+    Store, store_read, store_require_current, store_record = store_module._build_range_store_type(
+        describe_request=describe_request, restore_request=restore_request,
+        source_type=FormalRangeSource, source_binding=lambda source: source_record(source).binding,
+        source_parse=FormalRangeSource.parse_verified_snapshot, fetch_type=fetch_type,
+        fetch_snapshot=fetch_snapshot, mint_observation=mint_observation, observation_wire=observation_wire,
+        require_execution=require_execution)
+    store_module.FormalRangeStore = Store
+    store_module.RangeObservation = RangeObservation
+    del store_module._build_range_store_type
+    observation_anchors = (RangeObservation, RangeObservation.require_current, RangeObservation.to_dict)
+
+    def observation_authority():
+        """Original type/current verifier/wire reader only; never a mint."""
+        return observation_anchors
+
+    return FormalRangeSource, RangeObservation, observation_authority
 
 
-FormalRangeSource = _build_source_type()
+FormalRangeSource, RangeObservation, _range_observation_authority = _build_source_type()
 del _build_source_type
-del _mint_first_calendar_request, _mint_fetch
+del _mint_first_calendar_request, _mint_fetch, _range_request_record
 
 
 __all__ = [
-    "FormalRangeRequestV1", "FormalRangeSource", "ParsedRangeDocumentV1", "RangeFetch",
+    "FormalRangeRequestV1", "FormalRangeSource", "ParsedRangeDocumentV1", "RangeFetch", "RangeObservation",
     "backward_interval", "page_successor",
 ]

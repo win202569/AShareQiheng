@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+from pathlib import Path
+import tempfile
 
 from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
 from ashare_pipeline.formal_range_contract import load_policy_range_bindings
@@ -201,7 +203,8 @@ class RangeSourceFixture:
     """A genuine signed binding with only in-memory range bytes and transport."""
 
     def __init__(self, *, mutate=None, implementations=None):
-        bundle, vocabulary, scoring, _, verifier = range_graph(mutate=mutate)
+        bundle, vocabulary, scoring, graph, verifier = range_graph(mutate=mutate)
+        self.bundle, self.graph, self.verifier = bundle, graph, verifier
         policy = load_formal_policy_registry(
             bundle, scoring_registry=scoring, feature_registry=vocabulary
         )
@@ -250,3 +253,71 @@ class RangeSourceFixture:
 
     def close(self):
         pass
+
+
+class RangeStoreFixture(RangeSourceFixture):
+    """Temporary V7 state populated only through genuine producer operations."""
+
+    def __init__(self, **kwargs):
+        from ashare_pipeline.state_store import StateStore
+        from ashare_pipeline.formal_range_store import FormalRangeStore
+        self.temp = tempfile.TemporaryDirectory()
+        try:
+            super().__init__(**kwargs)
+            self.root = Path(self.temp.name)
+            self.store = StateStore(self.root / "state.sqlite", registry_signature_verifier=self.verifier)
+            self.store.initialize()
+            for blob in self.graph.blobs.values():
+                self.store.put_formal_registry_blob(blob)
+            self.store.put_formal_registry_manifest(self.graph.manifest)
+            self.range_store = FormalRangeStore(self.store, root=self.root,
+                signature_verifier=self.verifier, source_factory=self.source_factory)
+        except BaseException:
+            self.temp.cleanup()
+            raise
+
+    def source_factory(self, binding):
+        return FormalRangeSource(binding, transport=self.transport, implementations=self.implementations)
+
+    def produce_calendar(self, *, days, generation="g1", omit_pages=()):
+        from tests.test_formal_range_source import document_wire
+        if type(days) is not dict or not days or any(type(value) is not bool for value in days.values()):
+            raise ValueError("fixture days require explicit nonempty boolean mapping")
+        request = self.source.first_calendar_request("2026-08-31T07:00:00+00:00")
+        observations = []
+        while request is not None:
+            rows = []
+            for day, opened in sorted(days.items()):
+                if request.start_date <= day <= request.end_date:
+                    row = dict(document_wire(request)["rows"][0], date=day, is_open=opened)
+                    rows.append(row)
+            config = self.binding.calendar_config
+            count = min(config.max_pages, max(1, len(rows))) if config.pagination != "single_response_v1" else 1
+            pages = [rows[index::count] for index in range(count)]
+            last = None
+            for index in range(1, count + 1):
+                task = self.range_store.enqueue(request, refresh_generation=generation)
+                if index in omit_pages:
+                    return tuple(observations)
+                wire = document_wire(request, rows=pages[index - 1], record_count=len(rows), page_record_count=len(pages[index - 1]),
+                    page_count=count, page_index=index,
+                    pagination_evidence="signed_single_response_v1" if count == 1 and config.pagination == "single_response_v1" else "source_declared_numbered_pages_v1",
+                    coverage=dict(start_date=request.start_date, end_date=request.end_date, complete=bool(rows)))
+                self.reply(wire)
+                lease = self.range_store.lease_next("fixture-worker", lease_seconds=3600)
+                if lease is None:
+                    last = self.range_store.read_verified(task["id"])
+                else:
+                    if lease["id"] != task["id"]:
+                        raise ValueError("fixture has an unrelated pending task")
+                    last = self.range_store.persist(task["id"], "fixture-worker", lease["attempt_id"], fetch=self.source.fetch_verified(request))
+                observations.append(last)
+                if index < count:
+                    request = self.source.next_page(last)
+            if request.start_date <= min(days):
+                break
+            request = self.source.previous_calendar_request(last)
+        return tuple(observations)
+
+    def close(self):
+        self.temp.cleanup()
