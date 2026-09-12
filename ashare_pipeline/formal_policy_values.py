@@ -218,7 +218,9 @@ class PolicyValue:
                     raise ValueError("bool policy value must be exact bool")
                 value = wire["value"]
             else:
-                value = _identifier(wire["value"], "enum policy value")
+                if type(wire["value"]) is not str:
+                    raise ValueError("enum policy value must be exact str")
+                value = wire["value"]
         else:
             if wire["value"] is not None:
                 raise ValueError("missing or conflicting policy value must be null")

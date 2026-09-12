@@ -146,7 +146,9 @@ class PolicyRuntimeFixture(FinancialFixture):
         generation="g1",
         persist=True,
     ):
-        canonical_security_id(security_id)
+        if (type(security_id) is not str or canonical_security_id(security_id) != security_id
+                or security_id not in {member.security_id for member in self.frozen.members}):
+            raise ValueError("policy financial security must be a canonical frozen-universe member")
         if type(values) is not dict or not values or type(units) is not dict or set(units) != set(values):
             raise ValueError("every policy fact requires one explicit unit")
         if type(fy_end) is not str:

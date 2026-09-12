@@ -105,7 +105,6 @@ class PolicyValueTests(unittest.TestCase):
         invalid = (
             value_wire(value=1, value_type="bool", unit=None),
             value_wire(value=True, value_type="enum", unit=None),
-            value_wire(value=" listed", value_type="enum", unit=None),
             value_wire(value="4.2", value_type="wrong"),
             value_wire(value="4.2", unit=None),
             value_wire(value=True, value_type="bool", unit="ratio"),
@@ -113,6 +112,20 @@ class PolicyValueTests(unittest.TestCase):
         for wire in invalid:
             with self.subTest(wire=wire), self.assertRaises(ValueError):
                 PolicyValue.from_dict(wire)
+
+    def test_enum_preserves_exact_strings_without_identifier_restrictions(self):
+        for text in ("listed", " listed ", "trading halted", "风险警示", "status/new!", ""):
+            with self.subTest(text=text):
+                item = PolicyValue.from_dict(value_wire(value=text, value_type="enum", unit=None))
+                self.assertEqual(item.value, text)
+                self.assertEqual(item.to_dict()["value"], text)
+
+        class StringSubclass(str):
+            pass
+
+        for value in (True, 1, None, b"listed", ["listed"], StringSubclass("listed")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                PolicyValue.from_dict(value_wire(value=value, value_type="enum", unit=None))
 
     def test_missing_and_domain_conflict_are_typed_records_not_values(self):
         for state, value_type in (
@@ -372,6 +385,34 @@ class PolicyRuntimeFixtureTests(unittest.TestCase):
             input_hash=bundle.input_hash, require_complete=False
         )
         self.assertEqual(authenticated.canonical_bytes(), bundle.canonical_bytes())
+
+    def test_financial_helpers_reject_invalid_security_without_persistence(self):
+        def persisted_state(fixture):
+            with closing(sqlite3.connect(fixture.db_path)) as connection:
+                database = tuple(connection.iterdump())
+            files = tuple(
+                (str(path.relative_to(fixture.root)), path.read_bytes())
+                for directory in (fixture.root / "raw", fixture.root / "features")
+                for path in sorted(directory.rglob("*")) if path.is_file()
+            )
+            return database, files
+
+        for method in ("put_policy_financial", "policy_financial_values"):
+            for security_id in (" sh600000 ", "SH600099"):
+                with self.subTest(method=method, security_id=security_id):
+                    fixture = self.fixture()
+                    before = persisted_state(fixture)
+                    try:
+                        with self.assertRaises(ValueError):
+                            if method == "put_policy_financial":
+                                fixture.put_policy_financial(
+                                    security_id, {"fixture.policy.roe": 7.5},
+                                    fy_end="2024-12-31", units={"fixture.policy.roe": "ratio"},
+                                )
+                            else:
+                                fixture.policy_financial_values(security_id)
+                    finally:
+                        self.assertEqual(persisted_state(fixture), before)
 
 
 if __name__ == "__main__":
