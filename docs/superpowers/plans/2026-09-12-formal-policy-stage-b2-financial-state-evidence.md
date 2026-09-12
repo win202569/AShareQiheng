@@ -162,11 +162,12 @@ def annual_targets(series_selector):
 
 ## F3：证券、监管与事件的显式状态证据
 
-**Files:** Create `ashare_pipeline/formal_policy_state.py`, `tests/test_formal_policy_state.py`; Modify `tests/formal_policy_runtime_fixtures.py`, `ashare_pipeline/formal_policy_values.py`, `tests/test_formal_policy_values.py`（仅接通 F1 留给 F3 的封闭 event_record 值格式及其测试）。
+**Files:** Create `ashare_pipeline/formal_policy_state.py`, `tests/test_formal_policy_state.py`; Modify `tests/formal_policy_runtime_fixtures.py`, `ashare_pipeline/formal_policy_values.py`, `tests/test_formal_policy_values.py`, `ashare_pipeline/formal_policy_registry.py`（封闭 event_record DTO 及原始模块私有身份/校验读取权威；不改签名规则合同）。
 
 **Interfaces:**
 
 - Consumes: `FormalContextRepository.get_verified_many(kind, scope_key, security_ids, as_of_utc, registry_manifest_hash)`、genuine FormalPolicyRegistry。
+- 仓库及值校验的权威须由其原始模块初始化时建立：policy registry 私有 reader 绑定原 proof_record 与规范字节；PolicyValue 私有 operations 绑定原 parser/serializer/type/依赖检查。state 在首次导入时不信任可替换的公共类或方法别名，不以相同 wire 授权；沿用受信任私有实现边界，不声称防御任意解释器/私有 helper 替换。不得以此修改 v1 签名规则。
 - 内部 lineage 的完整引用为所选 Context Fact 原文加精确签名 descriptor/selector/读取身份；normalization_input_hash 绑定完整请求及 manifest/content，genuine get_verified_many 重验生产者、收据、原始字节和历史日历关系。这不是内嵌完整 OfficialSnapshotRef/receipt 导出或可独立授信的序列化证明；收据/文件丢失撤销 selection，W3 必须重新认证，不增加破坏历史读取的 current-only 快照读取。
 - 可构造内部真实 FormalMetricContextRepository companion，仅复用既有同库 Context/raw/verifier 的 captured authenticity guard；不读取 universe/industry，不增加其证据前置条件，实际状态读取仍使用封存的 get_verified_many。
 - Produces: `FormalPolicyStateRepository(context_repository)`；`.select(security_id, as_of_utc, *, template_id, policy_registry) -> PolicyStateSelection`；selection 提供 `.values/.lineage/.selection_hash/.recheck()`，内部身份边界与 F2 相同。
@@ -203,8 +204,8 @@ def read_flag(flags, flag_id):
 
 旧规范 regulatory flags 的实际字段就是 flag_id/active，保持原样。selection.values 以 selector_hash 为键，完整请求/来源引用保存在 lineage 中，不向 F1 封闭 PolicyValue 偷加字段。真正缺条目使用 runtime/state_entry_missing，错误单位用 unsupported_unit，时点未证明用 visibility_unproven。已登记原始来源文件不存在则整次失败，不 pending。
 
-- [ ] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_state tests.test_formal_policy_values tests.test_formal_context_schema tests.test_formal_context_repository -v`。
-- [ ] **审查并提交白名单。** 本任务五个文件；提交信息 `feat: preserve explicit policy state coverage and missing entries`。
+- [ ] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_state tests.test_formal_policy_values tests.test_formal_policy_registry tests.test_formal_context_schema tests.test_formal_context_repository -v`。
+- [ ] **审查并提交白名单。** 本任务六个文件；提交信息 `feat: preserve explicit policy state coverage and missing entries`。
 
 ## B2 交接
 
