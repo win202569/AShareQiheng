@@ -516,7 +516,14 @@ def _make_signed_registry_type() -> tuple[type[object], object]:
         slot_bytes: tuple[bytes, ...]
         release_eligible: bool
 
-    records: dict[int, tuple[weakref.ReferenceType[object], _Seal]] = {}
+    records: dict[
+        int,
+        tuple[
+            weakref.ReferenceType[object],
+            _Seal,
+            tuple[tuple[str, tuple[bytes, ...]], ...],
+        ],
+    ] = {}
 
     def forget(identity: int) -> None:
         records.pop(identity, None)
@@ -576,12 +583,20 @@ def _make_signed_registry_type() -> tuple[type[object], object]:
             or current.release_eligible is not sealed.release_eligible
         ):
             raise ValueError("signed formal feature registry was not verified or was mutated")
-        parsed, _ = _parse_registry_bytes(sealed.canonical_json)
         if hashlib.sha256(sealed.canonical_json).hexdigest() != sealed.registry_hash:
             raise ValueError("signed formal feature registry hash no longer matches")
-        if parsed["contract_version"] != sealed.contract_version:
-            raise ValueError("signed formal feature registry contract changed")
         return sealed
+
+    def slot_bytes_for_template(
+        registry: object, sealed: _Seal, template_id: str
+    ) -> tuple[bytes, ...]:
+        record = records.get(id(registry))
+        if record is None or record[0]() is not registry or record[1] is not sealed:
+            raise ValueError("signed formal feature registry was not verified or was mutated")
+        for declared_template, slot_bytes in record[2]:
+            if declared_template == template_id:
+                return slot_bytes
+        raise ValueError("feature template is not declared")
 
     @dataclass(frozen=True, slots=True, weakref_slot=True, init=False)
     class SignedFormalFeatureRegistry:
@@ -608,8 +623,12 @@ def _make_signed_registry_type() -> tuple[type[object], object]:
             sealed = require_verified(self)
             if type(template_id) is not str or template_id not in sealed.template_ids:
                 raise ValueError("feature template is not declared")
-            _, effective_slots = _parse_registry_bytes(sealed.canonical_json)
-            return tuple(slot for slot in effective_slots if slot.template_id == template_id)
+            return tuple(
+                FormalFeatureSlot.from_dict(
+                    _load_canonical_object(slot_bytes, label="formal feature slot")
+                )
+                for slot_bytes in slot_bytes_for_template(self, sealed, template_id)
+            )
 
         def require_release_eligible(self) -> None:
             sealed = require_verified(self)
@@ -637,8 +656,21 @@ def _make_signed_registry_type() -> tuple[type[object], object]:
         sealed = fingerprint(registry)
         assert sealed is not None
         identity = id(registry)
+        template_slot_bytes = tuple(
+            (
+                template_id,
+                tuple(
+                    slot_bytes
+                    for slot, slot_bytes in zip(sealed.slots, sealed.slot_bytes)
+                    if slot.template_id == template_id
+                ),
+            )
+            for template_id in sealed.template_ids
+        )
         records[identity] = (
-            weakref.ref(registry, lambda _reference, identity=identity: forget(identity)), sealed
+            weakref.ref(registry, lambda _reference, identity=identity: forget(identity)),
+            sealed,
+            template_slot_bytes,
         )
         return registry
 

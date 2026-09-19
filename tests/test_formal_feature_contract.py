@@ -7,7 +7,9 @@ import hashlib
 import json
 import math
 import unittest
+from unittest import mock
 
+import ashare_pipeline.formal_feature_contract as feature_contract
 from ashare_pipeline.financial_schema import FinancialFact
 from ashare_pipeline.formal_financial_schema import FormalFinancialFact
 from ashare_pipeline.formal_registry_manifest import FormalRegistryManifest
@@ -202,6 +204,218 @@ def feature_bundle(**changes: object) -> FormalFeatureBundle:
 
 
 class FormalFeatureContractTests(unittest.TestCase):
+    def test_registry_reuses_authenticated_parse_and_returns_fresh_template_slots(self) -> None:
+        slot_wires = [
+            {
+                "slot_id": "bank.asset_quality",
+                "template_id": "bank",
+                "dimension": "G",
+                "required": True,
+                "unit": "ratio",
+                "formula": {
+                    "op": "divide",
+                    "left": {"op": "fact", "fact_key": "balance.bad_loans", "period_key": "FY0"},
+                    "right": {"op": "fact", "fact_key": "balance.total_loans", "period_key": "FY0"},
+                },
+                "formula_version": "bank-formula-v1",
+            },
+            {
+                "slot_id": "broker.momentum",
+                "template_id": "broker",
+                "dimension": "M",
+                "required": False,
+                "unit": "ratio",
+                "formula": {"op": "fact", "fact_key": "market.return_12m", "period_key": "FY0"},
+                "formula_version": "broker-formula-v1",
+            },
+            {
+                "slot_id": "general_nonfinancial.growth",
+                "template_id": "general_nonfinancial",
+                "dimension": "G",
+                "required": True,
+                "unit": "ratio",
+                "formula": {
+                    "op": "cagr",
+                    "left": {"op": "fact", "fact_key": "income.revenue", "period_key": "FY-3"},
+                    "right": {"op": "fact", "fact_key": "income.revenue", "period_key": "FY0"},
+                    "intervals": 3,
+                },
+                "formula_version": "general-formula-v1",
+            },
+            {
+                "slot_id": "general_nonfinancial.margin",
+                "template_id": "general_nonfinancial",
+                "dimension": "V",
+                "required": False,
+                "unit": "ratio",
+                "formula": {
+                    "op": "divide",
+                    "left": {"op": "fact", "fact_key": "income.profit", "period_key": "FY0"},
+                    "right": {"op": "fact", "fact_key": "income.revenue", "period_key": "FY0"},
+                },
+                "formula_version": "general-formula-v2",
+            },
+            {
+                "slot_id": "insurance.reserve",
+                "template_id": "insurance",
+                "dimension": "FS",
+                "required": True,
+                "unit": "CNY",
+                "formula": {"op": "fact", "fact_key": "balance.reserve", "period_key": "FY0"},
+                "formula_version": "insurance-formula-v1",
+            },
+            {
+                "slot_id": "real_estate.inventory",
+                "template_id": "real_estate",
+                "dimension": "CA",
+                "required": True,
+                "unit": "CNY",
+                "formula": {"op": "fact", "fact_key": "balance.inventory", "period_key": "FY0"},
+                "formula_version": "real-estate-formula-v1",
+            },
+        ]
+        raw = feature_registry_bytes(slots=slot_wires)
+
+        with mock.patch.object(
+            feature_contract,
+            "_parse_registry_bytes",
+            wraps=feature_contract._parse_registry_bytes,
+        ) as parse_registry:
+            registry = load_registry(raw, registry_manifest(raw))
+            self.assertEqual(parse_registry.call_count, 1)
+            self.assertEqual(registry.canonical_json, raw)
+            self.assertEqual(registry.registry_hash, hashlib.sha256(raw).hexdigest())
+
+            for template_id in TEMPLATES:
+                expected = tuple(
+                    wire for wire in slot_wires if wire["template_id"] == template_id
+                )
+                first = registry.slots_for_template(template_id)
+                second = registry.slots_for_template(template_id)
+                self.assertEqual(tuple(slot.to_dict() for slot in first), expected)
+                self.assertEqual(tuple(slot.to_dict() for slot in second), expected)
+                self.assertTrue(all(type(slot) is FormalFeatureSlot for slot in first))
+                self.assertTrue(all(type(slot.formula) is FormulaNode for slot in first))
+                self.assertIsNot(first[0], second[0])
+                self.assertIsNot(first[0].formula, second[0].formula)
+
+            with self.assertRaisesRegex(ValueError, "not declared"):
+                registry.slots_for_template("unknown")
+            self.assertEqual(parse_registry.call_count, 1)
+
+    def test_registry_cached_slot_wires_are_detached_per_registry_and_read(self) -> None:
+        nested_formula = {
+            "op": "divide",
+            "left": {"op": "fact", "fact_key": "income.profit", "period_key": "FY0"},
+            "right": {"op": "fact", "fact_key": "income.revenue", "period_key": "FY0"},
+        }
+        slots = sorted(
+            (
+                slot_wire(template_id)
+                for template_id in TEMPLATES
+                if template_id != "general_nonfinancial"
+            ),
+            key=lambda item: item["slot_id"],
+        )
+        expected = slot_wire("general_nonfinancial", formula=nested_formula)
+        slots.append(expected)
+        slots.sort(key=lambda item: item["slot_id"])
+        raw = feature_registry_bytes(slots=slots)
+        first_registry = load_registry(raw, registry_manifest(raw))
+        second_registry = load_registry(raw, registry_manifest(raw))
+
+        poisoned = first_registry.slots_for_template("general_nonfinancial")[0]
+        object.__setattr__(poisoned.formula.left, "fact_key", "income.poisoned")
+        object.__setattr__(poisoned, "formula_version", "poisoned-v1")
+
+        for registry in (first_registry, second_registry):
+            fresh = registry.slots_for_template("general_nonfinancial")[0]
+            self.assertEqual(fresh.to_dict(), expected)
+            self.assertEqual(
+                next(
+                    slot
+                    for slot in registry.slots
+                    if slot.template_id == "general_nonfinancial"
+                ).to_dict(),
+                expected,
+            )
+            self.assertIsNot(fresh, poisoned)
+            self.assertIsNot(fresh.formula, poisoned.formula)
+            self.assertIsNot(fresh.formula.left, poisoned.formula.left)
+
+    def test_registry_parse_reuse_does_not_cache_load_acceptance_or_live_validity(self) -> None:
+        raw = feature_registry_bytes()
+        malformed = b" " + raw
+        with mock.patch.object(
+            feature_contract,
+            "_parse_registry_bytes",
+            wraps=feature_contract._parse_registry_bytes,
+        ) as parse_registry:
+            for _ in range(2):
+                with self.assertRaises(ValueError):
+                    load_registry(malformed)
+                with self.assertRaisesRegex(ValueError, "signature"):
+                    load_signed_feature_registry(
+                        raw, "fixture-signature", "fixture-key", RejectingVerifier()
+                    )
+                with self.assertRaisesRegex(ValueError, "signature"):
+                    load_signed_feature_registry(
+                        raw, "fixture-signature", "fixture-key", IntegerVerifier()
+                    )
+            self.assertEqual(parse_registry.call_count, 6)
+
+        mutation_cases = (
+            ("canonical_json", b"{}"),
+            ("registry_hash", "f" * 64),
+            ("contract_version", EqualitySpoof()),
+        )
+        for field, value in mutation_cases:
+            with self.subTest(field=field):
+                registry = load_registry(raw, registry_manifest(raw))
+                registry.slots_for_template("bank")
+                object.__setattr__(registry, field, value)
+                with self.assertRaises(ValueError):
+                    registry.slots_for_template("bank")
+
+        registry = load_registry(raw, registry_manifest(raw))
+        registry.slots_for_template("bank")
+        object.__setattr__(registry.slots[0].formula, "fact_key", EqualitySpoof())
+        with self.assertRaises(ValueError):
+            registry.slots_for_template("bank")
+
+        registry = load_registry(raw, registry_manifest(raw))
+        registry.slots_for_template("bank")
+        object.__setattr__(registry.slots[0], "unit", EqualitySpoof())
+        with self.assertRaises(ValueError):
+            registry.slots_for_template("bank")
+
+        genuine = load_registry(raw, registry_manifest(raw))
+        genuine.slots_for_template("bank")
+        copied = object.__new__(SignedFormalFeatureRegistry)
+        for field in (
+            "canonical_json",
+            "registry_hash",
+            "signature",
+            "key_id",
+            "contract_version",
+            "source_registry_hash",
+            "mapping_registry_hash",
+            "template_ids",
+            "slots",
+            "release_eligible",
+        ):
+            object.__setattr__(copied, field, object.__getattribute__(genuine, field))
+        with self.assertRaises(ValueError):
+            copied.slots_for_template("bank")
+
+        wrong_root = load_registry(
+            raw,
+            registry_manifest(raw, feature_hash="f" * 64),
+        )
+        self.assertFalse(wrong_root.release_eligible)
+        with self.assertRaises(ValueError):
+            wrong_root.require_release_eligible()
+
     def test_registry_requires_canonical_unique_json_and_exact_signature_true(self) -> None:
         raw = feature_registry_bytes(template_ids=("general_nonfinancial",))
         invalid = (
