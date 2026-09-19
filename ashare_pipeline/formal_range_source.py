@@ -143,6 +143,10 @@ from .formal_sources import (
 from .formal_range_contract import _range_binding_authority
 
 
+class FormalRangeAcquisitionError(FormalTerminalSourceError):
+    """Terminal live response failure, never a persisted-evidence replay failure."""
+
+
 (
     SignedSourceRegistry,
     _require_source_registry,
@@ -333,6 +337,20 @@ def _build_request_authority():
     _range_request_record,
 ) = _build_request_authority()
 del _build_request_authority
+
+
+def _build_request_binding_reader():
+    request_record = _range_request_record
+
+    def range_request_binding(request):
+        """Authenticate an existing request and return its genuine binding only."""
+        return request_record(request).binding
+
+    return range_request_binding
+
+
+range_request_binding = _build_request_binding_reader()
+del _build_request_binding_reader
 
 
 def _build_select_range():
@@ -940,6 +958,10 @@ def _build_source_type():
                 )
                 source_record(source_record_from)
                 document = ParsedRangeDocumentV1.from_dict(normalized)
+            except FormalRangeAcquisitionError as error:
+                # Registered implementations cannot classify saved replay as
+                # live acquisition. Only fetch's authenticated boundary can.
+                raise FormalTerminalSourceError(str(error)) from error
             except FormalTerminalSourceError:
                 raise
             except Exception as error:
@@ -1000,15 +1022,26 @@ def _build_source_type():
             except Exception as error:
                 raise FormalRetryableSourceError("range transport failed") from error
             source_record(self)
-            response = _snapshot_transport_response(response)
-            _classify_transport_response(response)
-            if _https_host(response.original_url, "range response original_url") != _https_host(
-                config.endpoint_url, "signed range endpoint_url"
-            ):
-                raise FormalTerminalSourceError("range response redirected outside the signed host")
-            document = trusted_parse(record, request_wire, config, response.raw_bytes)
-            if document.to_dict()["captured_at_utc"] != response.captured_at_utc:
-                raise FormalTerminalSourceError("document capture time differs from transport")
+            try:
+                response = _snapshot_transport_response(response)
+                _classify_transport_response(response)
+                if _https_host(response.original_url, "range response original_url") != _https_host(
+                    config.endpoint_url, "signed range endpoint_url"
+                ):
+                    raise FormalTerminalSourceError("range response redirected outside the signed host")
+                document = trusted_parse(record, request_wire, config, response.raw_bytes)
+                if document.to_dict()["captured_at_utc"] != response.captured_at_utc:
+                    raise FormalTerminalSourceError("document capture time differs from transport")
+            except FormalTerminalSourceError as error:
+                # Parser callbacks may have changed authority or invalidated a
+                # parent. Those failures must escape as integrity failures.
+                source_record(self)
+                request_record(request)
+                if previous is not None:
+                    require_observation(previous, current=True)
+                source_record(self)
+                request_record(request)
+                raise FormalRangeAcquisitionError(str(error)) from error
             source_record(self)
             if previous is not None:
                 require_observation(previous, current=True)
@@ -1106,4 +1139,5 @@ del _mint_first_calendar_request, _mint_fetch, _range_request_record
 __all__ = [
     "FormalRangeRequestV1", "FormalRangeSource", "ParsedRangeDocumentV1", "RangeFetch", "RangeObservation",
     "backward_interval", "page_successor",
+    "range_request_binding", "FormalRangeAcquisitionError",
 ]

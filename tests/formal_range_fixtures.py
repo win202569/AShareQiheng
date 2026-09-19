@@ -173,9 +173,19 @@ class _CapturingRangeTransport:
     def __init__(self):
         self.requests = []
         self.response = None
+        self.error = None
+        self.on_send = None
+
+    @property
+    def calls(self):
+        return self.requests
 
     def send(self, request):
         self.requests.append(request)
+        if self.on_send is not None:
+            self.on_send(request)
+        if self.error is not None:
+            raise self.error
         if self.response is None:
             raise RuntimeError("fixture transport has no reply")
         return self.response
@@ -321,3 +331,32 @@ class RangeStoreFixture(RangeSourceFixture):
 
     def close(self):
         self.temp.cleanup()
+
+
+class RangeWorkerFixture(RangeStoreFixture):
+    """Real worker/store/source with an in-memory, countable fake transport."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        from ashare_pipeline.formal_range_worker import FormalRangeWorker
+        self.worker = FormalRangeWorker(self.range_store,
+            source_factory=self.source_factory, worker_id="fixture-worker")
+
+    def enqueue_calendar(self, *, refresh_generation="g1"):
+        from tests.test_formal_range_source import document_wire
+        request = self.source.first_calendar_request("2026-08-31T07:00:00+00:00")
+        self.reply(document_wire(request))
+        self.range_store.enqueue(request, refresh_generation=refresh_generation)
+        return request
+
+    def restart_worker(self):
+        from ashare_pipeline.state_store import StateStore
+        from ashare_pipeline.formal_range_store import FormalRangeStore
+        from ashare_pipeline.formal_range_worker import FormalRangeWorker
+        self.store = StateStore(self.root / "state.sqlite", registry_signature_verifier=self.verifier)
+        self.store.initialize()
+        self.range_store = FormalRangeStore(self.store, root=self.root,
+            signature_verifier=self.verifier, source_factory=self.source_factory)
+        self.source = self.source_factory(self.binding)
+        self.worker = FormalRangeWorker(self.range_store,
+            source_factory=self.source_factory, worker_id="restarted-worker")
