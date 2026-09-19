@@ -972,7 +972,10 @@ def _build_source_type():
 
         def fetch_verified(self, request: FormalRangeRequestV1) -> RangeFetch:
             record = source_record(self)
-            previous = request_record(request).previous
+            try:
+                previous = request_record(request).previous
+            except ValueError as error:
+                raise FormalTerminalSourceError(str(error)) from error
             if previous is not None:
                 require_observation(previous, current=True)
             try:
