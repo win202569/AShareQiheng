@@ -10,7 +10,11 @@ import textwrap
 import unittest
 from unittest.mock import patch
 
-from ashare_pipeline.formal_sources import FormalRetryableSourceError, FormalTerminalSourceError
+from ashare_pipeline.formal_sources import (
+    FormalRetryableSourceError,
+    FormalSourceBlocked,
+    FormalTerminalSourceError,
+)
 from tests import formal_range_fixtures
 from tests.test_formal_range_source import document_wire
 
@@ -366,6 +370,62 @@ class FormalRangeWorkerTests(unittest.TestCase):
             with self.assertRaises(FormalRetryableSourceError):
                 fixture.worker.resume(request, refresh_generation="g1")
         self.assertEqual(self.rows(fixture, "SELECT outcome FROM formal_range_attempt"), [(None,)])
+
+    def test_transport_error_cannot_hide_source_callback_mutation(self):
+        fixture = self.fixture()
+        live_source = []
+
+        def source_factory(binding):
+            source = fixture.source_factory(binding)
+            live_source[:] = [source]
+            return source
+
+        fixture.worker.source_factory = source_factory
+        fixture.transport.on_send = lambda _request: setattr(live_source[0], "_binding", object())
+        errors = (TimeoutError("timeout"), FormalRetryableSourceError("retryable"),
+                  FormalSourceBlocked("blocked"))
+        for index, error in enumerate(errors, 1):
+            with self.subTest(error=type(error).__name__):
+                fixture.enqueue_calendar(refresh_generation=f"g{index}")
+                fixture.transport.error = error
+                with self.assertRaises(FormalTerminalSourceError):
+                    fixture.worker.run_once()
+        self.assertEqual(len(fixture.transport.calls), 3)
+        self.assertEqual(self.rows(fixture, "SELECT status FROM formal_range_task"), [("leased",)] * 3)
+        self.assertEqual(self.rows(fixture, "SELECT outcome FROM formal_range_attempt"), [(None,)] * 3)
+        self.assertEqual(self.rows(fixture, "SELECT count(*) FROM formal_range_snapshot"), [(0,)])
+
+    def test_retryable_response_cannot_hide_original_request_mutation(self):
+        fixture = formal_range_fixtures.RangeSourceFixture()
+        self.addCleanup(fixture.close)
+        for status in (403, 503):
+            with self.subTest(status=status):
+                request = fixture.source.first_calendar_request("2026-08-31T07:00:00+00:00")
+                fixture.reply({}, status_code=status)
+                fixture.transport.on_send = lambda _sent: object.__setattr__(request, "page_index", 2)
+                with self.assertRaises(Exception) as caught:
+                    fixture.source.fetch_verified(request)
+                self.assertIsInstance(caught.exception, ValueError)
+        self.assertEqual(len(fixture.transport.calls), 2)
+
+    def test_blocked_response_cannot_hide_current_parent_corruption(self):
+        fixture = self.fixture(mutate=numbered)
+        first_request = fixture.enqueue_calendar()
+        fixture.reply(self.page(first_request))
+        lease = fixture.range_store.lease_next("producer", lease_seconds=60)
+        parent = fixture.range_store.persist(lease["id"], "producer", lease["attempt_id"],
+            fetch=fixture.source.fetch_verified(lease["request"]))
+        request = fixture.source.next_page(parent)
+        path = Path(parent.snapshot["content_path"])
+        corrupted = path.read_bytes() + b" "
+        fixture.reply({}, status_code=403)
+        fixture.transport.on_send = lambda _sent: path.write_bytes(corrupted)
+        with self.assertRaises(Exception) as caught:
+            fixture.source.fetch_verified(request)
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertEqual(path.read_bytes(), corrupted)
+        self.assertEqual(self.rows(fixture, "SELECT status FROM formal_range_task"), [("verified",)])
+        self.assertEqual(self.rows(fixture, "SELECT count(*) FROM formal_range_normalization_receipt"), [(1,)])
 
     def test_authenticated_binding_accessor_rejects_clones_and_replaced_aliases(self):
         from ashare_pipeline import formal_range_source as source_module

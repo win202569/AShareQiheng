@@ -883,6 +883,16 @@ def _build_source_type():
             raise FormalTerminalSourceError("formal range source dependencies changed")
         return record
 
+    def require_acquisition_authority(source, request, previous):
+        # Error classification must not hide transport/parser callback mutation.
+        # Parent replay can itself invoke callbacks, so check both sides of it.
+        source_record(source)
+        request_record(request)
+        if previous is not None:
+            require_observation(previous, current=True)
+        source_record(source)
+        request_record(request)
+
     class FormalRangeSource:
         """One binding's sealed transport and exact range implementation registry."""
 
@@ -1018,8 +1028,10 @@ def _build_source_type():
             try:
                 response = record.transport.send(sent)
             except (FormalRetryableSourceError, FormalSourceBlocked):
+                require_acquisition_authority(self, request, previous)
                 raise
             except Exception as error:
+                require_acquisition_authority(self, request, previous)
                 raise FormalRetryableSourceError("range transport failed") from error
             source_record(self)
             try:
@@ -1032,15 +1044,13 @@ def _build_source_type():
                 document = trusted_parse(record, request_wire, config, response.raw_bytes)
                 if document.to_dict()["captured_at_utc"] != response.captured_at_utc:
                     raise FormalTerminalSourceError("document capture time differs from transport")
+            except FormalRetryableSourceError:
+                require_acquisition_authority(self, request, previous)
+                raise
             except FormalTerminalSourceError as error:
                 # Parser callbacks may have changed authority or invalidated a
                 # parent. Those failures must escape as integrity failures.
-                source_record(self)
-                request_record(request)
-                if previous is not None:
-                    require_observation(previous, current=True)
-                source_record(self)
-                request_record(request)
+                require_acquisition_authority(self, request, previous)
                 raise FormalRangeAcquisitionError(str(error)) from error
             source_record(self)
             if previous is not None:
