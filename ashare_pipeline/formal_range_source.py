@@ -178,6 +178,7 @@ def _build_request_authority():
         source_registry_hash: str
         previous: object = None
         parent: object = None
+        owner_store: object = None
 
     records: dict[int, _RequestRecord] = {}
 
@@ -252,7 +253,10 @@ def _build_request_authority():
             raise ValueError("formal range request binding, root, or config changed")
         return record
 
-    def seal(binding, wire, config, *, previous=None, parent=None):
+    def seal(binding, wire, config, *, previous=None, parent=None, owner_store=None):
+        if ((wire["kind"] == "market_range" and previous is None)
+                != (owner_store is not None)):
+            raise ValueError("initial market request requires exact Store provenance")
         request = object.__new__(FormalRangeRequestV1)
         for field in _REQUEST_FIELDS:
             object.__setattr__(request, field, wire[field])
@@ -267,6 +271,7 @@ def _build_request_authority():
         records[identity] = _RequestRecord(
             weakref.ref(request, forget), binding, dict(wire), fingerprint,
             _range_config_to_dict(config), _source_hash_get(binding), previous, parent,
+            owner_store,
         )
         request_record(request)
         return request
@@ -313,7 +318,7 @@ def _build_request_authority():
 
     def mint_market(binding: object, security_id: object, as_of_utc: object,
                     start_date: object, end_date: object,
-                    calendar_coverage_hash: object) -> FormalRangeRequestV1:
+                    calendar_coverage_hash: object, owner_store: object) -> FormalRangeRequestV1:
         if type(binding) is not RangeBinding:
             raise ValueError("market request requires an exact genuine RangeBinding")
         _require_range_binding(binding)
@@ -349,7 +354,7 @@ def _build_request_authority():
             "page_index": 1,
             "calendar_coverage_hash": calendar_coverage_hash,
         }
-        return seal(binding, wire, config)
+        return seal(binding, wire, config, owner_store=owner_store)
 
     def mint_continuation(binding, prior, mode, *, previous=None, parent=None):
         old_wire, document = prior
@@ -765,7 +770,7 @@ def _build_source_type():
             raise ValueError("market request bounds require covered trading days")
         return restore_market_request(
             record.binding, security_id, payload["as_of_utc"], start_date, end_date,
-            payload["coverage_hash"],
+            payload["coverage_hash"], store,
         )
 
     def fetch_snapshot(fetch):
@@ -866,6 +871,8 @@ def _build_source_type():
 
     def require_execution(request, store):
         sealed = request_record(request)
+        if sealed.owner_store is not None and sealed.owner_store is not store:
+            raise ValueError("initial market request belongs to another Store")
         if sealed.previous is not None:
             prior = observation_record(sealed.previous)
             origin = store_record(prior[1])
@@ -896,7 +903,8 @@ def _build_source_type():
                 request = mint_request(record.binding, wire["as_of_utc"])
             elif wire["kind"] == "market_range":
                 request = restore_market_request(record.binding, wire["security_id"], wire["as_of_utc"],
-                    wire["start_date"], wire["end_date"], wire["calendar_coverage_hash"])
+                    wire["start_date"], wire["end_date"], wire["calendar_coverage_hash"],
+                    source_store(record))
             else:
                 raise ValueError("stored range request kind is invalid")
         else:

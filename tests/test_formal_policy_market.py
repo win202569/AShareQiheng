@@ -287,6 +287,25 @@ class MarketRepositoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             peer_source.market_requests("SH600000", calendar_coverage=proof)
 
+    def test_initial_market_request_rejects_same_root_cross_store_enqueue(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        owner = self.fixture()
+        peer = self.fixture()
+        recent = trading_days(20)
+        first = owner.source.first_calendar_request(FREEZE)
+        self.persist(owner, first, self.calendar_wire(owner, first, opened=recent))
+        proof = FormalPolicyMarketRepository(owner.range_store).select_calendar(
+            owner.binding, FREEZE).coverage
+
+        _, same_store_source = owner.range_store.resolve_planning_binding(peer.binding)
+        request = same_store_source.market_requests(
+            "SH600000", calendar_coverage=proof)[0]
+        task = owner.range_store.enqueue(request, refresh_generation="owner-market")
+        self.assertEqual(task["status"], "pending")
+
+        with self.assertRaises(ValueError):
+            peer.range_store.enqueue(request, refresh_generation="peer-market")
+
     def test_date_only_hash_without_resolved_temporal_proof_stays_unproven(self):
         from ashare_pipeline.formal_policy_market import (
             FormalPolicyMarketRepository, plan_next_window_request,
