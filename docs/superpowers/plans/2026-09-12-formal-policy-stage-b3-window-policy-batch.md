@@ -128,7 +128,7 @@ def evaluate_window(trading_days, daily_rows):
 - applicability 限定 applicable/not_applicable/unresolved；values/annual 按 selector hash 索引；缺键是显式 missing，不默认为 false。仅 W3 能把真实行业证明转换到纯 applicability 参数。
 - decision 固定规格 §8.1 字段；聚合固定 `decisions,dimension_caps,pool_prohibitions,states,normalization_basis,pending_requirements,evidence_state`。pool_prohibitions 展开 strong/wait，保留每个效果全部 rule/evidence trace；无最终分数或 ready/eligible 字段。
 
-- [ ] **写失败测试。**
+- [x] **写失败测试。**
 
 ```python
 from decimal import Decimal, localcontext
@@ -148,8 +148,8 @@ def test_two_explicit_quantiles_do_not_share_a_default(self):
 
 市场专例：尾20已证实而价格incomplete，整体pending但仅释放由该20日证明授权的 pool_prohibition；不能同时释放其他依赖整体命中的 cap/status/利润替换。confirmed_no_price_250 必须同时保留 runtime/market_evidence_missing 和双池否决。未命中也不清除输入层已认证的待补。
 
-- [ ] **运行 RED。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_evaluator -v`。
-- [ ] **实现。** Decimal 运算始终用 F1 独立 context；四个判定状态明确分支；作用效果逐条绑定实际证明输入。算法内核如下：
+- [x] **运行 RED。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_evaluator -v`。
+- [x] **实现。** Decimal 运算始终用 F1 独立 context；四个判定状态明确分支；作用效果逐条绑定实际证明输入。算法内核如下：
 
 ```python
 from decimal import Decimal, ROUND_CEILING, localcontext
@@ -178,8 +178,8 @@ def combine_caps(caps):
 
 当周期命中时，normalization_basis 保存原当期利润、五年原值/证据、排序第三值 median、minimum_current_and_five_fy_median_v1 结果及已签名 V dependency 清单；不调用 V adapter。cap 数值与允许维度从已解析效果读取，原周期 G/M=80 由合同验证，不硬编码成任意政策默认值。所有 effect/trace 排序规范化，去重仅作用显示键，底层理由全部保留。
 
-- [ ] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_evaluator tests.test_formal_policy_values tests.test_formal_policy_contract -v`。
-- [ ] **审查并提交白名单。** 本任务两个文件；提交信息 `feat: evaluate policy decisions without erasing pending evidence`。
+- [x] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_evaluator tests.test_formal_policy_values tests.test_formal_policy_contract -v`。
+- [x] **审查并提交白名单。** 本任务两个文件；提交信息 `feat: evaluate policy decisions without erasing pending evidence`。
 
 ## W3：唯一全冻结批次入口与失败撤销
 
