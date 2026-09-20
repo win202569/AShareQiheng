@@ -92,6 +92,7 @@ def _build_proof_types():
         wire: dict
         wire_bytes: bytes
         binding_identity: dict
+        range_store: object
         recheck: object
 
     calendar_records = {}
@@ -181,7 +182,7 @@ def _build_proof_types():
         def __deepcopy__(self, memo):
             raise TypeError("market windows cannot be copied")
 
-    def mint(proof_type, records, wire, binding, recheck, hash_field):
+    def mint(proof_type, records, wire, binding, range_store, recheck, hash_field):
         identity = _binding_identity(binding)
         content = _detached(wire)
         digest = hashlib.sha256(canonical_bytes(content)).hexdigest()
@@ -190,22 +191,24 @@ def _build_proof_types():
         identity_key = id(result)
         reference = weakref.ref(result, lambda ref, key=identity_key: records.pop(key, None))
         records[identity_key] = _ProofRecord(reference, content, canonical_bytes(content),
-                                             identity, recheck)
+                                             identity, range_store, recheck)
         return result
 
-    def mint_calendar(wire, binding, recheck):
-        return mint(VerifiedCalendarCoverageV1, calendar_records, wire, binding,
+    def mint_calendar(wire, binding, range_store, recheck):
+        return mint(VerifiedCalendarCoverageV1, calendar_records, wire, binding, range_store,
                     recheck, "coverage_hash")
 
-    def mint_window(wire, binding, recheck):
-        return mint(VerifiedMarketWindowV1, window_records, wire, binding,
+    def mint_window(wire, binding, range_store, recheck):
+        return mint(VerifiedMarketWindowV1, window_records, wire, binding, range_store,
                     recheck, "window_hash")
 
-    def require_calendar(proof, *, binding):
+    def require_calendar(proof, *, binding, range_store):
         sealed = record(proof, VerifiedCalendarCoverageV1, calendar_records)
         VerifiedCalendarCoverageV1.require_current(proof)
         if _binding_identity(binding) != sealed.binding_identity:
             raise ValueError("calendar coverage belongs to another binding")
+        if range_store is not sealed.range_store:
+            raise ValueError("calendar coverage belongs to another range store")
         return _detached(sealed.wire)
 
     proof_type = VerifiedCalendarCoverageV1
@@ -217,12 +220,113 @@ def _build_proof_types():
 
     installed = False
 
-    def install_market_owner():
+    def install_market_owner(dependencies):
         nonlocal installed
         if installed:
             raise RuntimeError("market proof owner is already installed")
         installed = True
-        return mint_calendar, mint_window
+        if type(dependencies) is not tuple or len(dependencies) != 13:
+            raise RuntimeError("market repository dependencies are invalid")
+        (store_type, resolve_binding, select_current, first_calendar_request,
+         next_page, previous_calendar_request, market_requests, observation_to_dict,
+         observation_require_current, implementation_page_group, implementation_select_calendar,
+         implementation_select_market, selection_types) = dependencies
+        calendar_selection_type, market_selection_type = selection_types
+
+        @dataclass(frozen=True)
+        class _RepositoryRecord:
+            reference: weakref.ReferenceType
+            range_store: object
+            resolve_binding: object
+            select_current: object
+            first_calendar_request: object
+            next_page: object
+            previous_calendar_request: object
+            market_requests: object
+            observation_to_dict: object
+            observation_require_current: object
+
+        repository_records = {}
+
+        class _RepositoryMeta(type):
+            def __new__(metaclass, name, bases, namespace):
+                if any(isinstance(base, _RepositoryMeta) for base in bases):
+                    raise TypeError("market repositories cannot be subclassed")
+                return super().__new__(metaclass, name, bases, namespace)
+
+            def __setattr__(self, name, value):
+                raise TypeError("market repository type is immutable")
+
+            def __delattr__(self, name):
+                raise TypeError("market repository type is immutable")
+
+        def repository_record(value):
+            sealed = repository_records.get(id(value))
+            if (type(value) is not FormalPolicyMarketRepository or sealed is None
+                    or sealed.reference() is not value):
+                raise ValueError("market repository is forged, copied, or unregistered")
+            if type(sealed.range_store) is not store_type:
+                raise ValueError("market repository Store identity changed")
+            return sealed
+
+        def assemble_calendar(sealed, binding, as_of_utc):
+            def owner_mint(wire, owned_binding, recheck):
+                return mint_calendar(wire, owned_binding, sealed.range_store, recheck)
+            return implementation_select_calendar(
+                sealed, binding, as_of_utc, _mint_calendar=owner_mint,
+                _page_group=implementation_page_group,
+                _select_calendar=assemble_calendar,
+                _calendar_selection_type=calendar_selection_type,
+            )
+
+        def assemble_market(sealed, security_id, as_of_utc, *, binding):
+            def owner_mint(wire, owned_binding, recheck):
+                return mint_window(wire, owned_binding, sealed.range_store, recheck)
+            return implementation_select_market(
+                sealed, security_id, as_of_utc, binding=binding,
+                _mint_window=owner_mint, _page_group=implementation_page_group,
+                _select_calendar=assemble_calendar, _select_market=assemble_market,
+                _market_selection_type=market_selection_type,
+            )
+
+        class FormalPolicyMarketRepository(metaclass=_RepositoryMeta):
+            __slots__ = ("__weakref__",)
+
+            def __init__(self, range_store):
+                if type(self) is not FormalPolicyMarketRepository or type(range_store) is not store_type:
+                    raise ValueError("market repository requires an exact FormalRangeStore")
+                identity = id(self)
+                reference = weakref.ref(self, lambda ref, key=identity:
+                    repository_records.pop(key, None)
+                    if repository_records.get(key) is not None
+                    and repository_records[key].reference is ref else None)
+                repository_records[identity] = _RepositoryRecord(
+                    reference, range_store, resolve_binding, select_current,
+                    first_calendar_request, next_page, previous_calendar_request,
+                    market_requests, observation_to_dict, observation_require_current,
+                )
+                repository_record(self)
+
+            def __setattr__(self, name, value):
+                raise AttributeError("market repositories are immutable")
+
+            def __delattr__(self, name):
+                raise AttributeError("market repositories are immutable")
+
+            def select_calendar(self, binding, as_of_utc):
+                return assemble_calendar(repository_record(self), binding, as_of_utc)
+
+            def select(self, security_id, as_of_utc, *, binding):
+                return assemble_market(repository_record(self), security_id, as_of_utc,
+                                       binding=binding)
+
+            def __copy__(self):
+                raise TypeError("market repositories cannot be copied")
+
+            def __deepcopy__(self, memo):
+                raise TypeError("market repositories cannot be copied")
+
+        return FormalPolicyMarketRepository
 
     return (VerifiedCalendarCoverageV1, VerifiedMarketWindowV1,
             calendar_proof_authority, install_market_owner)
@@ -235,7 +339,11 @@ del _build_proof_types
 
 # Deliberately after proof ownership: this order completes the circular module
 # initialization eagerly for source-first and market-first imports alike.
-from .formal_range_source import FormalRangeRequestV1, FormalRangeSource
+from .formal_range_source import (
+    FormalRangeRequestV1,
+    FormalRangeSource,
+    RangeObservation,
+)
 from .formal_range_store import FormalRangeStore
 
 
@@ -367,36 +475,33 @@ def _dates_between(start, end):
 
 
 class _MarketRepositoryImplementation:
-    def __init__(self, range_store):
-        if type(range_store) is not FormalRangeStore:
-            raise ValueError("market repository requires an exact FormalRangeStore")
-        self._store = range_store
-
-    def _page_group(self, source, first_request):
+    def _page_group(sealed, source, first_request):
         observations = []
         request = first_request
         while request is not None:
-            observation = self._store.select_current(request.request_fingerprint)
+            observation = sealed.select_current(
+                sealed.range_store, request.request_fingerprint)
             if observation is None:
                 return tuple(observations), request
             observations.append(observation)
-            request = source.next_page(observation)
+            request = sealed.next_page(source, observation)
         return tuple(observations), None
 
-    def select_calendar(self, binding, as_of_utc, *, _mint_calendar) -> CalendarSelection:
+    def select_calendar(sealed, binding, as_of_utc, *, _mint_calendar, _page_group,
+                        _select_calendar, _calendar_selection_type) -> CalendarSelection:
         if type(binding) is not _binding_type:
             raise ValueError("calendar selection requires a genuine range binding")
         as_of = _aware(as_of_utc, "calendar as_of_utc")
         if as_of_utc != _FREEZE_UTC:
             raise ValueError("calendar selection requires the formal freeze")
-        owned_binding, source = self._store.resolve_planning_binding(binding)
-        request = source.first_calendar_request(as_of_utc)
+        owned_binding, source = sealed.resolve_binding(sealed.range_store, binding)
+        request = sealed.first_calendar_request(source, as_of_utc)
         groups = []
         missing = None
         current_request = request
         open_count = 0
         while current_request is not None and open_count < 250:
-            group, missing = self._page_group(source, current_request)
+            group, missing = _page_group(sealed, source, current_request)
             if missing is not None:
                 break
             if not group:
@@ -405,20 +510,21 @@ class _MarketRepositoryImplementation:
             groups.append((current_request, group))
             open_count += sum(
                 1 for observation in group
-                for row in observation.to_dict()["document"]["rows"]
+                for row in sealed.observation_to_dict(observation)["document"]["rows"]
                 if type(row) is dict and row.get("is_open") is True
             )
-            current_request = source.previous_calendar_request(group[-1])
+            current_request = sealed.previous_calendar_request(source, group[-1])
         observations = tuple(item for _, group in groups for item in group)
         if not groups:
             pending = ("calendar_coverage_missing",)
             identity = hashlib.sha256(canonical_bytes({"pending": list(pending),
                 "request": request.to_dict()})).hexdigest()
             def check_missing():
-                self._store.resolve_planning_binding(owned_binding)
-                if missing is not None and self._store.select_current(missing.request_fingerprint) is not None:
+                sealed.resolve_binding(sealed.range_store, owned_binding)
+                if (missing is not None and sealed.select_current(
+                        sealed.range_store, missing.request_fingerprint) is not None):
                     raise ValueError("calendar selection changed")
-            return CalendarSelection(None, pending,
+            return _calendar_selection_type(None, pending,
                 (), identity, check_missing)
 
         documents = []
@@ -427,7 +533,7 @@ class _MarketRepositoryImplementation:
         request_ranges = []
         rows = []
         for group_request, group in groups:
-            group_wires = [item.to_dict() for item in group]
+            group_wires = [sealed.observation_to_dict(item) for item in group]
             group_documents = [item["document"] for item in group_wires]
             first = group_documents[0]
             count = first["page_count"]
@@ -479,23 +585,29 @@ class _MarketRepositoryImplementation:
             raise ValueError("calendar coverage contains a date outside its declaration")
         if set(expected_dates) - set(by_date):
             pending = ("calendar_coverage_missing",)
-            lineage = tuple(item.observation_hash for item in observations)
+            lineage = tuple(sealed.observation_to_dict(item)["observation_hash"]
+                            for item in observations)
             identity = hashlib.sha256(canonical_bytes({"pending": list(pending),
                 "lineage": list(lineage)})).hexdigest()
-            return CalendarSelection(None, pending, lineage, identity,
-                lambda: tuple(item.require_current() for item in observations))
+            return _calendar_selection_type(None, pending, lineage, identity,
+                lambda: tuple(sealed.observation_require_current(item)
+                              for item in observations))
         if visibility_missing or not all(_visible(document, as_of) for document in documents):
             pending = ("visibility_unproven",)
             identity = hashlib.sha256(canonical_bytes({"pending": list(pending),
-                "lineage": [item.observation_hash for item in observations]})).hexdigest()
-            return CalendarSelection(None, pending,
-                tuple(item.observation_hash for item in observations), identity,
-                lambda: tuple(item.require_current() for item in observations))
+                "lineage": [sealed.observation_to_dict(item)["observation_hash"]
+                            for item in observations]})).hexdigest()
+            return _calendar_selection_type(None, pending,
+                tuple(sealed.observation_to_dict(item)["observation_hash"]
+                      for item in observations), identity,
+                lambda: tuple(sealed.observation_require_current(item)
+                              for item in observations))
         if as_of.date().isoformat() not in by_date or by_date[as_of.date().isoformat()]["is_open"] is not True:
             raise ValueError("formal freeze is not proven as a trading day")
         trading = tuple(day for day in expected_dates if by_date[day]["is_open"])[-250:]
         config = _read_binding(owned_binding)["calendar_config"]
-        lineage = tuple(item.observation_hash for item in observations)
+        lineage = tuple(sealed.observation_to_dict(item)["observation_hash"]
+                        for item in observations)
         wire = {
             "schema_version": "formal-calendar-coverage-v1",
             "registry_manifest_hash": _read_binding(owned_binding)["registry_manifest_hash"],
@@ -520,44 +632,48 @@ class _MarketRepositoryImplementation:
                                  for day in expected_dates],
             "trading_days": list(trading),
             "lineage": list(lineage),
-            "observations": [item.to_dict() for item in observations],
+            "observations": [sealed.observation_to_dict(item) for item in observations],
             "upstream_generations": sorted({item["upstream_generation"] for item in documents}),
         }
         expected_proof_wire = dict(wire,
             coverage_hash=hashlib.sha256(canonical_bytes(wire)).hexdigest())
         def recheck():
-            current = self.select_calendar(owned_binding, as_of_utc)
+            current = _select_calendar(sealed, owned_binding, as_of_utc)
             if (current.coverage is None
                     or current.coverage.canonical_bytes() != canonical_bytes(expected_proof_wire)):
                 raise ValueError("calendar coverage selection changed")
         proof = _mint_calendar(wire, owned_binding, recheck)
         selection_hash = hashlib.sha256(proof.canonical_bytes()).hexdigest()
-        return CalendarSelection(proof, (), lineage, selection_hash, proof.require_current)
+        return _calendar_selection_type(
+            proof, (), lineage, selection_hash, proof.require_current)
 
-    def select(self, security_id, as_of_utc, *, binding, _mint_window) -> MarketSelection:
+    def select(sealed, security_id, as_of_utc, *, binding, _mint_window, _page_group,
+               _select_calendar, _select_market,
+               _market_selection_type) -> MarketSelection:
         if type(security_id) is not str or _SECURITY.fullmatch(security_id) is None:
             raise ValueError("market selection security_id is invalid")
-        owned_binding, source = self._store.resolve_planning_binding(binding)
-        calendar = self.select_calendar(owned_binding, as_of_utc)
+        owned_binding, source = sealed.resolve_binding(sealed.range_store, binding)
+        calendar = _select_calendar(sealed, owned_binding, as_of_utc)
         if calendar.coverage is None:
-            return MarketSelection(None, calendar.pending, calendar.lineage,
+            return _market_selection_type(None, calendar.pending, calendar.lineage,
                 calendar.selection_hash, calendar.recheck)
         coverage_payload = calendar.coverage.to_dict()
         days = tuple(coverage_payload["trading_days"])[-250:]
-        requests = source.market_requests(security_id, calendar_coverage=calendar.coverage)
+        requests = sealed.market_requests(
+            source, security_id, calendar_coverage=calendar.coverage)
         observations = []
         missing_reasons = {}
         rows = {}
         seen_dates = set()
         for request in requests:
-            group, missing = self._page_group(source, request)
+            group, missing = _page_group(sealed, source, request)
             observations.extend(group)
             requested_days = {day for day in days if request.start_date <= day <= request.end_date}
             if missing is not None:
                 for day in requested_days:
                     missing_reasons.setdefault(day, "market_coverage_missing")
                 continue
-            documents = [item.to_dict()["document"] for item in group]
+            documents = [sealed.observation_to_dict(item)["document"] for item in group]
             first = documents[0]
             if (len(documents) != first["page_count"]
                     or [item["page_index"] for item in documents] != list(range(1, first["page_count"] + 1))
@@ -594,14 +710,16 @@ class _MarketRepositoryImplementation:
                                 or raw["reason"] != raw["reason"].strip()):
                             raise ValueError("market domain conflict row is invalid")
                         rows[day] = {"coverage": "domain_conflict", "reason": raw["reason"],
-                                     "observation_hash": observation.observation_hash}
+                                     "observation_hash": sealed.observation_to_dict(
+                                         observation)["observation_hash"]}
                     else:
                         if (raw["volume_unit"] != "shares" or raw["turnover_unit"] != "CNY"
                                 or raw["close_unit"] != "CNY_per_share"):
                             raise ValueError("market normalized units differ from signed contract")
                         rows[day] = {"coverage": "covered", "exchange_allows_trading": raw["exchange_allows_trading"],
                             "volume": raw["volume"], "turnover": raw["turnover"], "close": raw["close"],
-                            "observation_hash": observation.observation_hash}
+                            "observation_hash": sealed.observation_to_dict(
+                                observation)["observation_hash"]}
             for day in requested_days - set(rows):
                 missing_reasons.setdefault(day, "market_coverage_missing")
         algorithm_rows = {}
@@ -621,7 +739,8 @@ class _MarketRepositoryImplementation:
                 daily_records.append({"date": day, "coverage": "missing", "reason": reason})
         result = evaluate_window(days, algorithm_rows)
         pending = set(result["pending"])
-        lineage = tuple(item.observation_hash for item in observations)
+        lineage = tuple(sealed.observation_to_dict(item)["observation_hash"]
+                        for item in observations)
         market_config = _read_binding(owned_binding)["market_config"]
         calendar_config = _read_binding(owned_binding)["calendar_config"]
         wire = {
@@ -648,7 +767,7 @@ class _MarketRepositoryImplementation:
             "daily_records": daily_records,
             "calendar_coverage_hash": coverage_payload["coverage_hash"],
             "lineage": list(lineage),
-            "observations": [item.to_dict() for item in observations],
+            "observations": [sealed.observation_to_dict(item) for item in observations],
             **{key: result[key] for key in ("price_state", "price", "price_date", "stale_days",
                                              "stale_at_least", "veto_state")},
             "pending": sorted(pending),
@@ -656,34 +775,32 @@ class _MarketRepositoryImplementation:
         expected_window_wire = dict(wire,
             window_hash=hashlib.sha256(canonical_bytes(wire)).hexdigest())
         def recheck():
-            current = self.select(security_id, as_of_utc, binding=owned_binding)
+            current = _select_market(
+                sealed, security_id, as_of_utc, binding=owned_binding)
             if (current.window is None
                     or current.window.canonical_bytes() != canonical_bytes(expected_window_wire)):
                 raise ValueError("market window selection changed")
         window = _mint_window(wire, owned_binding, recheck)
-        return MarketSelection(window, tuple(sorted(pending)), lineage,
+        return _market_selection_type(window, tuple(sorted(pending)), lineage,
             hashlib.sha256(window.canonical_bytes()).hexdigest(), window.require_current)
 
 
-def _build_market_repository_type(mint_calendar, mint_window):
-    class FormalPolicyMarketRepository(_MarketRepositoryImplementation):
-        def select_calendar(self, binding, as_of_utc) -> CalendarSelection:
-            return _MarketRepositoryImplementation.select_calendar(
-                self, binding, as_of_utc, _mint_calendar=mint_calendar)
-
-        def select(self, security_id, as_of_utc, *, binding) -> MarketSelection:
-            return _MarketRepositoryImplementation.select(
-                self, security_id, as_of_utc, binding=binding,
-                _mint_window=mint_window)
-
-    return FormalPolicyMarketRepository
-
-
-(_calendar_owner_mint, _window_owner_mint) = _install_market_proof_owner()
-FormalPolicyMarketRepository = _build_market_repository_type(
-    _calendar_owner_mint, _window_owner_mint)
-del _calendar_owner_mint, _window_owner_mint
-del _install_market_proof_owner, _build_market_repository_type
+FormalPolicyMarketRepository = _install_market_proof_owner((
+    FormalRangeStore,
+    FormalRangeStore.resolve_planning_binding,
+    FormalRangeStore.select_current,
+    FormalRangeSource.first_calendar_request,
+    FormalRangeSource.next_page,
+    FormalRangeSource.previous_calendar_request,
+    FormalRangeSource.market_requests,
+    RangeObservation.to_dict,
+    RangeObservation.require_current,
+    _MarketRepositoryImplementation._page_group,
+    _MarketRepositoryImplementation.select_calendar,
+    _MarketRepositoryImplementation.select,
+    (CalendarSelection, MarketSelection),
+))
+del _install_market_proof_owner, _MarketRepositoryImplementation
 
 
 def plan_next_window_request(security_id, as_of_utc, *, binding, range_store):

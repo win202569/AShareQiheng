@@ -82,7 +82,8 @@ def _read_content(root, path_text, digest, suffix):
 
 
 def _build_range_store_type(*, describe_request, restore_request, source_type,
-                           source_binding, source_parse, fetch_type, fetch_snapshot,
+                           source_binding, bind_source_store, source_parse,
+                           fetch_type, fetch_snapshot,
                            mint_observation, observation_wire, require_execution):
     """Paired only by the source factory; no authority escapes this closure."""
     from .state_store import _range_state_store_authority, _V7_TABLE_DDL, _V7_INDEX_DDL
@@ -139,10 +140,12 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             source = factory(matches[0])
             if type(source) is not source_type or source_binding(source) is not matches[0]:
                 raise ValueError("range source factory returned a different binding")
+            bind_source_store(source, store)
             cache[key] = (matches[0], source)
         binding, source = cache[key]
         binding.require_current()
         source_binding(source)
+        bind_source_store(source, store)
         return binding, source
 
     def load_binding(store, payload):

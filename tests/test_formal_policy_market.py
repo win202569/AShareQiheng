@@ -202,6 +202,91 @@ class MarketRepositoryTests(unittest.TestCase):
                     cwd=".", text=True, capture_output=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_repository_rejects_instance_authority_method_shadowing(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        repository = FormalPolicyMarketRepository(self.fixture().range_store)
+        for name in ("_page_group", "select_calendar", "select"):
+            with self.subTest(name=name), self.assertRaises(AttributeError):
+                setattr(repository, name, lambda *args, **kwargs: None)
+
+    def test_repository_rejects_subclass_authority_overrides(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        with self.assertRaises(TypeError):
+            class ShadowRepository(FormalPolicyMarketRepository):
+                def _page_group(self, source, first_request):
+                    return (), None
+
+                def select_calendar(self, binding, as_of_utc):
+                    return None
+
+                def select(self, security_id, as_of_utc, *, binding):
+                    return None
+
+    def test_repository_rejects_store_replacement(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        owned = self.fixture()
+        foreign = self.fixture()
+        repository = FormalPolicyMarketRepository(owned.range_store)
+        with self.assertRaises(AttributeError):
+            repository._store = foreign.range_store
+
+    def test_stale_recheck_cannot_be_bypassed_by_method_shadowing(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+
+        calendar_fixture = self.fixture()
+        first = calendar_fixture.source.first_calendar_request(FREEZE)
+        first_observation = self.persist(calendar_fixture, first,
+            self.calendar_wire(calendar_fixture, first, opened=("2026-08-31",)))
+        calendar_repository = FormalPolicyMarketRepository(calendar_fixture.range_store)
+        calendar_selection = calendar_repository.select_calendar(
+            calendar_fixture.binding, FREEZE)
+        try:
+            object.__setattr__(calendar_repository, "select_calendar",
+                lambda *args, **kwargs: calendar_selection)
+        except (AttributeError, TypeError):
+            pass
+        older = calendar_fixture.source.previous_calendar_request(first_observation)
+        self.persist(calendar_fixture, older,
+            self.calendar_wire(calendar_fixture, older), generation="g1")
+        with self.assertRaises(ValueError):
+            calendar_selection.coverage.require_current()
+
+        market_fixture = self.fixture()
+        recent = trading_days(20)
+        first = market_fixture.source.first_calendar_request(FREEZE)
+        self.persist(market_fixture, first,
+            self.calendar_wire(market_fixture, first, opened=recent))
+        market_repository = FormalPolicyMarketRepository(market_fixture.range_store)
+        market_selection = market_repository.select(
+            "SH600000", FREEZE, binding=market_fixture.binding)
+        try:
+            object.__setattr__(market_repository, "select",
+                lambda *args, **kwargs: market_selection)
+        except (AttributeError, TypeError):
+            pass
+        market_fixture.put_window("SH600000", trading_days=recent,
+            rows={day: quiet_row() for day in recent})
+        with self.assertRaises(ValueError):
+            market_selection.window.require_current()
+
+    def test_calendar_proof_rejects_same_root_cross_store_reuse(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        owner = self.fixture()
+        peer = self.fixture()
+        recent = trading_days(20)
+        first = owner.source.first_calendar_request(FREEZE)
+        self.persist(owner, first, self.calendar_wire(owner, first, opened=recent))
+        proof = FormalPolicyMarketRepository(owner.range_store).select_calendar(
+            owner.binding, FREEZE).coverage
+
+        _, same_store_source = owner.range_store.resolve_planning_binding(peer.binding)
+        self.assertTrue(same_store_source.market_requests(
+            "SH600000", calendar_coverage=proof))
+
+        _, peer_source = peer.range_store.resolve_planning_binding(peer.binding)
+        with self.assertRaises(ValueError):
+            peer_source.market_requests("SH600000", calendar_coverage=proof)
+
     def test_date_only_hash_without_resolved_temporal_proof_stays_unproven(self):
         from ashare_pipeline.formal_policy_market import (
             FormalPolicyMarketRepository, plan_next_window_request,

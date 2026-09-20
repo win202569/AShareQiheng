@@ -757,7 +757,9 @@ def _build_source_type():
         proof_type, _, _, require_coverage = record.calendar_proof_anchors
         if type(calendar_coverage) is not proof_type:
             raise ValueError("market requests require a genuine calendar coverage proof")
-        payload = require_coverage(calendar_coverage, binding=record.binding)
+        store = source_store(record)
+        payload = require_coverage(
+            calendar_coverage, binding=record.binding, range_store=store)
         days = tuple(payload["trading_days"])
         if start_date not in days or end_date not in days:
             raise ValueError("market request bounds require covered trading days")
@@ -930,6 +932,7 @@ def _build_source_type():
         selected: dict[str, _ImplementationRecord]
         config_wires: dict[str, dict[str, object]]
         calendar_proof_anchors: tuple[object, object, object, object]
+        store_reference: weakref.ReferenceType[object] | None
 
     records: dict[int, _SourceRecord] = {}
 
@@ -997,6 +1000,23 @@ def _build_source_type():
             raise FormalTerminalSourceError("formal range source dependencies changed")
         return record
 
+    def bind_source_store(source, store):
+        sealed = source_record(source)
+        current = sealed.store_reference
+        if current is None:
+            object.__setattr__(sealed, "store_reference", weakref.ref(store))
+        elif current() is not store:
+            raise FormalTerminalSourceError("formal range source belongs to another Store")
+        source_record(source)
+
+    def source_store(record):
+        reference = record.store_reference
+        store = None if reference is None else reference()
+        if store is None:
+            raise FormalTerminalSourceError(
+                "market requests require an owning FormalRangeStore")
+        return store
+
     def require_acquisition_authority(source, request, previous):
         # Error classification must not hide transport/parser callback mutation.
         # Parent replay can itself invoke callbacks, so check both sides of it.
@@ -1055,7 +1075,7 @@ def _build_source_type():
                 weakref.ref(self, forget), binding, transport, transport_anchor,
                 implementations, items, selected,
                 {kind: _range_config_to_dict(config) for kind, config in configs.items()},
-                calendar_proof_anchors[0],
+                calendar_proof_anchors[0], None,
             )
             source_record(self)
 
@@ -1071,7 +1091,12 @@ def _build_source_type():
 
         def market_requests(self, security_id: str, *, calendar_coverage) -> tuple[FormalRangeRequestV1, ...]:
             record = source_record(self)
-            payload = record.calendar_proof_anchors[2](calendar_coverage)
+            proof_type, _, _, require_coverage = record.calendar_proof_anchors
+            if type(calendar_coverage) is not proof_type:
+                raise ValueError("market requests require a genuine calendar coverage proof")
+            payload = require_coverage(
+                calendar_coverage, binding=record.binding,
+                range_store=source_store(record))
             days = tuple(payload["trading_days"])[-250:]
             if not days:
                 raise ValueError("calendar proof has no trading days")
@@ -1278,6 +1303,7 @@ def _build_source_type():
     Store, store_read, store_require_current, store_record = store_module._build_range_store_type(
         describe_request=describe_request, restore_request=restore_request,
         source_type=FormalRangeSource, source_binding=lambda source: source_record(source).binding,
+        bind_source_store=bind_source_store,
         source_parse=FormalRangeSource.parse_verified_snapshot, fetch_type=fetch_type,
         fetch_snapshot=fetch_snapshot, mint_observation=mint_observation, observation_wire=observation_wire,
         require_execution=require_execution)
