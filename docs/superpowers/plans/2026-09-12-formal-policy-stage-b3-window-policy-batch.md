@@ -43,7 +43,7 @@ W1 仅在 R4/F1 接受后执行，修改 `formal_range_source.py` 激活真实�
 - 纯 `evaluate_window(trading_days: tuple[str,...], daily_rows: dict[str,dict]) -> dict`，仅返回非正式 `price_state,price,price_date,stale_days,stale_at_least,veto_state,pending`，其输入必须经调用层验证 sorted/unique/ISO/冻结日/最多250。
 - Fixture 新增 `.put_window(security_id, *, trading_days, rows, generation="g1", missing_calendar_dates=(), omit_pages=())`，经真实 R2/R3 生产；不接受 stale_days、veto、confirmed_no_price 参数。`rows` 只含原始 permission/volume/turnover/close 数据。
 
-- [ ] **写失败测试。** 先测纯双轴，再测相同场景的 genuine 来源路径。
+- [x] **写失败测试。** 先测纯双轴，再测相同场景的 genuine 来源路径。
 
 ```python
 from datetime import date, timedelta
@@ -66,8 +66,8 @@ def test_tail_veto_survives_older_gap(self):
 
 日历矩阵：每个自然日一个 exact bool；稀疏交易日列表只能在有签名且已实现的完整性合同下补非交易日；请求区间与证明子区间分别保存；整份文档分页未验证不能部分冒充完整；重叠矛盾/错交易所/根/代际/日期重复；来源 date_only 不用 captured/as_of 补成有利时刻；冻结日未被证明交易日为失败而非退到前一天。
 
-- [ ] **运行 RED。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_market -v`。
-- [ ] **实现完整区间组合和双轴内核。** `.select_calendar` 按完整页面组核验 page_count/record_count/lineage，展开有来源依据的自然日判定；只组合无矛盾、同根同版本同交换所的成员。missing 行不补零，缺公开时点保留待补。所有原始内容/请求/收据作为组合依赖保存并可重验。
+- [x] **运行 RED。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_market -v`。
+- [x] **实现完整区间组合和双轴内核。** `.select_calendar` 按完整页面组核验 page_count/record_count/lineage，展开有来源依据的自然日判定；只组合无矛盾、同根同版本同交换所的成员。missing 行不补零，缺公开时点保留待补。所有原始内容/请求/收据作为组合依赖保存并可重验。
 
 ```python
 from decimal import Decimal
@@ -114,8 +114,8 @@ def evaluate_window(trading_days, daily_rows):
 
 市场计划入口顺序：先验证 binding/当前已存页 → 无日历取首日历请求 → 有日历先补其中尚无有效收据的行情请求 → 两轴已可判定则停止 → 不足 250 且仍需旧价格时取前一个自然日分段 → 未完成分页只补其未完成页。该入口不把领域缺口改成已无成交；任务错误由 R4 处理，避免无限重复同一失败请求。
 
-- [ ] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_market tests.test_formal_range_source tests.test_formal_range_store tests.test_formal_context_schema -v`。
-- [ ] **审查并提交白名单。** 本任务五个文件；提交信息 `feat: prove calendar coverage and independent market window outcomes`。
+- [x] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_market tests.test_formal_range_source tests.test_formal_range_store tests.test_formal_context_schema -v`。
+- [x] **审查并提交白名单。** 经接口审计扩展后的本任务十三个文件；初始提交信息 `feat: prove calendar coverage and independent market window outcomes`，并包含三轮审查修复提交。
 
 ## W2：纯政策判定、正常化依据和效果聚合
 
