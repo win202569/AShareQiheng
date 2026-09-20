@@ -16,6 +16,10 @@ _DECISION_FIELDS = frozenset((
     "definition_hash", "input_references", "operands", "parameters",
     "evaluation_state", "proven_effects", "pending_requirements", "trace",
 ))
+_MARKET_FIELDS = (
+    "price_state", "price", "price_date", "stale_days", "stale_at_least",
+    "veto_state", "pending",
+)
 
 
 def _decimal_text(value: Decimal) -> str:
@@ -229,6 +233,20 @@ def _market_reference(rule, market):
     } for name in sorted(rule["inputs"])]
 
 
+def _closed_market_payload(market):
+    if any(field not in market for field in _MARKET_FIELDS):
+        raise ValueError("market input lacks a closed W1 result axis")
+    parsed = PolicyValue.from_dict({
+        "state": "value",
+        "value": {field: copy.deepcopy(market[field]) for field in _MARKET_FIELDS},
+        "value_type": "market_window",
+        "unit": None,
+        "evidence_hashes": [],
+        "pending": [],
+    })
+    return parsed.to_dict()["value"]
+
+
 def _signed_pending(effect, rule, evidence_hashes):
     return {
         "origin": "signed_policy",
@@ -375,24 +393,20 @@ def evaluate_rule(rule: dict, *, security_id: str, applicability: str,
         else:
             if type(market) is not dict:
                 raise ValueError("market must be a detached object or None")
-            required = {"price_state", "veto_state", "pending"}
-            if not required <= set(market):
-                raise ValueError("market input lacks a W1 result axis")
+            payload = _closed_market_payload(market)
             references.extend(_market_reference(rule, market))
             evidence_hashes = sorted({value for item in references
                                       for value in item["evidence_hashes"]})
-            if type(market["pending"]) not in (list, tuple):
-                raise ValueError("market pending reasons must be an array")
-            for code in market["pending"]:
+            for code in payload["pending"]:
                 pending.append(_runtime_pending(
                     code, input_name="market", selector_hash=None,
                     evidence_hashes=evidence_hashes,
                 ))
-            price_state, veto_state = market["price_state"], market["veto_state"]
+            price_state, veto_state = payload["price_state"], payload["veto_state"]
             operands.update(price_state=price_state, veto_state=veto_state,
-                            price=market.get("price"), price_date=market.get("price_date"),
-                            stale_days=market.get("stale_days"),
-                            stale_at_least=market.get("stale_at_least"))
+                            price=payload["price"], price_date=payload["price_date"],
+                            stale_days=payload["stale_days"],
+                            stale_at_least=payload["stale_at_least"])
             if veto_state == "proven" and price_state == "incomplete":
                 state = "pending_evidence"
                 proven, signed_pending = _match_effects(

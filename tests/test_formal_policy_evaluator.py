@@ -324,6 +324,50 @@ class MarketRuleTests(unittest.TestCase):
         self.assertEqual(aggregate["evidence_state"], "pending_evidence")
 
 
+class MarketRuleValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.rule = parsed_rule(market_rule(), "status", "bank_market")
+
+    @staticmethod
+    def market(**changes):
+        result = {
+            "price_state": "incomplete",
+            "price": None,
+            "price_date": None,
+            "stale_days": None,
+            "stale_at_least": None,
+            "veto_state": "proven",
+            "pending": ["market_coverage_missing"],
+            "window_hash": HASHES[5],
+        }
+        result.update(changes)
+        return result
+
+    def test_unknown_price_state_cannot_release_signed_effects(self):
+        malformed = self.market(price_state="unknown", pending=[])
+        with self.assertRaises(ValueError):
+            decision(self.rule, market=malformed)
+
+    def test_confirmed_no_price_cannot_erase_market_evidence_missing(self):
+        malformed = self.market(
+            price_state="confirmed_no_price_250",
+            stale_at_least=250,
+            pending=[],
+        )
+        with self.assertRaises(ValueError):
+            decision(self.rule, market=malformed)
+
+    def test_incomplete_proven_veto_requires_an_explicit_pending_reason(self):
+        malformed = self.market(pending=[])
+        with self.assertRaises(ValueError):
+            decision(self.rule, market=malformed)
+
+    def test_invented_runtime_market_pending_code_is_rejected(self):
+        malformed = self.market(pending=["invented_reason"])
+        with self.assertRaises(ValueError):
+            decision(self.rule, market=malformed)
+
+
 class AggregationTests(unittest.TestCase):
     def test_caps_take_minimum_pool_union_and_every_effect_trace_is_preserved(self):
         wire = cyclic_rule()
