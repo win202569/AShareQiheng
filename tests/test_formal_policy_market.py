@@ -3,9 +3,13 @@
 from datetime import date, timedelta
 from decimal import Decimal
 import copy
+import subprocess
+import sys
+import textwrap
 import unittest
 
 from tests.formal_range_fixtures import RangeStoreFixture
+from tests.test_formal_range_source import document_wire
 
 
 FREEZE = "2026-08-31T07:00:00+00:00"
@@ -125,6 +129,317 @@ class MarketRepositoryTests(unittest.TestCase):
         fixture = RangeStoreFixture(**kwargs)
         self.addCleanup(fixture.close)
         return fixture
+
+    def persist(self, fixture, request, wire, *, generation="g1"):
+        task = fixture.range_store.enqueue(request, refresh_generation=generation)
+        fixture.reply(wire, original_url=(
+            "https://www.cninfo.com.cn/fixture/range-calendar.json"
+            if request.kind == "calendar_range"
+            else "https://www.cninfo.com.cn/fixture/range-market.json"
+        ))
+        lease = fixture.range_store.lease_next("market-review-worker", lease_seconds=3600)
+        self.assertIsNotNone(lease)
+        self.assertEqual(lease["id"], task["id"])
+        return fixture.range_store.persist(task["id"], "market-review-worker",
+            lease["attempt_id"], fetch=fixture.source.fetch_verified(request))
+
+    def calendar_wire(self, fixture, request, *, opened=(), coverage=None,
+                      upstream_generation="calendar-g1", row_time=None):
+        config = fixture.source.range_config(request)
+        opened = set(opened)
+        start = date.fromisoformat((coverage or {}) .get("start_date", request.start_date))
+        end = date.fromisoformat((coverage or {}) .get("end_date", request.end_date))
+        times = {
+            "published_at_utc": "2026-08-29T08:00:00+00:00",
+            "published_precision": "timestamp",
+            "effective_at_utc": "2026-08-29T08:00:00+00:00",
+            "effective_time_evidence_hash": None,
+            "captured_at_utc": "2026-08-31T06:59:00+00:00",
+        }
+        if row_time is not None:
+            times.update(row_time)
+        rows = []
+        cursor = start
+        while cursor <= end:
+            day = cursor.isoformat()
+            rows.append({"date": day, "is_open": day in opened, **times})
+            cursor += timedelta(days=1)
+        declared = {"start_date": start.isoformat(), "end_date": end.isoformat(),
+                    "complete": True}
+        return document_wire(request, rows=rows, record_count=len(rows),
+            page_record_count=len(rows), coverage=declared,
+            upstream_generation=upstream_generation,
+            parser_id=config.parser_id, parser_version=config.parser_version,
+            mapping_version=config.mapping_version,
+            normalizer_version=config.normalizer_version,
+            request_version=config.request_version)
+
+    def test_no_module_global_proof_mint_survives_either_import_order(self):
+        script = textwrap.dedent("""
+            import importlib
+            import sys
+            order = sys.argv[1]
+            if order == "source-first":
+                importlib.import_module("ashare_pipeline.formal_range_source")
+            market = importlib.import_module("ashare_pipeline.formal_policy_market")
+            if order == "market-first":
+                importlib.import_module("ashare_pipeline.formal_range_source")
+            forbidden = ("_mint_calendar_coverage", "_mint_market_window",
+                         "_install_market_proof_owner", "_build_proof_types")
+            assert not any(hasattr(market, name) for name in forbidden), forbidden
+            for proof_type in (market.VerifiedCalendarCoverageV1,
+                               market.VerifiedMarketWindowV1):
+                try:
+                    proof_type()
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("external proof construction succeeded")
+        """)
+        for order in ("source-first", "market-first"):
+            with self.subTest(order=order):
+                result = subprocess.run([sys.executable, "-c", script, order],
+                    cwd=".", text=True, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_date_only_hash_without_resolved_temporal_proof_stays_unproven(self):
+        from ashare_pipeline.formal_policy_market import (
+            FormalPolicyMarketRepository, plan_next_window_request,
+        )
+        fixture = self.fixture()
+        request = fixture.source.first_calendar_request(FREEZE)
+        wire = self.calendar_wire(fixture, request, opened=("2026-08-31",), row_time={
+            "published_precision": "date_only",
+            "effective_at_utc": "2026-08-29T08:00:00+00:00",
+            "effective_time_evidence_hash": "a" * 64,
+        })
+        self.persist(fixture, request, wire)
+        selection = FormalPolicyMarketRepository(fixture.range_store).select_calendar(
+            fixture.binding, FREEZE)
+        self.assertIsNone(selection.coverage)
+        self.assertEqual(selection.pending, ("visibility_unproven",))
+        self.assertIsNone(plan_next_window_request("SH600000", FREEZE,
+            binding=fixture.binding, range_store=fixture.range_store))
+
+    def test_calendar_rejects_nonadjacent_and_mixed_generation_composition(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        for defect in ("gap", "generation"):
+            with self.subTest(defect=defect):
+                fixture = self.fixture()
+                first = fixture.source.first_calendar_request(FREEZE)
+                first_observation = self.persist(fixture, first,
+                    self.calendar_wire(fixture, first, opened=("2026-08-31",),
+                                       upstream_generation="calendar-g1"),
+                    generation="refresh-g1")
+                older = fixture.source.previous_calendar_request(first_observation)
+                coverage = None
+                if defect == "gap":
+                    coverage = {"start_date": older.start_date,
+                                "end_date": (date.fromisoformat(older.end_date)
+                                             - timedelta(days=1)).isoformat()}
+                self.persist(fixture, older, self.calendar_wire(fixture, older,
+                    coverage=coverage,
+                    upstream_generation=("calendar-g2" if defect == "generation"
+                                         else "calendar-g1")),
+                    generation=("refresh-g2" if defect == "generation" else "refresh-g1"))
+                with self.assertRaises(ValueError):
+                    FormalPolicyMarketRepository(fixture.range_store).select_calendar(
+                        fixture.binding, FREEZE)
+
+    def test_calendar_proof_tracks_absent_older_segment(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        fixture = self.fixture()
+        first = fixture.source.first_calendar_request(FREEZE)
+        recent = trading_days(20)
+        first_observation = self.persist(fixture, first,
+            self.calendar_wire(fixture, first, opened=recent))
+        repository = FormalPolicyMarketRepository(fixture.range_store)
+        proof = repository.select_calendar(fixture.binding, FREEZE).coverage
+        self.assertIsNotNone(proof)
+        older = fixture.source.previous_calendar_request(first_observation)
+        self.persist(fixture, older, self.calendar_wire(fixture, older), generation="g1")
+        with self.assertRaises(ValueError):
+            proof.require_current()
+
+    def test_market_window_tracks_absent_request_and_numbered_page(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        recent = trading_days(20)
+        rows = {day: quiet_row() for day in recent}
+
+        fixture = self.fixture()
+        first = fixture.source.first_calendar_request(FREEZE)
+        self.persist(fixture, first, self.calendar_wire(fixture, first, opened=recent))
+        repository = FormalPolicyMarketRepository(fixture.range_store)
+        absent = repository.select("SH600000", FREEZE, binding=fixture.binding).window
+        self.assertIsNotNone(absent)
+        fixture.put_window("SH600000", trading_days=recent, rows=rows)
+        with self.assertRaises(ValueError):
+            absent.require_current()
+
+        def numbered(documents):
+            market = next(item for item in documents["source"]["range_configs"]
+                          if item["kind"] == "market_range" and item["exchange_scope"] == "SH")
+            market.update(pagination="numbered_pages_v1", max_pages=2)
+
+        paged = self.fixture(mutate=numbered)
+        paged.put_window("SH600000", trading_days=recent, rows=rows, omit_pages=(2,))
+        repository = FormalPolicyMarketRepository(paged.range_store)
+        incomplete = repository.select("SH600000", FREEZE, binding=paged.binding).window
+        self.assertIsNotNone(incomplete)
+        calendar = repository.select_calendar(paged.binding, FREEZE).coverage
+        _, source = paged.range_store.resolve_planning_binding(paged.binding)
+        request = source.market_requests("SH600000", calendar_coverage=calendar)[0]
+        page_one = paged.range_store.select_current(request.request_fingerprint)
+        page_two = source.next_page(page_one)
+        selected = [(day, rows[day]) for day in recent
+                    if request.start_date <= day <= request.end_date]
+        market_rows = []
+        base = document_wire(page_two)["rows"][0]
+        for day, raw in selected[1::2]:
+            market_rows.append({"date": day,
+                "exchange_allows_trading": raw["exchange_allows_trading"],
+                "volume": raw["volume"], "volume_unit": "shares",
+                "turnover": raw["turnover"], "turnover_unit": "CNY",
+                "close": dict(raw["close"]), "close_unit": "CNY_per_share",
+                **{key: base[key] for key in (
+                    "published_at_utc", "published_precision", "effective_at_utc",
+                    "effective_time_evidence_hash", "captured_at_utc")}})
+        config = source.range_config(page_two)
+        wire = document_wire(page_two, rows=market_rows, page_index=2, page_count=2,
+            record_count=len(selected), page_record_count=len(market_rows),
+            upstream_generation="fixture-market-g1",
+            pagination_evidence="source_declared_numbered_pages_v1",
+            coverage={"start_date": page_two.start_date, "end_date": page_two.end_date,
+                      "complete": True},
+            parser_id=config.parser_id, parser_version=config.parser_version,
+            mapping_version=config.mapping_version,
+            normalizer_version=config.normalizer_version,
+            request_version=config.request_version)
+        self.persist(paged, page_two, wire, generation="g1")
+        with self.assertRaises(ValueError):
+            incomplete.require_current()
+
+    def test_planner_does_not_repeat_verified_blocker_or_scan_past_price_blocker(self):
+        from ashare_pipeline.formal_policy_market import plan_next_window_request
+        fixture = self.fixture()
+        first = fixture.source.first_calendar_request(FREEZE)
+        wire = self.calendar_wire(fixture, first, opened=("2026-08-31",))
+        wire["rows"].pop(0)
+        wire["record_count"] -= 1
+        wire["page_record_count"] -= 1
+        self.persist(fixture, first, wire)
+        self.assertIsNone(plan_next_window_request("SH600000", FREEZE,
+            binding=fixture.binding, range_store=fixture.range_store))
+
+        blocked = self.fixture()
+        recent = trading_days(20)
+        rows = {day: quiet_row() for day in recent}
+        rows[recent[-1]] = {"exchange_allows_trading": True, "volume": "1",
+            "turnover": "1", "close": {"state": "unavailable",
+                                          "reason": "source_omits_close"}}
+        blocked.put_window("SH600000", trading_days=recent, rows=rows)
+        self.assertIsNone(plan_next_window_request("SH600000", FREEZE,
+            binding=blocked.binding, range_store=blocked.range_store))
+
+        searching = self.fixture()
+        searching.put_window("SH600000", trading_days=recent,
+                             rows={day: quiet_row() for day in recent})
+        older = plan_next_window_request("SH600000", FREEZE,
+            binding=searching.binding, range_store=searching.range_store)
+        self.assertIsNotNone(older)
+        self.assertEqual(older.kind, "calendar_range")
+
+    def test_authenticated_domain_conflict_survives_repository_path(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        fixture = self.fixture()
+        recent = trading_days(20)
+        rows = {day: quiet_row() for day in recent}
+        rows[recent[-1]] = {"coverage": "domain_conflict",
+                            "reason": "source_duplicate_trading_day"}
+        fixture.put_window("SH600000", trading_days=recent, rows=rows)
+        selection = FormalPolicyMarketRepository(fixture.range_store).select(
+            "SH600000", FREEZE, binding=fixture.binding)
+        self.assertIn("market_domain_conflict", selection.pending)
+        daily = {item["date"]: item for item in selection.window.to_dict()["daily_records"]}
+        self.assertEqual(daily[recent[-1]], {"date": recent[-1],
+            "coverage": "domain_conflict", "reason": "source_duplicate_trading_day",
+            "observation_hash": daily[recent[-1]]["observation_hash"]})
+
+    def test_distinct_signed_config_keys_and_wrong_binding_boundaries(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        def distinct(documents):
+            market = next(item for item in documents["source"]["range_configs"]
+                          if item["kind"] == "market_range" and item["exchange_scope"] == "SH")
+            market.update(parser_version="fixture-market-v2",
+                          normalizer_version="fixture-market-normalizer-v2")
+
+        fixture = self.fixture(mutate=distinct)
+        self.assertNotEqual(fixture.binding.calendar_config.parser_version,
+                            fixture.binding.market_config.parser_version)
+        recent = trading_days(20)
+        fixture.put_window("SH600000", trading_days=recent,
+                           rows={day: quiet_row() for day in recent})
+        repository = FormalPolicyMarketRepository(fixture.range_store)
+        with self.assertRaises(ValueError):
+            repository.select("SZ000001", FREEZE, binding=fixture.binding)
+        foreign = self.fixture(mutate=distinct)
+        self.assertEqual(
+            repository.select("SH600000", FREEZE, binding=foreign.binding).window.to_dict(),
+            repository.select("SH600000", FREEZE, binding=fixture.binding).window.to_dict(),
+        )
+
+        def different_root(documents):
+            distinct(documents)
+            market = next(item for item in documents["source"]["range_configs"]
+                          if item["kind"] == "market_range" and item["exchange_scope"] == "SH")
+            market["retry_base_seconds"] = 2.0
+
+        wrong_root = self.fixture(mutate=different_root)
+        with self.assertRaises(ValueError):
+            repository.select("SH600000", FREEZE, binding=wrong_root.binding)
+
+    def test_numbered_market_pages_reject_duplicate_dates(self):
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        def numbered(documents):
+            market = next(item for item in documents["source"]["range_configs"]
+                          if item["kind"] == "market_range" and item["exchange_scope"] == "SH")
+            market.update(pagination="numbered_pages_v1", max_pages=2)
+
+        fixture = self.fixture(mutate=numbered)
+        recent = trading_days(20)
+        first = fixture.source.first_calendar_request(FREEZE)
+        self.persist(fixture, first, self.calendar_wire(fixture, first, opened=recent))
+        repository = FormalPolicyMarketRepository(fixture.range_store)
+        calendar = repository.select_calendar(fixture.binding, FREEZE).coverage
+        _, source = fixture.range_store.resolve_planning_binding(fixture.binding)
+        request = source.market_requests("SH600000", calendar_coverage=calendar)[0]
+        config = source.range_config(request)
+
+        def market_wire(page, index):
+            base = document_wire(page)["rows"][0]
+            row = {"date": recent[-1], "exchange_allows_trading": True,
+                "volume": "0", "volume_unit": "shares", "turnover": "0",
+                "turnover_unit": "CNY",
+                "close": {"state": "unavailable", "reason": "source_reports_no_trade"},
+                "close_unit": "CNY_per_share",
+                **{key: base[key] for key in (
+                    "published_at_utc", "published_precision", "effective_at_utc",
+                    "effective_time_evidence_hash", "captured_at_utc")}}
+            return document_wire(page, rows=[row], page_index=index, page_count=2,
+                record_count=2, page_record_count=1,
+                pagination_evidence="source_declared_numbered_pages_v1",
+                coverage={"start_date": page.start_date, "end_date": page.end_date,
+                          "complete": True},
+                parser_id=config.parser_id, parser_version=config.parser_version,
+                mapping_version=config.mapping_version,
+                normalizer_version=config.normalizer_version,
+                request_version=config.request_version)
+
+        page_one = self.persist(fixture, request, market_wire(request, 1))
+        page_two = source.next_page(page_one)
+        self.persist(fixture, page_two, market_wire(page_two, 2))
+        with self.assertRaises(ValueError):
+            repository.select("SH600000", FREEZE, binding=fixture.binding)
 
     def test_genuine_source_path_proves_tail_veto_and_keeps_older_gap_pending(self):
         from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository

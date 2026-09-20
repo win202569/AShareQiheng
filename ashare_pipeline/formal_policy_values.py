@@ -198,11 +198,18 @@ def _market_window(value: object):
             raise ValueError("complete market price must be positive and dated")
         if type(stale_days) is not int or stale_days < 0 or stale_days > 249 or stale_at_least is not None:
             raise ValueError("complete market price stale fields are invalid")
+        expected_veto = "clear" if stale_days < 20 else "proven"
+        if pending or veto_state != expected_veto:
+            raise ValueError("complete market price has inconsistent pending or veto state")
     elif price_state == "confirmed_no_price_250":
         if price is not None or price_date is not None or stale_days is not None or stale_at_least != 250:
             raise ValueError("confirmed no-price market shape is invalid")
+        if veto_state != "proven" or pending != ["market_evidence_missing"]:
+            raise ValueError("confirmed no-price market pending or veto state is invalid")
     elif any(item is not None for item in (price, price_date, stale_days, stale_at_least)):
         raise ValueError("incomplete market price cannot carry authoritative values")
+    elif not pending:
+        raise ValueError("incomplete market price requires an explicit pending reason")
     return MappingProxyType({
         "price_state": price_state,
         "price": None if price is None else parsed,

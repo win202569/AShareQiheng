@@ -208,33 +208,29 @@ def _build_proof_types():
             raise ValueError("calendar coverage belongs to another binding")
         return _detached(sealed.wire)
 
-    def calendar_record(proof):
-        return record(proof, VerifiedCalendarCoverageV1, calendar_records)
-
-    return (VerifiedCalendarCoverageV1, VerifiedMarketWindowV1, mint_calendar,
-            mint_window, require_calendar, calendar_record)
-
-
-(VerifiedCalendarCoverageV1, VerifiedMarketWindowV1, _mint_calendar_coverage,
- _mint_market_window, _require_calendar_coverage,
- _calendar_record) = _build_proof_types()
-del _build_proof_types
-
-
-def _make_calendar_proof_authority():
     proof_type = VerifiedCalendarCoverageV1
     require_current = VerifiedCalendarCoverageV1.require_current
     to_dict = VerifiedCalendarCoverageV1.to_dict
-    require = _require_calendar_coverage
 
-    def authority():
-        return proof_type, require_current, to_dict, require
+    def calendar_proof_authority():
+        return proof_type, require_current, to_dict, require_calendar
 
-    return authority
+    installed = False
+
+    def install_market_owner():
+        nonlocal installed
+        if installed:
+            raise RuntimeError("market proof owner is already installed")
+        installed = True
+        return mint_calendar, mint_window
+
+    return (VerifiedCalendarCoverageV1, VerifiedMarketWindowV1,
+            calendar_proof_authority, install_market_owner)
 
 
-_calendar_proof_authority = _make_calendar_proof_authority()
-del _make_calendar_proof_authority
+(VerifiedCalendarCoverageV1, VerifiedMarketWindowV1,
+ _calendar_proof_authority, _install_market_proof_owner) = _build_proof_types()
+del _build_proof_types
 
 
 # Deliberately after proof ownership: this order completes the circular module
@@ -257,17 +253,28 @@ def evaluate_window(trading_days: tuple[str, ...], daily_rows: dict[str, dict]) 
 
     days = trading_days[-250:]
     effective = {}
-    conflict = False
+    unresolved = {}
     for day in days:
         row = daily_rows.get(day)
         if row is None:
             effective[day] = None
+            unresolved[day] = "market_coverage_missing"
             continue
         if type(row) is not dict or row.get("coverage") not in {"covered", "missing", "domain_conflict"}:
             raise ValueError("daily coverage state is invalid")
         if row["coverage"] != "covered":
+            if row["coverage"] == "domain_conflict":
+                if (set(row) != {"coverage", "reason"} or type(row["reason"]) is not str
+                        or not row["reason"] or row["reason"] != row["reason"].strip()):
+                    raise ValueError("domain conflict row shape is invalid")
+                unresolved[day] = "market_domain_conflict"
+            else:
+                if (set(row) not in ({"coverage"}, {"coverage", "reason"})
+                        or ("reason" in row and row["reason"] not in {
+                            "market_coverage_missing", "visibility_unproven"})):
+                    raise ValueError("missing market row shape is invalid")
+                unresolved[day] = row.get("reason", "market_coverage_missing")
             effective[day] = None
-            conflict = conflict or row["coverage"] == "domain_conflict"
             continue
         required = {"coverage", "exchange_allows_trading", "volume", "turnover", "close"}
         if set(row) != required or type(row["exchange_allows_trading"]) is not bool:
@@ -296,7 +303,7 @@ def evaluate_window(trading_days: tuple[str, ...], daily_rows: dict[str, dict]) 
     for stale, day in enumerate(reversed(days)):
         active = effective[day]
         if active is None:
-            pending.append("market_domain_conflict" if conflict else "market_coverage_missing")
+            pending.append(unresolved[day])
             return result
         if active:
             close = daily_rows[day]["close"]
@@ -345,9 +352,10 @@ def _visible(container, as_of):
     if container["published_precision"] == "timestamp":
         effective = _aware(container["effective_at_utc"], "effective_at_utc")
         return effective <= as_of
-    effective = container["effective_at_utc"]
-    evidence = container["effective_time_evidence_hash"]
-    return effective is not None and evidence is not None and _aware(effective, "effective_at_utc") <= as_of
+    # A date-only pair is only a reference to possible temporal evidence.  W1
+    # owns no authenticated resolver for that reference, so syntax alone never
+    # upgrades it to freeze-visible evidence.
+    return False
 
 
 def _dates_between(start, end):
@@ -358,7 +366,7 @@ def _dates_between(start, end):
         cursor += timedelta(days=1)
 
 
-class FormalPolicyMarketRepository:
+class _MarketRepositoryImplementation:
     def __init__(self, range_store):
         if type(range_store) is not FormalRangeStore:
             raise ValueError("market repository requires an exact FormalRangeStore")
@@ -375,7 +383,7 @@ class FormalPolicyMarketRepository:
             request = source.next_page(observation)
         return tuple(observations), None
 
-    def select_calendar(self, binding, as_of_utc) -> CalendarSelection:
+    def select_calendar(self, binding, as_of_utc, *, _mint_calendar) -> CalendarSelection:
         if type(binding) is not _binding_type:
             raise ValueError("calendar selection requires a genuine range binding")
         as_of = _aware(as_of_utc, "calendar as_of_utc")
@@ -415,26 +423,41 @@ class FormalPolicyMarketRepository:
 
         documents = []
         coverage_ranges = []
+        coverage_generations = []
         request_ranges = []
         rows = []
         for group_request, group in groups:
-            group_documents = [item.to_dict()["document"] for item in group]
+            group_wires = [item.to_dict() for item in group]
+            group_documents = [item["document"] for item in group_wires]
             first = group_documents[0]
             count = first["page_count"]
+            generation_pairs = {
+                (document["upstream_generation"], item["generation"]["refresh_generation"])
+                for item, document in zip(group_wires, group_documents)
+            }
             if (len(group_documents) != count
                     or [item["page_index"] for item in group_documents] != list(range(1, count + 1))
                     or any(item["record_count"] != first["record_count"]
                            or item["coverage"] != first["coverage"]
                            or item["upstream_generation"] != first["upstream_generation"]
                            for item in group_documents)
+                    or len(generation_pairs) != 1
                     or sum(item["page_record_count"] for item in group_documents) != first["record_count"]
                     or not first["coverage"]["complete"]):
                 raise ValueError("calendar page group is incomplete or inconsistent")
             documents.extend(group_documents)
             rows.extend(row for document in group_documents for row in document["rows"])
             coverage_ranges.append(first["coverage"])
+            coverage_generations.append(next(iter(generation_pairs)))
             request_ranges.append({"start_date": group_request.start_date,
                                    "end_date": group_request.end_date})
+        if len(set(coverage_generations)) != 1:
+            raise ValueError("calendar coverage generations cannot be spliced")
+        ordered_coverage = sorted(coverage_ranges, key=lambda item: item["start_date"])
+        if any(_iso_date(left["end_date"], "coverage end") + timedelta(days=1)
+               != _iso_date(right["start_date"], "coverage start")
+               for left, right in zip(ordered_coverage, ordered_coverage[1:])):
+            raise ValueError("calendar coverage intervals must be adjacent")
         expected_fields = {"date", "is_open", "published_at_utc", "published_precision",
             "effective_at_utc", "effective_time_evidence_hash", "captured_at_utc"}
         by_date = {}
@@ -500,15 +523,18 @@ class FormalPolicyMarketRepository:
             "observations": [item.to_dict() for item in observations],
             "upstream_generations": sorted({item["upstream_generation"] for item in documents}),
         }
+        expected_proof_wire = dict(wire,
+            coverage_hash=hashlib.sha256(canonical_bytes(wire)).hexdigest())
         def recheck():
-            _read_binding(owned_binding)
-            for item in observations:
-                item.require_current()
-        proof = _mint_calendar_coverage(wire, owned_binding, recheck)
+            current = self.select_calendar(owned_binding, as_of_utc)
+            if (current.coverage is None
+                    or current.coverage.canonical_bytes() != canonical_bytes(expected_proof_wire)):
+                raise ValueError("calendar coverage selection changed")
+        proof = _mint_calendar(wire, owned_binding, recheck)
         selection_hash = hashlib.sha256(proof.canonical_bytes()).hexdigest()
         return CalendarSelection(proof, (), lineage, selection_hash, proof.require_current)
 
-    def select(self, security_id, as_of_utc, *, binding) -> MarketSelection:
+    def select(self, security_id, as_of_utc, *, binding, _mint_window) -> MarketSelection:
         if type(security_id) is not str or _SECURITY.fullmatch(security_id) is None:
             raise ValueError("market selection security_id is invalid")
         owned_binding, source = self._store.resolve_planning_binding(binding)
@@ -516,20 +542,20 @@ class FormalPolicyMarketRepository:
         if calendar.coverage is None:
             return MarketSelection(None, calendar.pending, calendar.lineage,
                 calendar.selection_hash, calendar.recheck)
-        coverage_payload = _require_calendar_coverage(calendar.coverage, binding=owned_binding)
+        coverage_payload = calendar.coverage.to_dict()
         days = tuple(coverage_payload["trading_days"])[-250:]
         requests = source.market_requests(security_id, calendar_coverage=calendar.coverage)
         observations = []
-        missing_dates = set()
+        missing_reasons = {}
         rows = {}
-        pending = set()
+        seen_dates = set()
         for request in requests:
             group, missing = self._page_group(source, request)
             observations.extend(group)
             requested_days = {day for day in days if request.start_date <= day <= request.end_date}
             if missing is not None:
-                missing_dates.update(requested_days)
-                pending.add("market_coverage_missing")
+                for day in requested_days:
+                    missing_reasons.setdefault(day, "market_coverage_missing")
                 continue
             documents = [item.to_dict()["document"] for item in group]
             first = documents[0]
@@ -542,41 +568,59 @@ class FormalPolicyMarketRepository:
                 raise ValueError("market page group is incomplete or inconsistent")
             for observation, document in zip(group, documents):
                 if not _visible(document, _aware(as_of_utc, "market as_of_utc")):
-                    pending.add("visibility_unproven")
-                    missing_dates.update(requested_days)
+                    for day in requested_days:
+                        missing_reasons[day] = "visibility_unproven"
                     continue
                 for raw in document["rows"]:
+                    visibility = {"published_at_utc", "published_precision", "effective_at_utc",
+                                  "effective_time_evidence_hash", "captured_at_utc"}
                     expected = {"date", "exchange_allows_trading", "volume", "volume_unit",
                         "turnover", "turnover_unit", "close", "close_unit", "published_at_utc",
                         "published_precision", "effective_at_utc", "effective_time_evidence_hash",
                         "captured_at_utc"}
-                    if type(raw) is not dict or set(raw) != expected:
+                    conflict = {"date", "coverage", "reason"} | visibility
+                    if type(raw) is not dict or set(raw) not in (expected, conflict):
                         raise ValueError("market row shape is invalid")
                     day = _iso_date(raw["date"], "market row date").isoformat()
-                    if day not in requested_days or day in rows:
+                    if day not in requested_days or day in seen_dates:
                         raise ValueError("market row date is duplicate or outside required trading days")
-                    if (raw["volume_unit"] != "shares" or raw["turnover_unit"] != "CNY"
-                            or raw["close_unit"] != "CNY_per_share"):
-                        raise ValueError("market normalized units differ from signed contract")
+                    seen_dates.add(day)
                     if not _visible(raw, _aware(as_of_utc, "market as_of_utc")):
-                        pending.add("visibility_unproven")
+                        missing_reasons[day] = "visibility_unproven"
                         continue
-                    rows[day] = {"coverage": "covered", "exchange_allows_trading": raw["exchange_allows_trading"],
-                        "volume": raw["volume"], "turnover": raw["turnover"], "close": raw["close"],
-                        "observation_hash": observation.observation_hash}
-            missing_dates.update(requested_days - set(rows))
+                    if set(raw) == conflict:
+                        if (raw["coverage"] != "domain_conflict"
+                                or type(raw["reason"]) is not str or not raw["reason"]
+                                or raw["reason"] != raw["reason"].strip()):
+                            raise ValueError("market domain conflict row is invalid")
+                        rows[day] = {"coverage": "domain_conflict", "reason": raw["reason"],
+                                     "observation_hash": observation.observation_hash}
+                    else:
+                        if (raw["volume_unit"] != "shares" or raw["turnover_unit"] != "CNY"
+                                or raw["close_unit"] != "CNY_per_share"):
+                            raise ValueError("market normalized units differ from signed contract")
+                        rows[day] = {"coverage": "covered", "exchange_allows_trading": raw["exchange_allows_trading"],
+                            "volume": raw["volume"], "turnover": raw["turnover"], "close": raw["close"],
+                            "observation_hash": observation.observation_hash}
+            for day in requested_days - set(rows):
+                missing_reasons.setdefault(day, "market_coverage_missing")
         algorithm_rows = {}
         daily_records = []
         for day in days:
-            if day in rows and day not in missing_dates:
-                algorithm_rows[day] = {key: rows[day][key] for key in
-                    ("coverage", "exchange_allows_trading", "volume", "turnover", "close")}
+            if day in rows and day not in missing_reasons:
+                if rows[day]["coverage"] == "domain_conflict":
+                    algorithm_rows[day] = {key: rows[day][key]
+                                           for key in ("coverage", "reason")}
+                else:
+                    algorithm_rows[day] = {key: rows[day][key] for key in
+                        ("coverage", "exchange_allows_trading", "volume", "turnover", "close")}
                 daily_records.append(dict(date=day, **rows[day]))
             else:
-                algorithm_rows[day] = {"coverage": "missing"}
-                daily_records.append({"date": day, "coverage": "missing"})
+                reason = missing_reasons.get(day, "market_coverage_missing")
+                algorithm_rows[day] = {"coverage": "missing", "reason": reason}
+                daily_records.append({"date": day, "coverage": "missing", "reason": reason})
         result = evaluate_window(days, algorithm_rows)
-        pending.update(result["pending"])
+        pending = set(result["pending"])
         lineage = tuple(item.observation_hash for item in observations)
         market_config = _read_binding(owned_binding)["market_config"]
         calendar_config = _read_binding(owned_binding)["calendar_config"]
@@ -609,14 +653,37 @@ class FormalPolicyMarketRepository:
                                              "stale_at_least", "veto_state")},
             "pending": sorted(pending),
         }
+        expected_window_wire = dict(wire,
+            window_hash=hashlib.sha256(canonical_bytes(wire)).hexdigest())
         def recheck():
-            calendar.coverage.require_current()
-            _read_binding(owned_binding)
-            for item in observations:
-                item.require_current()
-        window = _mint_market_window(wire, owned_binding, recheck)
+            current = self.select(security_id, as_of_utc, binding=owned_binding)
+            if (current.window is None
+                    or current.window.canonical_bytes() != canonical_bytes(expected_window_wire)):
+                raise ValueError("market window selection changed")
+        window = _mint_window(wire, owned_binding, recheck)
         return MarketSelection(window, tuple(sorted(pending)), lineage,
             hashlib.sha256(window.canonical_bytes()).hexdigest(), window.require_current)
+
+
+def _build_market_repository_type(mint_calendar, mint_window):
+    class FormalPolicyMarketRepository(_MarketRepositoryImplementation):
+        def select_calendar(self, binding, as_of_utc) -> CalendarSelection:
+            return _MarketRepositoryImplementation.select_calendar(
+                self, binding, as_of_utc, _mint_calendar=mint_calendar)
+
+        def select(self, security_id, as_of_utc, *, binding) -> MarketSelection:
+            return _MarketRepositoryImplementation.select(
+                self, security_id, as_of_utc, binding=binding,
+                _mint_window=mint_window)
+
+    return FormalPolicyMarketRepository
+
+
+(_calendar_owner_mint, _window_owner_mint) = _install_market_proof_owner()
+FormalPolicyMarketRepository = _build_market_repository_type(
+    _calendar_owner_mint, _window_owner_mint)
+del _calendar_owner_mint, _window_owner_mint
+del _install_market_proof_owner, _build_market_repository_type
 
 
 def plan_next_window_request(security_id, as_of_utc, *, binding, range_store):
@@ -635,7 +702,9 @@ def plan_next_window_request(security_id, as_of_utc, *, binding, range_store):
         successor = source.next_page(page)
     calendar = repository.select_calendar(owned_binding, as_of_utc)
     if calendar.coverage is None:
-        return first_calendar
+        # A verified first group whose content cannot form coverage needs a new
+        # source generation or temporal evidence, not the identical request.
+        return None
     requests = source.market_requests(security_id, calendar_coverage=calendar.coverage)
     for request in requests:
         observation = range_store.select_current(request.request_fingerprint)
@@ -652,9 +721,10 @@ def plan_next_window_request(security_id, as_of_utc, *, binding, range_store):
         return None
     if selection.window.price_state != "incomplete":
         return None
-    if selection.window.price_state == "incomplete" and len(selection.window.required_trading_days) < 250:
-        observations = _calendar_record(calendar.coverage)
-        payload = observations.wire
+    if (selection.window.price_state == "incomplete"
+            and len(selection.window.required_trading_days) < 250
+            and tuple(selection.window.pending) == ("calendar_coverage_missing",)):
+        payload = calendar.coverage.to_dict()
         last = payload["observations"][-1]
         oldest = range_store.read_verified(last["task"]["id"])
         return source.previous_calendar_request(oldest)

@@ -233,15 +233,29 @@ class RangeSourceFixture:
         self.transport = _CapturingRangeTransport()
         self.parser = _JsonRangeParser()
         self.normalizer = _IdentityRangeNormalizer()
-        config = self.binding.calendar_config
-        key = (
-            config.parser_id,
-            config.parser_version,
-            config.mapping_version,
-            config.normalizer_version,
-            config.request_version,
+        calendar_config = self.binding.calendar_config
+        market_config = self.binding.market_config
+        calendar_key = (
+            calendar_config.parser_id,
+            calendar_config.parser_version,
+            calendar_config.mapping_version,
+            calendar_config.normalizer_version,
+            calendar_config.request_version,
         )
-        registry = {key: (self.parser, self.normalizer)}
+        market_key = (
+            market_config.parser_id,
+            market_config.parser_version,
+            market_config.mapping_version,
+            market_config.normalizer_version,
+            market_config.request_version,
+        )
+        self.market_parser = self.parser if market_key == calendar_key else _JsonRangeParser()
+        self.market_normalizer = (self.normalizer if market_key == calendar_key
+                                  else _IdentityRangeNormalizer())
+        registry = {
+            calendar_key: (self.parser, self.normalizer),
+            market_key: (self.market_parser, self.market_normalizer),
+        }
         if implementations is not None:
             registry = implementations
         self.implementations = registry
@@ -313,6 +327,10 @@ class RangeStoreFixture(RangeSourceFixture):
                     return tuple(observations)
                 wire = document_wire(request, rows=pages[index - 1], record_count=len(rows), page_record_count=len(pages[index - 1]),
                     page_count=count, page_index=index,
+                    parser_id=config.parser_id, parser_version=config.parser_version,
+                    mapping_version=config.mapping_version,
+                    normalizer_version=config.normalizer_version,
+                    request_version=config.request_version,
                     pagination_evidence="signed_single_response_v1" if count == 1 and config.pagination == "single_response_v1" else "source_declared_numbered_pages_v1",
                     coverage=dict(start_date=request.start_date, end_date=request.end_date, complete=bool(rows)))
                 self.reply(wire)
@@ -339,11 +357,15 @@ class RangeStoreFixture(RangeSourceFixture):
                 or tuple(sorted(set(trading_days))) != trading_days
                 or type(rows) is not dict or not set(rows) <= set(trading_days)):
             raise ValueError("fixture market window inputs are invalid")
-        forbidden = {"coverage", "stale_days", "veto", "confirmed_no_price"}
+        forbidden = {"stale_days", "veto", "confirmed_no_price"}
         expected = {"exchange_allows_trading", "volume", "turnover", "close"}
-        if any(type(value) is not dict or set(value) != expected or forbidden & set(value)
+        conflict = {"coverage", "reason"}
+        if any(type(value) is not dict or set(value) not in (expected, conflict)
+               or forbidden & set(value)
+               or (set(value) == conflict and (value["coverage"] != "domain_conflict"
+                   or type(value["reason"]) is not str or not value["reason"]))
                for value in rows.values()):
-            raise ValueError("fixture rows must contain only raw market operands")
+            raise ValueError("fixture rows must contain raw market operands or a typed domain conflict")
         missing_calendar_dates = tuple(missing_calendar_dates)
         omit_pages = tuple(omit_pages)
         if any(type(item) is not str for item in (*missing_calendar_dates,)) or any(
@@ -388,22 +410,31 @@ class RangeStoreFixture(RangeSourceFixture):
                 market_rows = []
                 base = document_wire(current)["rows"][0]
                 for day, raw in pages[index - 1]:
-                    market_rows.append({
-                        "date": day,
-                        "exchange_allows_trading": raw["exchange_allows_trading"],
-                        "volume": raw["volume"],
-                        "volume_unit": "shares",
-                        "turnover": raw["turnover"],
-                        "turnover_unit": "CNY",
-                        "close": dict(raw["close"]),
-                        "close_unit": "CNY_per_share",
-                        **{key: base[key] for key in (
-                            "published_at_utc", "published_precision", "effective_at_utc",
-                            "effective_time_evidence_hash", "captured_at_utc")},
-                    })
+                    visibility = {key: base[key] for key in (
+                        "published_at_utc", "published_precision", "effective_at_utc",
+                        "effective_time_evidence_hash", "captured_at_utc")}
+                    if raw.get("coverage") == "domain_conflict":
+                        market_rows.append({"date": day, "coverage": "domain_conflict",
+                                            "reason": raw["reason"], **visibility})
+                    else:
+                        market_rows.append({
+                            "date": day,
+                            "exchange_allows_trading": raw["exchange_allows_trading"],
+                            "volume": raw["volume"],
+                            "volume_unit": "shares",
+                            "turnover": raw["turnover"],
+                            "turnover_unit": "CNY",
+                            "close": dict(raw["close"]),
+                            "close_unit": "CNY_per_share",
+                            **visibility,
+                        })
                 wire = document_wire(current, rows=market_rows, record_count=len(selected),
                     page_record_count=len(market_rows), page_count=count, page_index=index,
                     upstream_generation=f"fixture-market-{generation}",
+                    parser_id=config.parser_id, parser_version=config.parser_version,
+                    mapping_version=config.mapping_version,
+                    normalizer_version=config.normalizer_version,
+                    request_version=config.request_version,
                     pagination_evidence="signed_single_response_v1" if count == 1 and config.pagination == "single_response_v1" else "source_declared_numbered_pages_v1",
                     coverage={"start_date": current.start_date, "end_date": current.end_date,
                               "complete": bool(market_rows)})

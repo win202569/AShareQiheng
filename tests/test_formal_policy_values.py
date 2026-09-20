@@ -107,9 +107,27 @@ class PolicyValueTests(unittest.TestCase):
             {**market["value"], "stale_days": True},
             {**market["value"], "veto_state": "maybe"},
             {**market["value"], "extra": None},
+            {**market["value"], "pending": ["market_coverage_missing"]},
+            {**market["value"], "stale_days": 20, "veto_state": "clear"},
+            {"price_state": "confirmed_no_price_250", "price": None,
+             "price_date": None, "stale_days": None, "stale_at_least": 250,
+             "veto_state": "proven", "pending": []},
+            {"price_state": "incomplete", "price": None, "price_date": None,
+             "stale_days": None, "stale_at_least": None,
+             "veto_state": "pending", "pending": []},
         ):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 PolicyValue.from_dict({**market, "value": bad})
+
+        no_price = {"price_state": "confirmed_no_price_250", "price": None,
+            "price_date": None, "stale_days": None, "stale_at_least": 250,
+            "veto_state": "proven", "pending": ["market_evidence_missing"]}
+        incomplete = {"price_state": "incomplete", "price": None,
+            "price_date": None, "stale_days": None, "stale_at_least": None,
+            "veto_state": "pending", "pending": ["market_coverage_missing"]}
+        for accepted in (no_price, incomplete):
+            self.assertEqual(PolicyValue.from_dict(
+                {**market, "value": accepted}).to_dict()["value"], accepted)
 
     def test_scalar_values_use_exact_types_and_normalize_evidence_hashes(self):
         decimal_value = PolicyValue.from_dict(value_wire())

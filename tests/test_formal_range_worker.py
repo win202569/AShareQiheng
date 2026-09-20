@@ -32,7 +32,8 @@ class FormalRangeWorkerTests(unittest.TestCase):
         def distinct(documents):
             market = next(item for item in documents["source"]["range_configs"]
                           if item["kind"] == "market_range" and item["exchange_scope"] == "SH")
-            market.update(retry_max_attempts=1, retry_base_seconds=7.0,
+            market.update(pagination="numbered_pages_v1", max_pages=2,
+                          retry_max_attempts=2, retry_base_seconds=7.0,
                           challenge_cooldown_seconds=23.0)
 
         fixture = self.fixture(mutate=distinct)
@@ -47,13 +48,44 @@ class FormalRangeWorkerTests(unittest.TestCase):
             fixture.binding, "2026-08-31T07:00:00+00:00")
         _, source = fixture.range_store.resolve_planning_binding(fixture.binding)
         request = source.market_requests("SH600000", calendar_coverage=calendar.coverage)[0]
-        fixture.range_store.enqueue(request, refresh_generation="g-market")
+        config = source.range_config(request)
+        self.assertEqual(config.max_pages, 2)
+        self.assertEqual(config.challenge_cooldown_seconds, 23.0)
+
+        first_row = document_wire(request)["rows"][0]
+        first_row["date"] = request.start_date
+        fixture.reply(document_wire(request, rows=[first_row], page_count=2,
+            record_count=2, page_record_count=1,
+            pagination_evidence="source_declared_numbered_pages_v1"),
+            original_url="https://www.cninfo.com.cn/fixture/range-market.json")
+        first = fixture.worker.run_once()
+        self.assertEqual(first["state"], "verified")
+        self.assertIsNotNone(first["next_task_id"])
+        page_one = fixture.range_store.select_current(request.request_fingerprint)
+        page_two = source.next_page(page_one)
+        second_row = document_wire(page_two)["rows"][0]
+        second_row["date"] = request.end_date
+        fixture.reply(document_wire(page_two, rows=[second_row], page_index=2, page_count=2,
+            record_count=2, page_record_count=1,
+            pagination_evidence="source_declared_numbered_pages_v1"),
+            original_url="https://www.cninfo.com.cn/fixture/range-market.json")
+        second = fixture.worker.run_once()
+        self.assertEqual(second["state"], "verified")
+        self.assertIsNone(second["next_task_id"])
+
+        retry_request = source.market_requests(
+            "SH600001", calendar_coverage=calendar.coverage)[0]
+        fixture.range_store.enqueue(retry_request, refresh_generation="g-retry")
         fixture.transport.error = FormalSourceBlocked("blocked")
-        with patch("ashare_pipeline.formal_range_store._utc_now", return_value=NOW), \
-                patch("ashare_pipeline.formal_range_worker._utc_now", return_value=NOW):
-            result = fixture.worker.run_once()
-        self.assertEqual(result["state"], "terminal_failed")
-        self.assertIsNone(result["next_retry_at"])
+        result = fixture.worker.run_once()
+        self.assertEqual(result["state"], "retryable_failed")
+        self.assertEqual(result["next_retry_at"], "2026-09-01T00:00:23+00:00")
+        later = "2026-09-01T00:00:23+00:00"
+        with patch("ashare_pipeline.formal_range_store._utc_now", return_value=later), \
+                patch("ashare_pipeline.formal_range_worker._utc_now", return_value=later):
+            terminal = fixture.worker.run_once()
+        self.assertEqual(terminal["state"], "terminal_failed")
+        self.assertIsNone(terminal["next_retry_at"])
 
     def fixture(self, **kwargs):
         self.assertTrue(hasattr(formal_range_fixtures, "RangeWorkerFixture"),
