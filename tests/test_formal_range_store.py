@@ -16,6 +16,29 @@ NOW = "2026-09-01T00:00:00+00:00"
 
 
 class FormalRangeStoreTests(unittest.TestCase):
+    def test_planning_resolution_uses_owning_store_graph_and_reconstructed_binding(self):
+        from tests.formal_range_fixtures import RangeStoreFixture
+        fixture = RangeStoreFixture()
+        self.addCleanup(fixture.close)
+        binding, source = fixture.range_store.resolve_planning_binding(fixture.binding)
+        self.assertIsNot(binding, fixture.binding)
+        self.assertEqual(binding.binding_hash, fixture.binding.binding_hash)
+        self.assertIs(source._binding, binding)
+        second_binding, second_source = fixture.range_store.resolve_planning_binding(binding)
+        self.assertIs(second_binding, binding)
+        self.assertIs(second_source, source)
+
+    def test_planning_resolution_rejects_genuine_binding_from_absent_store_root(self):
+        from tests.formal_range_fixtures import RangeStoreFixture
+        fixture = RangeStoreFixture()
+        def other_root(documents):
+            documents["event"]["rules"]["event"]["evidence_kind"] = "fixture-event-v2"
+        other = RangeStoreFixture(mutate=other_root)
+        self.addCleanup(fixture.close)
+        self.addCleanup(other.close)
+        with self.assertRaises(ValueError):
+            fixture.range_store.resolve_planning_binding(other.binding)
+
     def test_writer_lock_wait_cannot_extend_expired_lease_or_retry_deadline(self):
         for operation in ("renew", "fail", "retry_deadline"):
             with self.subTest(operation=operation):

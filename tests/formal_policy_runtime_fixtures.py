@@ -158,6 +158,29 @@ class PolicyRuntimeFixture(FinancialFixture):
                 scoring_registry=self.scoring,
                 feature_registry=self.vocabulary,
             )
+            if range_enabled:
+                from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+                from ashare_pipeline.formal_range_source import FormalRangeSource
+                from ashare_pipeline.formal_range_store import FormalRangeStore
+                from tests.formal_range_fixtures import (
+                    _CapturingRangeTransport, _IdentityRangeNormalizer, _JsonRangeParser,
+                )
+                bindings = load_policy_range_bindings(self.bundle,
+                    scoring_registry=self.scoring, policy_registry=self.policy_registry)
+                self.binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+                self.transport = _CapturingRangeTransport()
+                self.parser = _JsonRangeParser()
+                self.normalizer = _IdentityRangeNormalizer()
+                self.implementations = {}
+                for range_config in (self.binding.calendar_config, self.binding.market_config):
+                    key = (range_config.parser_id, range_config.parser_version,
+                           range_config.mapping_version, range_config.normalizer_version,
+                           range_config.request_version)
+                    self.implementations[key] = (self.parser, self.normalizer)
+                self.source = FormalRangeSource(self.binding, transport=self.transport,
+                                                implementations=self.implementations)
+                self.range_store = FormalRangeStore(self.store, root=self.root / "range_raw",
+                    signature_verifier=self.verifier, source_factory=self.source_factory)
         except Exception:
             if hasattr(self, "tempdir"):
                 self.tempdir.cleanup()
@@ -168,6 +191,23 @@ class PolicyRuntimeFixture(FinancialFixture):
             current_input_provider=self.provider)
         self._policy_industry_ids = set()
         self._policy_context_generations = {}
+
+    def source_factory(self, binding):
+        from ashare_pipeline.formal_range_source import FormalRangeSource
+        return FormalRangeSource(binding, transport=self.transport,
+                                 implementations=self.implementations)
+
+    def reply(self, *args, **kwargs):
+        from tests.formal_range_fixtures import RangeSourceFixture
+        return RangeSourceFixture.reply(self, *args, **kwargs)
+
+    def produce_calendar(self, *args, **kwargs):
+        from tests.formal_range_fixtures import RangeStoreFixture
+        return RangeStoreFixture.produce_calendar(self, *args, **kwargs)
+
+    def put_window(self, *args, **kwargs):
+        from tests.formal_range_fixtures import RangeStoreFixture
+        return RangeStoreFixture.put_window(self, *args, **kwargs)
 
     def put_policy_context(self, security_id, kind, value, *, generation="g1"):
         """Persist only this temporary graph's signed Context producer chain."""

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from datetime import date, timedelta
 from pathlib import Path
 import tempfile
 
@@ -297,9 +298,10 @@ class RangeStoreFixture(RangeSourceFixture):
         observations = []
         while request is not None:
             rows = []
+            base_row = document_wire(request)["rows"][0]
             for day, opened in sorted(days.items()):
                 if request.start_date <= day <= request.end_date:
-                    row = dict(document_wire(request)["rows"][0], date=day, is_open=opened)
+                    row = dict(base_row, date=day, is_open=opened)
                     rows.append(row)
             config = self.binding.calendar_config
             count = min(config.max_pages, max(1, len(rows))) if config.pagination != "single_response_v1" else 1
@@ -327,6 +329,95 @@ class RangeStoreFixture(RangeSourceFixture):
             if request.start_date <= min(days):
                 break
             request = self.source.previous_calendar_request(last)
+        return tuple(observations)
+
+    def put_window(self, security_id, *, trading_days, rows, generation="g1",
+                   missing_calendar_dates=(), omit_pages=()):
+        """Persist a genuine explicit calendar and raw daily market rows."""
+        if (type(security_id) is not str or not security_id.startswith("SH")
+                or type(trading_days) is not tuple or not trading_days
+                or tuple(sorted(set(trading_days))) != trading_days
+                or type(rows) is not dict or not set(rows) <= set(trading_days)):
+            raise ValueError("fixture market window inputs are invalid")
+        forbidden = {"coverage", "stale_days", "veto", "confirmed_no_price"}
+        expected = {"exchange_allows_trading", "volume", "turnover", "close"}
+        if any(type(value) is not dict or set(value) != expected or forbidden & set(value)
+               for value in rows.values()):
+            raise ValueError("fixture rows must contain only raw market operands")
+        missing_calendar_dates = tuple(missing_calendar_dates)
+        omit_pages = tuple(omit_pages)
+        if any(type(item) is not str for item in (*missing_calendar_dates,)) or any(
+                type(item) is not int or item <= 0 for item in omit_pages):
+            raise ValueError("fixture omissions are invalid")
+
+        first_request = self.source.first_calendar_request("2026-08-31T07:00:00+00:00")
+        start = date.fromisoformat(first_request.start_date)
+        end = date.fromisoformat(first_request.end_date)
+        explicit = {}
+        cursor = start
+        trading = set(trading_days)
+        missing_calendar = set(missing_calendar_dates)
+        while cursor <= end:
+            text = cursor.isoformat()
+            if text not in missing_calendar:
+                explicit[text] = text in trading
+            cursor += timedelta(days=1)
+        self.produce_calendar(days=explicit, generation=generation)
+
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        from tests.test_formal_range_source import document_wire
+        repository = FormalPolicyMarketRepository(self.range_store)
+        calendar = repository.select_calendar(self.binding, "2026-08-31T07:00:00+00:00")
+        if calendar.coverage is None:
+            return ()
+        _, source = self.range_store.resolve_planning_binding(self.binding)
+        requests = source.market_requests(security_id, calendar_coverage=calendar.coverage)
+        observations = []
+        for request in requests:
+            config = source.range_config(request)
+            selected = [(day, rows[day]) for day in trading_days
+                        if request.start_date <= day <= request.end_date and day in rows]
+            count = (min(config.max_pages, max(1, len(selected)))
+                     if config.pagination != "single_response_v1" else 1)
+            pages = [selected[index::count] for index in range(count)]
+            current = request
+            for index in range(1, count + 1):
+                task = self.range_store.enqueue(current, refresh_generation=generation)
+                if index in omit_pages:
+                    return tuple(observations)
+                market_rows = []
+                base = document_wire(current)["rows"][0]
+                for day, raw in pages[index - 1]:
+                    market_rows.append({
+                        "date": day,
+                        "exchange_allows_trading": raw["exchange_allows_trading"],
+                        "volume": raw["volume"],
+                        "volume_unit": "shares",
+                        "turnover": raw["turnover"],
+                        "turnover_unit": "CNY",
+                        "close": dict(raw["close"]),
+                        "close_unit": "CNY_per_share",
+                        **{key: base[key] for key in (
+                            "published_at_utc", "published_precision", "effective_at_utc",
+                            "effective_time_evidence_hash", "captured_at_utc")},
+                    })
+                wire = document_wire(current, rows=market_rows, record_count=len(selected),
+                    page_record_count=len(market_rows), page_count=count, page_index=index,
+                    upstream_generation=f"fixture-market-{generation}",
+                    pagination_evidence="signed_single_response_v1" if count == 1 and config.pagination == "single_response_v1" else "source_declared_numbered_pages_v1",
+                    coverage={"start_date": current.start_date, "end_date": current.end_date,
+                              "complete": bool(market_rows)})
+                self.reply(wire,
+                    original_url="https://www.cninfo.com.cn/fixture/range-market.json")
+                lease = self.range_store.lease_next("fixture-market-worker", lease_seconds=3600)
+                if lease is None:
+                    observation = self.range_store.read_verified(task["id"])
+                else:
+                    observation = self.range_store.persist(task["id"], "fixture-market-worker",
+                        lease["attempt_id"], fetch=source.fetch_verified(current))
+                observations.append(observation)
+                if index < count:
+                    current = source.next_page(observation)
         return tuple(observations)
 
     def close(self):

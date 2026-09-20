@@ -2,16 +2,12 @@
 
 from datetime import datetime, timedelta, timezone
 
-from .formal_range_contract import _range_binding_authority
 from .formal_range_source import (
     FormalRangeAcquisitionError,
     FormalRangeSource,
     range_request_binding,
 )
 from .formal_sources import FormalRetryableSourceError, FormalSourceBlocked
-
-
-_, _require_binding, _calendar_config, _, _ = _range_binding_authority()
 
 
 def _utc_now():
@@ -39,11 +35,10 @@ class FormalRangeWorker:
 
     def _source(self, request):
         binding = range_request_binding(request)
-        _require_binding(binding)
         source = self.source_factory(binding)
         if type(source) is not FormalRangeSource:
             raise ValueError("range worker requires a genuine range source")
-        return source, _calendar_config(binding)
+        return source, source.range_config(request)
 
     def _failure(self, lease, config, *, code, retryable, blocked=False):
         retryable = retryable and lease["attempt_no"] < config.retry_max_attempts

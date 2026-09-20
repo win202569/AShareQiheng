@@ -503,10 +503,25 @@ def _build_range_bindings_contract():
         )
         return result
 
-    return RangeBinding, RangeBindings, load_policy_range_bindings
+    def read_planning_binding(value: object) -> Mapping[str, object]:
+        """Read a current binding through the original owner's sealed records."""
+        child = _binding_record(value, current=True)
+        parent = _bindings_record(child.parent())
+        return MappingProxyType({
+            "market_config": child.market_config,
+            "calendar_config": child.calendar_config,
+            "registry_manifest_hash": parent.root_hash,
+            "source_registry_hash": parent.role_hashes["source"],
+            "binding_hash": child.binding_hash,
+            "rule_id": child.key[0],
+            "exchange": child.key[1],
+        })
+
+    return RangeBinding, RangeBindings, load_policy_range_bindings, read_planning_binding
 
 
-RangeBinding, RangeBindings, load_policy_range_bindings = _build_range_bindings_contract()
+(RangeBinding, RangeBindings, load_policy_range_bindings,
+ _read_range_binding_planning) = _build_range_bindings_contract()
 del _build_range_bindings_contract
 
 
@@ -535,6 +550,21 @@ def _make_range_binding_authority():
 
 _range_binding_authority = _make_range_binding_authority()
 del _make_range_binding_authority
+
+
+def _make_range_binding_planning_authority():
+    """Expose the original type and owner reader, without changing legacy anchors."""
+    binding_type = RangeBinding
+    read = _read_range_binding_planning
+
+    def authority():
+        return binding_type, read
+
+    return authority
+
+
+_range_binding_planning_authority = _make_range_binding_planning_authority()
+del _make_range_binding_planning_authority, _read_range_binding_planning
 
 
 __all__ = [

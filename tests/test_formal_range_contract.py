@@ -21,6 +21,27 @@ from tests.test_formal_sources import config
 
 
 class FormalRangeContractTests(unittest.TestCase):
+    def test_legacy_and_planning_binding_authorities_are_separate_and_owner_read(self):
+        from unittest.mock import patch
+        from ashare_pipeline import formal_range_contract as contract
+        from tests.formal_range_fixtures import RangeSourceFixture
+
+        fixture = RangeSourceFixture()
+        self.addCleanup(fixture.close)
+        expected_market = fixture.binding.market_config
+        expected_hash = fixture.binding.binding_hash
+        self.assertEqual(len(contract._range_binding_authority()), 5)
+        planning = contract._range_binding_planning_authority()
+        self.assertEqual(len(planning), 2)
+        binding_type, read = planning
+        with patch.object(binding_type, "market_config", property(lambda _self: object())), \
+                patch.object(binding_type, "binding_hash", property(lambda _self: "0" * 64)):
+            identity = read(fixture.binding)
+        self.assertIs(identity["market_config"], expected_market)
+        self.assertEqual(identity["binding_hash"], expected_hash)
+        self.assertEqual(identity["rule_id"], "bank_no_effective_trade_20d")
+        self.assertEqual(identity["exchange"], "SH")
+
     def _registry(self, wire):
         verifier = HmacVerifier()
         raw = canonical(wire)

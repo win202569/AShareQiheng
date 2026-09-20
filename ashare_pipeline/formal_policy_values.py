@@ -159,6 +159,61 @@ def _event_record(value: object):
         unit=_controlled_text(value["unit"], "event unit")))
 
 
+def _calendar_record(value: object):
+    """Closed non-authoritative daily calendar DTO."""
+    if type(value) is not dict or set(value) != {"date", "is_trading_day"}:
+        raise ValueError("calendar record requires exactly date and is_trading_day")
+    day = value["date"]
+    if type(day) is not str or date.fromisoformat(day).isoformat() != day:
+        raise ValueError("calendar record date must be canonical ISO")
+    if type(value["is_trading_day"]) is not bool:
+        raise ValueError("calendar record is_trading_day must be exact bool")
+    return MappingProxyType({"date": day, "is_trading_day": value["is_trading_day"]})
+
+
+def _market_window(value: object):
+    """Closed non-authoritative result DTO; proof authority remains elsewhere."""
+    fields = {"price_state", "price", "price_date", "stale_days", "stale_at_least",
+              "veto_state", "pending"}
+    if type(value) is not dict or set(value) != fields:
+        raise ValueError("market window result has unknown or missing fields")
+    price_state = value["price_state"]
+    veto_state = value["veto_state"]
+    if price_state not in {"positive_close_complete", "confirmed_no_price_250", "incomplete"}:
+        raise ValueError("market window price_state is invalid")
+    if veto_state not in {"proven", "clear", "pending"}:
+        raise ValueError("market window veto_state is invalid")
+    pending = value["pending"]
+    if type(pending) is not list or any(type(item) is not str or item not in _RUNTIME_REASONS for item in pending):
+        raise ValueError("market window pending reasons are invalid")
+    if pending != sorted(set(pending)):
+        raise ValueError("market window pending reasons must be sorted and unique")
+    price = value["price"]
+    price_date = value["price_date"]
+    stale_days = value["stale_days"]
+    stale_at_least = value["stale_at_least"]
+    if price_state == "positive_close_complete":
+        parsed = _decimal(price)
+        if parsed <= 0 or type(price_date) is not str or date.fromisoformat(price_date).isoformat() != price_date:
+            raise ValueError("complete market price must be positive and dated")
+        if type(stale_days) is not int or stale_days < 0 or stale_days > 249 or stale_at_least is not None:
+            raise ValueError("complete market price stale fields are invalid")
+    elif price_state == "confirmed_no_price_250":
+        if price is not None or price_date is not None or stale_days is not None or stale_at_least != 250:
+            raise ValueError("confirmed no-price market shape is invalid")
+    elif any(item is not None for item in (price, price_date, stale_days, stale_at_least)):
+        raise ValueError("incomplete market price cannot carry authoritative values")
+    return MappingProxyType({
+        "price_state": price_state,
+        "price": None if price is None else parsed,
+        "price_date": price_date,
+        "stale_days": stale_days,
+        "stale_at_least": stale_at_least,
+        "veto_state": veto_state,
+        "pending": tuple(pending),
+    })
+
+
 @dataclass(frozen=True, slots=True)
 class _Pending:
     origin: str
@@ -223,9 +278,11 @@ class PolicyValue:
         if state == "value":
             if pending:
                 raise ValueError("a present policy value cannot be pending")
-            if value_type in _COMPOUND_TYPES:
-                raise ValueError("compound policy values require their closed producer validator")
-            if value_type == "event_record":
+            if value_type == "calendar_record":
+                value = _calendar_record(wire["value"])
+            elif value_type == "market_window":
+                value = _market_window(wire["value"])
+            elif value_type == "event_record":
                 value = _event_record(wire["value"])
             elif value_type == "decimal":
                 value: Decimal | bool | str | None = _decimal(wire["value"])
@@ -260,6 +317,13 @@ class PolicyValue:
         elif self.value_type == "event_record" and value is not None:
             value = dict(value)
             value["quantified_value"] = _decimal_text(value["quantified_value"])
+        elif self.value_type == "calendar_record" and value is not None:
+            value = dict(value)
+        elif self.value_type == "market_window" and value is not None:
+            value = dict(value)
+            if value["price"] is not None:
+                value["price"] = _decimal_text(value["price"])
+            value["pending"] = list(value["pending"])
         return {
             "state": self.state,
             "value": value,
@@ -277,7 +341,8 @@ def _install_value_operations():
     parse, serialize = value_type.from_dict, value_type.to_dict
     bindings = tuple((name, owner[name]) for name in (
         "PolicyValue", "_Pending", "_unit", "_identifier", "_controlled_text", "_hashes",
-        "_decimal", "_decimal_text", "_event_record", "_FIELDS", "_PENDING_FIELDS", "_STATES",
+        "_decimal", "_decimal_text", "_event_record", "_calendar_record", "_market_window",
+        "_FIELDS", "_PENDING_FIELDS", "_STATES",
         "_VALUE_TYPES", "_COMPOUND_TYPES", "_RUNTIME_REASONS", "_SHA256", "_IDENTIFIER",
         "Decimal", "date", "MappingProxyType"))
     classes = tuple((cls, dict(vars(cls)), cls.__bases__, cls.__mro__)

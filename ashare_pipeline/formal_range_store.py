@@ -91,7 +91,11 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
     from .formal_feature_contract import load_signed_feature_registry
     from .formal_scoring_registry import load_formal_registry, RegistryApproval
     from .formal_policy_registry import load_formal_policy_registry
-    from .formal_range_contract import load_policy_range_bindings
+    from .formal_range_contract import (
+        load_policy_range_bindings,
+        _range_binding_planning_authority,
+    )
+    from .formal_range_format import _canonical as canonical_range, _range_config_to_dict
 
     StateStore, transaction, insert, schema_check, connect = _range_state_store_authority()
     records = {}
@@ -109,11 +113,13 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             raise ValueError("range signature verifier changed")
         return state, root, verifier, factory, cache
 
-    def load_binding(store, payload):
+    planning_binding_type, read_planning_binding = _range_binding_planning_authority()
+
+    def load_binding_identity(store, *, registry_manifest_hash, binding_hash, exchange):
         state, _, verifier, factory, cache = record(store)
-        root_hash = payload["request"]["registry_manifest_hash"]
+        root_hash = registry_manifest_hash
         bundle = FormalRegistryBundleLoader(state, verifier).load(root_hash)
-        key = root_hash, payload.get("binding_hash")
+        key = root_hash, binding_hash, exchange
         if key not in cache:
             blob = bundle.blob("feature")
             vocabulary = load_signed_feature_registry(blob.canonical_json, blob.signature, blob.key_id,
@@ -125,8 +131,8 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             matches = []
             for rule in policy.to_dict()["rules"]:
                 if rule["kind"] == "market_liquidity":
-                    binding = bindings.for_rule(rule["rule_id"], payload["request"]["exchange"])
-                    if binding.binding_hash == payload["binding_hash"]:
+                    binding = bindings.for_rule(rule["rule_id"], exchange)
+                    if read_planning_binding(binding)["binding_hash"] == binding_hash:
                         matches.append(binding)
             if len(matches) != 1:
                 raise ValueError("range task binding absent or ambiguous")
@@ -138,6 +144,27 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
         binding.require_current()
         source_binding(source)
         return binding, source
+
+    def load_binding(store, payload):
+        request = payload["request"]
+        return load_binding_identity(
+            store,
+            registry_manifest_hash=request["registry_manifest_hash"],
+            binding_hash=payload.get("binding_hash"),
+            exchange=request["exchange"],
+        )
+
+    def planning_identity(value):
+        identity = read_planning_binding(value)
+        return {
+            "market_config": canonical_range(_range_config_to_dict(identity["market_config"])),
+            "calendar_config": canonical_range(_range_config_to_dict(identity["calendar_config"])),
+            "registry_manifest_hash": identity["registry_manifest_hash"],
+            "source_registry_hash": identity["source_registry_hash"],
+            "binding_hash": identity["binding_hash"],
+            "rule_id": identity["rule_id"],
+            "exchange": identity["exchange"],
+        }
 
     def task_payload(row):
         value = _row_payload(row)
@@ -403,6 +430,22 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             if result["status"] == "verified":
                 read(self, result["id"])
             return result
+
+        def resolve_planning_binding(self, binding):
+            if type(binding) is not planning_binding_type:
+                raise ValueError("planning requires an exact genuine range binding")
+            caller = read_planning_binding(binding)
+            reconstructed, source = load_binding_identity(
+                self,
+                registry_manifest_hash=caller["registry_manifest_hash"],
+                binding_hash=caller["binding_hash"],
+                exchange=caller["exchange"],
+            )
+            if planning_identity(binding) != planning_identity(reconstructed):
+                raise ValueError("planning binding identity differs from owning Store graph")
+            if type(source) is not source_type or source_binding(source) is not reconstructed:
+                raise ValueError("planning source factory returned a different binding")
+            return reconstructed, source
 
         def lease_next(self, worker_id, *, lease_seconds):
             state, _, _, _, _ = record(self)

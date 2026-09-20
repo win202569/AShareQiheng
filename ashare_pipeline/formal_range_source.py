@@ -140,7 +140,10 @@ from .formal_sources import (
     _https_host,
     _range_registry_authority,
 )
-from .formal_range_contract import _range_binding_authority
+from .formal_range_contract import (
+    _range_binding_authority,
+    _range_binding_planning_authority,
+)
 
 
 class FormalRangeAcquisitionError(FormalTerminalSourceError):
@@ -159,6 +162,7 @@ class FormalRangeAcquisitionError(FormalTerminalSourceError):
     _manifest_hash_get,
     _source_hash_get,
 ) = _range_binding_authority()
+(_, _read_planning_binding) = _range_binding_planning_authority()
 
 
 def _build_request_authority():
@@ -211,6 +215,13 @@ def _build_request_authority():
         def __deepcopy__(self, _memo):
             raise TypeError("formal range requests cannot be copied")
 
+    def binding_config(binding: object, kind: str) -> RangeConfig:
+        identity = _read_planning_binding(binding)
+        config = identity["calendar_config" if kind == "calendar_range" else "market_config"]
+        if type(config) is not RangeConfig or config.kind != kind:
+            raise ValueError("range binding config is invalid")
+        return config
+
     def request_record(request: object) -> _RequestRecord:
         record = records.get(id(request))
         if (
@@ -231,8 +242,7 @@ def _build_request_authority():
             or hashlib.sha256(_canonical(current)).hexdigest() != record.fingerprint
         ):
             raise ValueError("formal range request fields changed")
-        _require_range_binding(record.binding)
-        config = _calendar_config_get(record.binding)
+        config = binding_config(record.binding, record.wire["kind"])
         if (
             type(config) is not RangeConfig
             or _range_config_to_dict(config) != record.config_wire
@@ -242,8 +252,26 @@ def _build_request_authority():
             raise ValueError("formal range request binding, root, or config changed")
         return record
 
-    def mint_first_calendar(binding: object, as_of_utc: object, *, prior=None, parent=None,
-                            previous=None, mode=None) -> FormalRangeRequestV1:
+    def seal(binding, wire, config, *, previous=None, parent=None):
+        request = object.__new__(FormalRangeRequestV1)
+        for field in _REQUEST_FIELDS:
+            object.__setattr__(request, field, wire[field])
+        identity = id(request)
+
+        def forget(reference, *, identity=identity):
+            existing = records.get(identity)
+            if existing is not None and existing.reference is reference:
+                records.pop(identity, None)
+
+        fingerprint = hashlib.sha256(_canonical(wire)).hexdigest()
+        records[identity] = _RequestRecord(
+            weakref.ref(request, forget), binding, dict(wire), fingerprint,
+            _range_config_to_dict(config), _source_hash_get(binding), previous, parent,
+        )
+        request_record(request)
+        return request
+
+    def mint_first_calendar(binding: object, as_of_utc: object) -> FormalRangeRequestV1:
         if type(binding) is not RangeBinding:
             raise ValueError("range request requires an exact genuine RangeBinding")
         _require_range_binding(binding)
@@ -254,9 +282,7 @@ def _build_request_authority():
             or parsed != datetime.fromisoformat(_FREEZE_UTC)
         ):
             raise ValueError("calendar request as_of_utc must equal the formal freeze in UTC")
-        config = _calendar_config_get(binding)
-        if type(config) is not RangeConfig or config.kind != "calendar_range":
-            raise ValueError("range binding calendar config is invalid")
+        config = binding_config(binding, "calendar_range")
         start, end = backward_interval(
             parsed.date().isoformat(), config.max_calendar_days_per_request
         )
@@ -277,62 +303,89 @@ def _build_request_authority():
             "page_index": 1,
             "calendar_coverage_hash": None,
         }
-        if prior is not None:
-            old_wire, document = prior
-            if mode == "previous_calendar":
-                old_start = _date(old_wire["start_date"], "previous start")
-                if old_start == date.min:
-                    return None
-                start, end = backward_interval((old_start - timedelta(days=1)).isoformat(),
-                                               config.max_calendar_days_per_request)
-                wire.update(start_date=start, end_date=end)
-            elif mode == "next_page":
-                page = page_successor(document, config.max_pages)
-                if page is None:
-                    return None
-                wire.update(start_date=old_wire["start_date"], end_date=old_wire["end_date"], page_index=page)
-            else:
-                raise ValueError("unknown range continuation mode")
         if type(wire["page_index"]) is not int or not 1 <= wire["page_index"] <= config.max_pages:
             raise ValueError("first calendar request page must be exact integer one")
         if _date(wire["start_date"], "request start_date") > _date(
             wire["end_date"], "request end_date"
         ) or wire["end_date"] > parsed.date().isoformat():
             raise ValueError("first calendar request interval is invalid")
-        request = object.__new__(FormalRangeRequestV1)
-        for field in _REQUEST_FIELDS:
-            object.__setattr__(request, field, wire[field])
-        identity = id(request)
+        return seal(binding, wire, config)
 
-        def forget(reference, *, identity=identity):
-            existing = records.get(identity)
-            if existing is not None and existing.reference is reference:
-                records.pop(identity, None)
+    def mint_market(binding: object, security_id: object, as_of_utc: object,
+                    start_date: object, end_date: object,
+                    calendar_coverage_hash: object) -> FormalRangeRequestV1:
+        if type(binding) is not RangeBinding:
+            raise ValueError("market request requires an exact genuine RangeBinding")
+        _require_range_binding(binding)
+        if type(security_id) is not str or _SECURITY.fullmatch(security_id) is None:
+            raise ValueError("market request security_id is invalid")
+        identity = _read_planning_binding(binding)
+        if security_id[:2] != identity["exchange"]:
+            raise ValueError("market request security exchange differs from binding")
+        parsed = _aware(as_of_utc, "as_of_utc")
+        if type(as_of_utc) is not str or as_of_utc != _FREEZE_UTC:
+            raise ValueError("market request as_of_utc must equal the formal freeze in UTC")
+        start = _date(start_date, "market request start_date")
+        end = _date(end_date, "market request end_date")
+        config = binding_config(binding, "market_range")
+        if (start > end or end > parsed.date()
+                or (end - start).days + 1 > config.max_calendar_days_per_request):
+            raise ValueError("market request interval is invalid")
+        _hash(calendar_coverage_hash, "calendar coverage hash")
+        wire = {
+            "schema_version": "formal-range-request-v1",
+            "kind": "market_range",
+            "source": config.source,
+            "dataset": config.dataset,
+            "security_id": security_id,
+            "exchange": config.exchange_scope,
+            "as_of_utc": as_of_utc,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "anchor_descriptor_id": config.anchor_descriptor_id,
+            "calendar_descriptor_id": config.calendar_descriptor_id,
+            "range_config_id": config.entry_id,
+            "registry_manifest_hash": identity["registry_manifest_hash"],
+            "page_index": 1,
+            "calendar_coverage_hash": calendar_coverage_hash,
+        }
+        return seal(binding, wire, config)
 
-        fingerprint = hashlib.sha256(_canonical(wire)).hexdigest()
-        records[identity] = _RequestRecord(
-            weakref.ref(request, forget),
-            binding,
-            dict(wire),
-            fingerprint,
-            _range_config_to_dict(config),
-            _source_hash_get(binding),
-            previous,
-            parent,
-        )
-        request_record(request)
-        return request
+    def mint_continuation(binding, prior, mode, *, previous=None, parent=None):
+        old_wire, document = prior
+        config = binding_config(binding, old_wire["kind"])
+        wire = dict(old_wire)
+        if mode == "previous_calendar":
+            if old_wire["kind"] != "calendar_range":
+                raise ValueError("only calendar requests can scan backwards")
+            old_start = _date(old_wire["start_date"], "previous start")
+            if old_start == date.min:
+                return None
+            start, end = backward_interval((old_start - timedelta(days=1)).isoformat(),
+                                           config.max_calendar_days_per_request)
+            wire.update(start_date=start, end_date=end, page_index=1)
+        elif mode == "next_page":
+            page = page_successor(document, config.max_pages)
+            if page is None:
+                return None
+            wire["page_index"] = page
+        else:
+            raise ValueError("unknown range continuation mode")
+        return seal(binding, wire, config, previous=previous, parent=parent)
 
     def snapshot(request: object) -> tuple[dict[str, object], dict[str, object], str]:
         record = request_record(request)
         return dict(record.wire), dict(record.config_wire), record.source_registry_hash
 
-    return FormalRangeRequestV1, mint_first_calendar, snapshot, request_record
+    return (FormalRangeRequestV1, mint_first_calendar, mint_market,
+            mint_continuation, snapshot, request_record)
 
 
 (
     FormalRangeRequestV1,
     _mint_first_calendar_request,
+    _mint_market_request,
+    _mint_range_continuation,
     _trusted_range_request_snapshot,
     _range_request_record,
 ) = _build_request_authority()
@@ -679,10 +732,12 @@ del _build_fetch_type
 
 def _build_source_type():
     require_binding = _require_range_binding
-    calendar_config_get = _calendar_config_get
+    read_planning_binding = _read_planning_binding
     source_hash_get = _source_hash_get
     manifest_hash_get = _manifest_hash_get
     mint_request = _mint_first_calendar_request
+    restore_market_request = _mint_market_request
+    mint_continuation = _mint_range_continuation
     mint_fetch = _mint_fetch
     request_record = _range_request_record
     binding_hash_get = RangeBinding.binding_hash.fget
@@ -691,6 +746,25 @@ def _build_source_type():
     fetch_require = RangeFetch._require
     fetch_fields = RangeFetch.__slots__[:-1]
     observation_records = {}
+    calendar_proof_anchors = [None]
+
+    def install_calendar_proof_authority(anchors):
+        if calendar_proof_anchors[0] is not None or type(anchors) is not tuple or len(anchors) != 4:
+            raise RuntimeError("calendar proof authority initialization is invalid")
+        calendar_proof_anchors[0] = anchors
+
+    def mint_market_request(record, security_id, calendar_coverage, start_date, end_date):
+        proof_type, _, _, require_coverage = record.calendar_proof_anchors
+        if type(calendar_coverage) is not proof_type:
+            raise ValueError("market requests require a genuine calendar coverage proof")
+        payload = require_coverage(calendar_coverage, binding=record.binding)
+        days = tuple(payload["trading_days"])
+        if start_date not in days or end_date not in days:
+            raise ValueError("market request bounds require covered trading days")
+        return restore_market_request(
+            record.binding, security_id, payload["as_of_utc"], start_date, end_date,
+            payload["coverage_hash"],
+        )
 
     def fetch_snapshot(fetch):
         # Detach both identities and bytes from the original producer registration
@@ -801,13 +875,13 @@ def _build_source_type():
     def continuation(source, previous, mode, *, current):
         record = source_record(source)
         wire = require_observation(previous, current=current)
-        config = calendar_config_get(record.binding)
+        config = range_config_for_wire(record, wire["request"])
         if (wire["request"]["registry_manifest_hash"] != manifest_hash_get(record.binding)
                 or wire["request"]["range_config_id"] != config.entry_id
                 or wire["snapshot"]["task_payload"]["source_registry_hash"] != source_hash_get(record.binding)):
             raise ValueError("range continuation binding differs")
-        request = mint_request(record.binding, wire["request"]["as_of_utc"],
-            prior=(wire["request"], wire["document"]), previous=previous, mode=mode,
+        request = mint_continuation(record.binding, (wire["request"], wire["document"]), mode,
+            previous=previous,
             parent=dict(task_id=wire["task"]["id"], observation_hash=observation_record(previous)[3], mode=mode))
         source_record(source)
         return request
@@ -816,16 +890,24 @@ def _build_source_type():
         record = source_record(source)
         # Parent was just reread by the captured store path. Avoid recursive reread.
         if previous is None:
-            request = mint_request(record.binding, wire["as_of_utc"])
+            if wire["kind"] == "calendar_range":
+                request = mint_request(record.binding, wire["as_of_utc"])
+            elif wire["kind"] == "market_range":
+                request = restore_market_request(record.binding, wire["security_id"], wire["as_of_utc"],
+                    wire["start_date"], wire["end_date"], wire["calendar_coverage_hash"])
+            else:
+                raise ValueError("stored range request kind is invalid")
         else:
             prior = observation_record(previous)
             old = _thaw(prior[2])
+            config = range_config_for_wire(record, old["request"])
             if (old["request"]["registry_manifest_hash"] != manifest_hash_get(record.binding)
-                    or old["request"]["range_config_id"] != calendar_config_get(record.binding).entry_id
+                    or old["request"]["range_config_id"] != config.entry_id
                     or old["snapshot"]["task_payload"]["source_registry_hash"] != source_hash_get(record.binding)):
                 raise ValueError("historical range parent binding differs")
-            request = mint_request(record.binding, wire["as_of_utc"], prior=(old["request"], old["document"]),
-                parent=dict(task_id=old["task"]["id"], observation_hash=prior[3], mode=mode), previous=previous, mode=mode)
+            request = mint_continuation(record.binding, (old["request"], old["document"]), mode,
+                parent=dict(task_id=old["task"]["id"], observation_hash=prior[3], mode=mode),
+                previous=previous)
         if request is None or _canonical(request_record(request).wire) != _canonical(wire):
             raise ValueError("stored range request lacks authentic derivation")
         return request
@@ -845,10 +927,40 @@ def _build_source_type():
         transport_anchor: tuple[object, object | None]
         implementations: dict
         implementation_items: tuple[tuple[tuple[str, ...], tuple[object, object]], ...]
-        selected: _ImplementationRecord
-        config_wire: dict[str, object]
+        selected: dict[str, _ImplementationRecord]
+        config_wires: dict[str, dict[str, object]]
+        calendar_proof_anchors: tuple[object, object, object, object]
 
     records: dict[int, _SourceRecord] = {}
+
+    def range_config_for_wire(record, wire):
+        identity = read_planning_binding(record.binding)
+        kind = wire["kind"]
+        config = identity["calendar_config" if kind == "calendar_range" else "market_config"]
+        if (type(config) is not RangeConfig or _range_config_to_dict(config) != record.config_wires.get(kind)):
+            raise FormalTerminalSourceError("range request config differs from sealed source")
+        return config
+
+    def binding_identity(binding):
+        identity = read_planning_binding(binding)
+        return {
+            "registry_manifest_hash": identity["registry_manifest_hash"],
+            "source_registry_hash": identity["source_registry_hash"],
+            "binding_hash": identity["binding_hash"],
+            "rule_id": identity["rule_id"],
+            "exchange": identity["exchange"],
+            "calendar_config": _range_config_to_dict(identity["calendar_config"]),
+            "market_config": _range_config_to_dict(identity["market_config"]),
+        }
+
+    def range_config_for_request(record, request):
+        sealed = request_record(request)
+        if binding_identity(sealed.binding) != binding_identity(record.binding):
+            raise FormalTerminalSourceError("range request belongs to another source binding")
+        config = range_config_for_wire(record, sealed.wire)
+        if sealed.config_wire != record.config_wires[sealed.wire["kind"]]:
+            raise FormalTerminalSourceError("range request config differs from sealed source")
+        return config
 
     def source_record(source: object) -> _SourceRecord:
         record = records.get(id(source))
@@ -864,18 +976,20 @@ def _build_source_type():
                     in zip(current_items, record.implementation_items)
                 )
             )
-            config = calendar_config_get(record.binding)
-            require_binding(record.binding)
+            identity = read_planning_binding(record.binding)
             unchanged = (
                 source._binding is record.binding
                 and source._transport is record.transport
                 and source._implementations is record.implementations
                 and items_unchanged
                 and _callable_anchor(record.transport, "send") == record.transport_anchor
-                and _callable_anchor(record.selected.parser, "parse") == record.selected.parser_anchor
-                and _callable_anchor(record.selected.normalizer, "normalize") == record.selected.normalizer_anchor
-                and type(config) is RangeConfig
-                and _range_config_to_dict(config) == record.config_wire
+                and all(_callable_anchor(selected.parser, "parse") == selected.parser_anchor
+                        and _callable_anchor(selected.normalizer, "normalize") == selected.normalizer_anchor
+                        for selected in record.selected.values())
+                and all(type(identity[name + "_config"]) is RangeConfig
+                        and _range_config_to_dict(identity[name + "_config"]) == record.config_wires[name + "_range"]
+                        for name in ("calendar", "market"))
+                and calendar_proof_anchors[0] is record.calendar_proof_anchors
             )
         except (AttributeError, TypeError, ValueError):
             unchanged = False
@@ -899,10 +1013,14 @@ def _build_source_type():
         def __init__(self, binding, *, transport, implementations):
             if type(binding) is not RangeBinding:
                 raise ValueError("range source requires an exact genuine RangeBinding")
-            require_binding(binding)
-            config = calendar_config_get(binding)
-            if type(config) is not RangeConfig:
-                raise ValueError("range binding calendar config is invalid")
+            identity_view = read_planning_binding(binding)
+            configs = {kind: identity_view[name] for kind, name in (
+                ("calendar_range", "calendar_config"), ("market_range", "market_config"))}
+            if any(type(config) is not RangeConfig or config.kind != kind
+                   for kind, config in configs.items()):
+                raise ValueError("range binding planning configs are invalid")
+            if calendar_proof_anchors[0] is None:
+                raise RuntimeError("calendar proof authority was not eagerly initialized")
             if type(implementations) is not dict:
                 raise ValueError("range implementations must be an exact dict")
             transport_anchor = _callable_anchor(transport, "send")
@@ -919,10 +1037,12 @@ def _build_source_type():
                     parser, normalizer, _callable_anchor(parser, "parse"),
                     _callable_anchor(normalizer, "normalize"),
                 )
-            key = (config.parser_id, config.parser_version, config.mapping_version,
-                   config.normalizer_version, config.request_version)
-            selected = sealed.get(key)
-            if selected is None:
+            selected = {}
+            for kind, config in configs.items():
+                key = (config.parser_id, config.parser_version, config.mapping_version,
+                       config.normalizer_version, config.request_version)
+                selected[kind] = sealed.get(key)
+            if any(value is None for value in selected.values()):
                 raise ValueError("signed range implementation is not registered")
             self._binding = binding
             self._transport = transport
@@ -933,7 +1053,9 @@ def _build_source_type():
                     records.pop(identity, None)
             records[identity] = _SourceRecord(
                 weakref.ref(self, forget), binding, transport, transport_anchor,
-                implementations, items, selected, _range_config_to_dict(config),
+                implementations, items, selected,
+                {kind: _range_config_to_dict(config) for kind, config in configs.items()},
+                calendar_proof_anchors[0],
             )
             source_record(self)
 
@@ -942,6 +1064,35 @@ def _build_source_type():
             request = mint_request(record.binding, as_of_utc)
             source_record(self)
             return request
+
+        def range_config(self, request: FormalRangeRequestV1) -> RangeConfig:
+            record = source_record(self)
+            return range_config_for_request(record, request)
+
+        def market_requests(self, security_id: str, *, calendar_coverage) -> tuple[FormalRangeRequestV1, ...]:
+            record = source_record(self)
+            payload = record.calendar_proof_anchors[2](calendar_coverage)
+            days = tuple(payload["trading_days"])[-250:]
+            if not days:
+                raise ValueError("calendar proof has no trading days")
+            config = read_planning_binding(record.binding)["market_config"]
+            groups = []
+            cursor = len(days)
+            while cursor:
+                end = date.fromisoformat(days[cursor - 1])
+                start_index = cursor - 1
+                while start_index > 0:
+                    candidate = date.fromisoformat(days[start_index - 1])
+                    if (end - candidate).days + 1 > config.max_calendar_days_per_request:
+                        break
+                    start_index -= 1
+                groups.append((days[start_index], days[cursor - 1]))
+                cursor = start_index
+            requests = tuple(mint_market_request(
+                record, security_id, calendar_coverage, start, end,
+            ) for start, end in groups)
+            source_record(self)
+            return requests
 
         def previous_calendar_request(self, previous: RangeObservation) -> FormalRangeRequestV1 | None:
             return continuation(self, previous, "previous_calendar", current=True)
@@ -956,14 +1107,15 @@ def _build_source_type():
             parser_request = dict(request_wire)
             parser_config = _range_config_to_dict(config)
             try:
-                parsed = record.selected.parser.parse(
+                selected = record.selected[config.kind]
+                parsed = selected.parser.parse(
                     raw_bytes, request=parser_request, config=dict(parser_config)
                 )
                 source_record_from = record.reference()
                 if source_record_from is None:
                     raise FormalTerminalSourceError("formal range source expired during parsing")
                 source_record(source_record_from)
-                normalized = record.selected.normalizer.normalize(
+                normalized = selected.normalizer.normalize(
                     parsed, request=dict(request_wire), config=dict(parser_config)
                 )
                 source_record(source_record_from)
@@ -1016,11 +1168,11 @@ def _build_source_type():
                 )
             except ValueError as error:
                 raise FormalTerminalSourceError(str(error)) from error
-            config = calendar_config_get(record.binding)
+            config = range_config_for_request(record, request)
             if (
                 request_wire["registry_manifest_hash"] != manifest_hash_get(record.binding)
                 or request_source_hash != source_hash_get(record.binding)
-                or request_config != record.config_wire
+                or request_config != record.config_wires[config.kind]
                 or request_config != _range_config_to_dict(config)
             ):
                 raise FormalTerminalSourceError("range request config differs from sealed source")
@@ -1067,11 +1219,11 @@ def _build_source_type():
                 )
             except ValueError as error:
                 raise FormalTerminalSourceError(str(error)) from error
-            config = calendar_config_get(record.binding)
+            config = range_config_for_request(record, request)
             if (
                 request_wire["registry_manifest_hash"] != manifest_hash_get(record.binding)
                 or request_source_hash != source_hash_get(record.binding)
-                or request_config != record.config_wire
+                or request_config != record.config_wires[config.kind]
                 or request_config != _range_config_to_dict(config)
             ):
                 raise FormalTerminalSourceError("range request config differs from sealed source")
@@ -1138,12 +1290,20 @@ def _build_source_type():
         """Original type/current verifier/wire reader only; never a mint."""
         return observation_anchors
 
-    return FormalRangeSource, RangeObservation, observation_authority
+    return FormalRangeSource, RangeObservation, observation_authority, install_calendar_proof_authority
 
 
-FormalRangeSource, RangeObservation, _range_observation_authority = _build_source_type()
+FormalRangeSource, RangeObservation, _range_observation_authority, _install_calendar_proof_authority = _build_source_type()
 del _build_source_type
-del _mint_first_calendar_request, _mint_fetch, _range_request_record
+
+# Complete the two-module cycle before either module becomes usable.  The market
+# module defines its proof owner before importing this module, so both import
+# orders reach this point with the original anchors available.
+from . import formal_policy_market as _formal_policy_market
+_install_calendar_proof_authority(_formal_policy_market._calendar_proof_authority())
+del _formal_policy_market, _install_calendar_proof_authority
+del _mint_first_calendar_request, _mint_market_request, _mint_range_continuation
+del _mint_fetch, _range_request_record
 
 
 __all__ = [

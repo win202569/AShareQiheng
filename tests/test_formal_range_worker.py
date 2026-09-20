@@ -28,6 +28,33 @@ def numbered(documents):
 
 
 class FormalRangeWorkerTests(unittest.TestCase):
+    def test_market_request_uses_market_retry_cooldown_and_page_budgets(self):
+        def distinct(documents):
+            market = next(item for item in documents["source"]["range_configs"]
+                          if item["kind"] == "market_range" and item["exchange_scope"] == "SH")
+            market.update(retry_max_attempts=1, retry_base_seconds=7.0,
+                          challenge_cooldown_seconds=23.0)
+
+        fixture = self.fixture(mutate=distinct)
+        days = tuple(f"2026-08-{day:02d}" for day in range(12, 32))
+        fixture.put_window("SH600000", trading_days=days,
+                           rows={day: {"exchange_allows_trading": True, "volume": "0",
+                                      "turnover": "0", "close": {"state": "unavailable",
+                                      "reason": "source_reports_no_trade"}} for day in days},
+                           omit_pages=(1,))
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        calendar = FormalPolicyMarketRepository(fixture.range_store).select_calendar(
+            fixture.binding, "2026-08-31T07:00:00+00:00")
+        _, source = fixture.range_store.resolve_planning_binding(fixture.binding)
+        request = source.market_requests("SH600000", calendar_coverage=calendar.coverage)[0]
+        fixture.range_store.enqueue(request, refresh_generation="g-market")
+        fixture.transport.error = FormalSourceBlocked("blocked")
+        with patch("ashare_pipeline.formal_range_store._utc_now", return_value=NOW), \
+                patch("ashare_pipeline.formal_range_worker._utc_now", return_value=NOW):
+            result = fixture.worker.run_once()
+        self.assertEqual(result["state"], "terminal_failed")
+        self.assertIsNone(result["next_retry_at"])
+
     def fixture(self, **kwargs):
         self.assertTrue(hasattr(formal_range_fixtures, "RangeWorkerFixture"),
                         "bounded range worker fixture is absent")

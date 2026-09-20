@@ -88,6 +88,29 @@ class DecimalBridgeTests(unittest.TestCase):
 
 
 class PolicyValueTests(unittest.TestCase):
+    def test_closed_calendar_and_market_dtos_validate_and_detach(self):
+        calendar = value_wire(value_type="calendar_record", unit=None,
+            value={"date": "2026-08-31", "is_trading_day": True})
+        parsed = PolicyValue.from_dict(calendar)
+        calendar["value"]["is_trading_day"] = False
+        self.assertEqual(parsed.to_dict()["value"],
+                         {"date": "2026-08-31", "is_trading_day": True})
+
+        market = value_wire(value_type="market_window", unit=None, value={
+            "price_state": "positive_close_complete", "price": "3.5",
+            "price_date": "2026-08-31", "stale_days": 0,
+            "stale_at_least": None, "veto_state": "clear", "pending": [],
+        })
+        self.assertEqual(PolicyValue.from_dict(market).to_dict()["value"], market["value"])
+        for bad in (
+            {**market["value"], "price": "Infinity"},
+            {**market["value"], "stale_days": True},
+            {**market["value"], "veto_state": "maybe"},
+            {**market["value"], "extra": None},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                PolicyValue.from_dict({**market, "value": bad})
+
     def test_scalar_values_use_exact_types_and_normalize_evidence_hashes(self):
         decimal_value = PolicyValue.from_dict(value_wire())
         self.assertEqual(decimal_value.value, Decimal("4.2"))
