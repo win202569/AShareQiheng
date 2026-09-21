@@ -144,6 +144,10 @@ class PolicyRuntimeFixture(FinancialFixture):
             if range_enabled:
                 from tests.formal_range_fixtures import add_range_documents
                 add_range_documents(documents)
+                # W3 needs a genuine recent window, not a 400-day fixture.
+                # Tests needing larger ranges may explicitly override this cap.
+                for entry in documents["source"]["range_configs"]:
+                    entry["max_calendar_days_per_request"] = 20
             if mutate is not None:
                 mutate(documents)
             rehash_documents(documents)
@@ -191,6 +195,69 @@ class PolicyRuntimeFixture(FinancialFixture):
             current_input_provider=self.provider)
         self._policy_industry_ids = set()
         self._policy_context_generations = {}
+        if range_enabled:
+            from ashare_pipeline.formal_policy_repository import FormalPolicyRepository
+            self.policy_repository = FormalPolicyRepository(self.feature_repository, self.context,
+                self.range_store, registry_signature_verifier=self.verifier)
+
+    def build_policy_batch(self):
+        return self.policy_repository.build_batch(self.frozen.frozen_input_hash,
+            scoring_registry=self.scoring, policy_registry=self.policy_registry)
+
+    def populate_policy_evidence(self):
+        """Populate every frozen security through the genuine temporary producers."""
+        from tests.formal_policy_fixtures import REGULATORY_SEMANTICS
+        from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        from tests.test_formal_range_source import document_wire
+        bindings = load_policy_range_bindings(self.bundle, scoring_registry=self.scoring,
+                                              policy_registry=self.policy_registry)
+        rules = self.policy_registry.to_dict()["rules"]
+        templates = {member["security_id"]: member["template_id"] for member in self.industry["memberships"]}
+        for member in self.frozen.members:
+            sid = member.security_id
+            self.put_industry(sid)
+            self._policy_industry_ids.add(sid)
+            self.put_policy_context(sid, "security_state", dict(is_st=False, is_star_st=False,
+                listing_status="listed", forced_delist_risk=False, suspended=False))
+            self.put_policy_context(sid, "regulatory_state", dict(flags=[
+                dict(flag_id=flag, active=False) for flag in REGULATORY_SEMANTICS]))
+            self.policy_financial_values(sid)
+            rule = next(rule for rule in rules if rule["template_id"] == templates[sid]
+                        and rule["kind"] == "market_liquidity")
+            self.binding = bindings.for_rule(rule["rule_id"], sid[:2])
+            self.source = self.source_factory(self.binding)
+            first = self.source.first_calendar_request(FREEZE)
+            cursor, end = date.fromisoformat(first.start_date), date.fromisoformat(first.end_date)
+            days = {}
+            while cursor <= end:
+                days[cursor.isoformat()] = cursor >= end - timedelta(days=19)
+                cursor += timedelta(days=1)
+            self.produce_calendar(days=days)
+            calendar = FormalPolicyMarketRepository(self.range_store).select_calendar(self.binding, FREEZE)
+            _, source = self.range_store.resolve_planning_binding(self.binding)
+            for request in source.market_requests(sid, calendar_coverage=calendar.coverage):
+                rows = []
+                sample = document_wire(request)["rows"][0]
+                base = {key: sample[key] for key in ("published_at_utc", "published_precision",
+                    "effective_at_utc", "effective_time_evidence_hash", "captured_at_utc")}
+                for day in calendar.coverage.trading_days:
+                    if request.start_date <= day <= request.end_date:
+                        rows.append(dict(base, date=day, exchange_allows_trading=True,
+                            volume="1", volume_unit="shares", turnover="2", turnover_unit="CNY",
+                            close={"state": "positive", "value": "2"}, close_unit="CNY_per_share"))
+                config = source.range_config(request)
+                wire = document_wire(request, rows=rows, record_count=len(rows), page_record_count=len(rows),
+                    coverage=dict(start_date=request.start_date, end_date=request.end_date, complete=True),
+                    parser_id=config.parser_id, parser_version=config.parser_version,
+                    mapping_version=config.mapping_version, normalizer_version=config.normalizer_version,
+                    request_version=config.request_version)
+                task = self.range_store.enqueue(request, refresh_generation="g1")
+                self.reply(wire, original_url="https://www.cninfo.com.cn/fixture/range-market.json")
+                lease = self.range_store.lease_next("policy-market-fixture", lease_seconds=3600)
+                self.assertEqual(lease["id"], task["id"])
+                self.range_store.persist(task["id"], "policy-market-fixture", lease["attempt_id"],
+                                         fetch=source.fetch_verified(request))
 
     def source_factory(self, binding):
         from ashare_pipeline.formal_range_source import FormalRangeSource

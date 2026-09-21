@@ -16,6 +16,26 @@ NOW = "2026-09-01T00:00:00+00:00"
 
 
 class FormalRangeStoreTests(unittest.TestCase):
+    def test_private_owner_check_accepts_only_genuine_same_store_and_verifier(self):
+        from ashare_pipeline import formal_range_store as module
+        self.assertTrue(hasattr(module, "_require_range_store_identity"),
+                        "W3 range owner identity validator is missing")
+        from tests.formal_range_fixtures import RangeStoreFixture
+        owner, peer = RangeStoreFixture(), RangeStoreFixture()
+        self.addCleanup(owner.close)
+        self.addCleanup(peer.close)
+        check = module._require_range_store_identity
+        self.assertIsNone(check(owner.range_store, owner.store, owner.verifier))
+        for ranges, store, verifier in (
+            (owner.range_store, peer.store, owner.verifier),
+            (owner.range_store, owner.store, peer.verifier),
+            (object.__new__(type(owner.range_store)), owner.store, owner.verifier),
+            (copy.copy(owner.range_store), owner.store, owner.verifier),
+            (object(), owner.store, owner.verifier),
+        ):
+            with self.subTest(ranges=type(ranges).__name__), self.assertRaises(ValueError):
+                check(ranges, store, verifier)
+
     def test_planning_resolution_uses_owning_store_graph_and_reconstructed_binding(self):
         from tests.formal_range_fixtures import RangeStoreFixture
         fixture = RangeStoreFixture()

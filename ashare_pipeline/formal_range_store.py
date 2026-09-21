@@ -582,7 +582,13 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             finish_current_check(self, snapshots)
             return candidates[0]
 
-    return FormalRangeStore, read, require_current, record
+    def require_identity(store, expected_state_store, expected_signature_verifier):
+        """Check ownership without exposing any captured dependency or authority."""
+        state, _, verifier, _, _ = record(store)
+        if state is not expected_state_store or verifier is not expected_signature_verifier:
+            raise ValueError("range store requires the same StateStore and signature verifier")
+
+    return FormalRangeStore, read, require_current, record, require_identity
 
 
 # Source completes both paired types; this import is safe in either entry order.

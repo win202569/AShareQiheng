@@ -1308,7 +1308,7 @@ def _build_source_type():
 
     trusted_parse = FormalRangeSource._parse
     from . import formal_range_store as store_module
-    Store, store_read, store_require_current, store_record = store_module._build_range_store_type(
+    Store, store_read, store_require_current, store_record, store_identity = store_module._build_range_store_type(
         describe_request=describe_request, restore_request=restore_request,
         source_type=FormalRangeSource, source_binding=lambda source: source_record(source).binding,
         bind_source_store=bind_source_store,
@@ -1317,6 +1317,7 @@ def _build_source_type():
         require_execution=require_execution)
     store_module.FormalRangeStore = Store
     store_module.RangeObservation = RangeObservation
+    store_module._require_range_store_identity = store_identity
     del store_module._build_range_store_type
     observation_anchors = (RangeObservation, RangeObservation.require_current, RangeObservation.to_dict)
 
