@@ -208,6 +208,32 @@ class PolicyRepositoryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fixture.build_policy_batch()
 
+    def test_relabeling_a_minted_proof_class_cannot_change_its_authority(self):
+        fixture = self.fixture()
+        batch = fixture.build_policy_batch()
+        result = batch.results[0]
+        object.__setattr__(result, "__class__", self.api.PolicyDecision)
+        try:
+            with self.assertRaises(ValueError):
+                result.require_verified()
+        finally:
+            object.__setattr__(result, "__class__", self.api.PolicyResult)
+        result.require_verified()
+
+    def test_calculation_and_deepcopy_dependencies_cannot_be_replaced(self):
+        from ashare_pipeline import formal_policy_evaluator, formal_policy_market, formal_range_store
+
+        fixture = self.fixture()
+        for owner, name, replacement in (
+            (formal_policy_market, "evaluate_window", lambda *args: {}),
+            (formal_range_store, "_digest", lambda *args: "0" * 64),
+            (formal_policy_evaluator, "copy", object()),
+            (formal_policy_evaluator.copy, "deepcopy", lambda value: value),
+        ):
+            with self.subTest(name=name), patch.object(owner, name, replacement):
+                with self.assertRaises(ValueError):
+                    fixture.build_policy_batch()
+
 
 if __name__ == "__main__":
     unittest.main()

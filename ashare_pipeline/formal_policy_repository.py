@@ -9,6 +9,7 @@ from types import MappingProxyType
 import weakref
 
 from . import formal_policy_evaluator as evaluator_module
+from . import formal_policy_market as market_module
 from . import formal_range_store as range_module
 from . import formal_policy_registry as registry_module
 from .formal_context_repository import FormalContextRepository
@@ -46,11 +47,16 @@ def _install_repository():
     captured += tuple((vars(evaluator_module), name, value)
                       for name, value in vars(evaluator_module).items()
                       if callable(value) or name.startswith("_DECISION"))
+    captured += tuple((vars(module), name, value)
+                      for module in (market_module, range_module)
+                      for name, value in vars(module).items() if callable(value))
     captured += ((vars(range_module), "_require_range_store_identity", range_identity),
                  (vars(registry_module), "_read_authenticated_policy_registry", read_policy),
                  (vars(range_module), "FormalRangeStore", range_module.FormalRangeStore),
+                 (vars(evaluator_module), "copy", evaluator_module.copy),
+                 (vars(evaluator_module.copy), "deepcopy", evaluator_module.copy.deepcopy),
                  (owner, "range_module", range_module), (owner, "registry_module", registry_module),
-                 (owner, "evaluator_module", evaluator_module))
+                 (owner, "evaluator_module", evaluator_module), (owner, "market_module", market_module))
     dependencies_classes = (FormalFeatureRepository, FormalContextRepository,
         FormalMetricCurrentInputProvider, FormalMetricContextRepository,
         FormalPolicyFinancialRepository, PolicyFinancialSelection,
@@ -116,6 +122,7 @@ def _install_repository():
         interfaces()
         saved = proofs.get(id(proof))
         if (type(proof) not in proof_types or saved is None or saved[0]() is not proof
+                or saved[6] is not type(proof)
                 or not saved[3]["published"] or saved[4] is not saved[3]["parent_link"]
                 or saved[5] != saved[3]["batch_hash"]):
             raise ValueError("policy proof is forged, copied, unpublished or revoked")
@@ -182,7 +189,7 @@ def _install_repository():
         data = dict(wire)
         data.update(attributes or {})
         proofs[key] = (weakref.ref(proof, lambda _: proofs.pop(key, None)), freeze(data), encode(wire),
-                       publication, publication["parent_link"], publication["batch_hash"])
+                       publication, publication["parent_link"], publication["batch_hash"], cls)
         return proof
 
     class FormalPolicyRepository(metaclass=SealedMeta):

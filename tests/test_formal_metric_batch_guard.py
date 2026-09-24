@@ -333,6 +333,33 @@ class OwnedProviderGuardTests(unittest.TestCase):
         with self.api._metric_batch_guard(self.provider, self.fixture.store) as guard:
             self.assertEqual(guard.finalize(lambda: "recovered"), "recovered")
 
+    def test_exact_owner_nested_guard_reuses_finalization_and_rejects_other_owners(self):
+        other_provider = self.api.FormalMetricCurrentInputProvider(self.fixture.store)
+        other_fixture = FinancialFixture(missing_memberships=True)
+        self.addCleanup(other_fixture.close)
+        other_store_provider = self.api.FormalMetricCurrentInputProvider(other_fixture.store)
+
+        def inside_outer():
+            with self.api._metric_batch_guard(self.provider, self.fixture.store) as nested:
+                self.assertEqual(nested.finalize(lambda: "nested"), "nested")
+                with self.assertRaises(ValueError):
+                    nested.finalize(lambda: "twice")
+            with self.assertRaises(ValueError):
+                with self.api._metric_batch_guard(self.provider, other_fixture.store):
+                    pass
+            with self.assertRaises(ValueError):
+                with self.api._metric_batch_guard(other_provider, self.fixture.store) as foreign:
+                    foreign.finalize(lambda: "foreign")
+            with self.assertRaises(ValueError):
+                with self.api._metric_batch_guard(other_store_provider, self.fixture.store):
+                    pass
+            return "outer"
+
+        with self.api._metric_batch_guard(self.provider, self.fixture.store) as outer:
+            self.assertEqual(outer.finalize(inside_outer), "outer")
+        with self.api._metric_batch_guard(self.provider, self.fixture.store) as fresh:
+            self.assertEqual(fresh.finalize(lambda: "released"), "released")
+
 
 if __name__ == "__main__":
     unittest.main()

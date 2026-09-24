@@ -8,7 +8,7 @@ feature repository reads still authenticate all published facts and receipts.
 from contextlib import contextmanager
 import json
 import sqlite3
-from threading import RLock
+from threading import RLock, get_ident
 import weakref
 
 from .formal_feature_repository import (
@@ -23,6 +23,7 @@ from .state_store import StateStore
 
 def _owned_provider():
     records = {}
+    active_finalizations = {}
     connect = StateStore._connect
     initialized = _require_repository_initialization
     identity = FormalFeatureRepository._snapshot_identity
@@ -109,6 +110,37 @@ def _owned_provider():
     @contextmanager
     def guard(provider, store):
         record = require(provider, store)
+        thread = get_ident()
+        enclosing = active_finalizations.get(thread)
+        if enclosing is not None:
+            if enclosing[0] is not provider or enclosing[1] is not store:
+                raise ValueError("nested metric guard requires the exact finalization owner")
+            _, _, owner_record, observer, epoch, database_epoch = enclosing
+            nested_active, nested_finalized = True, False
+
+            class NestedGuard:
+                __slots__ = ()
+
+                def finalize(self, mint):
+                    nonlocal nested_finalized
+                    if not nested_active or nested_finalized or active_finalizations.get(thread) is not enclosing:
+                        raise ValueError("nested metric batch guard is closed or already finalized")
+                    nested_finalized = True
+                    require(provider, store)
+                    if not owner_record["finalizing"] or owner_record["epoch"] != epoch:
+                        raise ValueError("metric provider changed during complete batch finalization")
+                    if observer.execute("PRAGMA data_version").fetchone()[0] != database_epoch:
+                        raise ValueError("metric database changed during complete batch")
+                    result = mint()
+                    if owner_record["epoch"] != epoch:
+                        raise ValueError("metric provider changed during complete batch finalization")
+                    return result
+
+            try:
+                yield NestedGuard()
+            finally:
+                nested_active = False
+            return
         observer = None
         active, finalized = False, False
         try:
@@ -140,11 +172,13 @@ def _owned_provider():
                             observer.execute("BEGIN IMMEDIATE")
                             if observer.execute("PRAGMA data_version").fetchone()[0] != database_epoch:
                                 raise ValueError("metric database changed during complete batch")
+                            active_finalizations[thread] = (provider, store, record, observer, epoch, database_epoch)
                             result = mint()
                             if record["epoch"] != epoch:
                                 raise ValueError("metric provider changed during complete batch finalization")
                             return result
                         finally:
+                            active_finalizations.pop(thread, None)
                             try:
                                 observer.rollback()
                             finally:

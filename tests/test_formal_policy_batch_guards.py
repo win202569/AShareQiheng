@@ -1,10 +1,12 @@
 """Adversarial changes throughout the genuine complete policy read interval."""
 
 import importlib
+import inspect
 import sqlite3
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
 
@@ -179,6 +181,47 @@ class PolicyBatchGuardTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         getattr(proof, method)()
             self.fixture.build_policy_batch().require_verified()
+
+    def test_literal_observer_close_failure_revokes_published_children(self):
+        real_connect = sqlite3.connect
+        captured = []
+        wrapped = []
+
+        class ClosingObserver:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def close(self):
+                self.connection.close()
+                raise RuntimeError("literal observer close failure")
+
+        def connect(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            caller = inspect.currentframe().f_back
+            owner = caller.f_back if caller is not None else None
+            if (not wrapped and owner is not None and owner.f_code.co_name == "guard"
+                    and owner.f_code.co_filename.endswith("formal_metric_batch_guard.py")):
+                wrapped.append(True)
+                return ClosingObserver(connection)
+            return connection
+
+        def hook(frame, event, result):
+            if (event == "return" and frame.f_code.co_name == "mint"
+                    and frame.f_code.co_filename.endswith("formal_policy_repository.py")):
+                captured.append(result)
+
+        with patch.object(sqlite3, "connect", connect):
+            with self.assertRaisesRegex(RuntimeError, "literal observer close failure"):
+                self.run_hook(hook)
+        self.assertEqual(wrapped, [True])
+        self.assertGreaterEqual(len(captured), 5)
+        for proof in captured:
+            with self.assertRaises(ValueError):
+                proof.require_verified()
+        self.fixture.build_policy_batch().require_verified()
 
 
 if __name__ == "__main__":
