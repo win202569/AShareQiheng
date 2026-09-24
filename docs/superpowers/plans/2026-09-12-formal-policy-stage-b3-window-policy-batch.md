@@ -193,7 +193,7 @@ def combine_caps(caps):
 - 单证券 PolicyResult 属性 `.security_id/.decisions/.pending_requirements/.dimension_caps/.pool_prohibitions/.states/.normalization_basis/.evidence_state`，纯 W2 字典不能通过其 require_official。
 - `PolicyRuntimeFixture(range_enabled=True)` 新增 `.policy_repository`；`.build_policy_batch()` 使用 fixture 当前真实 frozen/scoring/policy；`.populate_policy_evidence()` 为每个冻结成员写 industry、显式清晰状态、F2 财务及 W1 日历/行情，真实小规模 producer receipts；默认不省略证券。
 
-- [ ] **写失败测试。**
+- [x] **写失败测试。**
 
 ```python
 def test_complete_enumeration_includes_pending_security(self):
@@ -213,8 +213,8 @@ def test_complete_enumeration_includes_pending_security(self):
 
 屏障专例在第一证券读完后修改第二证券、先缺后有、equal-leading ambiguity、provider 重入发布且内部吞错、DB 写入、原始文件改动但 DB 未变、source 配置替换、最终 rollback/close 抛错；任何被测试钩子捕获的未发布子对象均不能通过 require_official。钩子只在测试替换实际依赖，不能添加生产公开 `skip_verify`。
 
-- [ ] **运行 RED。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_repository tests.test_formal_policy_batch_guards -v`。
-- [ ] **实现闭包和生命周期。** 按 `formal_metric_engine._install_engine` 的精确类/方法/来源依赖捕获模式建立仓库和 proof 记录；不用公共 `verified=True`、可读 nonce 或自报 hash 作为权能。F2/F3/W1 `.recheck()`、context `.recheck_batch()`、九角色源文件重验全部进入最终检查。将值和来源规范 payload 先脱离外部引用，昂贵取证阶段不持有 writer lock。
+- [x] **运行 RED。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_repository tests.test_formal_policy_batch_guards -v`。
+- [x] **实现闭包和生命周期。** 按 `formal_metric_engine._install_engine` 的精确类/方法/来源依赖捕获模式建立仓库和 proof 记录；不用公共 `verified=True`、可读 nonce 或自报 hash 作为权能。F2/F3/W1 `.recheck()`、context `.recheck_batch()`、九角色源文件重验全部进入最终检查。将值和来源规范 payload 先脱离外部引用，昂贵取证阶段不持有 writer lock。
 
 以下是本任务私有工厂的控制流，`prepare/read_and_recheck/mark_published/revoke` 均在同一闭包内定义，不导出：
 
@@ -242,8 +242,8 @@ def publish_under_guard(provider, store, prepare, read_and_recheck,
 
 批次 hash 计算依赖顺序：各来源/selection payload → 各非正式 rule input/decision payload → evidence batch payload → result batch payload；各自先算无自身 hash 的内容，子对象之后附加所属 batch hash 但不反向改变父身份。保存 parent_link 单独参与资格验证，避免 selfhash/circular hash。
 
-- [ ] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_repository tests.test_formal_policy_batch_guards tests.test_formal_metric_batch_guard tests.test_formal_metric_engine -v`。
-- [ ] **审查并提交白名单。** 本任务四个文件；提交信息 `feat: publish revocable complete-universe policy result batches`。
+- [x] **运行 GREEN。** `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_policy_repository tests.test_formal_policy_batch_guards tests.test_formal_metric_batch_guard tests.test_formal_metric_engine -v`。
+- [x] **审查并提交白名单。** 本任务按获批接口扩展后的九个文件；提交 `18c45b3` 与 `36f12b2`，独立审查无发现。
 
 ## W4：五模板、恢复与旧合同组合验收
 
