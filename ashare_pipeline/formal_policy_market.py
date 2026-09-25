@@ -238,6 +238,52 @@ def _build_proof_types():
         anchored_binding_identity = _binding_identity
         anchored_read_binding = _read_binding
         anchored_canonical = canonical_bytes
+        selection_fields = {
+            calendar_selection_type: ("coverage", "pending", "lineage", "selection_hash", "_check"),
+            market_selection_type: ("window", "pending", "lineage", "selection_hash", "_check"),
+        }
+        selection_interfaces = {
+            cls: (cls.__new__, cls.__init__, cls.__getattribute__, cls.__setattr__,
+                  cls.__dataclass_fields__, tuple((name, cls.__dataclass_fields__[name],
+                      cls.__dataclass_fields__[name].name,
+                      cls.__dataclass_fields__[name].type,
+                      cls.__dataclass_fields__[name].init,
+                      vars(cls).get(name)) for name in names), cls.__slots__)
+            for cls, names in selection_fields.items()
+        }
+
+        def selection_interface():
+            if (globals().get("CalendarSelection") is not calendar_selection_type
+                    or globals().get("MarketSelection") is not market_selection_type):
+                raise ValueError("market selection type identity changed")
+            for cls, names in selection_fields.items():
+                (new, init, lookup, setter, fields, entries, slots) = selection_interfaces[cls]
+                if (cls.__new__ is not new or cls.__init__ is not init
+                        or cls.__getattribute__ is not lookup or cls.__setattr__ is not setter
+                        or cls.__dataclass_fields__ is not fields
+                        or tuple(cls.__dataclass_fields__) != names
+                        or cls.__slots__ != slots
+                        or any(cls.__dataclass_fields__.get(name) is not field
+                            or field.name != field_name or field.type != field_type
+                            or field.init != field_init or vars(cls).get(name) is not descriptor
+                            for name, field, field_name, field_type, field_init, descriptor in entries)):
+                    raise ValueError("market selection constructor or field interface changed")
+
+        def construct_selection(cls, values):
+            selection_interface()
+            new, init = selection_interfaces[cls][:2]
+            result = new(cls)
+            init(result, *values)
+            selection_interface()
+            names = selection_fields[cls]
+            if (type(result) is not cls
+                    or any((object.__getattribute__(result, name) is not expected
+                            if name in {"coverage", "window", "_check"}
+                            else type(object.__getattribute__(result, name)) is not type(expected)
+                            or object.__getattribute__(result, name) != expected)
+                           for name, expected in zip(names, values, strict=True))):
+                raise ValueError("market selection constructor changed its result")
+            return result
 
         @dataclass(frozen=True)
         class _RepositoryRecord:
@@ -267,6 +313,7 @@ def _build_proof_types():
                 raise TypeError("market repository type is immutable")
 
         def repository_record(value):
+            selection_interface()
             if (_binding_identity is not anchored_binding_identity
                     or _read_binding is not anchored_read_binding
                     or canonical_bytes is not anchored_canonical):
@@ -357,11 +404,13 @@ def _build_proof_types():
             def owner_seal(selected):
                 return seal_selection("calendar", selected, sealed, binding, as_of_utc,
                                       _binding_identity(binding)["exchange"])
+            constructor = (calendar_selection_type if batch_capture.get() is None else
+                lambda *values: construct_selection(calendar_selection_type, values))
             return implementation_select_calendar(
                 sealed, binding, as_of_utc, _mint_calendar=owner_mint,
                 _page_group=owner_page_group,
                 _select_calendar=assemble_calendar,
-                _calendar_selection_type=calendar_selection_type,
+                _calendar_selection_type=constructor,
                 _seal_selection=owner_seal,
             )
 
@@ -371,11 +420,13 @@ def _build_proof_types():
             def owner_seal(selected):
                 return seal_selection("market", selected, sealed, binding, as_of_utc,
                                       security_id)
+            constructor = (market_selection_type if batch_capture.get() is None else
+                lambda *values: construct_selection(market_selection_type, values))
             return implementation_select_market(
                 sealed, security_id, as_of_utc, binding=binding,
                 _mint_window=owner_mint, _page_group=owner_page_group,
                 _select_calendar=calendar_for_market, _select_market=assemble_market,
-                _market_selection_type=market_selection_type,
+                _market_selection_type=constructor,
                 _seal_selection=owner_seal,
             )
 

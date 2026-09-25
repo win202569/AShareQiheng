@@ -3,9 +3,13 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
-from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+from ashare_pipeline.formal_policy_market import (
+    CalendarSelection, FormalPolicyMarketRepository, MarketSelection,
+)
+from ashare_pipeline import formal_policy_market as market_module
 from tests.formal_range_fixtures import RangeStoreFixture
 from tests.test_formal_policy_market import trading_days
 
@@ -164,6 +168,115 @@ class MarketTicketTests(unittest.TestCase):
         finally:
             sys.setprofile(None)
         self.assertEqual(len(mutated), 1)
+
+    def test_preopen_selection_constructor_replacement_is_rejected(self):
+        fixture = self.fixture
+        repository = FormalPolicyMarketRepository(fixture.range_store)
+        args = dict(registry_manifest_hash=fixture.graph.manifest.manifest_hash,
+            as_of_utc=FREEZE, population=("SH600000",),
+            required_keys=(("SH600000",),))
+        for selection_type in (CalendarSelection, MarketSelection):
+            for name in ("__init__", "__new__"):
+                with self.subTest(selection=selection_type.__name__, method=name):
+                    had_local = name in vars(selection_type)
+                    replacement = (lambda self, *a, **k: None) if name == "__init__" else \
+                                  staticmethod(lambda cls, *a, **k: object.__new__(cls))
+                    try:
+                        with patch.object(selection_type, name, replacement):
+                            with self.assertRaises(ValueError):
+                                FormalBatchReadJournal.open(repository, **args)
+                    finally:
+                        if not had_local and name in vars(selection_type):
+                            delattr(selection_type, name)
+
+    def test_warm_selection_constructor_replacement_is_rejected(self):
+        fixture = self.fixture
+        repository = FormalPolicyMarketRepository(fixture.range_store)
+        args = dict(registry_manifest_hash=fixture.graph.manifest.manifest_hash,
+            as_of_utc=FREEZE, population=("SH600000",),
+            required_keys=(("SH600000",),))
+        for selection_type in (CalendarSelection, MarketSelection):
+            for name in ("__init__", "__new__"):
+                with self.subTest(selection=selection_type.__name__, method=name):
+                    journal = FormalBatchReadJournal.open(repository, **args)
+                    repository.select_current_batch_ticket(journal, "SH600000", FREEZE,
+                        binding=fixture.binding)
+                    journal.checkpoint()
+                    had_local = name in vars(selection_type)
+                    replacement = (lambda self, *a, **k: None) if name == "__init__" else \
+                                  staticmethod(lambda cls, *a, **k: object.__new__(cls))
+                    try:
+                        with patch.object(selection_type, name, replacement):
+                            with self.assertRaises(ValueError):
+                                journal.checkpoint()
+                    finally:
+                        if not had_local and name in vars(selection_type):
+                            delattr(selection_type, name)
+
+    def test_constructor_result_pollution_cannot_become_ticket_baseline(self):
+        fixture = self.fixture
+        repository = FormalPolicyMarketRepository(fixture.range_store)
+        root = fixture.graph.manifest.manifest_hash
+        for selection_type, kind in ((CalendarSelection, "calendar"),
+                                     (MarketSelection, "market")):
+            with self.subTest(kind=kind):
+                journal = FormalBatchReadJournal.open(repository,
+                    registry_manifest_hash=root, as_of_utc=FREEZE,
+                    population=("SH600000",), required_keys=(("SH600000",),))
+                constructed = []
+                init_code = selection_type.__init__.__code__
+                def inject(frame, event, arg):
+                    if (event == "return" and frame.f_code is init_code
+                            and type(frame.f_locals.get("self")) is selection_type):
+                        sys.setprofile(None)
+                        selected = frame.f_locals["self"]
+                        object.__setattr__(selected, "pending", ("forged-at-construction",))
+                        constructed.append(selected)
+                sys.setprofile(inject)
+                try:
+                    with self.assertRaises(ValueError):
+                        if kind == "calendar":
+                            repository.select_calendar_batch_ticket(journal, fixture.binding, FREEZE)
+                        else:
+                            repository.select_current_batch_ticket(journal, "SH600000", FREEZE,
+                                binding=fixture.binding)
+                finally:
+                    sys.setprofile(None)
+                self.assertEqual(len(constructed), 1)
+
+    def test_unrelated_repr_change_does_not_block_ticket_scope(self):
+        fixture = self.fixture
+        repository = FormalPolicyMarketRepository(fixture.range_store)
+        args = dict(registry_manifest_hash=fixture.graph.manifest.manifest_hash,
+            as_of_utc=FREEZE, population=("SH600000",),
+            required_keys=(("SH600000",),))
+        with patch.object(MarketSelection, "__repr__", lambda self: "market selection"):
+            journal = FormalBatchReadJournal.open(repository, **args)
+            ticket = repository.select_current_batch_ticket(journal, "SH600000", FREEZE,
+                binding=fixture.binding)
+            self.assertIsNone(ticket.selected().window)
+            journal.finalize()
+
+    def test_preopen_selection_field_and_type_alias_replacement_are_rejected(self):
+        fixture = self.fixture
+        repository = FormalPolicyMarketRepository(fixture.range_store)
+        args = dict(registry_manifest_hash=fixture.graph.manifest.manifest_hash,
+            as_of_utc=FREEZE, population=("SH600000",),
+            required_keys=(("SH600000",),))
+        with patch.object(market_module, "CalendarSelection", MarketSelection):
+            with self.assertRaises(ValueError):
+                FormalBatchReadJournal.open(repository, **args)
+        with patch.object(CalendarSelection, "pending", property(lambda self: ("forged",))):
+            with self.assertRaises(ValueError):
+                FormalBatchReadJournal.open(repository, **args)
+        fields = CalendarSelection.__dataclass_fields__
+        original = fields["pending"]
+        try:
+            fields["pending"] = fields["lineage"]
+            with self.assertRaises(ValueError):
+                FormalBatchReadJournal.open(repository, **args)
+        finally:
+            fields["pending"] = original
 
 
 if __name__ == "__main__":
