@@ -54,6 +54,20 @@ def _install_metric_definition_producer():
     mapping_type, decimal_type, field_reader = MappingProxyType, Decimal, fields
     json_module, hash_module, scoring_type = json, hashlib, FormalScoringRegistry
     dumps, sha256, template_for = json_module.dumps, hash_module.sha256, scoring_type.template_for
+    encoder_module, encoder_type = json_module.encoder, json_module.JSONEncoder
+    encoder_bindings = (
+        (vars(json_module), "encoder", encoder_module),
+        (vars(json_module), "JSONEncoder", encoder_type),
+        (vars(encoder_module), "JSONEncoder", encoder_type),
+        *((vars(encoder_type), name, vars(encoder_type)[name])
+            for name in ("__init__", "encode", "iterencode", "default")),
+        *((vars(encoder_module), name, vars(encoder_module)[name])
+            for name in ("encode_basestring", "encode_basestring_ascii",
+                "c_make_encoder", "_make_iterencode", "INFINITY", "ESCAPE", "ESCAPE_DCT")),
+    )
+    encoder_bases, encoder_mro = encoder_type.__bases__, encoder_type.__mro__
+    encoder_members = tuple(vars(encoder_type).items())
+    escape_values = tuple(sorted(encoder_module.ESCAPE_DCT.items()))
     dict_type, tuple_type, list_type = dict, tuple, list
     type_of, is_instance, as_text, read_field = type, isinstance, str, getattr
 
@@ -99,9 +113,20 @@ def _install_metric_definition_producer():
             (owner, "_metric_definition_dependency_changes", dependency_changes),
             (vars(json_module), "dumps", dumps), (vars(hash_module), "sha256", sha256),
             (vars(scoring_type), "template_for", template_for),
+            *encoder_bindings,
         )
-        return tuple(name for source, name, original in bindings
-            if source.get(name) is not original)
+        changed = [name for source, name, original in bindings
+            if source.get(name) is not original]
+        if encoder_type.__bases__ != encoder_bases or encoder_type.__mro__ != encoder_mro:
+            changed.append("JSONEncoder inheritance")
+        current_encoder_members = vars(encoder_type)
+        if (set(current_encoder_members) != {name for name, _ in encoder_members}
+                or any(current_encoder_members[name] is not original
+                    for name, original in encoder_members)):
+            changed.append("JSONEncoder members")
+        if tuple(sorted(encoder_module.ESCAPE_DCT.items())) != escape_values:
+            changed.append("ESCAPE_DCT values")
+        return tuple(changed)
 
     return plain, canonical, digest, definitions, dependency_changes
 

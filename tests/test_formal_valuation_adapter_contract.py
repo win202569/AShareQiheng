@@ -2,6 +2,7 @@
 
 import copy
 from dataclasses import asdict, replace
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -275,6 +276,68 @@ class ValuationAdapterContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
                     registry.require_official(bundle)
         registry.require_official(bundle)
+
+    def _poisoned_json_encoder(self):
+        original = json.JSONEncoder
+
+        class PoisonedEncoder(original):
+            def encode(self, value):
+                if type(value) is dict and "definition" in value:
+                    return '"poisoned-metric-definition"'
+                return super().encode(value)
+
+        return PoisonedEncoder
+
+    def test_public_loader_rejects_a_replaced_json_encoder(self):
+        bundle, scoring, policy = load_graph()
+        with patch.object(json, "JSONEncoder", self._poisoned_json_encoder()):
+            with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
+                load_formal_valuation_adapter_registry(bundle,
+                    scoring_registry=scoring, policy_registry=policy)
+
+    def test_existing_registry_reads_reject_an_active_json_encoder_swap(self):
+        bundle, scoring, policy = load_graph()
+        registry = load_formal_valuation_adapter_registry(bundle,
+            scoring_registry=scoring, policy_registry=policy)
+        with patch.object(json, "JSONEncoder", self._poisoned_json_encoder()):
+            with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
+                registry.to_dict()
+        registry.require_official(bundle)
+
+    def test_json_encoder_swap_cannot_publish_a_proof_official_after_restore(self):
+        bundle, scoring, policy = load_graph()
+        try:
+            with patch.object(json, "JSONEncoder", self._poisoned_json_encoder()):
+                registry = load_formal_valuation_adapter_registry(bundle,
+                    scoring_registry=scoring, policy_registry=policy)
+        except ValueError as error:
+            self.assertRegex(str(error), "valuation adapter.*definition dependencies")
+        else:
+            with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
+                registry.require_official(bundle)
+
+    def test_json_encoder_methods_and_both_encoding_branches_are_sealed(self):
+        bundle, scoring, policy = load_graph()
+        registry = load_formal_valuation_adapter_registry(bundle,
+            scoring_registry=scoring, policy_registry=policy)
+        for owner, name in ((json.JSONEncoder, "__init__"),
+                (json.JSONEncoder, "encode"), (json.JSONEncoder, "iterencode"),
+                (json.encoder, "encode_basestring"), (json.encoder, "c_make_encoder"),
+                (json.encoder, "_make_iterencode")):
+            original = getattr(owner, name)
+            replacement = lambda *args, _original=original, **kwargs: _original(*args, **kwargs)
+            with self.subTest(owner=owner, name=name), patch.object(owner, name, replacement):
+                with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
+                    registry.require_official(bundle)
+
+    def test_json_encoder_rejects_new_attribute_lookup_method(self):
+        bundle, scoring, policy = load_graph()
+        registry = load_formal_valuation_adapter_registry(bundle,
+            scoring_registry=scoring, policy_registry=policy)
+        with patch.object(json.JSONEncoder, "__getattribute__",
+                lambda self, name: object.__getattribute__(self, name)):
+            with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
+                registry.require_official(bundle)
 
     def test_v1_graph_cannot_load_a_formal_valuation_adapter(self):
         bundle, vocabulary, scoring, _, _ = policy_graph(
