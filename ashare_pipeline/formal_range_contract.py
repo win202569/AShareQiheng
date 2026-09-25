@@ -68,12 +68,84 @@ def _build_range_bindings_contract():
     from .formal_registry_manifest import VerifiedRegistryBundle as bundle_type
     from .formal_scoring_registry import FormalScoringRegistry as scoring_type
     from .formal_range_format import RangeConfig, parse_range_entry, _range_config_to_dict
+    from . import formal_range_format as format_module
+    from . import formal_context_schema as context_module
 
     require_bundle = bundle_type.require_official
     blob_for = bundle_type.blob
     require_scoring = scoring_type.require_official
-    require_policy = policy_type.require_verified
     policy_bytes_for = policy_type.canonical_bytes
+
+    module_globals = globals()
+    dependencies = tuple((module_globals, name, module_globals[name]) for name in (
+        "_load_canonical_object", "_canonical", "_freeze", "_text", "_exchange",
+        "RangeConfig", "parse_range_entry", "MappingProxyType", "json", "hashlib", "weakref",
+    )) + tuple((vars(format_module), name, vars(format_module)[name]) for name in (
+        "RangeConfig", "parse_range_entry", "_range_config_to_dict", "_canonical",
+        "_text", "_hash", "_exchange", "_positive_number", "_positive_integer",
+        "_https_url", "_placeholder_text", "_template_tree", "_request_template",
+        "_walk_strings", "_context_selector", "_freeze", "json", "hashlib", "math", "re",
+        "_SOURCES", "_EXCHANGES", "_IDENTIFIER", "_VERSION_IDENTIFIER", "_SHA256",
+        "_PLACEHOLDER", "_PLACEHOLDERS", "_RANGE_FIELDS", "_RANGE_FIELD_SET",
+        "_CONTEXT_SELECTOR_FIELDS",
+    )) + ((vars(context_module), "_descriptor", validate_descriptor),
+          (vars(json), "loads", json.loads), (vars(hashlib), "sha256", hashlib.sha256))
+    config_members = tuple(vars(RangeConfig).items())
+    interfaces = (
+        (bundle_type, "require_official", require_bundle),
+        (bundle_type, "blob", blob_for),
+        (scoring_type, "require_official", require_scoring),
+        (policy_type, "canonical_bytes", policy_bytes_for),
+    )
+
+    def _check_dependencies() -> None:
+        if any(owner.get(name) is not expected for owner, name, expected in dependencies):
+            raise ValueError("range binding dependency changed")
+        current_members = vars(RangeConfig)
+        if (set(current_members) != {name for name, _ in config_members}
+                or any(current_members[name] is not value for name, value in config_members)):
+            raise ValueError("range configuration interface changed")
+        if any(getattr(cls, name, None) is not expected for cls, name, expected in interfaces):
+            raise ValueError("range binding verifier changed")
+
+
+    @dataclass(frozen=True)
+    class _GraphSnapshot:
+        manifest_bytes: bytes
+        root_hash: str
+        roles: tuple[tuple[str, bytes, str], ...]
+        policy_bytes: bytes
+        policy_hash: str
+
+
+    def _capture_graph_snapshot(bundle, scoring_registry, policy_registry) -> _GraphSnapshot:
+        _check_dependencies()
+        if (type(bundle) is not bundle_type or type(scoring_registry) is not scoring_type
+                or type(policy_registry) is not policy_type):
+            raise ValueError("range bindings require exact genuine registry types")
+        require_bundle(bundle)
+        require_scoring(scoring_registry, bundle)
+        # canonical_bytes executes the original complete policy proof verifier.
+        policy_bytes = policy_bytes_for(policy_registry)
+        manifest = bundle.manifest
+        manifest_bytes = manifest.canonical_json
+        root_hash = hashlib.sha256(manifest_bytes).hexdigest()
+        if root_hash != manifest.manifest_hash:
+            raise ValueError("range binding registry root hash mismatch")
+        roles = ("source", "mapping", "feature", "scoring", "industry", "cyclic",
+                 "redline", "status", "event")
+        if manifest.schema_version == "formal-registry-manifest-v2":
+            roles += ("valuation_adapter",)
+        snapshots = []
+        for role in roles:
+            blob = blob_for(bundle, role)
+            raw = blob.canonical_json
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest != blob.registry_hash or digest != getattr(manifest, role + "_registry_hash"):
+                raise ValueError("range binding actual child hash mismatch")
+            snapshots.append((role, raw, digest))
+        return _GraphSnapshot(manifest_bytes, root_hash, tuple(snapshots), policy_bytes,
+                              hashlib.sha256(policy_bytes).hexdigest())
 
     def _range_catalog_from_source(raw: bytes) -> tuple[dict[str, object], tuple[RangeConfig, ...]]:
         source = _load_canonical_object(raw, "source registry")
@@ -136,33 +208,20 @@ def _build_range_bindings_contract():
 
 
     def _derive_graph(bundle, scoring_registry, policy_registry):
-        if (
-            type(bundle) is not bundle_type
-            or type(scoring_registry) is not scoring_type
-            or type(policy_registry) is not policy_type
-        ):
-            raise ValueError("range bindings require exact genuine registry types")
-        require_bundle(bundle)
-        require_scoring(scoring_registry, bundle)
-        require_policy(policy_registry)
-        policy = json.loads(policy_bytes_for(policy_registry))
-        root_hash = hashlib.sha256(bundle.manifest.canonical_json).hexdigest()
-        if root_hash != bundle.manifest.manifest_hash:
-            raise ValueError("range binding registry root hash mismatch")
+        snapshot = _capture_graph_snapshot(bundle, scoring_registry, policy_registry)
+        policy = json.loads(snapshot.policy_bytes)
+        root_hash = snapshot.root_hash
         if policy["registry_manifest_hash"] != root_hash:
             raise ValueError("policy and range registry roots differ")
-        role_hashes = {}
-        for role in ("source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event"):
-            blob = blob_for(bundle, role)
-            digest = hashlib.sha256(blob.canonical_json).hexdigest()
-            if digest != blob.registry_hash or digest != getattr(bundle.manifest, role + "_registry_hash"):
-                raise ValueError("range binding actual child hash mismatch")
-            role_hashes[role] = digest
-        if policy["role_hashes"] != role_hashes:
+        role_hashes = {role: digest for role, _, digest in snapshot.roles}
+        policy_role_hashes = {role: digest for role, digest in role_hashes.items()
+                              if role != "valuation_adapter"}
+        if policy["role_hashes"] != policy_role_hashes:
             raise ValueError("policy roles differ from the current range graph")
 
-        source_wire, range_configs = _range_catalog_from_source(blob_for(bundle, "source").canonical_json)
-        wrapper = _load_canonical_object(blob_for(bundle, "scoring").canonical_json, "scoring registry")
+        raw_roles = {role: raw for role, raw, _ in snapshot.roles}
+        source_wire, range_configs = _range_catalog_from_source(raw_roles["source"])
+        wrapper = _load_canonical_object(raw_roles["scoring"], "scoring registry")
         descriptors = {}
         scopes = set()
         raw_descriptors = wrapper.get("descriptors")
@@ -288,7 +347,7 @@ def _build_range_bindings_contract():
                     binding_wire["policy_calendar_selector"],
                     binding_hash,
                 )
-        return root_hash, role_hashes, definitions
+        return snapshot, definitions
 
 
     @dataclass(frozen=True)
@@ -297,9 +356,7 @@ def _build_range_bindings_contract():
         bundle: object
         scoring_registry: object
         policy_registry: object
-        root_hash: str
-        role_hashes: dict[str, str]
-        definition_fingerprint: bytes
+        snapshot: _GraphSnapshot
         bindings: dict[tuple[str, str], object]
 
 
@@ -320,22 +377,6 @@ def _build_range_bindings_contract():
     _binding_records: dict[int, _BindingRecord] = {}
 
 
-    def _definitions_fingerprint(definitions) -> bytes:
-        rows = []
-        for (rule_id, exchange), (market, calendar, selector, binding_hash) in sorted(definitions.items()):
-            rows.append(
-                {
-                    "rule_id": rule_id,
-                    "exchange": exchange,
-                    "market": _range_config_to_dict(market),
-                    "calendar": _range_config_to_dict(calendar),
-                    "selector": selector,
-                    "binding_hash": binding_hash,
-                }
-            )
-        return _canonical(rows)
-
-
     def _bindings_record(value: object, *, current: bool = False) -> _BindingsRecord:
         record = _bindings_records.get(id(value))
         if type(value) is not RangeBindings or record is None or record.reference() is not value:
@@ -348,14 +389,10 @@ def _build_range_bindings_contract():
         ):
             raise ValueError("range binding set children changed")
         if current:
-            root_hash, role_hashes, definitions = _derive_graph(
+            snapshot = _capture_graph_snapshot(
                 record.bundle, record.scoring_registry, record.policy_registry
             )
-            if (
-                root_hash != record.root_hash
-                or role_hashes != record.role_hashes
-                or _definitions_fingerprint(definitions) != record.definition_fingerprint
-            ):
+            if snapshot != record.snapshot:
                 raise ValueError("range binding sources changed")
         return record
 
@@ -403,11 +440,13 @@ def _build_range_bindings_contract():
 
         @property
         def registry_manifest_hash(self) -> str:
-            return _bindings_record(_binding_record(self).parent()).root_hash
+            return _bindings_record(_binding_record(self).parent()).snapshot.root_hash
 
         @property
         def source_registry_hash(self) -> str:
-            return _bindings_record(_binding_record(self).parent()).role_hashes["source"]
+            return next(digest for role, _, digest in
+                        _bindings_record(_binding_record(self).parent()).snapshot.roles
+                        if role == "source")
 
         @property
         def binding_hash(self) -> str:
@@ -453,9 +492,10 @@ def _build_range_bindings_contract():
         bundle, *, scoring_registry, policy_registry
     ) -> RangeBindings:
         """Bind signed range configs to every active market rule and exchange."""
-        root_hash, role_hashes, definitions = _derive_graph(
+        snapshot, definitions = _derive_graph(
             bundle, scoring_registry, policy_registry
         )
+        root_hash = snapshot.root_hash
         result = object.__new__(RangeBindings)
         binding_objects = {}
         for key, (market, calendar, selector, binding_hash) in definitions.items():
@@ -490,15 +530,15 @@ def _build_range_bindings_contract():
             if record is not None and record.reference is reference:
                 _bindings_records.pop(identity, None)
 
+        if _capture_graph_snapshot(bundle, scoring_registry, policy_registry) != snapshot:
+            raise ValueError("range binding sources changed during loading")
         reference = weakref.ref(result, forget_bindings)
         _bindings_records[identity] = _BindingsRecord(
             reference,
             bundle,
             scoring_registry,
             policy_registry,
-            root_hash,
-            dict(role_hashes),
-            _definitions_fingerprint(definitions),
+            snapshot,
             {key: weakref.ref(binding) for key, binding in binding_objects.items()},
         )
         return result
@@ -510,8 +550,8 @@ def _build_range_bindings_contract():
         return MappingProxyType({
             "market_config": child.market_config,
             "calendar_config": child.calendar_config,
-            "registry_manifest_hash": parent.root_hash,
-            "source_registry_hash": parent.role_hashes["source"],
+            "registry_manifest_hash": parent.snapshot.root_hash,
+            "source_registry_hash": dict((role, digest) for role, _, digest in parent.snapshot.roles)["source"],
             "binding_hash": child.binding_hash,
             "rule_id": child.key[0],
             "exchange": child.key[1],

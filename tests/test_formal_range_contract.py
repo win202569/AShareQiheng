@@ -21,6 +21,100 @@ from tests.test_formal_sources import config
 
 
 class FormalRangeContractTests(unittest.TestCase):
+    def test_current_revalidates_sources_without_rederiving_range_graph(self):
+        from ashare_pipeline import formal_range_contract as contract
+
+        bindings, *_ = self._load()
+        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        _, owner_read = contract._range_binding_planning_authority()
+        counts = {}
+
+        def profile(frame, event, _arg):
+            if event == "call":
+                name = frame.f_code.co_name
+                counts[name] = counts.get(name, 0) + 1
+
+        sys.setprofile(profile)
+        try:
+            for _ in range(2):
+                binding.require_current()
+                owner_read(binding)
+        finally:
+            sys.setprofile(None)
+
+        for name in ("_derive_graph", "_range_catalog_from_source", "parse_range_entry",
+                     "_definitions_fingerprint"):
+            self.assertEqual(counts.get(name, 0), 0, name)
+        self.assertGreaterEqual(counts.get("require_official", 0), 8)
+        self.assertGreaterEqual(counts.get("canonical_bytes", 0), 4)
+
+    def test_range_config_method_replacement_is_rejected_before_first_load_and_current(self):
+        from ashare_pipeline import formal_range_format as range_format
+        from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+
+        bundle, vocabulary, scoring, *_ = range_graph()
+        policy = load_formal_policy_registry(
+            bundle, scoring_registry=scoring, feature_registry=vocabulary)
+        original = range_format.RangeConfig.to_dict
+        with patch.object(range_format.RangeConfig, "to_dict", lambda self: original(self)):
+            with self.assertRaises(ValueError):
+                load_policy_range_bindings(bundle, scoring_registry=scoring, policy_registry=policy)
+
+        bindings = load_policy_range_bindings(
+            bundle, scoring_registry=scoring, policy_registry=policy)
+        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        with patch.object(range_format.RangeConfig, "to_dict", lambda self: original(self)):
+            with self.assertRaises(ValueError):
+                binding.require_current()
+        binding.require_current()
+
+    def test_v2_adapter_and_feature_bytes_remain_current_dependencies(self):
+        from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+        from tests.formal_policy_fixtures import policy_graph
+        from tests.formal_range_fixtures import add_range_documents
+
+        bundle, vocabulary, scoring, *_ = policy_graph(
+            manifest_version="formal-registry-manifest-v2",
+            with_valuation_adapter=True, mutate=add_range_documents)
+        policy = load_formal_policy_registry(
+            bundle, scoring_registry=scoring, feature_registry=vocabulary)
+        bindings = load_policy_range_bindings(
+            bundle, scoring_registry=scoring, policy_registry=policy)
+        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        binding.require_current()
+        for role in ("valuation_adapter", "feature"):
+            blob = bundle.blob(role)
+            original = blob.canonical_json
+            try:
+                object.__setattr__(blob, "canonical_json", original + b" ")
+                with self.subTest(role=role), self.assertRaises(ValueError):
+                    binding.require_current()
+            finally:
+                object.__setattr__(blob, "canonical_json", original)
+        binding.require_current()
+
+    def test_nested_feature_and_scoring_mutations_revoke_current_binding(self):
+        bindings, _, vocabulary, scoring, *_ = self._load()
+        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        formula = vocabulary.slots[0].formula
+        original_op = formula.op
+        try:
+            object.__setattr__(formula, "op", "subtract" if original_op != "subtract" else "add")
+            with self.assertRaises(ValueError):
+                binding.require_current()
+        finally:
+            object.__setattr__(formula, "op", original_op)
+        binding.require_current()
+
+        original_hash = scoring.content_sha256
+        try:
+            object.__setattr__(scoring, "content_sha256", "0" * 64)
+            with self.assertRaises(ValueError):
+                binding.require_current()
+        finally:
+            object.__setattr__(scoring, "content_sha256", original_hash)
+        binding.require_current()
+
     def test_legacy_and_planning_binding_authorities_are_separate_and_owner_read(self):
         from unittest.mock import patch
         from ashare_pipeline import formal_range_contract as contract
