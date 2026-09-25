@@ -77,12 +77,15 @@ def _build_range_bindings_contract():
     policy_bytes_for = policy_type.canonical_bytes
 
     module_globals = globals()
-    # parse_range_entry -> _bridge/_context_selector, _request_template and its
-    # text/tree helpers, numeric validators and _freeze. The serializer used by
+    # _range_catalog_from_source reads _load_canonical_object and the immutable
+    # _LEGACY_CONFIG_FIELDS global; its parser/type/serializer are captured
+    # closure references. parse_range_entry -> _bridge/_context_selector,
+    # _request_template and its text/tree helpers, numeric validators and
+    # _freeze. The serializer used by
     # current checks -> _thaw (recursive). Inventory every non-builtin global
     # reached by those call chains, including the module aliases they use.
     dependencies = tuple((module_globals, name, module_globals[name]) for name in (
-        "_load_canonical_object", "_canonical", "_freeze", "_text", "_exchange",
+        "_load_canonical_object", "_LEGACY_CONFIG_FIELDS", "_canonical", "_freeze", "_text", "_exchange",
         "RangeConfig", "parse_range_entry", "MappingProxyType", "json", "hashlib", "weakref",
     )) + tuple((vars(format_module), name, vars(format_module)[name]) for name in (
         "RangeConfig", "parse_range_entry", "_range_config_to_dict", "_canonical",

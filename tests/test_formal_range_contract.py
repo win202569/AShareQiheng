@@ -21,6 +21,33 @@ from tests.test_formal_sources import config
 
 
 class FormalRangeContractTests(unittest.TestCase):
+    def test_equal_identity_replacement_of_legacy_fields_before_load_is_rejected(self):
+        from ashare_pipeline import formal_range_contract as contract
+
+        bundle, vocabulary, scoring, *_ = range_graph()
+        policy = load_formal_policy_registry(
+            bundle, scoring_registry=scoring, feature_registry=vocabulary)
+        replacement = frozenset(list(contract._LEGACY_CONFIG_FIELDS))
+        self.assertEqual(replacement, contract._LEGACY_CONFIG_FIELDS)
+        self.assertIsNot(replacement, contract._LEGACY_CONFIG_FIELDS)
+        with patch.object(contract, "_LEGACY_CONFIG_FIELDS", replacement):
+            with self.assertRaises(ValueError):
+                contract.load_policy_range_bindings(
+                    bundle, scoring_registry=scoring, policy_registry=policy)
+
+    def test_empty_legacy_fields_after_warmup_revoke_current_and_owner_read(self):
+        from ashare_pipeline import formal_range_contract as contract
+
+        bindings, *_ = self._load()
+        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        _, owner_read = contract._range_binding_planning_authority()
+        with patch.object(contract, "_LEGACY_CONFIG_FIELDS", frozenset()):
+            with self.assertRaises(ValueError):
+                binding.require_current()
+            with self.assertRaises(ValueError):
+                owner_read(binding)
+        binding.require_current()
+
     def test_current_revalidates_sources_without_rederiving_range_graph(self):
         from ashare_pipeline import formal_range_contract as contract
 
