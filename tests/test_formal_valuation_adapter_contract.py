@@ -2,6 +2,7 @@
 
 import copy
 from dataclasses import asdict, replace
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -233,6 +234,46 @@ class ValuationAdapterContractTests(unittest.TestCase):
         with patch.object(metric_engine, "_canonical", lambda value: b"wrong"):
             with self.assertRaisesRegex(ValueError, "valuation adapter.*encoder"):
                 registry.require_official(bundle)
+        registry.require_official(bundle)
+
+    def _metric_dependency_substitutions(self):
+        plain = metric_engine._plain
+        fields = metric_engine.fields
+
+        def poisoned_plain(value):
+            return "lower" if value == "higher" else plain(value)
+
+        def omitted_direction(value):
+            return tuple(field for field in fields(value) if field.name != "direction")
+
+        return (
+            ("_plain", poisoned_plain),
+            ("fields", omitted_direction),
+            ("json", SimpleNamespace(dumps=lambda *args, **kwargs: '"poisoned"')),
+        )
+
+    def test_all_definition_dependencies_reject_poisoned_public_loads_after_restore(self):
+        bundle, scoring, policy = load_graph()
+        for name, replacement in self._metric_dependency_substitutions():
+            with self.subTest(dependency=name):
+                try:
+                    with patch.object(metric_engine, name, replacement):
+                        registry = load_formal_valuation_adapter_registry(bundle,
+                            scoring_registry=scoring, policy_registry=policy)
+                except ValueError as error:
+                    self.assertRegex(str(error), "valuation adapter.*definition dependencies")
+                else:
+                    with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
+                        registry.require_official(bundle)
+
+    def test_existing_registry_rejects_every_active_definition_dependency_swap(self):
+        bundle, scoring, policy = load_graph()
+        registry = load_formal_valuation_adapter_registry(bundle,
+            scoring_registry=scoring, policy_registry=policy)
+        for name, replacement in self._metric_dependency_substitutions():
+            with self.subTest(dependency=name), patch.object(metric_engine, name, replacement):
+                with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
+                    registry.require_official(bundle)
         registry.require_official(bundle)
 
     def test_v1_graph_cannot_load_a_formal_valuation_adapter(self):

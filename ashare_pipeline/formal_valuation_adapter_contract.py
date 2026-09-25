@@ -72,9 +72,9 @@ def _install_registry():
     bundle_type, scoring_type, policy_type = VerifiedRegistryBundle, FormalScoringRegistry, FormalPolicyRegistry
     require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
     require_scoring, require_policy = scoring_type.require_official, policy_type.require_verified
-    template_for = scoring_type.template_for
     definitions = _scoring_metric_definitions
-    metric_encoder = metric_module._canonical
+    metric_owner = metric_module
+    definition_guard = metric_owner._metric_definition_dependency_changes
     definition_type, serialize_definition = ValuationAdapterDefinition, asdict
     dumps, loads, sha256 = json.dumps, json.loads, hashlib.sha256
     parse = _load_canonical_object
@@ -86,10 +86,13 @@ def _install_registry():
     def sources(bundle, scoring, policy):
         if type(bundle) is not bundle_type or type(scoring) is not scoring_type or type(policy) is not policy_type:
             _fail("graph", "requires exact verified source types")
-        if vars(scoring_type).get("template_for") is not template_for:
-            _fail("graph.template_for", "scoring template reader changed")
-        if vars(metric_module).get("_canonical") is not metric_encoder:
-            _fail("graph.encoder", "metric definition encoder changed")
+        if (globals().get("metric_module") is not metric_owner
+                or vars(metric_owner).get("_metric_definition_dependency_changes") is not definition_guard):
+            _fail("graph.definition dependencies", "metric definition encoder or producer guard changed")
+        changes = definition_guard()
+        if changes:
+            _fail("graph.definition dependencies",
+                "metric definition encoder or producer changed: " + ", ".join(changes))
         require_bundle(bundle)
         if bundle.manifest.schema_version != "formal-registry-manifest-v2":
             raise ValueError("valuation_adapter role is unavailable for this manifest version")

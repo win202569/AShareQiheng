@@ -39,22 +39,6 @@ def percentile_rank(raw_value, values, *, direction):
         return rank, 100 - percentile if direction == "lower" else percentile
 
 
-def _plain(value):
-    if isinstance(value, (dict, MappingProxyType)):
-        return {key: _plain(item) for key, item in value.items()}
-    if type(value) in (tuple, list):
-        return [_plain(item) for item in value]
-    return str(value) if type(value) is Decimal else value
-
-
-def _canonical(value):
-    return json.dumps(_plain(value), sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
-
-
-def _digest(value, _encoder=_canonical, _sha256=hashlib.sha256):
-    return _sha256(_encoder(value)).hexdigest()
-
-
 def _freeze(value):
     if type(value) is dict:
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
@@ -64,22 +48,67 @@ def _freeze(value):
     return value
 
 
-def _scoring_metric_definitions(scoring, _definition_digest=_digest,
-        _template_for=FormalScoringRegistry.template_for):
-    result = {}
-    for tid in scoring.templates:
-        template = _template_for(scoring, tid)
-        result[tid] = {}
-        for dimension, metrics in template.metrics.items():
-            for metric in metrics:
-                key = dimension + "." + metric.metric_id
-                definition = {field.name: _plain(getattr(metric, field.name)) for field in fields(metric)}
-                payload = dict(template_id=tid, metric_id=key, definition=definition,
-                    registry_manifest_hash=scoring.registry_manifest_hash,
-                    scoring_registry_hash=scoring.content_sha256, feature_registry_hash=scoring.role_hashes["feature"])
-                payload["definition_hash"] = _definition_digest(payload)
-                result[tid][key] = payload
-    return result
+def _install_metric_definition_producer():
+    """Close the complete metric-definition encoding chain over original dependencies."""
+    owner = globals()
+    mapping_type, decimal_type, field_reader = MappingProxyType, Decimal, fields
+    json_module, hash_module, scoring_type = json, hashlib, FormalScoringRegistry
+    dumps, sha256, template_for = json_module.dumps, hash_module.sha256, scoring_type.template_for
+    dict_type, tuple_type, list_type = dict, tuple, list
+    type_of, is_instance, as_text, read_field = type, isinstance, str, getattr
+
+    def plain(value):
+        if is_instance(value, (dict_type, mapping_type)):
+            return {key: plain(item) for key, item in value.items()}
+        if type_of(value) in (tuple_type, list_type):
+            return [plain(item) for item in value]
+        return as_text(value) if type_of(value) is decimal_type else value
+
+    def canonical(value):
+        return dumps(plain(value), sort_keys=True, ensure_ascii=False,
+            separators=(",", ":"), allow_nan=False).encode()
+
+    def digest(value):
+        return sha256(canonical(value)).hexdigest()
+
+    def definitions(scoring):
+        result = {}
+        for tid in scoring.templates:
+            template = template_for(scoring, tid)
+            result[tid] = {}
+            for dimension, metrics in template.metrics.items():
+                for metric in metrics:
+                    key = dimension + "." + metric.metric_id
+                    definition = {field.name: plain(read_field(metric, field.name))
+                        for field in field_reader(metric)}
+                    payload = dict_type(template_id=tid, metric_id=key, definition=definition,
+                        registry_manifest_hash=scoring.registry_manifest_hash,
+                        scoring_registry_hash=scoring.content_sha256,
+                        feature_registry_hash=scoring.role_hashes["feature"])
+                    payload["definition_hash"] = digest(payload)
+                    result[tid][key] = payload
+        return result
+
+    def dependency_changes():
+        bindings = (
+            (owner, "MappingProxyType", mapping_type), (owner, "Decimal", decimal_type),
+            (owner, "fields", field_reader), (owner, "json", json_module),
+            (owner, "hashlib", hash_module), (owner, "FormalScoringRegistry", scoring_type),
+            (owner, "_plain", plain), (owner, "_canonical", canonical),
+            (owner, "_digest", digest), (owner, "_scoring_metric_definitions", definitions),
+            (owner, "_metric_definition_dependency_changes", dependency_changes),
+            (vars(json_module), "dumps", dumps), (vars(hash_module), "sha256", sha256),
+            (vars(scoring_type), "template_for", template_for),
+        )
+        return tuple(name for source, name, original in bindings
+            if source.get(name) is not original)
+
+    return plain, canonical, digest, definitions, dependency_changes
+
+
+(_plain, _canonical, _digest, _scoring_metric_definitions,
+ _metric_definition_dependency_changes) = _install_metric_definition_producer()
+del _install_metric_definition_producer
 
 
 def _install_engine():
