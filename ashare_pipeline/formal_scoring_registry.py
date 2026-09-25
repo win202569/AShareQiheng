@@ -183,15 +183,22 @@ class StatusRule(RedlineDefinition):
     pass
 
 
-def _feature_slots(feature_registry, bundle):
+def _feature_slots(feature_registry, bundle, *, materialize=True):
     if type(feature_registry) is not SignedFormalFeatureRegistry:
         raise RegistryValidationError("official feature vocabulary must be an exact sealed SignedFormalFeatureRegistry")
     feature_registry.require_release_eligible()
     feature = bundle.blob("feature")
-    if (feature_registry.canonical_json != feature.canonical_json or feature_registry.registry_hash != feature.registry_hash
-        or feature_registry.source_registry_hash != bundle.blob("source").registry_hash
-        or feature_registry.mapping_registry_hash != bundle.blob("mapping").registry_hash):
+    # The original verifier has checked the whole sealed feature object above.
+    # Read its four graph fields directly so each comparison does not repeat
+    # that full fingerprint (including all slot formulas).
+    read = object.__getattribute__
+    if (read(feature_registry, "canonical_json") != feature.canonical_json
+        or read(feature_registry, "registry_hash") != feature.registry_hash
+        or read(feature_registry, "source_registry_hash") != bundle.blob("source").registry_hash
+        or read(feature_registry, "mapping_registry_hash") != bundle.blob("mapping").registry_hash):
         raise RegistryValidationError("feature vocabulary differs from registry manifest graph")
+    if not materialize:
+        return None
     return {t: {slot.slot_id: slot for slot in feature_registry.slots_for_template(t)} for t in _TEMPLATES}
 
 
@@ -523,7 +530,7 @@ def _trusted_registry():
                     raise RegistryValidationError("registry manifest graph differs from loaded scoring registry")
                 if registry_bundle.blob("scoring").canonical_json != record[2]:
                     raise RegistryValidationError("scoring content differs from registry manifest")
-                _feature_slots(record[3], registry_bundle)
+                _feature_slots(record[3], registry_bundle, materialize=False)
             except (ValueError, TypeError, AttributeError) as error:
                 raise RegistryValidationError(f"official registry manifest proof failed: {error}") from error
 
