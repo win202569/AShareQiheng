@@ -3,6 +3,7 @@
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -47,6 +48,136 @@ class ContextJournalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             journal.checkpoint()
 
+    def test_checker_is_called_once_per_phase_for_same_evidence(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        self.put()
+        root = self.manifest.manifest_hash
+        journal = FormalBatchReadJournal.open(self.repo, registry_manifest_hash=root,
+            as_of_utc=FREEZE, population=("SZ000001",),
+            required_keys=(("security_state", "fixture-state", "SZ000001"),))
+        self.repo.select_current_batch_ticket(journal, "security_state", "fixture-state",
+            ("SZ000001",), FREEZE, root)
+        code = type(self.repo)._batch_recheck_ticket.__code__
+        calls = []
+        def profile(frame, event, arg):
+            if event == "call" and frame.f_code is code:
+                calls.append(1)
+        sys.setprofile(profile)
+        try:
+            journal.checkpoint()
+            journal.checkpoint()
+            self.assertEqual(len(calls), 1)
+            journal.next_phase()
+            journal.checkpoint()
+            self.assertEqual(len(calls), 2)
+        finally:
+            sys.setprofile(None)
+
+    def test_preopen_owner_method_replacement_is_rejected(self):
+        from ashare_pipeline import formal_batch_read_journal as journal_module
+        FormalBatchReadJournal = journal_module.FormalBatchReadJournal
+
+        root = self.manifest.manifest_hash
+        arguments = dict(registry_manifest_hash=root, as_of_utc=FREEZE,
+            population=("SZ000001",),
+            required_keys=(("security_state", "fixture-state", "SZ000001"),))
+        for method in ("get_verified_many", "select_current_batch_ticket", "_batch_recheck_ticket"):
+            with self.subTest(method=method):
+                with patch.object(type(self.repo), method, lambda *_a, **_k: None):
+                    with self.assertRaises(ValueError):
+                        FormalBatchReadJournal.open(self.repo, **arguments)
+        with patch.object(self.api, "formal_version_sort_key", lambda *_: ()):
+            with self.assertRaises(ValueError):
+                FormalBatchReadJournal.open(self.repo, **arguments)
+        with patch.object(journal_module, "_issue_current_ticket", lambda *_a, **_k: None):
+            with self.assertRaises(ValueError):
+                FormalBatchReadJournal.open(self.repo, **arguments)
+
+    def test_two_member_scope_issues_two_current_tickets(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        self.put()
+        self.put(request=self.request(security_id="SZ000002"))
+        root = self.manifest.manifest_hash
+        members = ("SZ000001", "SZ000002")
+        required = tuple(("security_state", "fixture-state", item) for item in members)
+        journal = FormalBatchReadJournal.open(self.repo, registry_manifest_hash=root,
+            as_of_utc=FREEZE, population=members, required_keys=required)
+        for member in members:
+            self.repo.select_current_batch_ticket(journal, "security_state", "fixture-state",
+                (member,), FREEZE, root)
+        journal.checkpoint()
+        journal.next_phase()
+        journal.finalize()
+
+    def test_population_member_can_issue_optional_ticket(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        self.put()
+        self.put(request=self.request(security_id="SZ000002"))
+        root = self.manifest.manifest_hash
+        journal = FormalBatchReadJournal.open(self.repo, registry_manifest_hash=root,
+            as_of_utc=FREEZE, population=("SZ000001", "SZ000002"),
+            required_keys=(("security_state", "fixture-state", "SZ000001"),))
+        self.repo.select_current_batch_ticket(journal, "security_state", "fixture-state",
+            ("SZ000002",), FREEZE, root)
+        self.repo.select_current_batch_ticket(journal, "security_state", "fixture-state",
+            ("SZ000001",), FREEZE, root)
+        journal.finalize()
+
+    def test_ticket_exposes_the_exact_selected_result(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        fact, _, _ = self.put()
+        root = self.manifest.manifest_hash
+        journal = FormalBatchReadJournal.open(self.repo, registry_manifest_hash=root,
+            as_of_utc=FREEZE, population=("SZ000001",),
+            required_keys=(("security_state", "fixture-state", "SZ000001"),))
+        ticket = self.repo.select_current_batch_ticket(journal, "security_state",
+            "fixture-state", ("SZ000001",), FREEZE, root)
+        self.assertEqual(ticket.selected()["SZ000001"].id, fact.id)
+        journal.finalize()
+        with self.assertRaises(ValueError):
+            ticket.selected()
+
+    def test_candidate_added_just_after_selection_cannot_be_issued_as_old_result(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        self.put()
+        root = self.manifest.manifest_hash
+        journal = FormalBatchReadJournal.open(self.repo, registry_manifest_hash=root,
+            as_of_utc=FREEZE, population=("SZ000001",),
+            required_keys=(("security_state", "fixture-state", "SZ000001"),))
+        selected_code = type(self.repo)._select_many_with_token.__code__
+        def inject(frame, event, arg):
+            if event == "return" and frame.f_code is selected_code:
+                sys.setprofile(None)
+                self.put(request=self.request(upstream_generation="late-correction"),
+                         published="2026-08-25T07:00:00+00:00")
+        sys.setprofile(inject)
+        try:
+            with self.assertRaises(ValueError):
+                self.repo.select_current_batch_ticket(journal, "security_state",
+                    "fixture-state", ("SZ000001",), FREEZE, root)
+        finally:
+            sys.setprofile(None)
+
+    def test_selected_winner_conflict_rejects_finalizing_checkpoint(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        self.put()
+        root = self.manifest.manifest_hash
+        journal = FormalBatchReadJournal.open(self.repo, registry_manifest_hash=root,
+            as_of_utc=FREEZE, population=("SZ000001",),
+            required_keys=(("security_state", "fixture-state", "SZ000001"),))
+        self.repo.select_current_batch_ticket(journal, "security_state", "fixture-state",
+            ("SZ000001",), FREEZE, root)
+        journal.checkpoint()
+        self.put(request=self.request(upstream_generation="same-leading-conflict"))
+        with self.assertRaises(ValueError):
+            journal.finalize()
+
     def test_current_ticket_detects_absence_turning_present(self):
         from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
 
@@ -76,7 +207,7 @@ class ContextJournalTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             CurrentReadTicket()
         with self.assertRaises(ValueError):
-            _issue_current_ticket(journal, self.repo, "context", ("fake",), b"fake", (), ())
+            _issue_current_ticket(journal, self.repo, "context", ("fake",), b"fake", (), (), None)
         peer = self.api.FormalContextRepository(self.store, self.snapshots, self.verifier)
         with self.assertRaises(ValueError):
             peer.select_current_batch_ticket(journal, "security_state", "fixture-state",
@@ -194,8 +325,83 @@ class FeatureJournalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             journal.checkpoint()
 
+    def test_preopen_feature_ticket_method_replacement_is_rejected(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        provider = feature_tests.SnapshotProvider(self.snapshot())
+        repo = self.repository(provider)
+        key = self.registry.slots_for_template("general_nonfinancial")[0].slot_id
+        arguments = dict(registry_manifest_hash=self.manifest.manifest_hash,
+            as_of_utc="2026-08-31T07:00:00+00:00", population=("SZ000001",),
+            required_keys=(("SZ000001", "general_nonfinancial", key),))
+        for method in ("select_current_metric_batch_ticket", "_batch_recheck_ticket"):
+            with self.subTest(method=method):
+                with patch.object(type(repo), method, lambda *_a, **_k: None):
+                    with self.assertRaises(ValueError):
+                        FormalBatchReadJournal.open(repo, **arguments)
+
 
 class RangeJournalTests(unittest.TestCase):
+    def test_preopen_range_selector_and_checker_replacement_is_rejected(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        fixture = RangeStoreFixture()
+        self.addCleanup(fixture.close)
+        first = fixture.produce_calendar(days={"2026-08-31": True})[0]
+        fingerprint = fixture.source.first_calendar_request(FREEZE).request_fingerprint
+        arguments = dict(registry_manifest_hash=first.request["registry_manifest_hash"],
+            as_of_utc=FREEZE, population=(fingerprint,), required_keys=((fingerprint,),))
+        for method in ("select_current", "select_current_batch_ticket", "_batch_recheck_ticket"):
+            with self.subTest(method=method):
+                with patch.object(type(fixture.range_store), method, lambda *_a, **_k: None):
+                    with self.assertRaises(ValueError):
+                        FormalBatchReadJournal.open(fixture.range_store, **arguments)
+
+    def test_conflicting_candidate_inserted_after_selection_cannot_enter_new_baseline(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        fixture = RangeStoreFixture()
+        self.addCleanup(fixture.close)
+        first = fixture.produce_calendar(days={"2026-08-31": True}, generation="g1")[0]
+        fingerprint = fixture.source.first_calendar_request(FREEZE).request_fingerprint
+        journal = FormalBatchReadJournal.open(fixture.range_store,
+            registry_manifest_hash=first.request["registry_manifest_hash"],
+            as_of_utc=FREEZE, population=(fingerprint,), required_keys=((fingerprint,),))
+        selected_code = type(fixture.range_store)._select_current_with_token.__code__
+        def inject(frame, event, arg):
+            if event == "return" and frame.f_code is selected_code:
+                sys.setprofile(None)
+                fixture.produce_calendar(days={"2026-08-31": False}, generation="g2")
+        sys.setprofile(inject)
+        try:
+            with self.assertRaises(ValueError):
+                fixture.range_store.select_current_batch_ticket(journal, fingerprint)
+        finally:
+            sys.setprofile(None)
+
+    def test_two_market_requests_share_one_frozen_range_scope(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        fixture = RangeStoreFixture()
+        self.addCleanup(fixture.close)
+        day = "2026-08-31"
+        row = {"exchange_allows_trading": True, "volume": "0", "turnover": "0",
+               "close": {"state": "unavailable", "reason": "source_reports_no_trade"}}
+        first = fixture.put_window("SH600000", trading_days=(day,), rows={day: row})
+        second = fixture.put_window("SH600001", trading_days=(day,), rows={day: row})
+        self.assertTrue(first and second)
+        fingerprints = tuple(sorted((first[0].task["request_fingerprint"],
+                                     second[0].task["request_fingerprint"])))
+        journal = FormalBatchReadJournal.open(fixture.range_store,
+            registry_manifest_hash=first[0].request["registry_manifest_hash"],
+            as_of_utc=FREEZE, population=fingerprints,
+            required_keys=tuple((item,) for item in fingerprints))
+        for fingerprint in fingerprints:
+            fixture.range_store.select_current_batch_ticket(journal, fingerprint)
+        journal.checkpoint()
+        journal.next_phase()
+        journal.finalize()
+
     def test_raw_change_invalidates_current_ticket_without_version_change(self):
         from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
 

@@ -621,7 +621,7 @@ def _install_metric_projection():
         return _issue_current_ticket(journal, self, "feature",
             (security_id, as_of_utc, template_id, registry_manifest_hash, required_feature_keys),
             baseline, evidence,
-            tuple((security_id, template_id, key) for key in required_feature_keys))
+            tuple((security_id, template_id, key) for key in required_feature_keys), result)
 
     def recheck_metric_ticket(self, evidence):
         dependencies(self)
@@ -655,7 +655,9 @@ def _install_metric_projection():
     repository_type.select_current_metric_batch_ticket = select_metric_ticket
     repository_type._batch_recheck_ticket = recheck_metric_ticket
     checked_methods += ((repository_type, "select_current_verified_metric_features", select),
-        (repository_type, "select_current_verified_metric_feature_state", select_state))
+        (repository_type, "select_current_verified_metric_feature_state", select_state),
+        (repository_type, "select_current_metric_batch_ticket", select_metric_ticket),
+        (repository_type, "_batch_recheck_ticket", recheck_metric_ticket))
     return VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence, dependencies
 
 

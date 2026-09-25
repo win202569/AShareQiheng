@@ -362,7 +362,7 @@ class FormalContextRepository:
             raise ValueError("trading calendars require an exchange selector")
         return self._select(kind, scope_key, security_id, as_of_utc, registry_manifest_hash)
 
-    def get_verified_many(self, kind, scope_key, security_ids, as_of_utc, registry_manifest_hash):
+    def _select_many_with_token(self, kind, scope_key, security_ids, as_of_utc, registry_manifest_hash):
         """Verify a complete scope twice, selecting each requested security once.
 
         None denotes actual absence; malformed evidence and selection races raise.
@@ -411,7 +411,17 @@ class FormalContextRepository:
         after = snapshot()
         if tuple(fact.canonical_bytes() for fact in before) != tuple(fact.canonical_bytes() for fact in after):
             raise ValueError("Context correction race during verification")
-        return MappingProxyType(selected)
+        token = (tuple(fact.canonical_bytes() for fact in before),
+                 tuple((security_id, None if selected[security_id] is None
+                        else selected[security_id].canonical_bytes())
+                       for security_id in security_ids))
+        return MappingProxyType(selected), token
+
+    def get_verified_many(self, kind, scope_key, security_ids, as_of_utc, registry_manifest_hash):
+        """Return the current complete Context scope as a detached mapping."""
+        selected, _ = self._select_many_with_token(
+            kind, scope_key, security_ids, as_of_utc, registry_manifest_hash)
+        return selected
 
     def select_current_batch_ticket(self, journal, kind, scope_key, security_ids,
                                     as_of_utc, registry_manifest_hash):
@@ -421,15 +431,8 @@ class FormalContextRepository:
         _require_authentic_context_repository(self)
         _require_current_scope(journal, self, root=registry_manifest_hash,
                                as_of_utc=as_of_utc, population=security_ids)
-        selected = self.get_verified_many(kind, scope_key, security_ids,
-                                          as_of_utc, registry_manifest_hash)
-        candidates = self._state_store.list_formal_context_facts(
-            registry_manifest_hash=registry_manifest_hash, context_kind=kind,
-            scope_key=scope_key, as_of_utc=as_of_utc)
-        candidate_bytes = tuple(fact.canonical_bytes() for fact in candidates)
-        selected_bytes = tuple((security_id, None if selected[security_id] is None
-                                else selected[security_id].canonical_bytes())
-                               for security_id in security_ids)
+        selected, (candidate_bytes, selected_bytes) = self._select_many_with_token(
+            kind, scope_key, security_ids, as_of_utc, registry_manifest_hash)
         if tuple(fact.canonical_bytes() for fact in self._state_store.list_formal_context_facts(
                 registry_manifest_hash=registry_manifest_hash, context_kind=kind,
                 scope_key=scope_key, as_of_utc=as_of_utc)) != candidate_bytes:
@@ -444,7 +447,7 @@ class FormalContextRepository:
         coverage = tuple((kind, scope_key, security_id) for security_id in security_ids)
         return _issue_current_ticket(journal, self, "context",
             (kind, scope_key, security_ids, as_of_utc, registry_manifest_hash),
-            baseline, evidence, coverage)
+            baseline, evidence, coverage, selected)
 
     def _batch_recheck_ticket(self, evidence):
         """Reread the original candidate and source evidence without selecting."""
@@ -462,9 +465,19 @@ class FormalContextRepository:
                     _validate_stored_fact(self._state_store, connection, fact,
                         self._verifier, snapshot_repository=self._snapshots)
         for security_id, selected in selected_bytes:
-            if selected is not None and selected not in tuple(
-                    fact.canonical_bytes() for fact in candidates if fact.security_id == security_id):
-                raise ValueError("Context selected source changed")
+            current = tuple(fact for fact in candidates if fact.security_id == security_id)
+            if selected is None:
+                if current:
+                    raise ValueError("Context selected absence became present")
+                continue
+            if not current:
+                raise ValueError("Context selected winner disappeared")
+            ordered = sorted(current, key=lambda fact: formal_version_sort_key(
+                FormalContextVersionView.from_fact(fact)))
+            key = formal_version_sort_key(FormalContextVersionView.from_fact(ordered[0]))
+            if (sum(formal_version_sort_key(FormalContextVersionView.from_fact(fact)) == key
+                    for fact in current) != 1 or ordered[0].canonical_bytes() != selected):
+                raise ValueError("Context original winner is no longer uniquely current")
 
     def resolve_verified_calendar_binding(self, selector, exchange, as_of_utc, registry_manifest_hash):
         self._load(registry_manifest_hash)
@@ -498,6 +511,12 @@ def _context_repository_identity():
     """
     initialized = {}
     original_init = FormalContextRepository.__init__
+    fixed_methods = tuple((cls, name, value)
+        for cls in (FormalContextRepository, StateStore, FormalSnapshotRepository,
+                    FormalContextVersionView)
+        for name, value in vars(cls).items()
+        if name != "__init__" and (callable(value) or isinstance(value, (staticmethod, classmethod))))
+    fixed_helpers = (formal_version_sort_key, _validate_stored_fact)
 
     def init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
@@ -512,6 +531,14 @@ def _context_repository_identity():
         if any(actual is not expected for actual, expected in zip(
                 (repository._state_store, repository._snapshots, repository._verifier), record[1:], strict=True)):
             raise ValueError("Context repository initialized dependencies changed")
+        if (formal_version_sort_key, _validate_stored_fact) != fixed_helpers:
+            raise ValueError("Context journal selection or source reader changed")
+        for cls, name, method in fixed_methods:
+            if vars(cls).get(name) is not method:
+                raise ValueError("Context journal reader or owner method changed")
+            for instance in (repository, repository._state_store, repository._snapshots):
+                if type(instance) is cls and name in getattr(instance, "__dict__", {}):
+                    raise ValueError("Context journal reader instance method changed")
 
     FormalContextRepository.__init__ = init
     return require

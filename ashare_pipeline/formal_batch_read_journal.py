@@ -25,7 +25,7 @@ def _install_journal():
     def _owner_state(owner):
         from .formal_context_repository import FormalContextRepository, _require_authentic_context_repository
         from .formal_feature_repository import FormalFeatureRepository, _require_authentic_metric_feature_repository
-        from .formal_range_store import FormalRangeStore
+        from .formal_range_store import FormalRangeStore, _require_range_batch_journal_owner
         if type(owner) is FormalContextRepository:
             _require_authentic_context_repository(owner)
             return "context", owner._state_store, (owner._snapshots, owner._verifier)
@@ -33,10 +33,13 @@ def _install_journal():
             _require_authentic_metric_feature_repository(owner)
             return "feature", owner._store, (owner._bundle_store, owner._verifier, owner._current_input_provider)
         if type(owner) is FormalRangeStore:
-            return "range", *owner._batch_journal_identity()
+            return "range", *_require_range_batch_journal_owner(owner)
         raise ValueError("batch journal requires a fixed genuine owner type")
 
     def _scope(scope, *, active=True):
+        if (globals().get("_issue_current_ticket") is not issue
+                or globals().get("_require_current_scope") is not require_scope):
+            raise ValueError("batch journal issuing authority changed")
         record = scopes.get(id(scope))
         if type(scope) is not FormalBatchReadJournal or record is None or record[0]() is not scope:
             raise ValueError("batch scope is forged or copied")
@@ -68,6 +71,13 @@ def _install_journal():
         def __init__(self, *args, **kwargs):
             raise TypeError("current read tickets are issued only by owners")
 
+        def selected(self):
+            record = tickets.get(id(self))
+            if type(self) is not CurrentReadTicket or record is None or record[0]() is not self:
+                raise ValueError("current read ticket is forged or copied")
+            _scope(record[1]())
+            return record[6]
+
         def __copy__(self):
             raise TypeError("current read ticket cannot be copied")
 
@@ -90,6 +100,9 @@ def _install_journal():
         def open(cls, owner, *, registry_manifest_hash, as_of_utc, population, required_keys):
             if cls is not FormalBatchReadJournal:
                 raise ValueError("batch scope type must be exact")
+            if (globals().get("_issue_current_ticket") is not issue
+                    or globals().get("_require_current_scope") is not require_scope):
+                raise ValueError("batch journal issuing authority changed")
             if (type(registry_manifest_hash) is not str or len(registry_manifest_hash) != 64
                     or any(c not in "0123456789abcdef" for c in registry_manifest_hash)):
                 raise ValueError("batch scope requires canonical signed root hash")
@@ -155,7 +168,7 @@ def _install_journal():
             raise ValueError("current read ticket is forged, copied, or cross-scope")
         return record
 
-    def issue(scope, owner, kind, key, baseline, evidence, coverage):
+    def issue(scope, owner, kind, key, baseline, evidence, coverage, selection):
         record = _scope(scope)
         if owner is not record[3] or kind != record[4]:
             raise ValueError("current ticket owner mismatch")
@@ -166,8 +179,12 @@ def _install_journal():
             raise ValueError("current ticket must be issued by the fixed owner selector")
         if type(key) is not tuple or type(baseline) is not bytes or type(coverage) is not tuple:
             raise ValueError("current ticket evidence shape invalid")
-        if any(item not in record[12] for item in coverage):
-            raise ValueError("current ticket coverage is outside build scope")
+        member_index = 2 if kind == "context" else 0
+        expected_length = 1 if kind == "range" else 3
+        if any(type(item) is not tuple or len(item) != expected_length
+               or type(item[member_index]) is not str
+               or item[member_index] not in record[11] for item in coverage):
+            raise ValueError("current ticket coverage is outside frozen population")
         identity = (id(owner), kind, key)
         previous = record[13].get(identity)
         if previous is not None:
@@ -178,14 +195,18 @@ def _install_journal():
         ticket = object.__new__(CurrentReadTicket)
         ticket_id = id(ticket)
         tickets[ticket_id] = (weakref.ref(ticket, lambda _, key=ticket_id: tickets.pop(key, None)),
-            weakref.ref(scope), identity, baseline, evidence, coverage)
+            weakref.ref(scope), identity, baseline, evidence, coverage, selection)
         record[13][identity] = ticket
         return ticket
 
     def require_scope(scope, owner, *, root, as_of_utc, population):
         record = _scope(scope)
+        if (type(population) is not tuple or not population
+                or any(type(item) is not str for item in population)
+                or tuple(sorted(set(population))) != population):
+            raise ValueError("current read population must be a sorted nonempty subset")
         if (owner is not record[3] or root != record[9] or as_of_utc != record[10]
-                or population != record[11]):
+                or not set(population) <= set(record[11])):
             raise ValueError("current read does not match owner build scope")
 
     return FormalBatchReadJournal, CurrentReadTicket, issue, require_scope

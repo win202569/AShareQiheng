@@ -572,26 +572,28 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
         def read_history(self, task_id):
             return read(self, task_id, historical=True)
 
-        def select_current(self, request_fingerprint):
+        def _select_current_with_token(self, request_fingerprint):
             candidates, token = current_candidates(self, _text(request_fingerprint))
             snapshots = [token]
             if not candidates:
                 finish_current_check(self, snapshots)
-                return None
+                return None, tuple(snapshots)
             require_parent_chain(self, observation_wire(candidates[0])[0], snapshots)
             finish_current_check(self, snapshots)
-            return candidates[0]
+            return candidates[0], tuple(snapshots)
+
+        def select_current(self, request_fingerprint):
+            return self._select_current_with_token(request_fingerprint)[0]
 
         def _batch_journal_identity(self):
-            state, root, verifier, factory, _ = record(self)
-            return state, (root, verifier, factory, source_type)
+            return require_batch_journal_owner(self)
 
         def select_current_batch_ticket(self, journal, request_fingerprint):
             """Issue only after the complete independent current selection."""
             from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
 
             fingerprint = _text(request_fingerprint)
-            selected = self.select_current(fingerprint)
+            selected, snapshots = self._select_current_with_token(fingerprint)
             if selected is None:
                 raise ValueError("range absence needs a bound request before ticket issuance")
             wire, digest = observation_wire(selected)
@@ -604,8 +606,10 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                 raise ValueError("range selected observation changed during ticket issuance")
             state, root, _, _, _ = record(self)
             with transaction(state) as connection:
-                fingerprints = {fingerprint, *(item[0]["request_fingerprint"] for item in authenticated)}
-                snapshots = tuple((key, candidate_snapshot(connection, key)) for key in sorted(fingerprints))
+                if not {item[0]["request_fingerprint"] for item in authenticated} <= {
+                        key for key, _ in snapshots}:
+                    raise ValueError("range ticket parent was outside selected candidate token")
+                check_candidate_snapshots(connection, snapshots)
                 for item in authenticated:
                     check_read_evidence(connection, root, item)
             evidence = (fingerprint, digest, tuple(authenticated), snapshots)
@@ -614,7 +618,7 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                 sources=[[_canonical(value).decode() if type(value) is dict else value.hex()
                           for value in item] for item in authenticated]))
             return _issue_current_ticket(journal, self, "range", (fingerprint,),
-                                         baseline, evidence, ((fingerprint,),))
+                                         baseline, evidence, ((fingerprint,),), selected)
 
         def _batch_recheck_ticket(self, evidence):
             """Compare the original six authenticated records and candidate sets."""
@@ -626,6 +630,24 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                 check_candidate_snapshots(connection, snapshots)
                 for item in authenticated:
                     check_read_evidence(connection, root, item)
+
+    batch_methods = tuple((cls, name, value)
+        for cls in (FormalRangeStore, source_type, StateStore)
+        for name, value in vars(cls).items()
+        if callable(value) or isinstance(value, (staticmethod, classmethod)))
+
+    def require_batch_journal_owner(store):
+        state, root, verifier, factory, _ = record(store)
+        for cls, name, method in batch_methods:
+            if vars(cls).get(name) is not method:
+                raise ValueError("range journal reader or owner method changed")
+            for instance in (store, state):
+                if type(instance) is cls and name in getattr(instance, "__dict__", {}):
+                    raise ValueError("range journal reader instance method changed")
+        return state, (root, verifier, factory, source_type)
+
+    # The source factory installs this sealed type once, before any Store exists.
+    globals()["_require_range_batch_journal_owner"] = require_batch_journal_owner
 
     def require_identity(store, expected_state_store, expected_signature_verifier):
         """Check ownership without exposing any captured dependency or authority."""
