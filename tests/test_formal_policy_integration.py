@@ -131,6 +131,24 @@ class FormalPolicyIntegrationTests(unittest.TestCase):
             second = fixture.build_policy_batch()
         self.assertEqual(first.canonical_bytes(), second.canonical_bytes())
         self.assertEqual(first.batch_hash, second.batch_hash)
+        with closing(sqlite3.connect(fixture.db_path)) as connection:
+            connection.row_factory = sqlite3.Row
+            old_snapshot = connection.execute("SELECT * FROM formal_source_snapshot WHERE id=?",
+                                              (old_ref.snapshot_id,)).fetchone()
+            self.assertIsNotNone(old_snapshot)
+            old_snapshot_row = dict(old_snapshot)
+            old_task = connection.execute("SELECT * FROM formal_collection_task WHERE id=?",
+                                          (old_snapshot_row["producing_task_id"],)).fetchone()
+            old_receipt = connection.execute("SELECT * FROM formal_task_snapshot_receipt WHERE snapshot_id=?",
+                                             (old_ref.snapshot_id,)).fetchone()
+            old_fact = connection.execute("SELECT * FROM formal_context_fact WHERE source_snapshot_id=?",
+                                          (old_ref.snapshot_id,)).fetchone()
+            self.assertIsNotNone(old_task)
+            self.assertIsNotNone(old_receipt)
+            self.assertIsNotNone(old_fact)
+            old_task_row = dict(old_task)
+            old_receipt_row = dict(old_receipt)
+            old_fact_row = dict(old_fact)
         _, new_ref = fixture.put_policy_context("SH600000", "security_state",
             dict(state, is_st=True), generation="g2")
         with patch.object(socket, "create_connection", side_effect=AssertionError("real HTTP forbidden")):
@@ -140,8 +158,23 @@ class FormalPolicyIntegrationTests(unittest.TestCase):
         self.assertEqual(old_path.read_bytes(), old_bytes)
         self.assertNotEqual(old_ref.snapshot_id, new_ref.snapshot_id)
         with closing(sqlite3.connect(fixture.db_path)) as connection:
-            self.assertTrue(connection.execute("SELECT 1 FROM formal_source_snapshot WHERE id=?",
-                                               (old_ref.snapshot_id,)).fetchone())
+            connection.row_factory = sqlite3.Row
+            old_snapshot_after = connection.execute("SELECT * FROM formal_source_snapshot WHERE id=?",
+                                                    (old_ref.snapshot_id,)).fetchone()
+            old_task_after = connection.execute("SELECT * FROM formal_collection_task WHERE id=?",
+                                                (old_snapshot_row["producing_task_id"],)).fetchone()
+            old_receipt_after = connection.execute("SELECT * FROM formal_task_snapshot_receipt WHERE snapshot_id=?",
+                                                   (old_ref.snapshot_id,)).fetchone()
+            old_fact_after = connection.execute("SELECT * FROM formal_context_fact WHERE source_snapshot_id=?",
+                                                (old_ref.snapshot_id,)).fetchone()
+            self.assertIsNotNone(old_snapshot_after)
+            self.assertIsNotNone(old_task_after)
+            self.assertIsNotNone(old_receipt_after)
+            self.assertIsNotNone(old_fact_after)
+            self.assertEqual(dict(old_snapshot_after), old_snapshot_row)
+            self.assertEqual(dict(old_task_after), old_task_row)
+            self.assertEqual(dict(old_receipt_after), old_receipt_row)
+            self.assertEqual(dict(old_fact_after), old_fact_row)
             self.assertTrue(connection.execute("SELECT 1 FROM formal_source_snapshot WHERE id=?",
                                                (new_ref.snapshot_id,)).fetchone())
         with self.assertRaises(ValueError):
@@ -149,6 +182,11 @@ class FormalPolicyIntegrationTests(unittest.TestCase):
         first.require_verified()  # Historical publication remains auditable.
 
     def test_restart_reuses_authenticated_page_without_transport_duplicate(self):
+        def assert_snapshot_paths(snapshot, fixture):
+            for key in ("content_path", "manifest_path"):
+                self.assertTrue(Path(snapshot[key]).resolve(strict=True).is_relative_to(fixture.root.resolve()),
+                                f"{key} escaped the fixture TemporaryDirectory")
+
         clock = patch("ashare_pipeline.formal_range_store._utc_now",
                       return_value="2026-09-01T00:00:00+00:00")
         clock.start()
@@ -163,6 +201,7 @@ class FormalPolicyIntegrationTests(unittest.TestCase):
             lease = crashed.range_store.lease_next("crashed", lease_seconds=60)
             first = crashed.range_store.persist(lease["id"], "crashed", lease["attempt_id"],
                                                 fetch=crashed.source.fetch_verified(lease["request"]))
+            assert_snapshot_paths(first.snapshot, crashed)
             first_raw = Path(first.snapshot["content_path"])
             first_bytes = first_raw.read_bytes()
             self.assertEqual(len(crashed.transport.calls), 1)
@@ -188,6 +227,8 @@ class FormalPolicyIntegrationTests(unittest.TestCase):
             self.assertEqual(control.worker.run_once()["state"], "verified")
         recovered = crashed.range_store.select_current(second_request.request_fingerprint)
         uninterrupted = control.range_store.select_current(control_second.request_fingerprint)
+        assert_snapshot_paths(recovered.snapshot, crashed)
+        assert_snapshot_paths(uninterrupted.snapshot, control)
         # Full proof hashes include temporary raw paths and task/worker identity.
         # Compare the canonical source observation/result carried by each proof.
         self.assertEqual(canonical(dict(request=recovered.to_dict()["request"],
