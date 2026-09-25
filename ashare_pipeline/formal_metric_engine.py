@@ -51,8 +51,8 @@ def _canonical(value):
     return json.dumps(_plain(value), sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
 
 
-def _digest(value):
-    return hashlib.sha256(_canonical(value)).hexdigest()
+def _digest(value, _encoder=_canonical, _sha256=hashlib.sha256):
+    return _sha256(_encoder(value)).hexdigest()
 
 
 def _freeze(value):

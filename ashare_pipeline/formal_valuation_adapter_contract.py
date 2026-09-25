@@ -8,6 +8,7 @@ import json
 from typing import Literal
 import weakref
 
+from . import formal_metric_engine as metric_module
 from .formal_metric_engine import _scoring_metric_definitions
 from .formal_policy_registry import FormalPolicyRegistry
 from .formal_registry_manifest import VerifiedRegistryBundle, _load_canonical_object
@@ -73,6 +74,7 @@ def _install_registry():
     require_scoring, require_policy = scoring_type.require_official, policy_type.require_verified
     template_for = scoring_type.template_for
     definitions = _scoring_metric_definitions
+    metric_encoder = metric_module._canonical
     definition_type, serialize_definition = ValuationAdapterDefinition, asdict
     dumps, loads, sha256 = json.dumps, json.loads, hashlib.sha256
     parse = _load_canonical_object
@@ -86,6 +88,8 @@ def _install_registry():
             _fail("graph", "requires exact verified source types")
         if vars(scoring_type).get("template_for") is not template_for:
             _fail("graph.template_for", "scoring template reader changed")
+        if vars(metric_module).get("_canonical") is not metric_encoder:
+            _fail("graph.encoder", "metric definition encoder changed")
         require_bundle(bundle)
         if bundle.manifest.schema_version != "formal-registry-manifest-v2":
             raise ValueError("valuation_adapter role is unavailable for this manifest version")

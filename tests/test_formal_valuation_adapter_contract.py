@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import ashare_pipeline.formal_valuation_adapter_contract as adapter_module
+import ashare_pipeline.formal_metric_engine as metric_engine
 from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
 from ashare_pipeline.formal_valuation_adapter_contract import (
     FormalValuationAdapterRegistry, load_formal_valuation_adapter_registry,
@@ -205,6 +206,34 @@ class ValuationAdapterContractTests(unittest.TestCase):
                     lambda self, name: object.__getattribute__(self, name))
         finally:
             type.__setattr__(FormalValuationAdapterRegistry, "__getattribute__", original)
+
+    def test_swapped_metric_encoder_cannot_leave_an_official_adapter_after_restore(self):
+        bundle, scoring, policy = load_graph()
+        genuine = metric_engine._canonical
+
+        def poisoned(value):
+            if type(value) is dict and "definition" in value:
+                return b"poisoned-metric-definition"
+            return genuine(value)
+
+        try:
+            with patch.object(metric_engine, "_canonical", poisoned):
+                registry = load_formal_valuation_adapter_registry(bundle,
+                    scoring_registry=scoring, policy_registry=policy)
+        except ValueError as error:
+            self.assertRegex(str(error), "valuation adapter.*encoder")
+        else:
+            with self.assertRaisesRegex(ValueError, "valuation adapter.*(encoder|definition)"):
+                registry.require_official(bundle)
+
+    def test_existing_adapter_rejects_a_swapped_metric_encoder(self):
+        bundle, scoring, policy = load_graph()
+        registry = load_formal_valuation_adapter_registry(bundle,
+            scoring_registry=scoring, policy_registry=policy)
+        with patch.object(metric_engine, "_canonical", lambda value: b"wrong"):
+            with self.assertRaisesRegex(ValueError, "valuation adapter.*encoder"):
+                registry.require_official(bundle)
+        registry.require_official(bundle)
 
     def test_v1_graph_cannot_load_a_formal_valuation_adapter(self):
         bundle, vocabulary, scoring, _, _ = policy_graph(

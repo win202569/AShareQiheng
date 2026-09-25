@@ -225,6 +225,9 @@ class MetricClosureTests(unittest.TestCase):
         with patch.object(self.api, "_digest", side_effect=AssertionError("replacement called")):
             third = self.build(metric_ids=(METRICS[0],))
         self.assertEqual(third.input_for("BJ430001", METRICS[0]).definition_hash, expected)
+        with patch.object(self.api, "_canonical", side_effect=AssertionError("replacement called")):
+            fourth = self.build(metric_ids=(METRICS[0],))
+        self.assertEqual(fourth.input_for("BJ430001", METRICS[0]).definition_hash, expected)
 
     def test_cross_member_still_absent_fact_issue_and_provider_corrections_fail_closure(self):
         for mutation in ("facts", "issues", "provider", "receipt"):
