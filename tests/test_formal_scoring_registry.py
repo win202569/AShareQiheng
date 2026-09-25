@@ -10,6 +10,7 @@ from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from ashare_pipeline.formal_feature_contract import load_signed_feature_registry
 from ashare_pipeline.formal_registry_manifest import (
@@ -298,6 +299,40 @@ class FormalScoringRegistryTests(unittest.TestCase):
             finally:
                 object.__setattr__(target, field, original)
             registry.require_official(bundle)
+
+    def test_warmed_official_proof_rejects_replaced_feature_verifier_and_slot_mutation(self):
+        bundle, vocabulary, _, _ = signed_graph()
+        registry = self.load_official(bundle, vocabulary)
+        registry.require_official(bundle)
+        slot = object.__getattribute__(vocabulary, "slots")[0]
+        original = object.__getattribute__(slot, "unit")
+        try:
+            object.__setattr__(slot, "unit", "changed")
+            with patch.object(type(vocabulary), "require_release_eligible", lambda self: None):
+                with self.assertRaises(self.api.RegistryValidationError):
+                    registry.require_official(bundle)
+            with self.assertRaises(self.api.RegistryValidationError):
+                registry.require_official(bundle)
+        finally:
+            object.__setattr__(slot, "unit", original)
+        registry.require_official(bundle)
+
+    def test_first_official_load_rejects_replaced_verifier_and_restored_polluted_feature(self):
+        bundle, vocabulary, _, _ = signed_graph()
+        slot = object.__getattribute__(vocabulary, "slots")[0]
+        original = object.__getattribute__(slot, "unit")
+        try:
+            with patch.object(type(vocabulary), "require_release_eligible", lambda self: None):
+                with self.assertRaises(self.api.RegistryValidationError):
+                    self.load_official(bundle, vocabulary)
+                object.__setattr__(slot, "unit", "changed")
+                with self.assertRaises(self.api.RegistryValidationError):
+                    self.load_official(bundle, vocabulary)
+            with self.assertRaises(self.api.RegistryValidationError):
+                self.load_official(bundle, vocabulary)
+        finally:
+            object.__setattr__(slot, "unit", original)
+        self.load_official(bundle, vocabulary).require_official(bundle)
 
     def test_official_required_key_must_exist_in_its_signed_template(self):
         def missing_slot(docs):

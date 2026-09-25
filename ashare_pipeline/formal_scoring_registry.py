@@ -183,10 +183,12 @@ class StatusRule(RedlineDefinition):
     pass
 
 
-def _feature_slots(feature_registry, bundle, *, materialize=True):
+def _feature_slots(feature_registry, bundle, *, verifier, materialize=True):
     if type(feature_registry) is not SignedFormalFeatureRegistry:
         raise RegistryValidationError("official feature vocabulary must be an exact sealed SignedFormalFeatureRegistry")
-    feature_registry.require_release_eligible()
+    if SignedFormalFeatureRegistry.require_release_eligible is not verifier:
+        raise RegistryValidationError("official feature verifier binding changed")
+    verifier(feature_registry)
     feature = bundle.blob("feature")
     # The original verifier has checked the whole sealed feature object above.
     # Read its four graph fields directly so each comparison does not repeat
@@ -369,7 +371,7 @@ def _consensus_links(wrapper, templates):
     return MappingProxyType(result)
 
 
-def _parse(raw, approval, bundle, feature_registry):
+def _parse(raw, approval, bundle, feature_registry, feature_verifier):
     wrapper = _load(raw)
     version = wrapper.get("schema_version")
     expected_wrapper = ("registry_role", "schema_version", "descriptors", "scoring")
@@ -401,7 +403,7 @@ def _parse(raw, approval, bundle, feature_registry):
             raise RegistryValidationError("official approval hash or approval_id mismatch")
         if raw != bundle.blob("scoring").canonical_json:
             raise RegistryValidationError("scoring bytes differ from registry manifest")
-        slots = _feature_slots(feature_registry, bundle)
+        slots = _feature_slots(feature_registry, bundle, verifier=feature_verifier)
     else:
         if bundle is not None or approval.approved_content_sha256 is not None or approval.approval_id is not None or feature_registry is not None:
             raise RegistryValidationError("test fixture cannot use an official bundle or approval")
@@ -471,6 +473,7 @@ def _parse(raw, approval, bundle, feature_registry):
 
 def _trusted_registry():
     seals = {}
+    feature_verifier = SignedFormalFeatureRegistry.require_release_eligible
 
     def fingerprint(value):
         if type(value) in (str, bytes, int, bool, Decimal, type(None)):
@@ -530,7 +533,7 @@ def _trusted_registry():
                     raise RegistryValidationError("registry manifest graph differs from loaded scoring registry")
                 if registry_bundle.blob("scoring").canonical_json != record[2]:
                     raise RegistryValidationError("scoring content differs from registry manifest")
-                _feature_slots(record[3], registry_bundle, materialize=False)
+                _feature_slots(record[3], registry_bundle, verifier=feature_verifier, materialize=False)
             except (ValueError, TypeError, AttributeError) as error:
                 raise RegistryValidationError(f"official registry manifest proof failed: {error}") from error
 
@@ -542,7 +545,7 @@ def _trusted_registry():
             if approval.purpose == "official" and bundle is None:
                 raise RegistryValidationError("official scoring must load from registry_bundle.blob('scoring')")
             raw = bundle.blob("scoring").canonical_json if bundle is not None else source if type(source) is bytes else Path(source).read_bytes()
-            values = _parse(raw, approval, bundle, feature_registry)
+            values = _parse(raw, approval, bundle, feature_registry, feature_verifier)
             registry = object.__new__(FormalScoringRegistry)
             for name, value in values.items():
                 object.__setattr__(registry, name, value)
