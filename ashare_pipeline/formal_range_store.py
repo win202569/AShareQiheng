@@ -588,15 +588,57 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
         def _batch_journal_identity(self):
             return require_batch_journal_owner(self)
 
-        def select_current_batch_ticket(self, journal, request_fingerprint):
+        def select_current_batch_ticket(self, journal, request_fingerprint, *, request=None):
             """Issue only after the complete independent current selection."""
             from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
 
             fingerprint = _text(request_fingerprint)
             selected, snapshots = self._select_current_with_token(fingerprint)
             if selected is None:
-                raise ValueError("range absence needs a bound request before ticket issuance")
+                if request is None:
+                    raise ValueError("range absence needs a bound request before ticket issuance")
+                request_description = describe_request(request)
+                request_wire = request_description["request"]
+                if _digest(request_wire) != fingerprint:
+                    raise ValueError("range absence request fingerprint differs")
+                require_execution(request, self)
+                _require_current_scope(journal, self,
+                    root=request_wire["registry_manifest_hash"],
+                    as_of_utc=request_wire["as_of_utc"], population=(fingerprint,))
+                authenticated = []
+                parent = request_description["parent"]
+                if parent is not None:
+                    previous = read(self, parent["task_id"], evidence=authenticated)
+                    if observation_wire(previous)[1] != parent["observation_hash"]:
+                        raise ValueError("range absence parent changed")
+                    state, root, _, _, _ = record(self)
+                    with transaction(state) as connection:
+                        row = connection.execute("SELECT * FROM formal_range_task WHERE id=?",
+                                                 (parent["task_id"],)).fetchone()
+                        if row is None:
+                            raise ValueError("range absence parent disappeared")
+                        snapshots = (*snapshots,
+                            (row["request_fingerprint"], candidate_snapshot(connection,
+                                row["request_fingerprint"])),
+                            *parent_candidate_snapshots(connection, row))
+                        check_candidate_snapshots(connection, snapshots)
+                        for item in authenticated:
+                            check_read_evidence(connection, root, item)
+                state, _, _, _, _ = record(self)
+                with transaction(state) as connection:
+                    check_candidate_snapshots(connection, snapshots)
+                baseline = _canonical(dict(fingerprint=fingerprint, request=request_description,
+                    selected_hash=None,
+                    candidates=[(key, [row.decode() for row in rows]) for key, rows in snapshots],
+                    sources=[[_canonical(value).decode() if type(value) is dict else value.hex()
+                              for value in item] for item in authenticated]))
+                evidence = (fingerprint, None, tuple(authenticated), snapshots, request,
+                            _canonical(request_description))
+                return _issue_current_ticket(journal, self, "range", (fingerprint,),
+                    baseline, evidence, ((fingerprint,),), None)
             wire, digest = observation_wire(selected)
+            if request is not None and describe_request(request)["request"] != wire["request"]:
+                raise ValueError("range selected request differs from bound request")
             _require_current_scope(journal, self,
                 root=wire["request"]["registry_manifest_hash"],
                 as_of_utc=wire["request"]["as_of_utc"], population=(fingerprint,))
@@ -612,7 +654,7 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                 check_candidate_snapshots(connection, snapshots)
                 for item in authenticated:
                     check_read_evidence(connection, root, item)
-            evidence = (fingerprint, digest, tuple(authenticated), snapshots)
+            evidence = (fingerprint, digest, tuple(authenticated), snapshots, None, None)
             baseline = _canonical(dict(fingerprint=fingerprint, selected_hash=digest,
                 candidates=[(key, [row.decode() for row in rows]) for key, rows in snapshots],
                 sources=[[_canonical(value).decode() if type(value) is dict else value.hex()
@@ -622,10 +664,17 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
 
         def _batch_recheck_ticket(self, evidence):
             """Compare the original six authenticated records and candidate sets."""
-            fingerprint, digest, authenticated, snapshots = evidence
+            fingerprint, digest, authenticated, snapshots, request, request_bytes = evidence
             state, root, _, _, _ = record(self)
-            if not digest or not authenticated or fingerprint not in dict(snapshots):
+            if fingerprint not in dict(snapshots):
                 raise ValueError("range ticket evidence is incomplete")
+            if digest is None:
+                if (request is None or request_bytes != _canonical(describe_request(request))
+                        or _digest(describe_request(request)["request"]) != fingerprint
+                        or dict(snapshots)[fingerprint]):
+                    raise ValueError("range absence request or candidates changed")
+            elif not digest or not authenticated or request is not None:
+                raise ValueError("range present ticket evidence is incomplete")
             with transaction(state) as connection:
                 check_candidate_snapshots(connection, snapshots)
                 for item in authenticated:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import weakref
+from contextvars import ContextVar
 from types import MappingProxyType
 
 from .formal_context_repository import FormalContextRepository
@@ -39,6 +40,7 @@ def _freeze(value):
 
 def _install_state():
     repositories, selections = {}, {}
+    batch_capture = ContextVar("policy_state_batch_capture", default=None)
     context_type = FormalContextRepository
     companion_type = FormalMetricContextRepository
     companion_init = companion_type.__init__
@@ -141,10 +143,20 @@ def _install_state():
 
         def read():
             result = {}
+            capture = batch_capture.get()
             for kind, scope in groups:
-                selected = read_many(context, kind, scope, security_ids, as_of_utc, policy["registry_manifest_hash"])
+                if capture is not None and not capture["complete"]:
+                    ticket = context.select_current_batch_ticket(capture["journal"], kind,
+                        scope, security_ids, as_of_utc, policy["registry_manifest_hash"])
+                    capture["tickets"].append(ticket)
+                    selected = ticket.selected()
+                else:
+                    selected = read_many(context, kind, scope, security_ids, as_of_utc,
+                        policy["registry_manifest_hash"])
                 fact = selected[security_id]
                 result[(kind, scope)] = None if fact is None else fact.to_dict()
+            if capture is not None:
+                capture["complete"] = True
             return result
 
         factors = read()
@@ -190,6 +202,55 @@ def _install_state():
             dict(security_id=security_id, as_of_utc=as_of_utc, template_id=template_id, policy_registry=policy_registry))
         return result
 
+    def select_current_batch_ticket(self, journal, security_id, as_of_utc, *,
+                                    template_id, policy_registry):
+        from .formal_batch_read_journal import (
+            _issue_current_ticket, _require_current_scope, _require_current_ticket,
+        )
+        context = dependencies(self)
+        policy = read_policy(policy_registry)
+        root = policy["registry_manifest_hash"]
+        _require_current_scope(journal, self, root=root, as_of_utc=as_of_utc,
+                               population=(security_id,))
+        capture = {"journal": journal, "tickets": [], "complete": False}
+        reset = batch_capture.set(capture)
+        try:
+            result = select(self, security_id, as_of_utc,
+                template_id=template_id, policy_registry=policy_registry)
+        finally:
+            batch_capture.reset(reset)
+        saved = record(result)
+        lower = tuple(capture["tickets"])
+        lower_baselines = tuple(_require_current_ticket(journal, item, context, "context")[1]
+                                for item in lower)
+        for item in lower:
+            context._batch_recheck_ticket(_require_current_ticket(
+                journal, item, context, "context")[2])
+        if read_policy(policy_registry) != policy:
+            raise PolicyIntegrityError("policy registry changed during state ticket issuance")
+        request = (security_id, as_of_utc, template_id, root)
+        baseline = canonical_bytes(dict(request=request, selected=json.loads(saved[1]),
+                                        policy=policy,
+                                        context=[item.decode() for item in lower_baselines]))
+        evidence = (result, saved[1], policy_registry, canonical_bytes(policy), lower,
+                    journal, context, request)
+        return _issue_current_ticket(journal, self, "state", request, baseline,
+                                     evidence, ((security_id,),), result)
+
+    def _batch_recheck_ticket(self, evidence):
+        from .formal_batch_read_journal import _require_current_ticket
+        selection, selected_bytes, policy_registry, policy_bytes, lower, journal, context, request = evidence
+        if (record(selection)[1] != selected_bytes
+                or canonical_bytes(read_policy(policy_registry)) != policy_bytes
+                or dependencies(self) is not context):
+            raise PolicyIntegrityError("state ticket selection or policy changed")
+        for ticket in lower:
+            _require_current_ticket(journal, ticket, context, "context")
+
+    def _batch_journal_identity(self):
+        context = dependencies(self)
+        return context._state_store, context
+
     class FormalPolicyStateRepository:
         __slots__ = ("__weakref__",)
 
@@ -212,6 +273,9 @@ def _install_state():
             raise TypeError("state repositories cannot be copied")
 
     FormalPolicyStateRepository.select = select
+    FormalPolicyStateRepository.select_current_batch_ticket = select_current_batch_ticket
+    FormalPolicyStateRepository._batch_recheck_ticket = _batch_recheck_ticket
+    FormalPolicyStateRepository._batch_journal_identity = _batch_journal_identity
     own_methods = tuple((cls, dict(vars(cls))) for cls in
                         (FormalPolicyStateRepository, PolicyStateSelection, SelectionMeta))
     return FormalPolicyStateRepository, PolicyStateSelection

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import weakref
+from contextvars import ContextVar
 from datetime import datetime
 from types import MappingProxyType
 
@@ -161,6 +162,7 @@ def _observation(selector, slot, projected, state, fy_end=None):
 
 def _install_financial():
     repositories, selections = {}, {}
+    batch_capture = ContextVar("policy_financial_batch_capture", default=None)
     feature_type = feature_module.FormalFeatureRepository
     feature_select = feature_type.select_current_verified_policy_feature_state
     feature_check, state_wire = _feature_dependencies, PolicyFeatureState.to_dict
@@ -264,8 +266,18 @@ def _install_financial():
         rules = [r for r in policy["rules"] if r["template_id"] == template_id
             and (r["kind"] == "numeric_redline" or (r["kind"] == "cyclic_protection" and applicability == "applicable"))]
         rule_ids = tuple(sorted(r["rule_id"] for r in rules))
-        state = feature_select(feature_repository, security_id, as_of_utc, template_id=template_id,
-            registry_manifest_hash=policy["registry_manifest_hash"], policy_registry=policy_registry, rule_ids=rule_ids)
+        capture = batch_capture.get()
+        if capture is None:
+            state = feature_select(feature_repository, security_id, as_of_utc, template_id=template_id,
+                registry_manifest_hash=policy["registry_manifest_hash"], policy_registry=policy_registry,
+                rule_ids=rule_ids)
+        else:
+            ticket = feature_repository.select_current_policy_batch_ticket(capture["journal"],
+                security_id, as_of_utc, template_id=template_id,
+                registry_manifest_hash=policy["registry_manifest_hash"],
+                policy_registry=policy_registry, rule_ids=rule_ids)
+            capture.update(feature_ticket=ticket, policy=policy, industry=industry)
+            state = ticket.selected()
         wire = state_wire(state)
         slots = {s["slot_id"]: s for s in wire["slots"]}
         projected = {v["slot_id"]: v for v in wire["values"]}
@@ -307,6 +319,68 @@ def _install_financial():
                  policy_registry=policy_registry, industry_batch=industry_batch))
         return result
 
+    def select_current_batch_ticket(self, journal, security_id, as_of_utc, *,
+                                    template_id, policy_registry, industry_batch):
+        from .formal_batch_read_journal import (
+            _issue_current_ticket, _require_current_scope, _require_current_ticket,
+        )
+        feature_repository, _ = dependencies(self)
+        policy = policy_wire(policy_registry)
+        root = policy["registry_manifest_hash"]
+        _require_current_scope(journal, self, root=root, as_of_utc=as_of_utc,
+                               population=(security_id,))
+        capture = {"journal": journal}
+        reset = batch_capture.set(capture)
+        try:
+            selected = select(self, security_id, as_of_utc, template_id=template_id,
+                policy_registry=policy_registry, industry_batch=industry_batch)
+        finally:
+            batch_capture.reset(reset)
+        feature_ticket = capture["feature_ticket"]
+        feature_selected, feature_baseline = _require_current_ticket(journal, feature_ticket,
+            feature_repository, "policy_feature")[:2]
+        feature_repository._batch_recheck_policy_ticket(_require_current_ticket(
+            journal, feature_ticket, feature_repository, "policy_feature")[2])
+        saved = record(selected)
+        if capture["policy"] != policy or industry_wire(industry_batch) != capture["industry"]:
+            raise PolicyIntegrityError("financial ticket registry or industry changed")
+        request = (security_id, as_of_utc, template_id, root)
+        baseline = canonical_bytes(dict(request=request, selected=json.loads(saved[1]),
+            feature=feature_baseline.decode(), policy=policy, industry=capture["industry"]))
+        evidence = (selected, saved[1], feature_ticket, feature_selected,
+            feature_repository, journal, policy_registry, canonical_bytes(policy),
+            industry_batch, canonical_bytes(capture["industry"]), request)
+        return _issue_current_ticket(journal, self, "financial", request, baseline,
+                                     evidence, ((security_id,),), selected)
+
+    def _batch_recheck_ticket(self, evidence):
+        from .formal_batch_read_journal import _require_current_ticket
+        (selected, selected_bytes, feature_ticket, feature_selected, feature_repository,
+         journal, policy_registry, policy_bytes, industry_batch, industry_bytes,
+         request) = evidence
+        current_feature = _require_current_ticket(journal, feature_ticket,
+            feature_repository, "policy_feature")[0]
+        if (record(selected)[1] != selected_bytes or current_feature is not feature_selected
+                or dependencies(self)[0] is not feature_repository):
+            raise PolicyIntegrityError("financial ticket selection ownership changed")
+        require_policy(policy_registry)
+        require_industry(industry_batch)
+        if (canonical_bytes(policy_wire(policy_registry)) != policy_bytes
+                or canonical_bytes(industry_wire(industry_batch)) != industry_bytes):
+            raise PolicyIntegrityError("financial ticket policy or industry changed")
+        security_id, as_of_utc, template_id, root = request
+        industry = industry_wire(industry_batch)
+        frozen = read_universe(feature_repository._store, industry["frozen_input_hash"])
+        if (frozen is None or frozen.registry_manifest_hash != root
+                or frozen.universe_hash != industry["universe_hash"]
+                or datetime.fromisoformat(frozen.as_of_utc) != datetime.fromisoformat(as_of_utc)
+                or security_id not in {member.security_id for member in frozen.members}):
+            raise PolicyIntegrityError("financial ticket frozen universe changed")
+
+    def _batch_journal_identity(self):
+        feature_repository, _ = dependencies(self)
+        return feature_repository._store, feature_repository
+
     class FormalPolicyFinancialRepository:
         __slots__ = ("__weakref__",)
 
@@ -321,6 +395,9 @@ def _install_financial():
                                  feature_repository, current_input_provider)
 
     FormalPolicyFinancialRepository.select = select
+    FormalPolicyFinancialRepository.select_current_batch_ticket = select_current_batch_ticket
+    FormalPolicyFinancialRepository._batch_recheck_ticket = _batch_recheck_ticket
+    FormalPolicyFinancialRepository._batch_journal_identity = _batch_journal_identity
     own_methods = tuple((cls, dict(vars(cls))) for cls in (FormalPolicyFinancialRepository, PolicyFinancialSelection, SelectionMeta))
     return FormalPolicyFinancialRepository, PolicyFinancialSelection
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -232,6 +233,10 @@ def _build_proof_types():
          observation_require_current, implementation_page_group, implementation_select_calendar,
          implementation_select_market, selection_types) = dependencies
         calendar_selection_type, market_selection_type = selection_types
+        batch_capture = ContextVar("policy_market_batch_capture", default=None)
+        anchored_binding_identity = _binding_identity
+        anchored_read_binding = _read_binding
+        anchored_canonical = canonical_bytes
 
         @dataclass(frozen=True)
         class _RepositoryRecord:
@@ -261,6 +266,10 @@ def _build_proof_types():
                 raise TypeError("market repository type is immutable")
 
         def repository_record(value):
+            if (_binding_identity is not anchored_binding_identity
+                    or _read_binding is not anchored_read_binding
+                    or canonical_bytes is not anchored_canonical):
+                raise ValueError("market ticket binding interface changed")
             sealed = repository_records.get(id(value))
             if (type(value) is not FormalPolicyMarketRepository or sealed is None
                     or sealed.reference() is not value):
@@ -269,12 +278,38 @@ def _build_proof_types():
                 raise ValueError("market repository Store identity changed")
             return sealed
 
+        def owner_page_group(sealed, source, first_request):
+            capture = batch_capture.get()
+            if capture is None:
+                return implementation_page_group(sealed, source, first_request)
+            observations = []
+            request = first_request
+            while request is not None:
+                ticket = sealed.range_store.select_current_batch_ticket(
+                    capture["journal"], request.request_fingerprint, request=request)
+                capture["tickets"].append(ticket)
+                observation = ticket.selected()
+                if observation is None:
+                    return tuple(observations), request
+                observations.append(observation)
+                request = sealed.next_page(source, observation)
+            return tuple(observations), None
+
+        def calendar_for_market(sealed, binding, as_of_utc):
+            capture = batch_capture.get()
+            if capture is None:
+                return assemble_calendar(sealed, binding, as_of_utc)
+            ticket = capture["owner"].select_calendar_batch_ticket(
+                capture["journal"], binding, as_of_utc)
+            capture["calendar_ticket"] = ticket
+            return ticket.selected()
+
         def assemble_calendar(sealed, binding, as_of_utc):
             def owner_mint(wire, owned_binding, recheck):
                 return mint_calendar(wire, owned_binding, sealed.range_store, recheck)
             return implementation_select_calendar(
                 sealed, binding, as_of_utc, _mint_calendar=owner_mint,
-                _page_group=implementation_page_group,
+                _page_group=owner_page_group,
                 _select_calendar=assemble_calendar,
                 _calendar_selection_type=calendar_selection_type,
             )
@@ -284,10 +319,47 @@ def _build_proof_types():
                 return mint_window(wire, owned_binding, sealed.range_store, recheck)
             return implementation_select_market(
                 sealed, security_id, as_of_utc, binding=binding,
-                _mint_window=owner_mint, _page_group=implementation_page_group,
-                _select_calendar=assemble_calendar, _select_market=assemble_market,
+                _mint_window=owner_mint, _page_group=owner_page_group,
+                _select_calendar=calendar_for_market, _select_market=assemble_market,
                 _market_selection_type=market_selection_type,
             )
+
+        def ticket_evidence(owner, journal, kind, selected, binding, as_of_utc,
+                            security_id, capture):
+            from .formal_batch_read_journal import _issue_current_ticket, _require_current_ticket
+            sealed = repository_record(owner)
+            lower = tuple(capture["tickets"])
+            baselines = tuple(_require_current_ticket(journal, ticket, sealed.range_store,
+                                                       "range")[1] for ticket in lower)
+            for ticket in lower:
+                sealed.range_store._batch_recheck_ticket(_require_current_ticket(
+                    journal, ticket, sealed.range_store, "range")[2])
+            calendar_ticket = capture.get("calendar_ticket")
+            if calendar_ticket is not None:
+                calendar_selected, calendar_baseline, calendar_evidence = _require_current_ticket(
+                    journal, calendar_ticket, owner, "calendar")
+                for ticket in calendar_evidence[9]:
+                    sealed.range_store._batch_recheck_ticket(_require_current_ticket(
+                        journal, ticket, sealed.range_store, "range")[2])
+            else:
+                calendar_selected, calendar_baseline = None, None
+            binding_identity = _binding_identity(binding)
+            proof = selected.coverage if kind == "calendar" else selected.window
+            proof_bytes = None if proof is None else proof.canonical_bytes()
+            fields = (selected.pending, selected.lineage, selected.selection_hash)
+            request = (security_id, as_of_utc, binding_identity["binding_hash"])
+            baseline = canonical_bytes(dict(kind=kind, request=request,
+                fields=[list(fields[0]), list(fields[1]), fields[2]],
+                proof=None if proof_bytes is None else proof_bytes.decode(),
+                binding=binding_identity,
+                range=[value.decode() for value in baselines],
+                calendar=None if calendar_baseline is None else calendar_baseline.decode()))
+            evidence = (kind, selected, fields, proof_bytes, proof, binding,
+                canonical_bytes(binding_identity), sealed.range_store, journal, lower,
+                calendar_ticket, calendar_selected, request)
+            coverage = () if kind == "calendar" else ((security_id,),)
+            return _issue_current_ticket(journal, owner, kind, request, baseline,
+                                         evidence, coverage, selected)
 
         class FormalPolicyMarketRepository(metaclass=_RepositoryMeta):
             __slots__ = ("__weakref__",)
@@ -319,6 +391,65 @@ def _build_proof_types():
             def select(self, security_id, as_of_utc, *, binding):
                 return assemble_market(repository_record(self), security_id, as_of_utc,
                                        binding=binding)
+
+            def _batch_journal_identity(self):
+                sealed = repository_record(self)
+                return sealed.range_store._batch_journal_identity()[0], sealed.range_store
+
+            def select_calendar_batch_ticket(self, journal, binding, as_of_utc):
+                from .formal_batch_read_journal import _require_current_scope
+                sealed = repository_record(self)
+                identity = _binding_identity(binding)
+                _require_current_scope(journal, self,
+                    root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
+                    population=(identity["exchange"],))
+                capture = {"journal": journal, "owner": self, "tickets": []}
+                reset = batch_capture.set(capture)
+                try:
+                    selected = assemble_calendar(sealed, binding, as_of_utc)
+                finally:
+                    batch_capture.reset(reset)
+                return ticket_evidence(self, journal, "calendar", selected, binding,
+                                       as_of_utc, identity["exchange"], capture)
+
+            def select_current_batch_ticket(self, journal, security_id, as_of_utc, *, binding):
+                from .formal_batch_read_journal import _require_current_scope
+                sealed = repository_record(self)
+                identity = _binding_identity(binding)
+                _require_current_scope(journal, self,
+                    root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
+                    population=(security_id,))
+                capture = {"journal": journal, "owner": self, "tickets": []}
+                reset = batch_capture.set(capture)
+                try:
+                    selected = assemble_market(sealed, security_id, as_of_utc, binding=binding)
+                finally:
+                    batch_capture.reset(reset)
+                return ticket_evidence(self, journal, "market", selected, binding,
+                                       as_of_utc, security_id, capture)
+
+            def _batch_recheck_ticket(self, evidence):
+                from .formal_batch_read_journal import _require_current_ticket
+                (kind, selected, fields, proof_bytes, proof, binding, binding_bytes,
+                 range_store, journal, lower, calendar_ticket, calendar_selected,
+                 request) = evidence
+                sealed = repository_record(self)
+                if (range_store is not sealed.range_store
+                        or canonical_bytes(_binding_identity(binding)) != binding_bytes
+                        or type(selected) is not (calendar_selection_type if kind == "calendar"
+                                                    else market_selection_type)
+                        or (selected.pending, selected.lineage, selected.selection_hash) != fields
+                        or (selected.coverage if kind == "calendar" else selected.window) is not proof
+                        or (None if proof is None else proof.canonical_bytes()) != proof_bytes):
+                    raise ValueError("market or calendar ticket selection changed")
+                if kind == "market":
+                    if calendar_ticket is None or _require_current_ticket(
+                            journal, calendar_ticket, self, "calendar")[0] is not calendar_selected:
+                        raise ValueError("market ticket calendar ownership changed")
+                elif kind != "calendar" or calendar_ticket is not None:
+                    raise ValueError("calendar ticket evidence is invalid")
+                for ticket in lower:
+                    _require_current_ticket(journal, ticket, range_store, "range")
 
             def __copy__(self):
                 raise TypeError("market repositories cannot be copied")

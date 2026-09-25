@@ -736,6 +736,7 @@ def _install_policy_projection(provider_module):
     registration authenticates repositories created before this installation.
     """
     from types import MappingProxyType
+    from contextvars import ContextVar
     from . import formal_financial_schema as mapping_module
     from . import formal_metric_features as metric_module
     from .formal_policy_registry import FormalPolicyRegistry
@@ -759,6 +760,7 @@ def _install_policy_projection(provider_module):
         (mapping_type, mapping_module.FormalFactMapping, mapping_module._FormalFactBinding))
     metric_leaves = metric_module._leaves
     records = {}
+    batch_capture = ContextVar("policy_feature_batch_capture", default=None)
 
     def freeze(value):
         if type(value) is dict:
@@ -781,6 +783,11 @@ def _install_policy_projection(provider_module):
         if (repository_type.select_current_verified_policy_feature_state is not select
                 or "select_current_verified_policy_feature_state" in vars(repository)):
             raise PolicyIntegrityError("policy repository selector was replaced")
+        if (repository_type.select_current_policy_batch_ticket is not select_policy_ticket
+                or repository_type._batch_recheck_policy_ticket is not recheck_policy_ticket
+                or "select_current_policy_batch_ticket" in vars(repository)
+                or "_batch_recheck_policy_ticket" in vars(repository)):
+            raise PolicyIntegrityError("policy feature ticket interface changed")
         return actual
 
     def scoped_issues(graph, verifier, security_id, slots, issues):
@@ -958,11 +965,83 @@ def _install_policy_projection(provider_module):
                 key = id(result)
                 records[key] = (weakref.ref(result, lambda _: records.pop(key, None)), encoded, self,
                     dict(request, policy_registry=policy_registry, rule_ids=rule_ids))
+                capture = batch_capture.get()
+                if capture is not None:
+                    receipt = []
+                    checked = read_bundle(self, input_hash=expected.input_hash,
+                                          require_complete=False, _receipt_capture=receipt)
+                    if ((checked is None) != (stored is None)
+                            or (checked is not None
+                                and checked.canonical_bytes() != stored.canonical_bytes())):
+                        raise PolicyIntegrityError("policy feature receipt changed at ticket boundary")
+                    capture["evidence"] = (result, encoded, dict(request), rule_ids,
+                        identity, fact_bytes, issue_bytes, expected.input_hash,
+                        None if stored is None else stored.canonical_bytes(), receipt[0],
+                        registry.registry_hash, graph.blob("feature").canonical_json,
+                        _canonical_json_bytes(policy), policy_registry)
                 return result
 
             return barrier.finalize(mint)
 
+    def select_policy_ticket(self, journal, security_id, as_of_utc, *, template_id,
+                             registry_manifest_hash, policy_registry, rule_ids):
+        from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
+        _require_current_scope(journal, self, root=registry_manifest_hash,
+                               as_of_utc=as_of_utc, population=(security_id,))
+        capture = {}
+        reset = batch_capture.set(capture)
+        try:
+            selected = select(self, security_id, as_of_utc, template_id=template_id,
+                registry_manifest_hash=registry_manifest_hash,
+                policy_registry=policy_registry, rule_ids=rule_ids)
+        finally:
+            batch_capture.reset(reset)
+        evidence = capture.get("evidence")
+        if evidence is None or evidence[0] is not selected:
+            raise PolicyIntegrityError("policy feature selection token was not captured")
+        recheck_policy_ticket(self, evidence)
+        baseline = _canonical_json_bytes(dict(request=evidence[2], rule_ids=rule_ids,
+            selected=json.loads(evidence[1]), identity=evidence[4],
+            facts=[item.decode() for item in evidence[5]],
+            issues=[item.decode() for item in evidence[6]], input_hash=evidence[7],
+            bundle=None if evidence[8] is None else evidence[8].decode(),
+            receipt=None if evidence[9] is None else evidence[9].decode(),
+            registry_hash=evidence[10], feature_registry=evidence[11].decode(),
+            policy=evidence[12].decode()))
+        return _issue_current_ticket(journal, self, "policy_feature",
+            (security_id, as_of_utc, template_id, registry_manifest_hash, rule_ids),
+            baseline, evidence, tuple((security_id, template_id, key) for key in rule_ids),
+            selected)
+
+    def recheck_policy_ticket(self, evidence):
+        (selected, selected_bytes, request, rule_ids, identity, facts, issues,
+         input_hash, bundle_bytes, receipt_bytes, registry_hash, feature_bytes,
+         policy_bytes, policy_registry) = evidence
+        provider = dependencies(self)
+        if (record(selected)[1] != selected_bytes
+                or _canonical_json_bytes(policy_wire(policy_registry)) != policy_bytes):
+            raise PolicyIntegrityError("policy feature ticket selection or registry changed")
+        require_policy(policy_registry)
+        graph, registry = read_registry(self, request["registry_manifest_hash"])
+        if (registry.registry_hash != registry_hash
+                or graph.blob("feature").canonical_json != feature_bytes):
+            raise PolicyIntegrityError("policy feature ticket signed registry changed")
+        supplied = resolve(provider, **request)
+        if (identity_of(supplied, request) != identity
+                or _fact_snapshot(supplied.facts, request["security_id"])[1] != facts
+                or _issue_snapshot(supplied.issues)[1] != issues
+                or persisted(self, request["security_id"]) != facts):
+            raise PolicyIntegrityError("policy feature ticket inputs changed")
+        receipt = []
+        current = read_bundle(self, input_hash=input_hash, require_complete=False,
+                              _receipt_capture=receipt)
+        if (receipt[0] != receipt_bytes
+                or (None if current is None else current.canonical_bytes()) != bundle_bytes):
+            raise PolicyIntegrityError("policy feature ticket receipt changed")
+
     repository_type.select_current_verified_policy_feature_state = select
+    repository_type.select_current_policy_batch_ticket = select_policy_ticket
+    repository_type._batch_recheck_policy_ticket = recheck_policy_ticket
     return PolicyFeatureState, dependencies
 
 __all__ = ["FormalFeatureRepository", "FormalFeatureCurrentInput", "FormalFeatureCurrentInputProvider", "VerifiedMetricFeatureProjection", "VerifiedMetricFeatureAbsence"]
