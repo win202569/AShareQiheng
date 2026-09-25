@@ -74,7 +74,8 @@ def _decimal(value):
     if type(value) is not str:
         return None, "invalid"
     try:
-        parsed = Decimal(value)
+        with localcontext(_arithmetic_context()):
+            parsed = Decimal(value)
     except InvalidOperation:
         return None, "invalid"
     return (parsed, None) if parsed.is_finite() else (None, "nonfinite")
@@ -90,8 +91,7 @@ def _decimal_text(value):
 
 
 def _definition_hash(adapter):
-    return digest({key: list(value) if key == "preconditions" else value
-                   for key, value in adapter.items()})
+    return digest(adapter)
 
 
 def _dependencies(values, label):
@@ -167,9 +167,9 @@ def evaluate_valuation_adjustment(*, metric: dict, policy_result: dict,
     if (cyclic_decision["role"] != "cyclic"
             or cyclic_decision["semantic_id"] != "cyclic_top"
             or cyclic_decision["security_id"] != metric["security_id"]
-            or cyclic_decision["template_id"] != metric["template_id"]
-            or cyclic_decision["rule_id"] != metric["template_id"] + "_cyclic_top"):
+            or cyclic_decision["template_id"] != metric["template_id"]):
         raise ValueError("cyclic decision identity differs from metric")
+    _text(cyclic_decision["rule_id"], "cyclic rule ID")
     if (type(cyclic_decision["parameters"]) is not dict
             or type(cyclic_decision["parameters"].get("valuation_dependencies")) is not list
             or not cyclic_decision["parameters"]["valuation_dependencies"]
@@ -198,7 +198,7 @@ def evaluate_valuation_adjustment(*, metric: dict, policy_result: dict,
             original_definition_hash=metric["definition_hash"],
             definition_basis=dependency["definition_basis"], policy_role="cyclic",
             rule_id=cyclic_decision["rule_id"], operation="profit_ratio_rescale_v1",
-            decimal_contract="decimal50-half-even-v1", preconditions=_PRECONDITIONS)
+            decimal_contract="decimal50-half-even-v1", preconditions=list(_PRECONDITIONS))
         if any(adapter[key] != value or type(adapter[key]) is not type(value)
                for key, value in required.items()):
             raise ValueError("adapter differs from signed dependency or metric")

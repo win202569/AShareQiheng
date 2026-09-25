@@ -1,6 +1,6 @@
 """Detached valuation arithmetic and per-metric policy state contract."""
 
-from decimal import Decimal, ROUND_DOWN, localcontext
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 import copy
 import unittest
 
@@ -29,7 +29,7 @@ def fixtures(*, state="matched", dependency_state="affected", current="10",
         profit_semantic_id="cyclic_top", metric_unit="ratio", profit_unit="CNY",
         output_unit="ratio", policy_role="cyclic", rule_id=RULE,
         decimal_contract="decimal50-half-even-v1",
-        preconditions=("exact_units", "finite_decimals", "nonzero_original_current_profit"),
+        preconditions=["exact_units", "finite_decimals", "nonzero_original_current_profit"],
         definition_basis="linear current profit")
     basis = dict(profit_semantic_id="cyclic_top",
         original_current_profit=dict(selector_hash=H, value=current, evidence_hashes=[H]),
@@ -184,6 +184,64 @@ class ValuationAdjustmentTests(unittest.TestCase):
         rehash(args)
         with self.assertRaises(ValueError):
             evaluate_valuation_adjustment(**args)
+
+    def test_actual_c2_registry_wire_adapter_is_accepted(self):
+        from ashare_pipeline.formal_valuation_adapter_contract import (
+            load_formal_valuation_adapter_registry,
+        )
+        from tests.test_formal_valuation_adapter_contract import load_graph
+
+        bundle, scoring, policy = load_graph()
+        registry = load_formal_valuation_adapter_registry(bundle,
+            scoring_registry=scoring, policy_registry=policy)
+        wire = registry.to_dict()
+        adapter = wire["adapters"][0]
+        template_id, metric_id = adapter["template_id"], adapter["metric_id"]
+        dependency = next(item for item in policy.to_dict()["valuation_dependencies"][template_id]
+                          if item["metric_id"] == metric_id)
+        definition = wire["metric_definitions"][template_id][metric_id]
+        args = fixtures()
+        args["adapter"] = adapter
+        args["dependency"] = dependency
+        args["metric"].update(template_id=template_id, metric_id=metric_id,
+            definition_hash=adapter["original_definition_hash"],
+            unit=adapter["metric_unit"], direction=definition["definition"]["direction"])
+        args["cyclic_decision"].update(template_id=template_id,
+            rule_id=adapter["rule_id"])
+        args["cyclic_decision"]["parameters"]["valuation_dependencies"] = [
+            copy.deepcopy(dependency)]
+        args["cyclic_decision"]["operands"]["normalization_basis"][
+            "valuation_dependencies"] = [copy.deepcopy(dependency)]
+        args["policy_result"]["normalization_basis"][0]["valuation_dependencies"] = [
+            copy.deepcopy(dependency)]
+        args["policy_result"]["normalization_basis"][0]["rule_id"] = adapter["rule_id"]
+        rehash(args)
+        self.assertIs(type(adapter["preconditions"]), list)
+        self.assertEqual(evaluate_valuation_adjustment(**args)["adjusted_value"], "0.12")
+
+    def test_consistent_nonconventional_signed_rule_id_is_accepted(self):
+        args = fixtures()
+        unusual = "signed_cyclic_rule_2030"
+        args["cyclic_decision"]["rule_id"] = unusual
+        args["adapter"]["rule_id"] = unusual
+        args["policy_result"]["normalization_basis"][0]["rule_id"] = unusual
+        rehash(args)
+        self.assertEqual(evaluate_valuation_adjustment(**args)["status"], "adjusted")
+
+    def test_invalid_decimal_wire_has_identical_result_and_hash_under_ambient_traps(self):
+        for field in ("metric", "current", "normalized"):
+            with self.subTest(field=field):
+                args = fixtures(value="not-decimal" if field == "metric" else "0.20",
+                    current="not-decimal" if field == "current" else "10",
+                    normalized="not-decimal" if field == "normalized" else "6")
+                outputs = []
+                for trap in (True, False):
+                    with localcontext() as ambient:
+                        ambient.traps[InvalidOperation] = trap
+                        outputs.append(evaluate_valuation_adjustment(**args))
+                self.assertEqual(outputs[0], outputs[1])
+                self.assertEqual(outputs[0]["status"], "invalid_adapter_operand")
+                self.assertIsNone(outputs[0]["adjusted_value"])
 
     def test_local_decimal_context_is_deterministic_and_requires_exact_decimal(self):
         with localcontext() as ambient:
