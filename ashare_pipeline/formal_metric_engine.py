@@ -64,10 +64,11 @@ def _freeze(value):
     return value
 
 
-def _scoring_metric_definitions(scoring, _definition_digest=_digest):
+def _scoring_metric_definitions(scoring, _definition_digest=_digest,
+        _template_for=FormalScoringRegistry.template_for):
     result = {}
     for tid in scoring.templates:
-        template = scoring.template_for(tid)
+        template = _template_for(scoring, tid)
         result[tid] = {}
         for dimension, metrics in template.metrics.items():
             for metric in metrics:

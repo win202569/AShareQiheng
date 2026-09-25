@@ -71,12 +71,21 @@ def _install_registry():
     bundle_type, scoring_type, policy_type = VerifiedRegistryBundle, FormalScoringRegistry, FormalPolicyRegistry
     require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
     require_scoring, require_policy = scoring_type.require_official, policy_type.require_verified
+    template_for = scoring_type.template_for
     definitions = _scoring_metric_definitions
-    canonical, parse = _canonical, _load_canonical_object
+    definition_type, serialize_definition = ValuationAdapterDefinition, asdict
+    dumps, loads, sha256 = json.dumps, json.loads, hashlib.sha256
+    parse = _load_canonical_object
+
+    def canonical(value):
+        return dumps(value, sort_keys=True, ensure_ascii=False,
+            separators=(",", ":"), allow_nan=False).encode("utf-8")
 
     def sources(bundle, scoring, policy):
         if type(bundle) is not bundle_type or type(scoring) is not scoring_type or type(policy) is not policy_type:
             _fail("graph", "requires exact verified source types")
+        if vars(scoring_type).get("template_for") is not template_for:
+            _fail("graph.template_for", "scoring template reader changed")
         require_bundle(bundle)
         if bundle.manifest.schema_version != "formal-registry-manifest-v2":
             raise ValueError("valuation_adapter role is unavailable for this manifest version")
@@ -86,7 +95,7 @@ def _install_registry():
                 or policy.role_hashes != {role: scoring.role_hashes[role] for role in policy.role_hashes}):
             _fail("graph", "policy and scoring have different roots")
         blob = blob_for(bundle, "valuation_adapter")
-        if (hashlib.sha256(blob.canonical_json).hexdigest() != blob.registry_hash
+        if (sha256(blob.canonical_json).hexdigest() != blob.registry_hash
                 or blob.registry_hash != bundle.manifest.valuation_adapter_registry_hash):
             _fail("graph", "signed child hash differs from root")
         return blob.canonical_json
@@ -136,7 +145,7 @@ def _install_registry():
             _fail("coverage", "must cover exactly every V metric")
 
         adapters = _entries(child["adapters"], _ADAPTER_KEYS, "adapters")
-        parsed_adapters = {}
+        parsed_adapters, verified_values = {}, {}
         previous = None
         for index, entry in enumerate(adapters):
             path = f"adapters[{index}]"
@@ -163,9 +172,13 @@ def _install_registry():
                     _fail(path + "." + field, "differs from signed contract")
             for field in ("adapter_id", "adapter_version", "profit_semantic_id", "definition_basis"):
                 _text(entry[field], path + "." + field)
-            parsed_adapters[key] = ValuationAdapterDefinition(
-                **(entry | {"preconditions": tuple(entry["preconditions"])}),
-                original_definition_hash=metric_definition["definition_hash"])
+            verified = entry | {"preconditions": tuple(entry["preconditions"]),
+                "original_definition_hash": metric_definition["definition_hash"]}
+            adapter = definition_type(**verified)
+            if type(adapter) is not definition_type or serialize_definition(adapter) != verified:
+                _fail(path + ".definition", "constructed definition differs from validated fields")
+            parsed_adapters[key] = adapter
+            verified_values[key] = verified
         affected = {key for key, (dependency, _, _) in expected.items()
             if dependency["policy_dependency"] == "affected"}
         if set(parsed_adapters) != affected:
@@ -176,16 +189,19 @@ def _install_registry():
                 for role in bundle.roles},
             policy_contract_hash=policy.contract_hash,
             signed_child=child, coverage=coverage,
-            adapters=[asdict(adapter) for adapter in parsed_adapters.values()],
+            adapters=list(verified_values.values()),
             metric_definitions={tid: {mid: definition for mid, definition in items.items()
                 if mid.startswith("V.")} for tid, items in metric_definitions.items()})
-        return raw, payload, actual_coverage, parsed_adapters
+        return raw, payload, actual_coverage, parsed_adapters, verified_values
 
-    def record(proof, bundle=None):
+    def class_intact():
         current = vars(FormalValuationAdapterRegistry)
         if set(current) != {name for name, _ in own_members} or any(
                 current[name] is not value for name, value in own_members):
             _fail("proof", "class contract changed")
+
+    def record(proof, bundle=None):
+        class_intact()
         found = records.get(id(proof))
         if type(proof) is not FormalValuationAdapterRegistry or found is None or found[0]() is not proof:
             _fail("proof", "is forged or copied")
@@ -194,15 +210,32 @@ def _install_registry():
             _fail("proof", "requires its original verified bundle")
         if sources(reference, scoring, policy) != raw:
             _fail("proof", "signed sources changed")
-        if any(canonical(asdict(adapter)) != fingerprints[key] for key, adapter in adapters.items()):
+        if any(type(adapter) is not definition_type
+                or canonical(serialize_definition(adapter)) != fingerprints[key]
+                for key, adapter in adapters.items()):
             _fail("proof", "definition changed after loading")
         return found
 
-    class FormalValuationAdapterRegistry:
+    class GuardedType(type):
+        def __setattr__(cls, name, value):
+            if name in ("__getattribute__", "__bases__"):
+                raise TypeError("valuation adapter proof lookup or inheritance cannot be replaced")
+            return super().__setattr__(name, value)
+
+        def __delattr__(cls, name):
+            if name in ("__getattribute__", "__bases__"):
+                raise TypeError("valuation adapter proof lookup or inheritance cannot be removed")
+            return super().__delattr__(name)
+
+    class FormalValuationAdapterRegistry(metaclass=GuardedType):
         __slots__ = ("__weakref__",)
 
         def __init__(self, *args, **kwargs):
             raise TypeError("valuation adapter registries require the signed loader")
+
+        def __getattribute__(self, name):
+            class_intact()
+            return object.__getattribute__(self, name)
 
         def require_official(self, bundle):
             record(self, bundle)
@@ -212,7 +245,7 @@ def _install_registry():
             if type(template_id) is not str or type(metric_id) is not str:
                 _fail("selector", "requires exact strings")
             entry = found[6].get((template_id, metric_id))
-            return None if entry is None else json.loads(canonical(entry))
+            return None if entry is None else loads(canonical(entry))
 
         def adapter_for(self, template_id, metric_id):
             found = record(self)
@@ -221,7 +254,7 @@ def _install_registry():
             return found[7].get((template_id, metric_id))
 
         def to_dict(self):
-            return json.loads(record(self)[5])
+            return loads(record(self)[5])
 
         def __copy__(self):
             raise TypeError("valuation adapter registry cannot be copied")
@@ -232,7 +265,7 @@ def _install_registry():
     own_members = tuple(vars(FormalValuationAdapterRegistry).items())
 
     def load(bundle, *, scoring_registry, policy_registry):
-        raw, payload, coverage, adapters = contract(bundle, scoring_registry, policy_registry)
+        raw, payload, coverage, adapters, verified_values = contract(bundle, scoring_registry, policy_registry)
         encoded = canonical(payload)
         if sources(bundle, scoring_registry, policy_registry) != raw:
             _fail("graph", "signed sources changed during loading")
@@ -240,7 +273,7 @@ def _install_registry():
         identity = id(result)
         records[identity] = (weakref.ref(result, lambda _: records.pop(identity, None)),
             bundle, scoring_registry, policy_registry, raw, encoded, coverage, adapters,
-            {key: canonical(asdict(adapter)) for key, adapter in adapters.items()})
+            {key: canonical(value) for key, value in verified_values.items()})
         return result
 
     return FormalValuationAdapterRegistry, load

@@ -1,13 +1,17 @@
 """Signed valuation adapter definitions bind exactly to same-root policy and metrics."""
 
 import copy
+from dataclasses import asdict, replace
 import unittest
+from unittest.mock import patch
 
+import ashare_pipeline.formal_valuation_adapter_contract as adapter_module
 from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
 from ashare_pipeline.formal_valuation_adapter_contract import (
     FormalValuationAdapterRegistry, load_formal_valuation_adapter_registry,
 )
 from tests.formal_policy_fixtures import policy_graph
+from ashare_pipeline.formal_scoring_registry import FormalScoringRegistry
 
 
 def load_graph(*, mutate=None):
@@ -123,10 +127,84 @@ class ValuationAdapterContractTests(unittest.TestCase):
             type.__setattr__(FormalValuationAdapterRegistry, "require_official",
                 lambda self, root: None)
             with self.assertRaisesRegex(ValueError, "valuation adapter proof"):
+                registry.require_official(bundle)
+            with self.assertRaisesRegex(ValueError, "valuation adapter proof"):
                 registry.adapter_for("bank", "V.unknown")
         finally:
             type.__setattr__(FormalValuationAdapterRegistry, "require_official", original)
         registry.require_official(bundle)
+
+    def test_replaced_definition_constructor_cannot_change_validated_operation(self):
+        bundle, scoring, policy = load_graph()
+        genuine = adapter_module.ValuationAdapterDefinition
+
+        def corrupt(**values):
+            return genuine(**(values | {"operation": "wrong"}))
+
+        with patch.object(adapter_module, "ValuationAdapterDefinition", corrupt):
+            registry = load_formal_valuation_adapter_registry(bundle,
+                scoring_registry=scoring, policy_registry=policy)
+        registry.require_official(bundle)
+        self.assertEqual(registry.to_dict()["adapters"][0]["operation"],
+            "profit_ratio_rescale_v1")
+
+    def test_mutated_definition_initializer_cannot_launder_validated_operation(self):
+        bundle, scoring, policy = load_graph()
+        definition_type = adapter_module.ValuationAdapterDefinition
+        genuine_init = definition_type.__init__
+
+        def corrupt(self, **values):
+            genuine_init(self, **values)
+            object.__setattr__(self, "operation", "wrong")
+
+        with patch.object(definition_type, "__init__", corrupt):
+            with self.assertRaisesRegex(ValueError, "valuation adapter.*definition"):
+                load_formal_valuation_adapter_registry(bundle,
+                    scoring_registry=scoring, policy_registry=policy)
+
+    def test_replaced_definition_serializer_cannot_change_bound_payload(self):
+        bundle, scoring, policy = load_graph()
+
+        def corrupt(value):
+            result = asdict(value)
+            result["operation"] = "wrong"
+            return result
+
+        with patch.object(adapter_module, "asdict", corrupt):
+            registry = load_formal_valuation_adapter_registry(bundle,
+                scoring_registry=scoring, policy_registry=policy)
+        registry.require_official(bundle)
+        self.assertEqual(registry.to_dict()["adapters"][0]["operation"],
+            "profit_ratio_rescale_v1")
+
+    def test_replaced_scoring_template_reader_cannot_define_adapter_hashes(self):
+        bundle, scoring, policy = load_graph()
+        genuine = FormalScoringRegistry.template_for
+
+        def altered(self, template_id):
+            template = genuine(self, template_id)
+            if template_id != "bank":
+                return template
+            metrics = dict(template.metrics)
+            first = metrics["V"][0]
+            metrics["V"] = (replace(first,
+                direction="higher" if first.direction == "lower" else "lower"),
+                *metrics["V"][1:])
+            return replace(template, metrics=metrics)
+
+        with patch.object(FormalScoringRegistry, "template_for", altered):
+            with self.assertRaisesRegex(ValueError, "valuation adapter.*template_for"):
+                load_formal_valuation_adapter_registry(bundle,
+                    scoring_registry=scoring, policy_registry=policy)
+
+    def test_protected_attribute_lookup_cannot_be_replaced(self):
+        original = FormalValuationAdapterRegistry.__getattribute__
+        try:
+            with self.assertRaises(TypeError):
+                setattr(FormalValuationAdapterRegistry, "__getattribute__",
+                    lambda self, name: object.__getattribute__(self, name))
+        finally:
+            type.__setattr__(FormalValuationAdapterRegistry, "__getattribute__", original)
 
     def test_v1_graph_cannot_load_a_formal_valuation_adapter(self):
         bundle, vocabulary, scoring, _, _ = policy_graph(
