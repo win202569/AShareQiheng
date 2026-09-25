@@ -413,6 +413,59 @@ class FormalContextRepository:
             raise ValueError("Context correction race during verification")
         return MappingProxyType(selected)
 
+    def select_current_batch_ticket(self, journal, kind, scope_key, security_ids,
+                                    as_of_utc, registry_manifest_hash):
+        """Issue a build-local ticket after the complete public batch selection."""
+        from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
+
+        _require_authentic_context_repository(self)
+        _require_current_scope(journal, self, root=registry_manifest_hash,
+                               as_of_utc=as_of_utc, population=security_ids)
+        selected = self.get_verified_many(kind, scope_key, security_ids,
+                                          as_of_utc, registry_manifest_hash)
+        candidates = self._state_store.list_formal_context_facts(
+            registry_manifest_hash=registry_manifest_hash, context_kind=kind,
+            scope_key=scope_key, as_of_utc=as_of_utc)
+        candidate_bytes = tuple(fact.canonical_bytes() for fact in candidates)
+        selected_bytes = tuple((security_id, None if selected[security_id] is None
+                                else selected[security_id].canonical_bytes())
+                               for security_id in security_ids)
+        if tuple(fact.canonical_bytes() for fact in self._state_store.list_formal_context_facts(
+                registry_manifest_hash=registry_manifest_hash, context_kind=kind,
+                scope_key=scope_key, as_of_utc=as_of_utc)) != candidate_bytes:
+            raise ValueError("Context candidates changed during ticket issuance")
+        evidence = (kind, scope_key, security_ids, as_of_utc, registry_manifest_hash,
+                    candidate_bytes, selected_bytes)
+        baseline = _canonical({"request": [kind, scope_key, list(security_ids), as_of_utc,
+                                           registry_manifest_hash],
+                               "candidates": [item.decode() for item in candidate_bytes],
+                               "selected": [[key, None if value is None else value.decode()]
+                                            for key, value in selected_bytes]})
+        coverage = tuple((kind, scope_key, security_id) for security_id in security_ids)
+        return _issue_current_ticket(journal, self, "context",
+            (kind, scope_key, security_ids, as_of_utc, registry_manifest_hash),
+            baseline, evidence, coverage)
+
+    def _batch_recheck_ticket(self, evidence):
+        """Reread the original candidate and source evidence without selecting."""
+        _require_authentic_context_repository(self)
+        kind, scope_key, security_ids, as_of_utc, root, candidate_bytes, selected_bytes = evidence
+        self._load(root)
+        candidates = self._state_store.list_formal_context_facts(
+            registry_manifest_hash=root, context_kind=kind, scope_key=scope_key,
+            as_of_utc=as_of_utc)
+        if tuple(fact.canonical_bytes() for fact in candidates) != candidate_bytes:
+            raise ValueError("Context current candidate set changed")
+        for fact in candidates:
+            if fact.security_id in security_ids:
+                with self._state_store._transaction() as connection:
+                    _validate_stored_fact(self._state_store, connection, fact,
+                        self._verifier, snapshot_repository=self._snapshots)
+        for security_id, selected in selected_bytes:
+            if selected is not None and selected not in tuple(
+                    fact.canonical_bytes() for fact in candidates if fact.security_id == security_id):
+                raise ValueError("Context selected source changed")
+
     def resolve_verified_calendar_binding(self, selector, exchange, as_of_utc, registry_manifest_hash):
         self._load(registry_manifest_hash)
         if type(selector) is not CalendarSelector:

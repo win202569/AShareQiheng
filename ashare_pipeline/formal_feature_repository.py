@@ -575,9 +575,85 @@ def _install_metric_projection():
         result = select_state(self, *args, **kwargs)
         return None if type(result) is VerifiedMetricFeatureAbsence else result
 
+    def select_metric_ticket(self, journal, security_id, as_of_utc, *, template_id,
+                             registry_manifest_hash, required_feature_keys):
+        from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
+
+        _require_current_scope(journal, self, root=registry_manifest_hash,
+                               as_of_utc=as_of_utc, population=(security_id,))
+        result = select_state(self, security_id, as_of_utc, template_id=template_id,
+            registry_manifest_hash=registry_manifest_hash,
+            required_feature_keys=required_feature_keys)
+        request = _request(security_id, as_of_utc, template_id, registry_manifest_hash)
+        provider = self._current_input_provider
+        try:
+            supplied = provider.resolve_current_inputs(**request)
+        except Exception as error:
+            raise ValueError("metric ticket provider reread failed") from error
+        identity = snapshot_identity(supplied, request)
+        facts = _fact_snapshot(supplied.facts, security_id)[1]
+        issues = _issue_snapshot(supplied.issues)[1]
+        if facts != persisted_facts(self, security_id) or identity[-1] != result.batch_id:
+            raise ValueError("metric ticket input differs from selected generation")
+        fact_hash = hashlib.sha256(_canonical_json_bytes([json.loads(r) for r in facts])).hexdigest()
+        issue_hash = hashlib.sha256(_canonical_json_bytes([json.loads(r) for r in issues])).hexdigest()
+        if result.fact_snapshot_hash != fact_hash or result.issue_snapshot_hash != issue_hash:
+            raise ValueError("metric ticket input differs from selected evidence")
+        graph, registry = read_registry(self, registry_manifest_hash)
+        if result.feature_registry_hash != registry.registry_hash:
+            raise ValueError("metric ticket signed registry changed")
+        bundle = read_bundle(self, input_hash=result.input_hash, require_complete=False)
+        bundle_bytes = None if bundle is None else bundle.canonical_bytes()
+        if (bundle is None) != (type(result) is VerifiedMetricFeatureAbsence):
+            raise ValueError("metric ticket receipt differs from selected state")
+        metadata = self._metadata(result.input_hash)
+        metadata_bytes = None if metadata is None else _canonical_json_bytes(metadata)
+        evidence = (request, identity, facts, issues, result.input_hash, bundle_bytes,
+                    metadata_bytes, registry.registry_hash,
+                    graph.blob("feature").canonical_json, result, result.canonical_bytes())
+        baseline = _canonical_json_bytes(dict(request=request, identity=list(identity),
+            facts=[item.decode() for item in facts], issues=[item.decode() for item in issues],
+            input_hash=result.input_hash, bundle=None if bundle_bytes is None else bundle_bytes.decode(),
+            metadata=None if metadata_bytes is None else metadata_bytes.decode(),
+            registry_hash=registry.registry_hash,
+            feature_registry=graph.blob("feature").canonical_json.decode(),
+            selected=result.canonical_bytes().decode()))
+        return _issue_current_ticket(journal, self, "feature",
+            (security_id, as_of_utc, template_id, registry_manifest_hash, required_feature_keys),
+            baseline, evidence,
+            tuple((security_id, template_id, key) for key in required_feature_keys))
+
+    def recheck_metric_ticket(self, evidence):
+        dependencies(self)
+        (request, identity, facts, issues, input_hash, bundle_bytes, metadata_bytes,
+         registry_hash, registry_bytes, selected, selected_bytes) = evidence
+        provider = self._current_input_provider
+        try:
+            supplied = provider.resolve_current_inputs(**request)
+        except Exception as error:
+            raise ValueError("metric ticket provider reread failed") from error
+        if (snapshot_identity(supplied, request) != identity
+                or _fact_snapshot(supplied.facts, request["security_id"])[1] != facts
+                or _issue_snapshot(supplied.issues)[1] != issues
+                or persisted_facts(self, request["security_id"]) != facts):
+            raise ValueError("metric ticket current input changed")
+        graph, registry = read_registry(self, request["registry_manifest_hash"])
+        if registry.registry_hash != registry_hash or graph.blob("feature").canonical_json != registry_bytes:
+            raise ValueError("metric ticket signed registry changed")
+        metadata = self._metadata(input_hash)
+        if (None if metadata is None else _canonical_json_bytes(metadata)) != metadata_bytes:
+            raise ValueError("metric ticket metadata receipt changed")
+        bundle = read_bundle(self, input_hash=input_hash, require_complete=False)
+        if (None if bundle is None else bundle.canonical_bytes()) != bundle_bytes:
+            raise ValueError("metric ticket stored bundle changed")
+        if selected.canonical_bytes() != selected_bytes:
+            raise ValueError("metric ticket selected proof changed")
+
     repository_type.__init__ = init
     repository_type.select_current_verified_metric_features = select
     repository_type.select_current_verified_metric_feature_state = select_state
+    repository_type.select_current_metric_batch_ticket = select_metric_ticket
+    repository_type._batch_recheck_ticket = recheck_metric_ticket
     checked_methods += ((repository_type, "select_current_verified_metric_features", select),
         (repository_type, "select_current_verified_metric_feature_state", select_state))
     return VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence, dependencies
