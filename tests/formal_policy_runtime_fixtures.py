@@ -72,9 +72,9 @@ def _templates(value):
     return result
 
 
-def _exchange_rows(templates):
+def _exchange_rows(templates, extra_members=()):
     result = {exchange: [] for exchange in ("BJ", "SH", "SZ")}
-    for security_id in sorted(templates):
+    for security_id in sorted((*templates, *extra_members)):
         result[security_id[:2]].append({
             "security_id": security_id,
             "listing_status": "listed",
@@ -83,13 +83,13 @@ def _exchange_rows(templates):
     return result
 
 
-def _policy_memberships(templates, cyclic):
+def _policy_memberships(templates, cyclic, noncyclic_ids=()):
     return [
         {
             "security_id": security_id,
             "template_id": templates[security_id],
             "primary_industry": "fixture-policy",
-            "secondary_industry": "fixture-cyclic" if cyclic else "fixture-noncyclic",
+            "secondary_industry": "fixture-cyclic" if cyclic and security_id not in noncyclic_ids else "fixture-noncyclic",
         }
         for security_id in sorted(templates)
     ]
@@ -125,13 +125,21 @@ def _patch_current_policy_periods(documents):
 class PolicyRuntimeFixture(FinancialFixture):
     """Small producer-backed graph; it does not confer production meaning."""
 
-    def __init__(self, *, range_enabled=False, templates=None, cyclic=True, mutate=None):
+    def __init__(self, *, range_enabled=False, templates=None, cyclic=True, mutate=None,
+                 extra_members=(), noncyclic_ids=()):
         if type(range_enabled) is not bool or type(cyclic) is not bool:
             raise ValueError("range_enabled and cyclic must be exact bool")
         selected_templates = _templates(templates)
+        extra_members = tuple(extra_members)
+        noncyclic_ids = tuple(noncyclic_ids)
+        if (any(type(sid) is not str or canonical_security_id(sid) != sid
+                or sid in selected_templates for sid in extra_members)
+                or len(set(extra_members)) != len(extra_members)
+                or any(sid not in selected_templates for sid in noncyclic_ids)):
+            raise ValueError("fixture membership inputs must be distinct canonical securities")
 
         def configure(documents):
-            documents["industry"]["memberships"] = _policy_memberships(selected_templates, cyclic)
+            documents["industry"]["memberships"] = _policy_memberships(selected_templates, cyclic, noncyclic_ids)
             update_mapping_digest(documents["industry"])
             documents["scoring"]["descriptors"].append(descriptor("security_state"))
             documents["source"]["configs"].extend(
@@ -155,7 +163,7 @@ class PolicyRuntimeFixture(FinancialFixture):
         try:
             super().__init__(
                 mutate=configure,
-                exchange_rows=_exchange_rows(selected_templates),
+                exchange_rows=_exchange_rows(selected_templates, extra_members),
             )
             self.policy_registry = load_formal_policy_registry(
                 self.bundle,
@@ -204,7 +212,7 @@ class PolicyRuntimeFixture(FinancialFixture):
         return self.policy_repository.build_batch(self.frozen.frozen_input_hash,
             scoring_registry=self.scoring, policy_registry=self.policy_registry)
 
-    def populate_policy_evidence(self):
+    def populate_policy_evidence(self, *, skip_financial=(), security_state_overrides=None):
         """Populate every frozen security through the genuine temporary producers."""
         from tests.formal_policy_fixtures import REGULATORY_SEMANTICS
         from ashare_pipeline.formal_range_contract import load_policy_range_bindings
@@ -214,15 +222,24 @@ class PolicyRuntimeFixture(FinancialFixture):
                                               policy_registry=self.policy_registry)
         rules = self.policy_registry.to_dict()["rules"]
         templates = {member["security_id"]: member["template_id"] for member in self.industry["memberships"]}
+        skip_financial = set(skip_financial)
+        security_state_overrides = dict(security_state_overrides or {})
+        if not skip_financial <= set(templates) or not set(security_state_overrides) <= set(templates):
+            raise ValueError("fixture evidence overrides require known members")
         for member in self.frozen.members:
             sid = member.security_id
+            if sid not in templates:
+                continue
             self.put_industry(sid)
             self._policy_industry_ids.add(sid)
-            self.put_policy_context(sid, "security_state", dict(is_st=False, is_star_st=False,
-                listing_status="listed", forced_delist_risk=False, suspended=False))
+            state = dict(is_st=False, is_star_st=False, listing_status="listed",
+                         forced_delist_risk=False, suspended=False)
+            state.update(security_state_overrides.get(sid, {}))
+            self.put_policy_context(sid, "security_state", state)
             self.put_policy_context(sid, "regulatory_state", dict(flags=[
                 dict(flag_id=flag, active=False) for flag in REGULATORY_SEMANTICS]))
-            self.policy_financial_values(sid)
+            if sid not in skip_financial:
+                self.policy_financial_values(sid)
             rule = next(rule for rule in rules if rule["template_id"] == templates[sid]
                         and rule["kind"] == "market_liquidity")
             self.binding = bindings.for_rule(rule["rule_id"], sid[:2])
@@ -233,8 +250,24 @@ class PolicyRuntimeFixture(FinancialFixture):
             while cursor <= end:
                 days[cursor.isoformat()] = cursor >= end - timedelta(days=19)
                 cursor += timedelta(days=1)
-            self.produce_calendar(days=days)
+            existing = self.range_store.select_current(first.request_fingerprint)
+            if existing is None:
+                self.produce_calendar(days=days)
+            else:
+                existing.require_current()
+                wire = existing.to_dict()
+                document = wire["document"]
+                if (wire["request"] != first.to_dict()
+                        or wire["generation"]["refresh_generation"] != "g1"
+                        or document["coverage"] != dict(start_date=first.start_date,
+                                                         end_date=first.end_date, complete=True)
+                        or {row["date"]: row["is_open"] for row in document["rows"]} != days
+                        or len(document["rows"]) != len(days)):
+                    raise ValueError("fixture calendar request or current receipt differs")
             calendar = FormalPolicyMarketRepository(self.range_store).select_calendar(self.binding, FREEZE)
+            if calendar.coverage is None:
+                raise ValueError("fixture calendar must have genuine current coverage")
+            calendar.coverage.require_current()
             _, source = self.range_store.resolve_planning_binding(self.binding)
             for request in source.market_requests(sid, calendar_coverage=calendar.coverage):
                 rows = []
