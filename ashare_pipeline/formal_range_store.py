@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import uuid
@@ -100,6 +101,7 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
 
     StateStore, transaction, insert, schema_check, connect = _range_state_store_authority()
     records = {}
+    parent_ticket_capture = ContextVar("range_absence_parent_ticket_capture", default=None)
 
     def record(store):
         value = records.get(id(store))
@@ -372,9 +374,23 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
         require_parent_chain(store, wire, snapshots)
 
     def require_current(store, wire, digest):
+        capture = parent_ticket_capture.get()
+        authenticated = []
+        if capture is not None:
+            reread = read(store, wire["task"]["id"], evidence=authenticated)
+            if observation_wire(reread)[1] != digest:
+                raise ValueError("range parent source changed before current check")
         snapshots = []
         qualify_current(store, wire, digest, snapshots)
-        finish_current_check(store, snapshots)
+        if capture is None:
+            finish_current_check(store, snapshots)
+        else:
+            state, root, _, _, _ = record(store)
+            with transaction(state) as connection:
+                check_candidate_snapshots(connection, snapshots)
+                for item in authenticated:
+                    check_read_evidence(connection, root, item)
+            capture.append((tuple(snapshots), tuple(authenticated), digest))
 
     def parent_candidate_snapshots(connection, task):
         snapshots, seen = [], {task["id"]}
@@ -601,32 +617,29 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                 request_wire = request_description["request"]
                 if _digest(request_wire) != fingerprint:
                     raise ValueError("range absence request fingerprint differs")
-                require_execution(request, self)
+                parent_tokens = []
+                reset = parent_ticket_capture.set(parent_tokens)
+                try:
+                    require_execution(request, self)
+                finally:
+                    parent_ticket_capture.reset(reset)
                 _require_current_scope(journal, self,
                     root=request_wire["registry_manifest_hash"],
                     as_of_utc=request_wire["as_of_utc"], population=(fingerprint,))
-                authenticated = []
+                authenticated = ()
                 parent = request_description["parent"]
                 if parent is not None:
-                    previous = read(self, parent["task_id"], evidence=authenticated)
-                    if observation_wire(previous)[1] != parent["observation_hash"]:
-                        raise ValueError("range absence parent changed")
-                    state, root, _, _, _ = record(self)
-                    with transaction(state) as connection:
-                        row = connection.execute("SELECT * FROM formal_range_task WHERE id=?",
-                                                 (parent["task_id"],)).fetchone()
-                        if row is None:
-                            raise ValueError("range absence parent disappeared")
-                        snapshots = (*snapshots,
-                            (row["request_fingerprint"], candidate_snapshot(connection,
-                                row["request_fingerprint"])),
-                            *parent_candidate_snapshots(connection, row))
-                        check_candidate_snapshots(connection, snapshots)
-                        for item in authenticated:
-                            check_read_evidence(connection, root, item)
-                state, _, _, _, _ = record(self)
+                    if len(parent_tokens) != 1 or parent_tokens[0][2] != parent["observation_hash"]:
+                        raise ValueError("range absence parent current token is missing")
+                    parent_snapshots, authenticated, _ = parent_tokens[0]
+                    snapshots = (*snapshots, *parent_snapshots)
+                elif parent_tokens:
+                    raise ValueError("range absence has an unexpected parent token")
+                state, root, _, _, _ = record(self)
                 with transaction(state) as connection:
                     check_candidate_snapshots(connection, snapshots)
+                    for item in authenticated:
+                        check_read_evidence(connection, root, item)
                 baseline = _canonical(dict(fingerprint=fingerprint, request=request_description,
                     selected_hash=None,
                     candidates=[(key, [row.decode() for row in rows]) for key, rows in snapshots],

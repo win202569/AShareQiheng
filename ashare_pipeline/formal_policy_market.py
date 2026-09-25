@@ -234,6 +234,7 @@ def _build_proof_types():
          implementation_select_market, selection_types) = dependencies
         calendar_selection_type, market_selection_type = selection_types
         batch_capture = ContextVar("policy_market_batch_capture", default=None)
+        selection_records = {}
         anchored_binding_identity = _binding_identity
         anchored_read_binding = _read_binding
         anchored_canonical = canonical_bytes
@@ -304,37 +305,96 @@ def _build_proof_types():
             capture["calendar_ticket"] = ticket
             return ticket.selected()
 
+        def seal_selection(kind, selected, sealed, binding, as_of_utc, security_id):
+            capture = batch_capture.get()
+            if capture is None:
+                return selected
+            owner = capture["owner"]
+            if repository_record(owner) is not sealed:
+                raise ValueError("market selection ticket owner changed")
+            proof = selected.coverage if kind == "calendar" else selected.window
+            proof_bytes = None if proof is None else proof.canonical_bytes()
+            binding_identity = _binding_identity(binding)
+            if proof is not None:
+                proof_seal = record(proof,
+                    VerifiedCalendarCoverageV1 if kind == "calendar" else VerifiedMarketWindowV1,
+                    calendar_records if kind == "calendar" else window_records)
+                if (proof_seal.range_store is not sealed.range_store
+                        or proof_seal.binding_identity != binding_identity
+                        or proof_seal.wire_bytes != proof_bytes):
+                    raise ValueError("market selection proof owner changed")
+            fields = (selected.pending, selected.lineage, selected.selection_hash)
+            identity = id(selected)
+            reference = weakref.ref(selected, lambda ref, key=identity:
+                selection_records.pop(key, None)
+                if selection_records.get(key) is not None
+                and selection_records[key][0] is ref else None)
+            selection_records[identity] = (reference, owner, kind, fields, proof,
+                proof_bytes, binding, canonical_bytes(binding_identity), sealed.range_store,
+                tuple(capture["tickets"]), capture.get("calendar_ticket"),
+                (security_id, as_of_utc, binding_identity["binding_hash"]))
+            capture["sealed_selection"] = selected
+            return selected
+
+        def selection_record(owner, selected, kind, capture=None):
+            saved = selection_records.get(id(selected))
+            if (saved is None or saved[0]() is not selected or saved[1] is not owner
+                    or saved[2] != kind or type(selected) is not
+                    (calendar_selection_type if kind == "calendar" else market_selection_type)
+                    or (selected.pending, selected.lineage, selected.selection_hash) != saved[3]
+                    or (selected.coverage if kind == "calendar" else selected.window) is not saved[4]
+                    or (None if saved[4] is None else saved[4].canonical_bytes()) != saved[5]):
+                raise ValueError("market or calendar selection changed after owner seal")
+            if capture is not None and (capture.get("sealed_selection") is not selected
+                    or tuple(capture["tickets"]) != saved[9]
+                    or capture.get("calendar_ticket") is not saved[10]):
+                raise ValueError("market selection token changed")
+            return saved
+
         def assemble_calendar(sealed, binding, as_of_utc):
             def owner_mint(wire, owned_binding, recheck):
                 return mint_calendar(wire, owned_binding, sealed.range_store, recheck)
+            def owner_seal(selected):
+                return seal_selection("calendar", selected, sealed, binding, as_of_utc,
+                                      _binding_identity(binding)["exchange"])
             return implementation_select_calendar(
                 sealed, binding, as_of_utc, _mint_calendar=owner_mint,
                 _page_group=owner_page_group,
                 _select_calendar=assemble_calendar,
                 _calendar_selection_type=calendar_selection_type,
+                _seal_selection=owner_seal,
             )
 
         def assemble_market(sealed, security_id, as_of_utc, *, binding):
             def owner_mint(wire, owned_binding, recheck):
                 return mint_window(wire, owned_binding, sealed.range_store, recheck)
+            def owner_seal(selected):
+                return seal_selection("market", selected, sealed, binding, as_of_utc,
+                                      security_id)
             return implementation_select_market(
                 sealed, security_id, as_of_utc, binding=binding,
                 _mint_window=owner_mint, _page_group=owner_page_group,
                 _select_calendar=calendar_for_market, _select_market=assemble_market,
                 _market_selection_type=market_selection_type,
+                _seal_selection=owner_seal,
             )
 
         def ticket_evidence(owner, journal, kind, selected, binding, as_of_utc,
                             security_id, capture):
             from .formal_batch_read_journal import _issue_current_ticket, _require_current_ticket
             sealed = repository_record(owner)
-            lower = tuple(capture["tickets"])
+            saved = selection_record(owner, selected, kind, capture)
+            (_, _, _, fields, proof, proof_bytes, sealed_binding, binding_bytes,
+             range_store, lower, sealed_calendar_ticket, request) = saved
+            if (sealed_binding is not binding or range_store is not sealed.range_store
+                    or request[0:2] != (security_id, as_of_utc)):
+                raise ValueError("market ticket request differs from sealed selection")
             baselines = tuple(_require_current_ticket(journal, ticket, sealed.range_store,
                                                        "range")[1] for ticket in lower)
             for ticket in lower:
                 sealed.range_store._batch_recheck_ticket(_require_current_ticket(
                     journal, ticket, sealed.range_store, "range")[2])
-            calendar_ticket = capture.get("calendar_ticket")
+            calendar_ticket = sealed_calendar_ticket
             if calendar_ticket is not None:
                 calendar_selected, calendar_baseline, calendar_evidence = _require_current_ticket(
                     journal, calendar_ticket, owner, "calendar")
@@ -344,10 +404,8 @@ def _build_proof_types():
             else:
                 calendar_selected, calendar_baseline = None, None
             binding_identity = _binding_identity(binding)
-            proof = selected.coverage if kind == "calendar" else selected.window
-            proof_bytes = None if proof is None else proof.canonical_bytes()
-            fields = (selected.pending, selected.lineage, selected.selection_hash)
-            request = (security_id, as_of_utc, binding_identity["binding_hash"])
+            if canonical_bytes(binding_identity) != binding_bytes:
+                raise ValueError("market ticket binding changed after selection")
             baseline = canonical_bytes(dict(kind=kind, request=request,
                 fields=[list(fields[0]), list(fields[1]), fields[2]],
                 proof=None if proof_bytes is None else proof_bytes.decode(),
@@ -355,7 +413,7 @@ def _build_proof_types():
                 range=[value.decode() for value in baselines],
                 calendar=None if calendar_baseline is None else calendar_baseline.decode()))
             evidence = (kind, selected, fields, proof_bytes, proof, binding,
-                canonical_bytes(binding_identity), sealed.range_store, journal, lower,
+                binding_bytes, sealed.range_store, journal, lower,
                 calendar_ticket, calendar_selected, request)
             coverage = () if kind == "calendar" else ((security_id,),)
             return _issue_current_ticket(journal, owner, kind, request, baseline,
@@ -435,6 +493,7 @@ def _build_proof_types():
                  request) = evidence
                 sealed = repository_record(self)
                 if (range_store is not sealed.range_store
+                        or selection_record(self, selected, kind)[3] != fields
                         or canonical_bytes(_binding_identity(binding)) != binding_bytes
                         or type(selected) is not (calendar_selection_type if kind == "calendar"
                                                     else market_selection_type)
@@ -560,7 +619,7 @@ def evaluate_window(trading_days: tuple[str, ...], daily_rows: dict[str, dict]) 
     return result
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class CalendarSelection:
     coverage: VerifiedCalendarCoverageV1 | None
     pending: tuple[str, ...]
@@ -572,7 +631,7 @@ class CalendarSelection:
         self._check()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class MarketSelection:
     window: VerifiedMarketWindowV1 | None
     pending: tuple[str, ...]
@@ -619,7 +678,8 @@ class _MarketRepositoryImplementation:
         return tuple(observations), None
 
     def select_calendar(sealed, binding, as_of_utc, *, _mint_calendar, _page_group,
-                        _select_calendar, _calendar_selection_type) -> CalendarSelection:
+                        _select_calendar, _calendar_selection_type,
+                        _seal_selection) -> CalendarSelection:
         if type(binding) is not _binding_type:
             raise ValueError("calendar selection requires a genuine range binding")
         as_of = _aware(as_of_utc, "calendar as_of_utc")
@@ -655,8 +715,8 @@ class _MarketRepositoryImplementation:
                 if (missing is not None and sealed.select_current(
                         sealed.range_store, missing.request_fingerprint) is not None):
                     raise ValueError("calendar selection changed")
-            return _calendar_selection_type(None, pending,
-                (), identity, check_missing)
+            return _seal_selection(_calendar_selection_type(None, pending,
+                (), identity, check_missing))
 
         documents = []
         coverage_ranges = []
@@ -720,19 +780,19 @@ class _MarketRepositoryImplementation:
                             for item in observations)
             identity = hashlib.sha256(canonical_bytes({"pending": list(pending),
                 "lineage": list(lineage)})).hexdigest()
-            return _calendar_selection_type(None, pending, lineage, identity,
+            return _seal_selection(_calendar_selection_type(None, pending, lineage, identity,
                 lambda: tuple(sealed.observation_require_current(item)
-                              for item in observations))
+                              for item in observations)))
         if visibility_missing or not all(_visible(document, as_of) for document in documents):
             pending = ("visibility_unproven",)
             identity = hashlib.sha256(canonical_bytes({"pending": list(pending),
                 "lineage": [sealed.observation_to_dict(item)["observation_hash"]
                             for item in observations]})).hexdigest()
-            return _calendar_selection_type(None, pending,
+            return _seal_selection(_calendar_selection_type(None, pending,
                 tuple(sealed.observation_to_dict(item)["observation_hash"]
                       for item in observations), identity,
                 lambda: tuple(sealed.observation_require_current(item)
-                              for item in observations))
+                              for item in observations)))
         if as_of.date().isoformat() not in by_date or by_date[as_of.date().isoformat()]["is_open"] is not True:
             raise ValueError("formal freeze is not proven as a trading day")
         trading = tuple(day for day in expected_dates if by_date[day]["is_open"])[-250:]
@@ -775,19 +835,19 @@ class _MarketRepositoryImplementation:
                 raise ValueError("calendar coverage selection changed")
         proof = _mint_calendar(wire, owned_binding, recheck)
         selection_hash = hashlib.sha256(proof.canonical_bytes()).hexdigest()
-        return _calendar_selection_type(
-            proof, (), lineage, selection_hash, proof.require_current)
+        return _seal_selection(_calendar_selection_type(
+            proof, (), lineage, selection_hash, proof.require_current))
 
     def select(sealed, security_id, as_of_utc, *, binding, _mint_window, _page_group,
                _select_calendar, _select_market,
-               _market_selection_type) -> MarketSelection:
+               _market_selection_type, _seal_selection) -> MarketSelection:
         if type(security_id) is not str or _SECURITY.fullmatch(security_id) is None:
             raise ValueError("market selection security_id is invalid")
         owned_binding, source = sealed.resolve_binding(sealed.range_store, binding)
         calendar = _select_calendar(sealed, owned_binding, as_of_utc)
         if calendar.coverage is None:
-            return _market_selection_type(None, calendar.pending, calendar.lineage,
-                calendar.selection_hash, calendar.recheck)
+            return _seal_selection(_market_selection_type(None, calendar.pending,
+                calendar.lineage, calendar.selection_hash, calendar.recheck))
         coverage_payload = calendar.coverage.to_dict()
         days = tuple(coverage_payload["trading_days"])[-250:]
         requests = sealed.market_requests(
@@ -912,8 +972,8 @@ class _MarketRepositoryImplementation:
                     or current.window.canonical_bytes() != canonical_bytes(expected_window_wire)):
                 raise ValueError("market window selection changed")
         window = _mint_window(wire, owned_binding, recheck)
-        return _market_selection_type(window, tuple(sorted(pending)), lineage,
-            hashlib.sha256(window.canonical_bytes()).hexdigest(), window.require_current)
+        return _seal_selection(_market_selection_type(window, tuple(sorted(pending)), lineage,
+            hashlib.sha256(window.canonical_bytes()).hexdigest(), window.require_current))
 
 
 FormalPolicyMarketRepository = _install_market_proof_owner((
