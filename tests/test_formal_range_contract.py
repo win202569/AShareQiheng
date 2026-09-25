@@ -21,6 +21,34 @@ from tests.test_formal_sources import config
 
 
 class FormalRangeContractTests(unittest.TestCase):
+    def test_current_authenticates_each_original_source_once_per_snapshot(self):
+        bindings, *_ = self._load()
+        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        counts = {"proof_record": 0, "scoring_fingerprint": 0,
+                  "feature_fingerprint": 0}
+
+        def profile(frame, event, _arg):
+            if event != "call":
+                return
+            name, path = frame.f_code.co_name, frame.f_code.co_filename
+            if name == "proof_record" and path.endswith("formal_policy_registry.py"):
+                counts["proof_record"] += 1
+            elif (name == "fingerprint" and path.endswith("formal_scoring_registry.py")
+                    and frame.f_back.f_code.co_name == "sealed"):
+                counts["scoring_fingerprint"] += 1
+            elif name == "fingerprint" and path.endswith("formal_feature_contract.py"):
+                counts["feature_fingerprint"] += 1
+
+        sys.setprofile(profile)
+        try:
+            binding.require_current()
+            binding.require_current()
+        finally:
+            sys.setprofile(None)
+        self.assertEqual(counts, {"proof_record": 2,
+                                  "scoring_fingerprint": 2,
+                                  "feature_fingerprint": 4})
+
     def test_equal_identity_replacement_of_legacy_fields_before_load_is_rejected(self):
         from ashare_pipeline import formal_range_contract as contract
 
@@ -73,7 +101,40 @@ class FormalRangeContractTests(unittest.TestCase):
                      "_definitions_fingerprint"):
             self.assertEqual(counts.get(name, 0), 0, name)
         self.assertGreaterEqual(counts.get("require_official", 0), 8)
-        self.assertGreaterEqual(counts.get("canonical_bytes", 0), 4)
+        self.assertGreaterEqual(counts.get("read_sources", 0), 4)
+
+    def test_replaced_policy_source_reader_revokes_warm_binding(self):
+        from ashare_pipeline import formal_policy_registry as policy_module
+
+        bindings, *_ = self._load()
+        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        original = policy_module._read_authenticated_policy_sources
+        with patch.object(policy_module, "_read_authenticated_policy_sources",
+                          lambda proof: original(proof)):
+            with self.assertRaises(ValueError):
+                binding.require_current()
+        binding.require_current()
+
+    def test_equal_root_separate_scoring_is_verified_against_passed_bundle(self):
+        from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+
+        bundle1, vocabulary1, scoring1, *_ = range_graph()
+        policy1 = load_formal_policy_registry(
+            bundle1, scoring_registry=scoring1, feature_registry=vocabulary1)
+        bundle2, _, scoring2, *_ = range_graph()
+        self.assertIsNot(bundle1, bundle2)
+        self.assertEqual(bundle1.manifest.manifest_hash, bundle2.manifest.manifest_hash)
+        bindings = load_policy_range_bindings(
+            bundle2, scoring_registry=scoring2, policy_registry=policy1)
+        bindings.for_rule("bank_no_effective_trade_20d", "SH").require_current()
+        original_hash = scoring2.content_sha256
+        try:
+            object.__setattr__(scoring2, "content_sha256", "0" * 64)
+            with self.assertRaises(ValueError):
+                load_policy_range_bindings(
+                    bundle2, scoring_registry=scoring2, policy_registry=policy1)
+        finally:
+            object.__setattr__(scoring2, "content_sha256", original_hash)
 
     def test_range_config_method_replacement_is_rejected_before_first_load_and_current(self):
         from ashare_pipeline import formal_range_format as range_format

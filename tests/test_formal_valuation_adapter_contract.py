@@ -3,6 +3,7 @@
 import copy
 from dataclasses import asdict, replace
 import json
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -27,6 +28,39 @@ def load_graph(*, mutate=None):
 
 
 class ValuationAdapterContractTests(unittest.TestCase):
+    def test_each_source_read_authenticates_policy_once(self):
+        bundle, scoring, policy = load_graph()
+        registry = load_formal_valuation_adapter_registry(bundle,
+            scoring_registry=scoring, policy_registry=policy)
+        calls = 0
+
+        def profile(frame, event, _arg):
+            nonlocal calls
+            if (event == "call" and frame.f_code.co_name == "proof_record"
+                    and frame.f_code.co_filename.endswith("formal_policy_registry.py")):
+                calls += 1
+
+        sys.setprofile(profile)
+        try:
+            registry.require_official(bundle)
+            registry.require_official(bundle)
+        finally:
+            sys.setprofile(None)
+        self.assertEqual(calls, 2)
+
+    def test_replaced_policy_reader_revokes_warm_adapter(self):
+        from ashare_pipeline import formal_policy_registry as policy_module
+
+        bundle, scoring, policy = load_graph()
+        registry = load_formal_valuation_adapter_registry(bundle,
+            scoring_registry=scoring, policy_registry=policy)
+        original = policy_module._read_authenticated_policy_registry
+        with patch.object(policy_module, "_read_authenticated_policy_registry",
+                          lambda proof: original(proof)):
+            with self.assertRaises(ValueError):
+                registry.require_official(bundle)
+        registry.require_official(bundle)
+
     def test_exact_signed_coverage_and_derived_definition_hash(self):
         bundle, scoring, policy = load_graph()
         registry = load_formal_valuation_adapter_registry(bundle,

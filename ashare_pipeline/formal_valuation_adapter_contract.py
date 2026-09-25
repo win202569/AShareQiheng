@@ -10,7 +10,7 @@ import weakref
 
 from . import formal_metric_engine as metric_module
 from .formal_metric_engine import _scoring_metric_definitions
-from .formal_policy_registry import FormalPolicyRegistry
+from .formal_policy_registry import FormalPolicyRegistry, _read_authenticated_policy_registry
 from .formal_registry_manifest import VerifiedRegistryBundle, _load_canonical_object
 from .formal_scoring_registry import FormalScoringRegistry
 
@@ -71,7 +71,7 @@ def _install_registry():
     records = {}
     bundle_type, scoring_type, policy_type = VerifiedRegistryBundle, FormalScoringRegistry, FormalPolicyRegistry
     require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
-    require_scoring, require_policy = scoring_type.require_official, policy_type.require_verified
+    require_scoring, read_policy = scoring_type.require_official, _read_authenticated_policy_registry
     definitions = _scoring_metric_definitions
     metric_owner = metric_module
     definition_guard = metric_owner._metric_definition_dependency_changes
@@ -97,9 +97,10 @@ def _install_registry():
         if bundle.manifest.schema_version != "formal-registry-manifest-v2":
             raise ValueError("valuation_adapter role is unavailable for this manifest version")
         require_scoring(scoring, bundle)
-        require_policy(policy)
-        if (policy.registry_manifest_hash != bundle.manifest.manifest_hash
-                or policy.role_hashes != {role: scoring.role_hashes[role] for role in policy.role_hashes}):
+        policy_wire = read_policy(policy)
+        if (policy_wire["registry_manifest_hash"] != bundle.manifest.manifest_hash
+                or policy_wire["role_hashes"] != {
+                    role: scoring.role_hashes[role] for role in policy_wire["role_hashes"]}):
             _fail("graph", "policy and scoring have different roots")
         blob = blob_for(bundle, "valuation_adapter")
         if (sha256(blob.canonical_json).hexdigest() != blob.registry_hash

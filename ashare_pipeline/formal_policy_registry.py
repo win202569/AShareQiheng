@@ -372,7 +372,8 @@ def _install_policy_registry():
             raise ValueError("policy proof dependency changed")
         if (module_globals.get("FormalPolicyRegistry") is not proof_type
                 or module_globals.get("load_formal_policy_registry") is not load
-                or module_globals.get("_read_authenticated_policy_registry") is not read):
+                or module_globals.get("_read_authenticated_policy_registry") is not read
+                or module_globals.get("_read_authenticated_policy_sources") is not read_sources):
             raise ValueError("policy proof entry point changed")
         if (any(resolved_member(cls, name) is not expected for cls, name, expected in source_members)
                 or any(cls.__bases__ != bases or cls.__mro__ != mro for cls, bases, mro in source_bases)):
@@ -505,12 +506,17 @@ def _install_policy_registry():
         record = proof_record(proof)
         return dict(loads(record[2]), contract_hash=record[1]["contract_hash"])
 
+    def read_sources(proof):
+        """Internal read of original sources and bytes after one complete proof check."""
+        record = proof_record(proof)
+        return record[3], record[4], record[5], record[2]
+
     own_members = class_snapshot((ProofMeta, Proof, proof_type))
-    return proof_type, load, read
+    return proof_type, load, read, read_sources
 
 
 (FormalPolicyRegistry, load_formal_policy_registry,
- _read_authenticated_policy_registry) = _install_policy_registry()
+ _read_authenticated_policy_registry, _read_authenticated_policy_sources) = _install_policy_registry()
 del _install_policy_registry
 
 

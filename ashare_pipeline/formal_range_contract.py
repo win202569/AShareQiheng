@@ -64,6 +64,7 @@ def _build_range_bindings_contract():
     # Source imports only the pure format module, so trust interfaces can be
     # captured now, before callers can replace methods ahead of the first load.
     from .formal_context_schema import _descriptor as validate_descriptor
+    from . import formal_policy_registry as policy_module
     from .formal_policy_registry import FormalPolicyRegistry as policy_type
     from .formal_registry_manifest import VerifiedRegistryBundle as bundle_type
     from .formal_scoring_registry import FormalScoringRegistry as scoring_type
@@ -74,7 +75,7 @@ def _build_range_bindings_contract():
     require_bundle = bundle_type.require_official
     blob_for = bundle_type.blob
     require_scoring = scoring_type.require_official
-    policy_bytes_for = policy_type.canonical_bytes
+    read_policy_sources = policy_module._read_authenticated_policy_sources
 
     module_globals = globals()
     # _range_catalog_from_source reads _load_canonical_object and the immutable
@@ -106,7 +107,7 @@ def _build_range_bindings_contract():
         (bundle_type, "require_official", require_bundle),
         (bundle_type, "blob", blob_for),
         (scoring_type, "require_official", require_scoring),
-        (policy_type, "canonical_bytes", policy_bytes_for),
+        (policy_module, "_read_authenticated_policy_sources", read_policy_sources),
     )
 
     def _check_dependencies() -> None:
@@ -134,10 +135,11 @@ def _build_range_bindings_contract():
         if (type(bundle) is not bundle_type or type(scoring_registry) is not scoring_type
                 or type(policy_registry) is not policy_type):
             raise ValueError("range bindings require exact genuine registry types")
-        require_bundle(bundle)
-        require_scoring(scoring_registry, bundle)
-        # canonical_bytes executes the original complete policy proof verifier.
-        policy_bytes = policy_bytes_for(policy_registry)
+        original_bundle, original_scoring, _, policy_bytes = read_policy_sources(policy_registry)
+        if bundle is not original_bundle:
+            require_bundle(bundle)
+        if bundle is not original_bundle or scoring_registry is not original_scoring:
+            require_scoring(scoring_registry, bundle)
         manifest = bundle.manifest
         manifest_bytes = manifest.canonical_json
         root_hash = hashlib.sha256(manifest_bytes).hexdigest()
