@@ -251,7 +251,7 @@ def publish_under_guard(provider, store, prepare, read_and_recheck,
 
 **Interfaces:** Consumes W3 唯一公开入口和 R4 恢复入口；不产生新的公开产品 API。
 
-- [ ] **写完整场景测试。** 五模板映射必须在签名前生成，使用至少五个明确证券 ID；一个非周期同模板证券、一个已证实硬否决兼有缺失输入证券、一个未知 membership 证券。测试断言不以分数/入池截断 universe。
+- [x] **写完整场景测试。** 五模板映射必须在签名前生成，使用至少五个明确证券 ID；一个非周期同模板证券、一个已证实硬否决兼有缺失输入证券、一个未知 membership 证券。测试断言不以分数/入池截断 universe。
 
 ```python
 def test_rebuild_is_byte_identical_without_new_input_generation(self):
@@ -267,8 +267,8 @@ def test_rebuild_is_byte_identical_without_new_input_generation(self):
 
 第二个组合测试在真实 source/task 中添加合法新 generation，更正一个观察并重发完整 provider，断言新批次身份改变、旧字节仍在、旧历史 proof 不满足新消费 current；第三个中断 worker 后重开临时 StateStore，重验已有页不重复 HTTP，最终规范结果与连续运行一致。
 
-- [ ] **运行新增测试，确认其针对真实缺口失败或已有正确实现通过。** 集成任务不为制造 RED 人工破坏代码；如测试已通过，记录这是对已实现行为的新增覆盖。发现缺陷才进行新的 RED→修复→GREEN。
-- [ ] **最小修复并核对隔离。** 测试拒绝所有真实网络调用；临时 DB 路径必须在 fixture TemporaryDirectory 内。增加如下测试断言，证明没有偷偷生成最终评分或池：
+- [x] **运行新增测试，确认其针对真实缺口失败或已有正确实现通过。** 集成任务不为制造 RED 人工破坏代码；如测试已通过，记录这是对已实现行为的新增覆盖。发现缺陷才进行新的 RED→修复→GREEN。
+- [x] **最小修复并核对隔离。** 测试拒绝所有真实网络调用；临时 DB 路径必须在 fixture TemporaryDirectory 内。增加如下测试断言，证明没有偷偷生成最终评分或池：
 
 ```python
 wire = fixture.build_policy_batch().to_dict()
@@ -280,7 +280,7 @@ for result in wire["results"]:
     self.assertNotIn("final_score", result)
 ```
 
-- [ ] **运行全受影响回归。** 使用一个完整命令，不重复导入 TestCase 制造用例数：
+- [x] **运行全受影响回归。** 使用一个完整命令，不重复导入 TestCase 制造用例数：
 
 ```powershell
 & D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_range_contract tests.test_formal_range_source tests.test_formal_range_store tests.test_formal_range_worker tests.test_formal_policy_values tests.test_formal_policy_financial tests.test_formal_policy_state tests.test_formal_policy_market tests.test_formal_policy_evaluator tests.test_formal_policy_repository tests.test_formal_policy_batch_guards tests.test_formal_policy_integration tests.test_formal_policy_contract tests.test_formal_policy_registry tests.test_formal_policy_registry_guards tests.test_formal_sources tests.test_formal_context_schema tests.test_formal_context_repository tests.test_formal_feature_repository tests.test_formal_feature_store tests.test_formal_metric_context tests.test_formal_metric_features tests.test_formal_metric_batch_guard tests.test_formal_metric_engine tests.test_state_store -v
@@ -288,7 +288,7 @@ for result in wire["results"]:
 
 若执行较久，保留 session ID，按不超过 60 秒的检查窗口汇报新进展；不反复重启测试。检查 `git diff --check`、所有旧 V2–V6 DDL 变化、真实文件改动清单，以及数据/SQLite/WAL/SHM/进度路径未进入暂存区。
 
-- [ ] **主代理核实并提交。** 记录真实用例数、失败数、耗时和修复说明；独立规格审查/代码审查通过后，仅提交本任务代码与测试白名单，提交信息 `test: verify policy evidence recovery and complete-batch compatibility`。不自动合并 main、推送、实爬或公布股票池。
+- [x] **主代理核实并提交。** 记录真实用例数、失败数、耗时和修复说明；独立规格审查/代码审查及 fix1 复审通过，仅提交两份测试白名单（`9452b31`、`bba7e0f`）。未自动合并 main、推送、实爬或公布股票池。
 
 ## 完成报告
 
