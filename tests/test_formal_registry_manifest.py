@@ -125,6 +125,7 @@ def untrusted_manifest_envelope(manifest, **changes):
     envelope = object.__new__(FormalRegistryManifest)
     for field in (
         "manifest_hash",
+        "schema_version",
         "purpose",
         "approval_id",
         "canonical_json",
@@ -139,6 +140,7 @@ def untrusted_manifest_envelope(manifest, **changes):
         "redline_registry_hash",
         "status_registry_hash",
         "event_registry_hash",
+        "valuation_adapter_registry_hash",
     ):
         object.__setattr__(envelope, field, changes.get(field, getattr(manifest, field)))
     return envelope
@@ -154,10 +156,11 @@ def binding_bytes(child_sha256, registry_manifest_hash, registry_role):
     )
 
 
-def fixture_repository():
+def fixture_repository(*, schema_version="formal-registry-manifest-v1", purpose="test"):
     hashes = {}
     raw_by_role = {}
-    for role in ROLES:
+    roles = ROLES + (("valuation_adapter",) if schema_version == "formal-registry-manifest-v2" else ())
+    for role in roles:
         raw = source_bytes() if role == "source" else canonical_bytes(
             {"registry_role": role, "schema_version": "fixture-v1"}
         )
@@ -166,9 +169,9 @@ def fixture_repository():
         raw_by_role[role] = raw
     root = canonical_bytes(
         {
-            "schema_version": "formal-registry-manifest-v1",
-            "purpose": "test",
-            "approval_id": None,
+            "schema_version": schema_version,
+            "purpose": purpose,
+            "approval_id": "release-1" if purpose == "official" else None,
             **hashes,
         }
     )
@@ -176,19 +179,20 @@ def fixture_repository():
         root, "fixture-signature", "fixture-key", AcceptingVerifier()
     )
     blobs = {
-        hashes[f"{role}_registry_hash"]: fixture_blob(
-            role, raw, manifest.manifest_hash
+        hashes[f"{role}_registry_hash"]: replace(
+            fixture_blob(role, raw, manifest.manifest_hash),
+            approval_id=manifest.approval_id,
         )
         for role, raw in raw_by_role.items()
     }
     return InMemoryRepository(manifest, blobs), manifest, blobs
 
 
-def strict_binding_fixture():
-    repository, manifest, blobs = fixture_repository()
+def strict_binding_fixture(*, schema_version="formal-registry-manifest-v1"):
+    repository, manifest, blobs = fixture_repository(schema_version=schema_version)
     signatures = {manifest.canonical_json: "fixture-signature"}
     strict_blobs = {}
-    for role in ROLES:
+    for role in ROLES + (("valuation_adapter",) if schema_version == "formal-registry-manifest-v2" else ()):
         registry_hash = getattr(manifest, f"{role}_registry_hash")
         blob = blobs[registry_hash]
         signatures[blob.canonical_json] = "fixture-signature"
@@ -200,6 +204,130 @@ def strict_binding_fixture():
 
 
 class FormalRegistryManifestTests(unittest.TestCase):
+    def test_v1_bundle_remains_valid_but_has_no_valuation_adapter_role(self):
+        repository, manifest, _ = fixture_repository()
+        bundle = FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(manifest.manifest_hash)
+        self.assertEqual(manifest.schema_version, "formal-registry-manifest-v1")
+        self.assertEqual(bundle.roles, ROLES)
+        self.assertIsNone(bundle.manifest.valuation_adapter_registry_hash)
+        with self.assertRaisesRegex(ValueError, "role is unavailable for this manifest version"):
+            bundle.blob("valuation_adapter")
+
+    def test_v2_requires_exact_ten_roles_and_signed_adapter_binding(self):
+        repository, manifest, blobs, verifier = strict_binding_fixture(
+            schema_version="formal-registry-manifest-v2"
+        )
+        bundle = FormalRegistryBundleLoader(repository, verifier).load(manifest.manifest_hash)
+        self.assertEqual(bundle.roles, ROLES + ("valuation_adapter",))
+        self.assertEqual(bundle.blob("valuation_adapter").registry_hash,
+                         manifest.valuation_adapter_registry_hash)
+        self.assertEqual(set(bundle.blobs), set(bundle.roles))
+        with self.assertRaisesRegex(ValueError, "member"):
+            manifest.assert_member_hashes(**{
+                f"{role}_registry_hash": getattr(manifest, f"{role}_registry_hash")
+                for role in ROLES
+            })
+        adapter = blobs[manifest.valuation_adapter_registry_hash]
+        repository.blobs[adapter.registry_hash] = replace(adapter, binding_signature="tampered")
+        with self.assertRaisesRegex(ValueError, "binding.*signature"):
+            FormalRegistryBundleLoader(repository, verifier).load(manifest.manifest_hash)
+
+    def test_v2_rejects_missing_duplicate_or_wrong_role_adapter_child(self):
+        for mutation, message in (
+            (lambda repository, manifest: repository.blobs.pop(manifest.valuation_adapter_registry_hash),
+             "unknown"),
+            (lambda repository, manifest: repository.blobs.__setitem__(
+                manifest.valuation_adapter_registry_hash,
+                replace(repository.blobs[manifest.valuation_adapter_registry_hash], registry_role="event")),
+             "role"),
+        ):
+            repository, manifest, _ = fixture_repository(schema_version="formal-registry-manifest-v2")
+            mutation(repository, manifest)
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(manifest.manifest_hash)
+
+        _, manifest, _ = fixture_repository(schema_version="formal-registry-manifest-v2")
+        root = json.loads(manifest.canonical_json)
+        root["valuation_adapter_registry_hash"] = root["event_registry_hash"]
+        with self.assertRaisesRegex(ValueError, "unique"):
+            FormalRegistryManifest.from_signed_bytes(
+                canonical_bytes(root), "fixture-signature", "fixture-key", AcceptingVerifier()
+            )
+
+        _, manifest, blobs = fixture_repository(schema_version="formal-registry-manifest-v2")
+        wrong_raw = canonical_bytes({"registry_role": "event", "schema_version": "fixture-v2"})
+        wrong_hash = hashlib.sha256(wrong_raw).hexdigest()
+        root = json.loads(manifest.canonical_json)
+        root["valuation_adapter_registry_hash"] = wrong_hash
+        swapped = FormalRegistryManifest.from_signed_bytes(
+            canonical_bytes(root), "fixture-signature", "fixture-key", AcceptingVerifier()
+        )
+        rebound = {hash_: replace(blob, declared_registry_manifest_hash=swapped.manifest_hash)
+                   for hash_, blob in blobs.items()}
+        rebound[wrong_hash] = fixture_blob("valuation_adapter", wrong_raw, swapped.manifest_hash)
+        with self.assertRaisesRegex(ValueError, "declared role"):
+            FormalRegistryBundleLoader(InMemoryRepository(swapped, rebound), AcceptingVerifier()).load(
+                swapped.manifest_hash
+            )
+
+    def test_v2_rejects_wrong_adapter_root_binding_and_approval(self):
+        repository, manifest, blobs = fixture_repository(
+            schema_version="formal-registry-manifest-v2", purpose="official"
+        )
+        FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(
+            manifest.manifest_hash
+        ).require_official()
+        adapter = blobs[manifest.valuation_adapter_registry_hash]
+        repository.blobs[adapter.registry_hash] = replace(
+            adapter, declared_registry_manifest_hash="0" * 64
+        )
+        with self.assertRaisesRegex(ValueError, "declared root"):
+            FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(manifest.manifest_hash)
+        repository.blobs[adapter.registry_hash] = replace(adapter, approval_id="other-release")
+        with self.assertRaisesRegex(ValueError, "approval"):
+            FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(manifest.manifest_hash)
+
+    def test_root_schema_has_exact_versioned_fields(self):
+        _, manifest, _ = fixture_repository()
+        root = json.loads(manifest.canonical_json)
+        root["valuation_adapter_registry_hash"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "unknown or missing keys"):
+            FormalRegistryManifest.from_signed_bytes(
+                canonical_bytes(root), "fixture-signature", "fixture-key", AcceptingVerifier()
+            )
+        root.pop("valuation_adapter_registry_hash")
+        root["schema_version"] = "formal-registry-manifest-v3"
+        with self.assertRaisesRegex(ValueError, "schema_version"):
+            FormalRegistryManifest.from_signed_bytes(
+                canonical_bytes(root), "fixture-signature", "fixture-key", AcceptingVerifier()
+            )
+        _, v2, _ = fixture_repository(schema_version="formal-registry-manifest-v2")
+        root = json.loads(v2.canonical_json)
+        root.pop("valuation_adapter_registry_hash")
+        with self.assertRaisesRegex(ValueError, "unknown or missing keys"):
+            FormalRegistryManifest.from_signed_bytes(
+                canonical_bytes(root), "fixture-signature", "fixture-key", AcceptingVerifier()
+            )
+        root["valuation_adapter_registry_hash"] = "not-a-sha256"
+        with self.assertRaisesRegex(ValueError, "SHA-256"):
+            FormalRegistryManifest.from_signed_bytes(
+                canonical_bytes(root), "fixture-signature", "fixture-key", AcceptingVerifier()
+            )
+
+    def test_schema_and_adapter_hash_mutation_invalidate_manifest_and_bundle_seals(self):
+        for field, value in (("schema_version", "formal-registry-manifest-v1"),
+                             ("valuation_adapter_registry_hash", "0" * 64)):
+            repository, manifest, _ = fixture_repository(schema_version="formal-registry-manifest-v2")
+            bundle = FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(manifest.manifest_hash)
+            object.__setattr__(bundle.manifest, field, value)
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "verified"):
+                bundle.manifest.assert_member_hashes(**{
+                    f"{role}_registry_hash": getattr(bundle.manifest, f"{role}_registry_hash")
+                    for role in ROLES + ("valuation_adapter",)
+                })
+            with self.assertRaisesRegex(ValueError, "verified"):
+                bundle.blob("source")
+
     def test_loader_rereads_exact_nine_role_blobs_and_test_bundle_cannot_be_official(self):
         repository, manifest, _ = fixture_repository()
 

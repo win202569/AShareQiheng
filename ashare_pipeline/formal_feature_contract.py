@@ -460,6 +460,8 @@ def _validate_root(root: object) -> FormalRegistryManifest:
                 "event_registry_hash",
             )
         }
+        if root.schema_version == "formal-registry-manifest-v2":
+            hashes["valuation_adapter_registry_hash"] = root.valuation_adapter_registry_hash
         root.assert_member_hashes(**hashes)
     except (AttributeError, TypeError, ValueError) as error:
         raise ValueError("registry manifest is unsealed, forged, or mutated") from error

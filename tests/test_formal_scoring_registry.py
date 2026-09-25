@@ -43,7 +43,8 @@ class HmacVerifier:
         return key_id == "scoring-test-key" and hmac.compare_digest(self.sign(raw), signature)
 
 
-def signed_graph(*, mutate=None, context=False):
+def signed_graph(*, mutate=None, context=False,
+                 manifest_version="formal-registry-manifest-v1"):
     """Author one complete synthetic official-wire graph, never promote the test registry by approval."""
     verifier = HmacVerifier()
     wrapper = fixture_wire()
@@ -70,9 +71,14 @@ def signed_graph(*, mutate=None, context=False):
     documents["scoring"] = wrapper
     if mutate:
         mutate(documents)
-    raws = {role: canonical(doc) for role, doc in documents.items()}
+    active_roles = tuple(ROLES)
+    if manifest_version == "formal-registry-manifest-v2":
+        active_roles += ("valuation_adapter",)
+    if set(documents) != set(active_roles):
+        raise ValueError("fixture documents differ from manifest roles")
+    raws = {role: canonical(documents[role]) for role in active_roles}
     hashes = {role + "_registry_hash": hashlib.sha256(raw).hexdigest() for role, raw in raws.items()}
-    root = canonical(dict(schema_version="formal-registry-manifest-v1", purpose="official", approval_id="test-graph-approval", **hashes))
+    root = canonical(dict(schema_version=manifest_version, purpose="official", approval_id="test-graph-approval", **hashes))
     manifest = FormalRegistryManifest.from_signed_bytes(root, verifier.sign(root), "scoring-test-key", verifier)
     blobs = {}
     for role, raw in raws.items():
@@ -97,6 +103,24 @@ class FormalScoringRegistryTests(unittest.TestCase):
     def load_official(self, bundle, vocabulary, approval=None):
         approval = approval or self.api.RegistryApproval("official", bundle.manifest.scoring_registry_hash, bundle.manifest.approval_id)
         return self.api.load_formal_registry(bundle, approval, feature_registry=vocabulary)
+
+    def test_signed_graph_fixture_selects_exact_manifest_role_set(self):
+        bundle, _, _, _ = signed_graph()
+        self.assertEqual(bundle.roles, ROLES)
+        with self.assertRaisesRegex(ValueError, "fixture documents differ from manifest roles"):
+            signed_graph(manifest_version="formal-registry-manifest-v2")
+
+        def add_adapter(documents):
+            documents["valuation_adapter"] = {
+                "registry_role": "valuation_adapter", "schema_version": "fixture-v1"
+            }
+
+        bundle, _, _, _ = signed_graph(
+            mutate=add_adapter, manifest_version="formal-registry-manifest-v2"
+        )
+        self.assertEqual(bundle.roles, ROLES + ("valuation_adapter",))
+        self.assertEqual(bundle.blob("valuation_adapter").registry_hash,
+                         bundle.manifest.valuation_adapter_registry_hash)
 
     def test_all_five_templates_preserve_exact_seven_dimension_slots_and_weights(self):
         registry = self.load_test()
