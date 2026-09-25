@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from contextvars import ContextVar
 import hashlib
 import json
 import weakref
@@ -198,11 +199,14 @@ class FormalFeatureRepository:
         """Read an exact historical receipt; this does not rebuild historical inputs."""
         return self._read_authenticated_bundle(input_hash=input_hash, require_complete=True)
 
-    def _read_authenticated_bundle(self, *, input_hash: str, require_complete: bool) -> FormalFeatureBundle | None:
+    def _read_authenticated_bundle(self, *, input_hash: str, require_complete: bool,
+                                   _receipt_capture: list[bytes | None] | None = None) -> FormalFeatureBundle | None:
         """Authenticate every persisted byte; completeness is a separate read gate."""
         _require_hash(input_hash, "formal feature input hash")
         row = self._metadata(input_hash)
         if row is None:
+            if _receipt_capture is not None:
+                _receipt_capture.append(None)
             return None
         before = _canonical_json_bytes(row)
         receipt_fields = {"bundle_path", "manifest_path", "bundle_hash", "bundle_manifest_hash"}
@@ -230,6 +234,8 @@ class FormalFeatureRepository:
         self._validate_evidence(bundle)
         if _canonical_json_bytes(self._metadata(input_hash)) != before:
             raise ValueError("formal feature metadata changed while reading")
+        if _receipt_capture is not None:
+            _receipt_capture.append(before)
         return bundle
 
     def _persisted_facts(self, security_id: str) -> tuple[bytes, ...]:
@@ -305,6 +311,7 @@ def _install_metric_projection():
     snapshot_identity = repository_type._snapshot_identity
     builder = build_formal_feature_bundle
     evaluator = evaluate_selected_features
+    ticket_capture = ContextVar("formal_metric_ticket_selection", default=None)
     repositories, proofs = {}, {}
     absences = {}
     fields = ("security_id", "as_of_utc", "template_id", "registry_manifest_hash",
@@ -505,7 +512,14 @@ def _install_metric_projection():
             raise ValueError("metric feature builder returned an invalid bundle")
         expected_bytes = expected.canonical_bytes()
         check_current()
-        stored = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+        capture = ticket_capture.get()
+        def read_selected(receipt):
+            if receipt is None:
+                return read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+            return read_bundle(self, input_hash=expected.input_hash, require_complete=False,
+                               _receipt_capture=receipt)
+        first_receipt = [] if capture is not None else None
+        stored = read_selected(first_receipt)
         if stored is not None and stored.canonical_bytes() != expected_bytes:
             raise ValueError("metric feature stored bundle differs from rebuilt inputs")
         check_current()
@@ -526,7 +540,8 @@ def _install_metric_projection():
                     or _issue_snapshot(current.issues)[1] != issue_records):
                 raise ValueError("metric absence provider generation changed during selection")
             check_current()
-            if read_bundle(self, input_hash=expected.input_hash, require_complete=False) is not None:
+            final_receipt = [] if capture is not None else None
+            if read_selected(final_receipt) is not None:
                 raise ValueError("metric absence receipt appeared during selection")
             check_current()
             payload = dict(request, feature_registry_hash=registry.registry_hash,
@@ -541,11 +556,17 @@ def _install_metric_projection():
             proof_id = id(result)
             absences[proof_id] = (weakref.ref(result, lambda _, proof_id=proof_id: absences.pop(proof_id, None)),
                 _canonical_json_bytes(payload))
+            if capture is not None:
+                if first_receipt != [None] or final_receipt != [None]:
+                    raise ValueError("metric absence receipt changed during selection")
+                capture["token"] = ("absent", expected.input_hash, expected.bundle_hash(),
+                                    expected_bytes, None, result.canonical_bytes())
             return result
         values, blockers = evaluator(slots=slots, facts=facts, issues=issues, as_of_utc=as_of_utc)
         # Re-read source lineage, root and the exact receipt after calculation:
         # a correct early read cannot bless a late SQL/file/source mutation.
-        reread = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+        final_receipt = [] if capture is not None else None
+        reread = read_selected(final_receipt)
         if reread is None or reread.canonical_bytes() != expected_bytes:
             raise ValueError("metric feature persisted receipt changed during projection")
         check_current()
@@ -569,6 +590,12 @@ def _install_metric_projection():
             object.__setattr__(result, field, value)
         proof_id = id(result)
         proofs[proof_id] = (weakref.ref(result, lambda _, proof_id=proof_id: proofs.pop(proof_id, None)), _canonical_json_bytes(payload))
+        if capture is not None:
+            if (first_receipt != final_receipt or len(first_receipt) != 1
+                    or first_receipt[0] is None):
+                raise ValueError("metric receipt changed during selected proof construction")
+            capture["token"] = ("present", expected.input_hash, stored.bundle_hash(),
+                                expected_bytes, first_receipt[0], result.canonical_bytes())
         return result
 
     def select(self, *args, **kwargs):
@@ -581,9 +608,24 @@ def _install_metric_projection():
 
         _require_current_scope(journal, self, root=registry_manifest_hash,
                                as_of_utc=as_of_utc, population=(security_id,))
-        result = select_state(self, security_id, as_of_utc, template_id=template_id,
-            registry_manifest_hash=registry_manifest_hash,
-            required_feature_keys=required_feature_keys)
+        selected_receipt = {}
+        capture_reset = ticket_capture.set(selected_receipt)
+        try:
+            result = select_state(self, security_id, as_of_utc, template_id=template_id,
+                registry_manifest_hash=registry_manifest_hash,
+                required_feature_keys=required_feature_keys)
+        finally:
+            ticket_capture.reset(capture_reset)
+        selection_token = selected_receipt.get("token")
+        if type(selection_token) is not tuple or len(selection_token) != 6:
+            raise ValueError("metric ticket lacks same-selection receipt token")
+        (selection_status, selected_input_hash, selected_bundle_hash, selected_input_bytes,
+         selected_metadata_bytes, selected_proof_bytes) = selection_token
+        if (selected_input_hash != result.input_hash or selected_bundle_hash != result.bundle_hash
+                or selected_proof_bytes != result.canonical_bytes()
+                or (selection_status == "absent") != (type(result) is VerifiedMetricFeatureAbsence)
+                or selection_status not in {"present", "absent"}):
+            raise ValueError("metric ticket proof differs from selected receipt token")
         request = _request(security_id, as_of_utc, template_id, registry_manifest_hash)
         provider = self._current_input_provider
         try:
@@ -604,20 +646,30 @@ def _install_metric_projection():
             raise ValueError("metric ticket signed registry changed")
         bundle = read_bundle(self, input_hash=result.input_hash, require_complete=False)
         bundle_bytes = None if bundle is None else bundle.canonical_bytes()
-        if (bundle is None) != (type(result) is VerifiedMetricFeatureAbsence):
-            raise ValueError("metric ticket receipt differs from selected state")
+        if selection_status == "present":
+            if (bundle is None or bundle.bundle_hash() != selected_bundle_hash
+                    or bundle_bytes != selected_input_bytes):
+                raise ValueError("metric ticket bundle differs from selected receipt")
+        elif bundle is not None:
+            raise ValueError("metric ticket selected absence became present")
         metadata = self._metadata(result.input_hash)
         metadata_bytes = None if metadata is None else _canonical_json_bytes(metadata)
+        if metadata_bytes != selected_metadata_bytes:
+            raise ValueError("metric ticket metadata differs from selected receipt")
         evidence = (request, identity, facts, issues, result.input_hash, bundle_bytes,
                     metadata_bytes, registry.registry_hash,
-                    graph.blob("feature").canonical_json, result, result.canonical_bytes())
+                    graph.blob("feature").canonical_json, result, result.canonical_bytes(),
+                    selection_token)
         baseline = _canonical_json_bytes(dict(request=request, identity=list(identity),
             facts=[item.decode() for item in facts], issues=[item.decode() for item in issues],
             input_hash=result.input_hash, bundle=None if bundle_bytes is None else bundle_bytes.decode(),
             metadata=None if metadata_bytes is None else metadata_bytes.decode(),
             registry_hash=registry.registry_hash,
             feature_registry=graph.blob("feature").canonical_json.decode(),
-            selected=result.canonical_bytes().decode()))
+            selected=result.canonical_bytes().decode(), selection_status=selection_status,
+            selected_input=selected_input_bytes.decode(),
+            selected_bundle_hash=selected_bundle_hash,
+            selected_receipt=None if selected_metadata_bytes is None else selected_metadata_bytes.decode()))
         return _issue_current_ticket(journal, self, "feature",
             (security_id, as_of_utc, template_id, registry_manifest_hash, required_feature_keys),
             baseline, evidence,
@@ -626,7 +678,14 @@ def _install_metric_projection():
     def recheck_metric_ticket(self, evidence):
         dependencies(self)
         (request, identity, facts, issues, input_hash, bundle_bytes, metadata_bytes,
-         registry_hash, registry_bytes, selected, selected_bytes) = evidence
+         registry_hash, registry_bytes, selected, selected_bytes, selection_token) = evidence
+        (selection_status, selected_input_hash, selected_bundle_hash, selected_input_bytes,
+         selected_metadata_bytes, selected_proof_bytes) = selection_token
+        if (input_hash != selected_input_hash or selected.bundle_hash != selected_bundle_hash
+                or selected.canonical_bytes() != selected_proof_bytes
+                or selected_bytes != selected_proof_bytes or metadata_bytes != selected_metadata_bytes
+                or (selection_status == "absent") != (type(selected) is VerifiedMetricFeatureAbsence)):
+            raise ValueError("metric ticket selected proof or receipt token changed")
         provider = self._current_input_provider
         try:
             supplied = provider.resolve_current_inputs(**request)
@@ -646,8 +705,12 @@ def _install_metric_projection():
         bundle = read_bundle(self, input_hash=input_hash, require_complete=False)
         if (None if bundle is None else bundle.canonical_bytes()) != bundle_bytes:
             raise ValueError("metric ticket stored bundle changed")
-        if selected.canonical_bytes() != selected_bytes:
-            raise ValueError("metric ticket selected proof changed")
+        if selection_status == "present":
+            if (bundle is None or bundle.bundle_hash() != selected_bundle_hash
+                    or bundle_bytes != selected_input_bytes):
+                raise ValueError("metric ticket selected bundle hash or bytes changed")
+        elif selection_status != "absent" or bundle is not None or metadata_bytes is not None:
+            raise ValueError("metric ticket selected absence changed")
 
     repository_type.__init__ = init
     repository_type.select_current_verified_metric_features = select

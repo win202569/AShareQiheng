@@ -340,6 +340,88 @@ class FeatureJournalTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         FormalBatchReadJournal.open(repo, **arguments)
 
+    def test_same_input_replaced_bundle_after_selection_never_becomes_ticket_baseline(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        provider = feature_tests.SnapshotProvider(self.snapshot())
+        repo = self.repository(provider)
+        key = self.registry.slots_for_template("general_nonfinancial")[0].slot_id
+        journal = FormalBatchReadJournal.open(repo,
+            registry_manifest_hash=self.manifest.manifest_hash,
+            as_of_utc="2026-08-31T07:00:00+00:00", population=("SZ000001",),
+            required_keys=(("SZ000001", "general_nonfinancial", key),))
+        changed_wire = self.bundle.to_dict()
+        changed_wire["values"][0]["value"] = 900.0
+        changed = feature_tests.FormalFeatureBundle.from_dict(changed_wire)
+        self.assertEqual(changed.input_hash, self.bundle.input_hash)
+        self.assertNotEqual(changed.bundle_hash(), self.bundle.bundle_hash())
+        selected_code = type(repo).select_current_verified_metric_feature_state.__code__
+        def inject(frame, event, arg):
+            if event == "return" and frame.f_code is selected_code:
+                sys.setprofile(None)
+                self.persist_unchecked(changed)
+        sys.setprofile(inject)
+        try:
+            with self.assertRaises(ValueError):
+                repo.select_current_metric_batch_ticket(journal, "SZ000001",
+                    "2026-08-31T07:00:00+00:00", template_id="general_nonfinancial",
+                    registry_manifest_hash=self.manifest.manifest_hash,
+                    required_feature_keys=(key,))
+        finally:
+            sys.setprofile(None)
+
+    def test_same_bundle_with_changed_receipt_metadata_cannot_become_ticket_baseline(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        repo = self.repository(feature_tests.SnapshotProvider(self.snapshot()))
+        key = self.registry.slots_for_template("general_nonfinancial")[0].slot_id
+        journal = FormalBatchReadJournal.open(repo,
+            registry_manifest_hash=self.manifest.manifest_hash,
+            as_of_utc="2026-08-31T07:00:00+00:00", population=("SZ000001",),
+            required_keys=(("SZ000001", "general_nonfinancial", key),))
+        before = repo._metadata(self.bundle.input_hash)
+        selected_code = type(repo).select_current_verified_metric_feature_state.__code__
+        def inject(frame, event, arg):
+            if event == "return" and frame.f_code is selected_code:
+                sys.setprofile(None)
+                self.persist_unchecked(self.bundle)
+        sys.setprofile(inject)
+        try:
+            with self.assertRaises(ValueError):
+                repo.select_current_metric_batch_ticket(journal, "SZ000001",
+                    "2026-08-31T07:00:00+00:00", template_id="general_nonfinancial",
+                    registry_manifest_hash=self.manifest.manifest_hash,
+                    required_feature_keys=(key,))
+        finally:
+            sys.setprofile(None)
+        self.assertNotEqual(repo._metadata(self.bundle.input_hash), before)
+
+    def test_absence_token_rejects_receipt_appearing_after_selection(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        self.sql("DELETE FROM formal_feature_value")
+        self.sql("DELETE FROM formal_feature_set")
+        repo = self.repository(feature_tests.SnapshotProvider(self.snapshot()))
+        key = self.registry.slots_for_template("general_nonfinancial")[0].slot_id
+        journal = FormalBatchReadJournal.open(repo,
+            registry_manifest_hash=self.manifest.manifest_hash,
+            as_of_utc="2026-08-31T07:00:00+00:00", population=("SZ000001",),
+            required_keys=(("SZ000001", "general_nonfinancial", key),))
+        selected_code = type(repo).select_current_verified_metric_feature_state.__code__
+        def inject(frame, event, arg):
+            if event == "return" and frame.f_code is selected_code:
+                sys.setprofile(None)
+                self.persist_unchecked(self.bundle)
+        sys.setprofile(inject)
+        try:
+            with self.assertRaises(ValueError):
+                repo.select_current_metric_batch_ticket(journal, "SZ000001",
+                    "2026-08-31T07:00:00+00:00", template_id="general_nonfinancial",
+                    registry_manifest_hash=self.manifest.manifest_hash,
+                    required_feature_keys=(key,))
+        finally:
+            sys.setprofile(None)
+
 
 class RangeJournalTests(unittest.TestCase):
     def test_preopen_range_selector_and_checker_replacement_is_rejected(self):
