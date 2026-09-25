@@ -64,6 +64,23 @@ def _freeze(value):
     return value
 
 
+def _scoring_metric_definitions(scoring, _definition_digest=_digest):
+    result = {}
+    for tid in scoring.templates:
+        template = scoring.template_for(tid)
+        result[tid] = {}
+        for dimension, metrics in template.metrics.items():
+            for metric in metrics:
+                key = dimension + "." + metric.metric_id
+                definition = {field.name: _plain(getattr(metric, field.name)) for field in fields(metric)}
+                payload = dict(template_id=tid, metric_id=key, definition=definition,
+                    registry_manifest_hash=scoring.registry_manifest_hash,
+                    scoring_registry_hash=scoring.content_sha256, feature_registry_hash=scoring.role_hashes["feature"])
+                payload["definition_hash"] = _definition_digest(payload)
+                result[tid][key] = payload
+    return result
+
+
 def _install_engine():
     repositories, proofs = {}, {}
     context_type = FormalMetricContextRepository
@@ -73,6 +90,7 @@ def _install_engine():
     load_root = FormalRegistryBundleLoader.load
     decimal_context = _arithmetic_context
     encode, digest, freeze = _canonical, _digest, _freeze
+    definitions = _scoring_metric_definitions
     checked = tuple((cls, name, method) for cls in (context_type, FormalFeatureRepository,
         FormalContextRepository, FormalRegistryBundleLoader, FormalScoringRegistry)
         for name, method in vars(cls).items() if callable(method) or isinstance(method, (staticmethod, classmethod)))
@@ -162,22 +180,6 @@ def _install_engine():
         proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)), freeze(data), encode(payload),
             private, [True] if publication is None else publication)
         return proof
-
-    def definitions(scoring):
-        result = {}
-        for tid in scoring.templates:
-            template = scoring.template_for(tid)
-            result[tid] = {}
-            for dimension, metrics in template.metrics.items():
-                for metric in metrics:
-                    key = dimension + "." + metric.metric_id
-                    definition = {field.name: _plain(getattr(metric, field.name)) for field in fields(metric)}
-                    payload = dict(template_id=tid, metric_id=key, definition=definition,
-                        registry_manifest_hash=scoring.registry_manifest_hash,
-                        scoring_registry_hash=scoring.content_sha256, feature_registry_hash=scoring.role_hashes["feature"])
-                    payload["definition_hash"] = digest(payload)
-                    result[tid][key] = payload
-        return result
 
     def build(repo, frozen_input_hash, scoring, metric_ids, guard):
         feature, _, verifier, context = dependencies(repo)

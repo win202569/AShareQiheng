@@ -326,21 +326,66 @@ def add_policy_documents(documents):
     scoring["market_liquidity_rule"] = dict(policy_role="status", rule_id="general_nonfinancial_no_effective_trade_20d")
 
 
-def policy_graph(*, version="v1", mutate=None):
+def add_valuation_adapter_document(documents):
+    """Author the signed Stage C child from scoring and keyed cyclic rules."""
+    scoring = documents["scoring"]["scoring"]
+    cyclic_rules = documents["cyclic"]["rules"]
+    coverage, adapters = [], []
+    for template_id in sorted(scoring["templates"]):
+        rule_id = f"{template_id}_cyclic_top"
+        rule = cyclic_rules[rule_id]
+        by_metric = {item["metric_id"]: item
+            for item in rule["parameters"]["valuation_dependencies"]}
+        for metric in scoring["templates"][template_id]["metrics"]["V"]:
+            metric_id = "V." + metric["metric_id"]
+            dependency = by_metric[metric_id]
+            coverage.append(dict(template_id=template_id, metric_id=metric_id,
+                policy_dependency=dependency["policy_dependency"]))
+            if dependency["policy_dependency"] == "affected":
+                adapters.append(dict(template_id=template_id, metric_id=metric_id,
+                    adapter_id=dependency["adapter_id"],
+                    adapter_version=dependency["adapter_version"],
+                    operation="profit_ratio_rescale_v1",
+                    profit_semantic_id=dependency["profit_semantic_id"],
+                    metric_unit=metric["unit_rule"], profit_unit="CNY",
+                    output_unit=metric["unit_rule"], policy_role="cyclic",
+                    rule_id=rule_id, decimal_contract="decimal50-half-even-v1",
+                    preconditions=["exact_units", "finite_decimals",
+                        "nonzero_original_current_profit"],
+                    definition_basis=dependency["definition_basis"]))
+    documents["valuation_adapter"] = dict(registry_role="valuation_adapter",
+        schema_version="formal-valuation-adapter-registry-v1", purpose="official",
+        registry_version="fixture-adapter-v1",
+        coverage=sorted(coverage, key=lambda x: (x["template_id"], x["metric_id"])),
+        adapters=sorted(adapters, key=lambda x: (x["template_id"], x["metric_id"])))
+
+
+def policy_graph(*, version="v1", manifest_version="formal-registry-manifest-v1",
+                 with_valuation_adapter=False, mutate=None):
     from ashare_pipeline.formal_scoring_registry import RegistryApproval, load_formal_registry
     from tests.test_formal_scoring_registry import signed_graph
     from tests.test_formal_scoring_consensus_registry import v2_graph
 
     if version not in ("v1", "v2"):
         raise ValueError("unknown fixture wrapper version")
+    if with_valuation_adapter and manifest_version != "formal-registry-manifest-v2":
+        raise ValueError("valuation_adapter fixture requires manifest v2")
 
     def prepare(documents):
         add_policy_documents(documents)
+        if with_valuation_adapter:
+            add_valuation_adapter_document(documents)
         if mutate is not None:
             mutate(documents)
         rehash_documents(documents)
 
-    values = (signed_graph(context=True, mutate=prepare) if version == "v1" else v2_graph(mutate=prepare))
+    if version == "v1":
+        values = signed_graph(context=True, mutate=prepare,
+            manifest_version=manifest_version)
+    else:
+        if manifest_version != "formal-registry-manifest-v1" or with_valuation_adapter:
+            raise ValueError("fixture scoring v2 does not author Stage C roots")
+        values = v2_graph(mutate=prepare)
     bundle, vocabulary, repository, verifier = values[:4]
     approval = RegistryApproval("official", bundle.manifest.scoring_registry_hash, bundle.manifest.approval_id)
     scoring = load_formal_registry(bundle, approval, feature_registry=vocabulary)

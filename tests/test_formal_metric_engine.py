@@ -215,6 +215,17 @@ class MetricClosureTests(unittest.TestCase):
         second = batch.input_for("BJ430001", "CA.return_persistence")
         self.assertNotEqual(first.definition_hash, second.definition_hash)
 
+    def test_definition_hash_is_stable_and_engine_captures_shared_producer(self):
+        expected = "96d0cb000910df365d981f826f125c2668bdbb55ca31d864f7a957cdafb4e774"
+        batch = self.build(metric_ids=(METRICS[0],))
+        self.assertEqual(batch.input_for("BJ430001", METRICS[0]).definition_hash, expected)
+        with patch.object(self.api, "_scoring_metric_definitions", side_effect=AssertionError("replacement called")):
+            second = self.build(metric_ids=(METRICS[0],))
+        self.assertEqual(second.input_for("BJ430001", METRICS[0]).definition_hash, expected)
+        with patch.object(self.api, "_digest", side_effect=AssertionError("replacement called")):
+            third = self.build(metric_ids=(METRICS[0],))
+        self.assertEqual(third.input_for("BJ430001", METRICS[0]).definition_hash, expected)
+
     def test_cross_member_still_absent_fact_issue_and_provider_corrections_fail_closure(self):
         for mutation in ("facts", "issues", "provider", "receipt"):
             fired = False
