@@ -68,6 +68,61 @@ class FormalRangeContractTests(unittest.TestCase):
                 binding.require_current()
         binding.require_current()
 
+    def test_range_format_thaw_and_bridge_replacement_before_first_load_is_rejected(self):
+        from ashare_pipeline import formal_range_format as range_format
+        from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+
+        bundle, vocabulary, scoring, *_ = range_graph()
+        policy = load_formal_policy_registry(
+            bundle, scoring_registry=scoring, feature_registry=vocabulary)
+        for name in ("_thaw", "_bridge"):
+            original = getattr(range_format, name)
+            with self.subTest(name=name), patch.object(
+                    range_format, name, lambda *args, _original=original: _original(*args)):
+                with self.assertRaises(ValueError):
+                    load_policy_range_bindings(
+                        bundle, scoring_registry=scoring, policy_registry=policy)
+
+    def test_range_format_thaw_cannot_hide_mutated_market_config(self):
+        from ashare_pipeline import formal_range_contract as contract
+        from ashare_pipeline import formal_range_format as range_format
+
+        bindings, *_ = self._load()
+        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        _, owner_read = contract._range_binding_planning_authority()
+        market = binding.market_config
+        original_dataset = market.dataset
+        original_thaw = range_format._thaw
+        try:
+            object.__setattr__(market, "dataset", "unsigned-dataset")
+
+            def disguised(value):
+                return original_dataset if value == "unsigned-dataset" else original_thaw(value)
+
+            with patch.object(range_format, "_thaw", disguised):
+                with self.assertRaises(ValueError):
+                    binding.require_current()
+                with self.assertRaises(ValueError):
+                    owner_read(binding)
+        finally:
+            object.__setattr__(market, "dataset", original_dataset)
+        binding.require_current()
+
+    def test_range_format_bridge_replacement_after_warmup_is_rejected(self):
+        from ashare_pipeline import formal_range_contract as contract
+        from ashare_pipeline import formal_range_format as range_format
+
+        bindings, *_ = self._load()
+        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+        _, owner_read = contract._range_binding_planning_authority()
+        original = range_format._bridge
+        with patch.object(range_format, "_bridge", lambda *args: original(*args)):
+            with self.assertRaises(ValueError):
+                binding.require_current()
+            with self.assertRaises(ValueError):
+                owner_read(binding)
+        binding.require_current()
+
     def test_v2_adapter_and_feature_bytes_remain_current_dependencies(self):
         from ashare_pipeline.formal_range_contract import load_policy_range_bindings
         from tests.formal_policy_fixtures import policy_graph

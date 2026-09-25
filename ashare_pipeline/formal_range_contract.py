@@ -77,6 +77,10 @@ def _build_range_bindings_contract():
     policy_bytes_for = policy_type.canonical_bytes
 
     module_globals = globals()
+    # parse_range_entry -> _bridge/_context_selector, _request_template and its
+    # text/tree helpers, numeric validators and _freeze. The serializer used by
+    # current checks -> _thaw (recursive). Inventory every non-builtin global
+    # reached by those call chains, including the module aliases they use.
     dependencies = tuple((module_globals, name, module_globals[name]) for name in (
         "_load_canonical_object", "_canonical", "_freeze", "_text", "_exchange",
         "RangeConfig", "parse_range_entry", "MappingProxyType", "json", "hashlib", "weakref",
@@ -84,12 +88,16 @@ def _build_range_bindings_contract():
         "RangeConfig", "parse_range_entry", "_range_config_to_dict", "_canonical",
         "_text", "_hash", "_exchange", "_positive_number", "_positive_integer",
         "_https_url", "_placeholder_text", "_template_tree", "_request_template",
-        "_walk_strings", "_context_selector", "_freeze", "json", "hashlib", "math", "re",
+        "_walk_strings", "_context_selector", "_bridge", "_freeze", "_thaw",
+        "Mapping", "MappingProxyType", "json", "hashlib", "math", "re",
         "_SOURCES", "_EXCHANGES", "_IDENTIFIER", "_VERSION_IDENTIFIER", "_SHA256",
         "_PLACEHOLDER", "_PLACEHOLDERS", "_RANGE_FIELDS", "_RANGE_FIELD_SET",
         "_CONTEXT_SELECTOR_FIELDS",
     )) + ((vars(context_module), "_descriptor", validate_descriptor),
-          (vars(json), "loads", json.loads), (vars(hashlib), "sha256", hashlib.sha256))
+          (vars(json), "loads", json.loads), (vars(json), "dumps", json.dumps),
+          (vars(hashlib), "sha256", hashlib.sha256),
+          (vars(format_module.math), "isfinite", format_module.math.isfinite),
+          (vars(format_module.re), "fullmatch", format_module.re.fullmatch))
     config_members = tuple(vars(RangeConfig).items())
     interfaces = (
         (bundle_type, "require_official", require_bundle),
