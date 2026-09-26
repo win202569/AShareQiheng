@@ -30,7 +30,8 @@ def _install_valuation_engine():
     repositories, proofs = {}, {}
     own_members = ()
     json_module, hashlib_module = json, hashlib
-    encode, decode, sha256, hash_payload = json.dumps, json.loads, hashlib.sha256, digest
+    encode, decode, sha256, hash_payload, decimal_type = (
+        json.dumps, json.loads, hashlib.sha256, digest, Decimal)
     guard_factory = _metric_batch_guard
     load_root = FormalRegistryBundleLoader.load
     adapter_source = adapter_module
@@ -69,6 +70,7 @@ def _install_valuation_engine():
                 or adapter_source._require_valuation_adapter_owner is not adapter_owner
                 or adapter_owner() is not evaluate
                 or globals().get("digest") is not hash_payload
+                or globals().get("Decimal") is not decimal_type
                 or globals().get("json") is not json_module or json_module.dumps is not encode
                 or json_module.loads is not decode or globals().get("hashlib") is not hashlib_module
                 or hashlib_module.sha256 is not sha256):
@@ -95,6 +97,34 @@ def _install_valuation_engine():
         if (type(proof) is not cls or saved is None or saved[0]() is not proof
                 or not saved[4][0]):
             raise ValueError("adjusted valuation proof is forged, copied, unpublished or revoked")
+        def check_row(row_record):
+            canonical = decode(row_record[2])["adjusted_value"]
+            public = row_record[1]["adjusted_value"]
+            if canonical is None:
+                valid = public is None
+            else:
+                try:
+                    valid = (type(canonical) is str and type(public) is decimal_type
+                        and public.is_finite()
+                        and public.as_tuple() == decimal_type(canonical).as_tuple())
+                except (ArithmeticError, TypeError, ValueError):
+                    valid = False
+            if not valid:
+                raise ValueError("adjusted valuation proof Decimal differs from canonical value")
+        if cls is PolicyAdjustedValuationInput:
+            check_row(saved)
+        elif cls is PolicyAdjustedValuationBatch:
+            batch = decode(saved[2])
+            children = saved[1]["inputs"]
+            if len(children) != len(batch["inputs"]):
+                raise ValueError("adjusted valuation proof children differ from canonical batch")
+            for child, row in zip(children, batch["inputs"], strict=True):
+                child_record = proofs.get(id(child))
+                if (type(child) is not PolicyAdjustedValuationInput or child_record is None
+                        or child_record[0]() is not child or child_record[4] is not saved[4]
+                        or decode(child_record[2]) != dict(row, batch_hash=batch["batch_hash"])):
+                    raise ValueError("adjusted valuation proof children differ from canonical batch")
+                check_row(child_record)
         return saved
 
     class SealedMeta(type):
@@ -301,7 +331,7 @@ def _install_valuation_engine():
                     children = tuple(mint(PolicyAdjustedValuationInput,
                         dict(row, batch_hash=common["batch_hash"]), publication,
                         attributes={"adjusted_value": None if row["adjusted_value"] is None
-                                    else Decimal(row["adjusted_value"])}) for row in rows)
+                                    else decimal_type(row["adjusted_value"])}) for row in rows)
                     index = {(row["security_id"], row["metric_id"]): item
                              for row, item in zip(rows, children, strict=True)}
                     prepared = mint(PolicyAdjustedValuationBatch, common, publication,

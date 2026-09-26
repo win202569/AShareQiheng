@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import json
 import sqlite3
 import sys
 import threading
@@ -11,7 +12,8 @@ from pathlib import Path
 from ashare_pipeline.formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
 from ashare_pipeline.formal_metric_engine import FormalMetricInputRepository, MetricInputBatch
 from ashare_pipeline.formal_policy_repository import VerifiedPolicyResultBatch
-from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal, _require_current_scope
+from ashare_pipeline.formal_batch_read_journal import (
+    FormalBatchReadJournal, _issue_current_ticket, _require_current_scope)
 from tests.formal_policy_fixtures import REGULATORY_SEMANTICS
 
 from ashare_pipeline.formal_valuation_engine import (
@@ -179,6 +181,61 @@ class ValuationBatchGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
             captured[0].require_verified()
 
+    def test_c4_decimal_binding_change_rejects_build(self):
+        import ashare_pipeline.formal_valuation_engine as engine
+
+        original = engine.Decimal
+        try:
+            engine.Decimal = lambda _value: "999"
+            with self.assertRaisesRegex(ValueError, "valuation publication dependency"):
+                self.build()
+        finally:
+            engine.Decimal = original
+        self.build().require_verified()
+
+    def test_adjusted_decimal_mint_pollution_cannot_authenticate_after_restore(self):
+        fixture = ValuationRuntimeFixture(peer_count=3)
+        self.addCleanup(fixture.close)
+        fixture.put_industry("BJ430001")
+        fixture.put_policy_context("BJ430001", "security_state", dict(is_st=False,
+            is_star_st=False, listing_status="listed", forced_delist_risk=False,
+            suspended=False))
+        fixture.put_policy_context("BJ430001", "regulatory_state", dict(flags=[
+            dict(flag_id=flag, active=False) for flag in REGULATORY_SEMANTICS]))
+        fixture.put_financial("BJ430001", {"V.normalized_earnings_yield": 0.2,
+            "V.normalized_free_cash_flow_yield": 0.08})
+        fixture.persist_features("BJ430001")
+        poisoned, captured = [], []
+
+        def hook(frame, event, result):
+            if (event == "call" and frame.f_code.co_name == "mint"
+                    and frame.f_code.co_filename.endswith("formal_valuation_engine.py")
+                    and frame.f_locals.get("cls") is PolicyAdjustedValuationInput
+                    and frame.f_locals["attributes"].get("adjusted_value") is not None
+                    and not poisoned):
+                frame.f_locals["attributes"]["adjusted_value"] = "999"
+                poisoned.append(True)
+            elif (event == "return" and frame.f_code.co_name == "mint"
+                    and frame.f_code.co_filename.endswith("formal_valuation_engine.py")
+                    and type(result) is PolicyAdjustedValuationInput and poisoned
+                    and not captured):
+                captured.append(result)
+
+        try:
+            batch = self.run_with_trace(hook, fixture.build_adjusted_batch)
+        except ValueError:
+            self.assertEqual(poisoned, [True])
+            self.assertEqual(len(captured), 1)
+            with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
+                captured[0].require_verified()
+        else:
+            self.assertEqual(poisoned, [True])
+            self.assertEqual(len(captured), 1)
+            with self.assertRaisesRegex(ValueError, "adjusted valuation proof"):
+                batch.require_verified()
+            with self.assertRaisesRegex(ValueError, "adjusted valuation proof"):
+                captured[0].require_verified()
+
     def test_c3_dynamic_dependency_rebinding_blocks_formal_valuation_build(self):
         import ashare_pipeline.formal_valuation_adapter as adapter
         import ashare_pipeline.formal_policy_values as policy_values
@@ -272,6 +329,167 @@ class ValuationBatchGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closed"):
             observed["scope"].checkpoint()
         fixture.build_adjusted_batch().require_verified()
+
+    def test_four_member_signed_universe_without_template_has_three_invalid_v_rows(self):
+        fixture = ValuationRuntimeFixture(peer_count=3, extra_members=("SH600001",))
+        self.addCleanup(fixture.close)
+        batch = fixture.build_adjusted_batch()
+        batch.require_verified()
+        self.assertEqual(len(batch.inputs), 12)
+        self.assertEqual(tuple(batch.security_ids),
+            ("BJ430001", "SH600000", "SH600001", "SZ000001"))
+        for metric_id in batch.metric_ids:
+            row = batch.input_for("SH600001", metric_id)
+            row.require_verified()
+            self.assertIsNone(row.template_id)
+            self.assertEqual(row.original_metric["invalid_reason"], "invalid_template")
+            self.assertEqual(row.status, "pending_policy_evidence")
+            self.assertIsNone(row.adjusted_value)
+        public = FormalMetricInputRepository(fixture.feature_repository,
+            fixture.context, registry_signature_verifier=fixture.verifier).build_batch(
+                fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring,
+                metric_ids=tuple(batch.metric_ids))
+        self.assertEqual(len(public.inputs), 12)
+        self.assertEqual(batch.base_batch_canonical_sha256,
+                         hashlib.sha256(public.canonical_bytes()).hexdigest())
+
+    def test_four_member_invalid_template_token_covers_each_v_in_all_four_phases(self):
+        from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
+
+        fixture = ValuationRuntimeFixture(peer_count=3, extra_members=("SH600001",))
+        self.addCleanup(fixture.close)
+        checkpoints, invalid_checks, feature_checks = [], [], []
+        checkpoint_code = FormalBatchReadJournal.checkpoint.__code__
+        metric_check_code = FormalMetricInputRepository._batch_recheck_ticket.__code__
+        feature_check_code = FormalFeatureRepository._batch_recheck_ticket.__code__
+
+        def hook(frame, event, _result):
+            if event != "call":
+                return
+            if frame.f_code is checkpoint_code:
+                checkpoints.append(frame.f_locals["self"])
+                print(f"C4 invalid-template checkpoint {len(checkpoints)}", flush=True)
+            elif frame.f_code is metric_check_code and frame.f_back.f_code is checkpoint_code:
+                if frame.f_locals["evidence"][0] == "invalid_template":
+                    invalid_checks.append(len(checkpoints) - 1)
+            elif frame.f_code is feature_check_code and frame.f_back.f_code is checkpoint_code:
+                feature_checks.append(len(checkpoints) - 1)
+
+        batch = self.run_with_trace(hook, fixture.build_adjusted_batch)
+        batch.require_verified()
+        self.assertEqual(len(checkpoints), 4)
+        self.assertTrue(all(scope is checkpoints[0] for scope in checkpoints))
+        self.assertEqual(invalid_checks, [0, 1, 2, 3])
+        self.assertEqual(feature_checks, [phase for phase in range(4) for _ in range(9)])
+        self.assertEqual(len([row for row in batch.inputs if row.security_id == "SH600001"]), 3)
+
+    def test_caller_cannot_forge_invalid_template_token_in_genuine_scope(self):
+        fixture = ValuationRuntimeFixture(peer_count=3, extra_members=("SH600001",))
+        self.addCleanup(fixture.close)
+        observed = []
+
+        def hook(frame, event, scope):
+            if (event != "return" or frame.f_code.co_name != "open"
+                    or not frame.f_code.co_filename.endswith("formal_batch_read_journal.py")
+                    or type(scope) is not FormalBatchReadJournal or observed):
+                return
+            metric = fixture.repository._batch_journal_identity()[1][0]
+            sid = "SH600001"
+            population = tuple(sorted((*fixture.templates, sid)))
+            mids = ("V.enterprise_value_or_sustainable_roe",
+                    "V.normalized_earnings_yield", "V.normalized_free_cash_flow_yield")
+            with self.assertRaisesRegex(ValueError, "fixed owner selector"):
+                _issue_current_ticket(scope, metric, "metric",
+                    (fixture.frozen.frozen_input_hash, "invalid_template", sid,
+                     fixture.bundle.manifest.manifest_hash, population), b"forged",
+                    ("invalid_template",), tuple((sid, mid) for mid in mids), object())
+            observed.append(True)
+
+        batch = self.run_with_trace(hook, fixture.build_adjusted_batch)
+        batch.require_verified()
+        self.assertEqual(observed, [True])
+        self.assertEqual(len(batch.inputs), 12)
+
+    def test_invalid_template_token_recheck_rejects_attempted_signed_mapping_change(self):
+        fixture = ValuationRuntimeFixture(peer_count=3, extra_members=("SH600001",))
+        self.addCleanup(fixture.close)
+        evidence = []
+        check_code = FormalMetricInputRepository._batch_recheck_ticket.__code__
+
+        def hook(frame, event, _result):
+            if (event == "call" and frame.f_code is check_code
+                    and frame.f_locals["evidence"][0] == "invalid_template"
+                    and not evidence):
+                evidence.append(frame.f_locals["evidence"])
+
+        self.run_with_trace(hook, fixture.build_adjusted_batch).require_verified()
+        self.assertEqual(len(evidence), 1)
+        root = fixture.bundle.manifest.industry_registry_hash
+        blob = fixture.store.get_formal_registry_blob(root)
+        mapping = json.loads(blob.canonical_json)
+        mapping["memberships"].append(dict(security_id="SH600001",
+            template_id="general_nonfinancial", primary_industry="fixture-policy",
+            secondary_industry="fixture-cyclic"))
+        changed = json.dumps(mapping, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode()
+        fixture.sql("UPDATE formal_registry_blob SET canonical_json=? WHERE registry_hash=?",
+            (changed, root))
+        metric = fixture.repository._batch_journal_identity()[1][0]
+        with self.assertRaises(ValueError):
+            metric._batch_recheck_ticket(evidence[0])
+
+    def test_signed_template_appearance_attempt_after_adjusted_mint_revokes_outer_only(self):
+        fixture = ValuationRuntimeFixture(peer_count=3, extra_members=("SH600001",))
+        self.addCleanup(fixture.close)
+        root = fixture.bundle.manifest.industry_registry_hash
+        blob = fixture.store.get_formal_registry_blob(root)
+        mapping = json.loads(blob.canonical_json)
+        mapping["memberships"].append(dict(security_id="SH600001",
+            template_id="general_nonfinancial", primary_industry="fixture-policy",
+            secondary_industry="fixture-cyclic"))
+        changed = json.dumps(mapping, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode()
+        captured = {"adjusted": [], "base": [], "policy": []}
+
+        def hook(frame, event, result):
+            if (event != "return" or frame.f_code.co_name != "mint"):
+                return
+            if type(result) is MetricInputBatch:
+                captured["base"].append(result)
+            elif type(result) is VerifiedPolicyResultBatch:
+                captured["policy"].append(result)
+            elif type(result) is PolicyAdjustedValuationBatch:
+                captured["adjusted"].append(result)
+                fixture.sql("UPDATE formal_registry_blob SET canonical_json=? WHERE registry_hash=?",
+                    (changed, root))
+
+        with self.assertRaises(ValueError):
+            self.run_with_trace(hook, fixture.build_adjusted_batch)
+        self.assertEqual([len(captured[kind]) for kind in ("adjusted", "base", "policy")],
+                         [1, 1, 1])
+        with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
+            captured["adjusted"][0].require_verified()
+        captured["base"][0].require_verified()
+        captured["policy"][0].require_verified()
+
+    def test_invalid_template_token_recheck_rejects_one_missing_v_row(self):
+        fixture = ValuationRuntimeFixture(peer_count=3, extra_members=("SH600001",))
+        self.addCleanup(fixture.close)
+        evidence = []
+        check_code = FormalMetricInputRepository._batch_recheck_ticket.__code__
+
+        def hook(frame, event, _result):
+            if (event == "call" and frame.f_code is check_code
+                    and frame.f_locals["evidence"][0] == "invalid_template"
+                    and not evidence):
+                evidence.append(frame.f_locals["evidence"])
+
+        self.run_with_trace(hook, fixture.build_adjusted_batch).require_verified()
+        self.assertEqual(len(evidence), 1)
+        metric = fixture.repository._batch_journal_identity()[1][0]
+        incomplete = evidence[0][:5] + (evidence[0][5][:-1],) + evidence[0][6:]
+        with self.assertRaisesRegex(ValueError, "wrong frozen rows"):
+            metric._batch_recheck_ticket(incomplete)
 
     def test_metric_private_early_failures_consume_only_the_genuine_owner_scope(self):
         from ashare_pipeline.formal_feature_repository import FormalFeatureRepository

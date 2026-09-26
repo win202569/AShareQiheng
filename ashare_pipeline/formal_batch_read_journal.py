@@ -216,14 +216,25 @@ def _install_journal():
                 raise ValueError("metric checkpoint requires the valuation owner scope")
             required = {key for key in record[12] if len(key) == 2}
             feature = record[16].get("feature")
-            actual = set()
+            feature_pairs, invalid_pairs = set(), set()
+            invalid_shape = False
             for ticket in record[13].values():
                 saved = _ticket(ticket, self)
                 issuer, kind, key = saved[2]
                 if (issuer == id(feature) and kind == "feature" and len(key) == 6
                         and type(key[-1]) is str and key[-1].startswith("V.")):
-                    actual.add((key[0], key[-1]))
-            if not required or actual != required:
+                    feature_pairs.add((key[0], key[-1]))
+                elif (issuer == id(owner) and kind == "metric" and len(key) >= 2
+                        and key[1] == "invalid_template"):
+                    covered = saved[5]
+                    if (len(key) != 5 or key[0] != record[17] or key[3] != record[9]
+                            or key[4] != record[11] or type(key[2]) is not str
+                            or len(covered) != 3
+                            or set(covered) != {pair for pair in required if pair[0] == key[2]}):
+                        invalid_shape = True
+                    invalid_pairs.update(covered)
+            if (not required or invalid_shape or feature_pairs & invalid_pairs
+                    or feature_pairs | invalid_pairs != required):
                 record[1] = "consumed"
                 raise ValueError("metric V source ticket coverage is incomplete")
             self.checkpoint()

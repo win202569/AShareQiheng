@@ -262,11 +262,13 @@ def _install_engine():
             population_hash=universe.population_hash, as_of_utc=universe.as_of_utc,
             industry_batch_hash=industry.batch_hash, registry_hashes=dict(scoring.role_hashes),
             universe_proof_hash=hashlib.sha256(universe.canonical_bytes()).hexdigest())
-        rows, markers, requests = [], {}, {}
+        rows, markers, requests, invalid_template_members = [], {}, {}, []
         for sid in universe.security_ids:
             assignment = industry.entries[sid]
             signed_member = next((m for m in universe.industry["memberships"] if m["security_id"] == sid), None)
             tid = None if signed_member is None else signed_member["template_id"]
+            if tid is None:
+                invalid_template_members.append(sid)
             marker = None
             if tid is not None:
                 keys = tuple(sorted({key for mid in selected for key in defs[tid][mid]["definition"]["required_feature_keys"]}))
@@ -358,6 +360,8 @@ def _install_engine():
             publication[0] = True
             return prepared
 
+        if owner_scope is not None:
+            return prepared, publish_complete, universe, industry, tuple(invalid_template_members)
         try:
             return guard.finalize(publish_complete)
         except BaseException:
@@ -396,6 +400,50 @@ def _install_engine():
             return feature._store, (feature, context)
 
         def _batch_recheck_ticket(self, evidence):
+            if (type(evidence) is tuple and len(evidence) == 9
+                    and evidence[0] == "invalid_template"):
+                _, batch, sid, universe, industry, bound_rows, frozen, root, population = evidence
+                _, _, _, context = dependencies(self)
+                context.recheck_batch(universe, industry)
+                batch_record = proofs.get(id(batch))
+                if (type(batch) is not MetricInputBatch or batch_record is None
+                        or batch_record[0]() is not batch or type(sid) is not str
+                        or type(population) is not tuple or sid not in population
+                        or universe.frozen_input_hash != frozen
+                        or universe.registry_manifest_hash != root
+                        or tuple(universe.security_ids) != population
+                        or any(member["security_id"] == sid
+                               for member in universe.industry["memberships"])
+                        or industry.entries[sid]["pending_reason"] != "signed_membership_absent"):
+                    raise ValueError("invalid-template metric token has no current signed absence")
+                batch_data = json.loads(batch_record[2])
+                mids = tuple(batch_data["metric_ids"])
+                if (len(mids) != 3 or any(not mid.startswith("V.") for mid in mids)
+                        or batch_data["frozen_input_hash"] != frozen
+                        or batch_data["registry_manifest_hash"] != root
+                        or batch_data["population_hash"] != universe.population_hash
+                        or tuple(batch_data["security_ids"]) != population
+                        or tuple(mid for mid, _, _ in bound_rows) != mids):
+                    raise ValueError("invalid-template metric token has wrong frozen rows")
+                batch_rows = {(row["security_id"], row["metric_id"]): row
+                    for row in batch_data["inputs"]}
+                for mid, row, wire in bound_rows:
+                    row_record = proofs.get(id(row))
+                    expected = batch_rows.get((sid, mid))
+                    if (type(row) is not MetricInput or row_record is None
+                            or row_record[0]() is not row
+                            or row_record[4] is not batch_record[4]
+                            or batch_record[3]["index"].get((sid, mid)) is not row
+                            or row_record[2] != wire or expected is None
+                            or json.loads(wire) != dict(expected,
+                                batch_hash=batch_data["batch_hash"])
+                            or expected["template_id"] is not None
+                            or expected["invalid_reason"] != "invalid_template"
+                            or expected["status"] != "pending_evidence"
+                            or expected["raw_value"] is not None
+                            or expected["verified_feature_refs"]):
+                        raise ValueError("invalid-template metric token row changed")
+                return
             batch, original = evidence
             dependencies(self)
             if record(batch, MetricInputBatch)[2] != original:
@@ -409,8 +457,27 @@ def _install_engine():
                 if type(owner_scope) is not FormalBatchReadJournal:
                     raise ValueError("metric batch requires an authentic owner scope")
                 with batch_guard(feature._current_input_provider, feature._store) as guard:
-                    result = build(self, frozen_input_hash, scoring_registry, metric_ids,
+                    prepared = build(self, frozen_input_hash, scoring_registry, metric_ids,
                         guard, owner_scope=owner_scope)
+                    if prepared is None:
+                        raise ValueError("metric frozen universe is absent")
+                    result, publish_complete, universe, industry, invalid_members = prepared
+                    index = proofs[id(result)][3]["index"]
+                    for sid in invalid_members:
+                        bound_rows = tuple((mid, index[(sid, mid)],
+                            proofs[id(index[(sid, mid)])][2]) for mid in metric_ids)
+                        evidence = ("invalid_template", result, sid, universe, industry,
+                            bound_rows, frozen_input_hash, universe.registry_manifest_hash,
+                            tuple(universe.security_ids))
+                        self._batch_recheck_ticket(evidence)
+                        _issue_current_ticket(owner_scope, self, "metric",
+                            (frozen_input_hash, "invalid_template", sid,
+                             universe.registry_manifest_hash, tuple(universe.security_ids)),
+                            encode(dict(security_id=sid, frozen_input_hash=frozen_input_hash,
+                                registry_manifest_hash=universe.registry_manifest_hash,
+                                row_hashes=tuple(row[2].hex() for row in bound_rows))),
+                            evidence, tuple((sid, mid) for mid in metric_ids), result)
+                    result = guard.finalize(publish_complete)
                 if result is None:
                     raise ValueError("metric frozen universe is absent")
                 original = record(result, MetricInputBatch)[2]

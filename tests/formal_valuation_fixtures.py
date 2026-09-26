@@ -7,7 +7,7 @@ from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
 
 
 class ValuationRuntimeFixture(PolicyRuntimeFixture):
-    def __init__(self, *, peer_count=20):
+    def __init__(self, *, peer_count=20, extra_members=()):
         if type(peer_count) is not int or peer_count < 3:
             raise ValueError("valuation fixture requires all three exchanges")
         securities = {"BJ430001": "general_nonfinancial"}
@@ -31,7 +31,7 @@ class ValuationRuntimeFixture(PolicyRuntimeFixture):
             for config in documents["source"]["range_configs"]:
                 config["max_calendar_days_per_request"] = 1
 
-        super().__init__(range_enabled=True, templates=securities, cyclic=True,
+        super().__init__(range_enabled=True, templates=securities, extra_members=extra_members, cyclic=True,
             noncyclic_ids=tuple(sorted(set(securities) - {"BJ430001"})),
             valuation_adapter=True, mutate=choose_earnings_adapter)
         self.templates = securities
