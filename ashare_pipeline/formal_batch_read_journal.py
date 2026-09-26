@@ -196,11 +196,24 @@ def _install_journal():
             record = _scope(self)
             phase = record[14]
             try:
-                for ticket in tuple(record[13].values()):
-                    ticket_record = _ticket(ticket, self)
+                ticket_records = tuple((ticket, _ticket(ticket, self))
+                    for ticket in record[13].values())
+                invalid_records = tuple((ticket, saved) for ticket, saved in ticket_records
+                    if saved[2][1] == "metric" and saved[4][0] == "invalid_template")
+                invalid_ids = {id(ticket) for ticket, _ in invalid_records}
+                invalid_checked = False
+                for ticket, ticket_record in ticket_records:
                     if record[15].get(id(ticket)) == phase:
                         continue
                     owner = record[16][ticket_record[2][1]]
+                    if id(ticket) in invalid_ids:
+                        if not invalid_checked:
+                            owner._batch_recheck_invalid_template_tickets(tuple(
+                                saved[4] for _, saved in invalid_records))
+                            invalid_checked = True
+                            for item, _ in invalid_records:
+                                record[15][id(item)] = phase
+                        continue
                     checker = (owner._batch_recheck_policy_ticket if ticket_record[2][1] == "policy_feature"
                                else owner._batch_recheck_ticket)
                     checker(ticket_record[4])

@@ -91,41 +91,62 @@ def _install_valuation_engine():
         # range and verifier dependencies when called below.
         return feature, context, ranges, verifier, metric_repo, policy_repo
 
-    def record(proof, cls):
-        interfaces()
+    def check_decimal(saved):
+        canonical = saved[5][6]
+        public = saved[1]["adjusted_value"]
+        if canonical is None:
+            valid = public is None
+        else:
+            try:
+                valid = (type(canonical) is str and type(public) is decimal_type
+                    and public.is_finite()
+                    and public.as_tuple() == decimal_type(canonical).as_tuple())
+            except (ArithmeticError, TypeError, ValueError):
+                valid = False
+        if not valid:
+            raise ValueError("adjusted valuation proof Decimal differs from canonical value")
+
+    def saved_proof(proof, cls, publication=None):
         saved = proofs.get(id(proof))
         if (type(proof) is not cls or saved is None or saved[0]() is not proof
-                or not saved[4][0]):
+                or (not saved[4][0] if publication is None else saved[4] is not publication)):
             raise ValueError("adjusted valuation proof is forged, copied, unpublished or revoked")
-        def check_row(row_record):
-            canonical = decode(row_record[2])["adjusted_value"]
-            public = row_record[1]["adjusted_value"]
-            if canonical is None:
-                valid = public is None
-            else:
-                try:
-                    valid = (type(canonical) is str and type(public) is decimal_type
-                        and public.is_finite()
-                        and public.as_tuple() == decimal_type(canonical).as_tuple())
-                except (ArithmeticError, TypeError, ValueError):
-                    valid = False
-            if not valid:
-                raise ValueError("adjusted valuation proof Decimal differs from canonical value")
+        seal = saved[5]
+        if (saved[2] is not seal[0] or saved[1]["batch_hash"] != seal[1]
+                or saved[1]["registry_manifest_hash"] != seal[4]
+                or saved[1]["frozen_input_hash"] != seal[5]):
+            raise ValueError("adjusted valuation proof canonical binding changed")
         if cls is PolicyAdjustedValuationInput:
-            check_row(saved)
+            if (saved[1]["security_id"] != seal[2]
+                    or saved[1]["metric_id"] != seal[3]):
+                raise ValueError("adjusted valuation proof row identity changed")
+            check_decimal(saved)
         elif cls is PolicyAdjustedValuationBatch:
-            batch = decode(saved[2])
-            children = saved[1]["inputs"]
-            if len(children) != len(batch["inputs"]):
-                raise ValueError("adjusted valuation proof children differ from canonical batch")
-            for child, row in zip(children, batch["inputs"], strict=True):
-                child_record = proofs.get(id(child))
-                if (type(child) is not PolicyAdjustedValuationInput or child_record is None
-                        or child_record[0]() is not child or child_record[4] is not saved[4]
-                        or decode(child_record[2]) != dict(row, batch_hash=batch["batch_hash"])):
-                    raise ValueError("adjusted valuation proof children differ from canonical batch")
-                check_row(child_record)
+            if (saved[1]["inputs"] is not seal[7]
+                    or saved[3]["index"] is not seal[8]):
+                raise ValueError("adjusted valuation proof batch index changed")
         return saved
+
+    def record(proof, cls):
+        interfaces()
+        return saved_proof(proof, cls)
+
+    def validate_prepared(batch, children, publication):
+        """Close the whole unpublished child set before final source checkpoint."""
+        interfaces()
+        saved = saved_proof(batch, PolicyAdjustedValuationBatch, publication)
+        batch_wire = decode(saved[2])
+        index = saved[3]["index"]
+        if (saved[1]["inputs"] != children or len(children) != len(batch_wire["inputs"])
+                or len(index) != len(children)):
+            raise ValueError("adjusted valuation proof children differ from canonical batch")
+        for child, row in zip(children, batch_wire["inputs"], strict=True):
+            child_saved = saved_proof(child, PolicyAdjustedValuationInput, publication)
+            if (child_saved[2] != encode(dict(row, batch_hash=batch_wire["batch_hash"]),
+                    sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                    allow_nan=False).encode()
+                    or index.get((row["security_id"], row["metric_id"])) is not child):
+                raise ValueError("adjusted valuation proof children differ from canonical batch")
 
     class SealedMeta(type):
         def __setattr__(cls, name, value):
@@ -174,9 +195,17 @@ def _install_valuation_engine():
         def input_for(self, security_id, metric_id):
             if type(security_id) is not str or type(metric_id) is not str:
                 raise ValueError("valuation selectors require exact strings")
-            result = record(self, PolicyAdjustedValuationBatch)[3]["index"].get((security_id, metric_id))
+            batch = record(self, PolicyAdjustedValuationBatch)
+            result = batch[3]["index"].get((security_id, metric_id))
             if result is None:
                 raise ValueError("security or V metric is outside complete adjusted batch")
+            row = record(result, PolicyAdjustedValuationInput)
+            if (row[4] is not batch[4] or row[1]["security_id"] != security_id
+                    or row[1]["metric_id"] != metric_id
+                    or row[1]["batch_hash"] != batch[1]["batch_hash"]
+                    or row[1]["registry_manifest_hash"] != batch[1]["registry_manifest_hash"]
+                    or row[1]["frozen_input_hash"] != batch[1]["frozen_input_hash"]):
+                raise ValueError("adjusted valuation proof index differs from bound row")
             return result
 
     def mint(cls, payload, publication, *, attributes=None, private=None):
@@ -186,8 +215,15 @@ def _install_valuation_engine():
         wire = encode(payload, sort_keys=True, ensure_ascii=False,
             separators=(",", ":"), allow_nan=False).encode()
         identity = id(proof)
+        frozen = freeze(data)
+        sealed_private = None if private is None else {
+            "index": MappingProxyType(dict(private["index"]))}
+        seal = (wire, payload["batch_hash"], payload.get("security_id"),
+            payload.get("metric_id"), payload["registry_manifest_hash"],
+            payload["frozen_input_hash"], payload.get("adjusted_value"),
+            frozen.get("inputs"), None if sealed_private is None else sealed_private["index"])
         proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)),
-            freeze(data), wire, private, publication)
+            frozen, wire, sealed_private, publication, seal)
         return proof
 
     def prepare_adjusted_rows(base_batch, policy_batch, adapter_registry):
@@ -351,6 +387,7 @@ def _install_valuation_engine():
                         policy_verify(policy)
                         if base.canonical_bytes() != base_bytes or policy.canonical_bytes() != policy_bytes:
                             raise ValueError("valuation source batches changed before publication")
+                        validate_prepared(prepared, children, publication)
                         scope.finalize()
                         publication[0] = True
                         return prepared

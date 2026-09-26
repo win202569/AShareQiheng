@@ -205,7 +205,7 @@ class ValuationBatchGuardTests(unittest.TestCase):
         fixture.put_financial("BJ430001", {"V.normalized_earnings_yield": 0.2,
             "V.normalized_free_cash_flow_yield": 0.08})
         fixture.persist_features("BJ430001")
-        poisoned, captured = [], []
+        poisoned, captured, batches = [], [], []
 
         def hook(frame, event, result):
             if (event == "call" and frame.f_code.co_name == "mint"
@@ -217,24 +217,65 @@ class ValuationBatchGuardTests(unittest.TestCase):
                 poisoned.append(True)
             elif (event == "return" and frame.f_code.co_name == "mint"
                     and frame.f_code.co_filename.endswith("formal_valuation_engine.py")
-                    and type(result) is PolicyAdjustedValuationInput and poisoned
-                    and not captured):
+                    and type(result) is PolicyAdjustedValuationInput):
                 captured.append(result)
+            elif (event == "return" and frame.f_code.co_name == "mint"
+                    and frame.f_code.co_filename.endswith("formal_valuation_engine.py")
+                    and type(result) is PolicyAdjustedValuationBatch):
+                batches.append(result)
 
-        try:
-            batch = self.run_with_trace(hook, fixture.build_adjusted_batch)
-        except ValueError:
-            self.assertEqual(poisoned, [True])
-            self.assertEqual(len(captured), 1)
+        with self.assertRaisesRegex(ValueError, "adjusted valuation proof Decimal"):
+            self.run_with_trace(hook, fixture.build_adjusted_batch)
+        self.assertEqual(poisoned, [True])
+        self.assertEqual(len(captured), 9)
+        self.assertEqual(len(batches), 1)
+        for proof in (*captured, *batches):
             with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
-                captured[0].require_verified()
-        else:
-            self.assertEqual(poisoned, [True])
-            self.assertEqual(len(captured), 1)
-            with self.assertRaisesRegex(ValueError, "adjusted valuation proof"):
-                batch.require_verified()
-            with self.assertRaisesRegex(ValueError, "adjusted valuation proof"):
-                captured[0].require_verified()
+                proof.require_verified()
+
+    def test_batch_input_for_reads_do_not_decode_every_child_each_time(self):
+        fixture = ValuationRuntimeFixture(peer_count=3)
+        self.addCleanup(fixture.close)
+        batch = fixture.build_adjusted_batch()
+        rows = tuple(batch.inputs)
+        decodes = []
+        import ashare_pipeline.formal_valuation_engine as engine
+        decode_code = engine.json.loads.__code__
+
+        def hook(frame, event, _result):
+            if (event == "call" and frame.f_code is decode_code
+                    and frame.f_back.f_code.co_name == "record"
+                    and frame.f_back.f_code.co_filename.endswith("formal_valuation_engine.py")):
+                decodes.append(True)
+
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(hook)
+            for row in rows:
+                selected = batch.input_for(row.security_id, row.metric_id)
+                self.assertIs(selected, row)
+                self.assertIsInstance(selected.status, str)
+        finally:
+            sys.setprofile(previous)
+        self.assertLessEqual(len(decodes), len(rows) + 5)
+
+    def test_batch_private_index_is_detached_from_mutable_mint_local(self):
+        fixture = ValuationRuntimeFixture(peer_count=3)
+        self.addCleanup(fixture.close)
+        captured = []
+
+        def hook(frame, event, result):
+            if (event == "return" and frame.f_code.co_name == "mint"
+                    and frame.f_code.co_filename.endswith("formal_valuation_engine.py")
+                    and type(result) is PolicyAdjustedValuationBatch):
+                captured.append(frame.f_locals["private"]["index"])
+
+        batch = self.run_with_trace(hook, fixture.build_adjusted_batch)
+        self.assertEqual(len(captured), 1)
+        row = batch.inputs[0]
+        captured[0].clear()
+        batch.require_verified()
+        self.assertIs(batch.input_for(row.security_id, row.metric_id), row)
 
     def test_c3_dynamic_dependency_rebinding_blocks_formal_valuation_build(self):
         import ashare_pipeline.formal_valuation_adapter as adapter
@@ -360,7 +401,7 @@ class ValuationBatchGuardTests(unittest.TestCase):
         self.addCleanup(fixture.close)
         checkpoints, invalid_checks, feature_checks = [], [], []
         checkpoint_code = FormalBatchReadJournal.checkpoint.__code__
-        metric_check_code = FormalMetricInputRepository._batch_recheck_ticket.__code__
+        metric_check_code = FormalMetricInputRepository._batch_recheck_invalid_template_tickets.__code__
         feature_check_code = FormalFeatureRepository._batch_recheck_ticket.__code__
 
         def hook(frame, event, _result):
@@ -370,8 +411,8 @@ class ValuationBatchGuardTests(unittest.TestCase):
                 checkpoints.append(frame.f_locals["self"])
                 print(f"C4 invalid-template checkpoint {len(checkpoints)}", flush=True)
             elif frame.f_code is metric_check_code and frame.f_back.f_code is checkpoint_code:
-                if frame.f_locals["evidence"][0] == "invalid_template":
-                    invalid_checks.append(len(checkpoints) - 1)
+                self.assertEqual(len(frame.f_locals["evidences"]), 1)
+                invalid_checks.append(len(checkpoints) - 1)
             elif frame.f_code is feature_check_code and frame.f_back.f_code is checkpoint_code:
                 feature_checks.append(len(checkpoints) - 1)
 
@@ -382,6 +423,45 @@ class ValuationBatchGuardTests(unittest.TestCase):
         self.assertEqual(invalid_checks, [0, 1, 2, 3])
         self.assertEqual(feature_checks, [phase for phase in range(4) for _ in range(9)])
         self.assertEqual(len([row for row in batch.inputs if row.security_id == "SH600001"]), 3)
+
+    def test_two_missing_templates_share_one_current_recheck_and_base_parse_per_phase(self):
+        from ashare_pipeline.formal_metric_context import FormalMetricContextRepository
+
+        fixture = ValuationRuntimeFixture(peer_count=3,
+            extra_members=("SH600001", "SH600002"))
+        self.addCleanup(fixture.close)
+        context_code = FormalMetricContextRepository.recheck_batch.__code__
+        import ashare_pipeline.formal_metric_engine as metric_engine
+        decode_code = metric_engine.json.loads.__code__
+        rechecks, base_decodes = [], []
+
+        def in_invalid_closure(frame):
+            cursor = frame.f_back
+            while cursor is not None:
+                if (cursor.f_code.co_filename.endswith("formal_metric_engine.py")
+                        and cursor.f_code.co_name in {
+                            "_batch_recheck_ticket", "_batch_recheck_invalid_template_tickets"}):
+                    return True
+                cursor = cursor.f_back
+            return False
+
+        def hook(frame, event, _result):
+            if (event != "call" or frame.f_code not in (context_code, decode_code)
+                    or not in_invalid_closure(frame)):
+                return
+            if frame.f_code is context_code:
+                rechecks.append(True)
+            elif frame.f_code is decode_code:
+                wire = frame.f_locals.get("s")
+                if (type(wire) is bytes
+                        and b'"schema_version":"formal-metric-input-batch-v1"' in wire):
+                    base_decodes.append(True)
+
+        batch = self.run_with_trace(hook, fixture.build_adjusted_batch)
+        batch.require_verified()
+        self.assertEqual(len(batch.inputs), 15)
+        self.assertEqual(len(rechecks), 5)  # one issuance preparation, four phases
+        self.assertEqual(len(base_decodes), 5)
 
     def test_caller_cannot_forge_invalid_template_token_in_genuine_scope(self):
         fixture = ValuationRuntimeFixture(peer_count=3, extra_members=("SH600001",))
@@ -414,13 +494,11 @@ class ValuationBatchGuardTests(unittest.TestCase):
         fixture = ValuationRuntimeFixture(peer_count=3, extra_members=("SH600001",))
         self.addCleanup(fixture.close)
         evidence = []
-        check_code = FormalMetricInputRepository._batch_recheck_ticket.__code__
+        check_code = FormalMetricInputRepository._batch_recheck_invalid_template_tickets.__code__
 
         def hook(frame, event, _result):
-            if (event == "call" and frame.f_code is check_code
-                    and frame.f_locals["evidence"][0] == "invalid_template"
-                    and not evidence):
-                evidence.append(frame.f_locals["evidence"])
+            if event == "call" and frame.f_code is check_code and not evidence:
+                evidence.append(frame.f_locals["evidences"][0])
 
         self.run_with_trace(hook, fixture.build_adjusted_batch).require_verified()
         self.assertEqual(len(evidence), 1)
@@ -476,13 +554,11 @@ class ValuationBatchGuardTests(unittest.TestCase):
         fixture = ValuationRuntimeFixture(peer_count=3, extra_members=("SH600001",))
         self.addCleanup(fixture.close)
         evidence = []
-        check_code = FormalMetricInputRepository._batch_recheck_ticket.__code__
+        check_code = FormalMetricInputRepository._batch_recheck_invalid_template_tickets.__code__
 
         def hook(frame, event, _result):
-            if (event == "call" and frame.f_code is check_code
-                    and frame.f_locals["evidence"][0] == "invalid_template"
-                    and not evidence):
-                evidence.append(frame.f_locals["evidence"])
+            if event == "call" and frame.f_code is check_code and not evidence:
+                evidence.append(frame.f_locals["evidences"][0])
 
         self.run_with_trace(hook, fixture.build_adjusted_batch).require_verified()
         self.assertEqual(len(evidence), 1)
