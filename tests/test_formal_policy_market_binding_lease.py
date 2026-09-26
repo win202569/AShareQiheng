@@ -210,6 +210,187 @@ class MarketBindingLeaseTests(unittest.TestCase):
             repository.select_current_batch_ticket(
                 journal, "SH600000", FREEZE, binding=fixture.binding)
 
+    def test_transient_signed_source_envelope_mutation_is_rejected_and_consumes_scope(self):
+        from ashare_pipeline import formal_batch_read_journal as journal_module
+
+        fixture = self._fixture()
+        days = _trading_days(20)
+        fixture.put_window("SH600000", trading_days=days,
+                           rows={day: quiet_row() for day in days})
+        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
+        journal = self._journal(fixture, repository)
+        source = fixture.bundle.blob("source")
+        original = source.signature
+        reader_code = market_module._read_binding.__code__
+        issue_code = journal_module._issue_current_ticket.__code__
+        transitions = []
+        market_issues = []
+
+        def inject(frame, event, arg):
+            if event == "return" and frame.f_code is reader_code:
+                if not transitions:
+                    object.__setattr__(source, "signature", "forged")
+                    transitions.append("mutated")
+                elif transitions == ["mutated"]:
+                    object.__setattr__(source, "signature", original)
+                    transitions.append("restored")
+            elif (event == "call" and frame.f_code is issue_code
+                  and frame.f_locals.get("kind") == "market"):
+                market_issues.append(True)
+
+        sys.setprofile(inject)
+        try:
+            with self.assertRaises(ValueError):
+                repository.select_current_batch_ticket(
+                    journal, "SH600000", FREEZE, binding=fixture.binding)
+        finally:
+            sys.setprofile(None)
+            object.__setattr__(source, "signature", original)
+        self.assertEqual(transitions, ["mutated", "restored"])
+        self.assertEqual(market_issues, [])
+        with self.assertRaisesRegex(ValueError, "closed"):
+            journal.checkpoint()
+
+        fresh = self._journal(fixture, repository)
+        repository.select_current_batch_ticket(
+            fresh, "SH600000", FREEZE, binding=fixture.binding)
+        fresh.close()
+
+    def test_cross_thread_close_rejection_keeps_real_token_live_for_owner_thread(self):
+        from ashare_pipeline import formal_range_contract as contract
+
+        fixture = self._fixture()
+        days = _trading_days(20)
+        fixture.put_window("SH600000", trading_days=days,
+                           rows={day: quiet_row() for day in days})
+        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
+        journal = self._journal(fixture, repository)
+        open_lease, close_lease = contract._range_binding_read_lease_authority()
+        captured = []
+        failures = []
+
+        def inject(frame, event, arg):
+            if event == "return" and frame.f_code is open_lease.__code__ and not captured:
+                sys.setprofile(None)
+                captured.append(arg)
+                worker = __import__("threading").Thread(
+                    target=lambda: _cross_thread_close(close_lease, arg, failures))
+                worker.start()
+                worker.join()
+
+        def _cross_thread_close(close, token, errors):
+            try:
+                close(token)
+            except Exception as error:
+                errors.append(type(error))
+
+        sys.setprofile(inject)
+        try:
+            ticket = repository.select_current_batch_ticket(
+                journal, "SH600000", FREEZE, binding=fixture.binding)
+        finally:
+            sys.setprofile(None)
+        self.assertIsNotNone(ticket.selected().window)
+        self.assertEqual(failures, [ValueError])
+        self.assertEqual(len(captured), 1)
+        with self.assertRaises(ValueError):
+            close_lease(captured[0])
+        journal.close()
+
+        fresh = self._journal(fixture, repository)
+        repository.select_current_batch_ticket(
+            fresh, "SH600000", FREEZE, binding=fixture.binding)
+        fresh.close()
+
+    def test_owner_entry_keys_recursion_and_calendar_child_depth_are_closed(self):
+        from ashare_pipeline import formal_range_contract as contract
+
+        fixture = self._fixture()
+        days = _trading_days(20)
+        fixture.put_window("SH600000", trading_days=days,
+                           rows={day: quiet_row() for day in days})
+        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
+        open_lease, close_lease = contract._range_binding_read_lease_authority()
+
+        with self.assertRaises(ValueError):
+            open_lease(fixture.binding, object(), ("arbitrary",))
+
+        calendar_scope = self._journal(fixture, repository)
+        recursive = []
+        open_code = open_lease.__code__
+
+        def recurse_calendar(frame, event, arg):
+            if event == "return" and frame.f_code is open_code and not recursive:
+                sys.setprofile(None)
+                try:
+                    repository.select_calendar_batch_ticket(
+                        calendar_scope, fixture.binding, FREEZE)
+                except Exception as error:
+                    recursive.append(type(error))
+
+        sys.setprofile(recurse_calendar)
+        try:
+            with self.assertRaises(ValueError):
+                repository.select_calendar_batch_ticket(
+                    calendar_scope, fixture.binding, FREEZE)
+        finally:
+            sys.setprofile(None)
+        self.assertEqual(recursive, [ValueError])
+        with self.assertRaisesRegex(ValueError, "closed"):
+            calendar_scope.checkpoint()
+
+        market_scope = self._journal(fixture, repository)
+        nested_close = close_lease.__code__
+        second_calendar = []
+        outer_tokens = []
+
+        def repeat_calendar(frame, event, arg):
+            if event == "return" and frame.f_code is open_code and not outer_tokens:
+                outer_tokens.append(arg)
+            if (event == "return" and frame.f_code is nested_close
+                    and frame.f_locals.get("nested") is True and not second_calendar):
+                sys.setprofile(None)
+                try:
+                    repository.select_calendar_batch_ticket(
+                        market_scope, fixture.binding, FREEZE)
+                except Exception as error:
+                    second_calendar.append(type(error))
+
+        sys.setprofile(repeat_calendar)
+        try:
+            with self.assertRaises(ValueError):
+                repository.select_current_batch_ticket(
+                    market_scope, "SH600000", FREEZE, binding=fixture.binding)
+        finally:
+            sys.setprofile(None)
+        self.assertEqual(second_calendar, [ValueError])
+        self.assertEqual(len(outer_tokens), 1)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            market_scope.checkpoint()
+        with self.assertRaises(ValueError):
+            close_lease(outer_tokens[0])
+
+        fresh = self._journal(fixture, repository)
+        phase_tokens = []
+
+        def capture_phase_token(frame, event, arg):
+            if event == "return" and frame.f_code is open_code and not phase_tokens:
+                phase_tokens.append(arg)
+
+        sys.setprofile(capture_phase_token)
+        try:
+            repository.select_current_batch_ticket(
+                fresh, "SH600000", FREEZE, binding=fixture.binding)
+        finally:
+            sys.setprofile(None)
+        fresh.checkpoint()
+        fresh.next_phase()
+        with self.assertRaises(ValueError):
+            close_lease(phase_tokens[0])
+        repository.select_current_batch_ticket(
+            fresh, "SH600000", FREEZE, binding=fixture.binding)
+        fresh.close()
+
 
 if __name__ == "__main__":
     unittest.main()

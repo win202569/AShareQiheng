@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
 import json
+import sys
 import threading
 from types import MappingProxyType
 import weakref
@@ -69,7 +70,12 @@ def _build_range_bindings_contract():
     from . import formal_policy_registry as policy_module
     from .formal_policy_registry import FormalPolicyRegistry as policy_type
     from .formal_registry_manifest import VerifiedRegistryBundle as bundle_type
+    from .formal_registry_manifest import (
+        FormalRegistryManifest as manifest_type,
+        VerifiedRegistryBlob as blob_type,
+    )
     from .formal_scoring_registry import FormalScoringRegistry as scoring_type
+    from .formal_batch_read_journal import _range_binding_lease_scope_authority
     from .formal_range_format import RangeConfig, parse_range_entry, _range_config_to_dict
     from . import formal_range_format as format_module
     from . import formal_context_schema as context_module
@@ -78,6 +84,9 @@ def _build_range_bindings_contract():
     blob_for = bundle_type.blob
     require_scoring = scoring_type.require_official
     read_policy_sources = policy_module._read_authenticated_policy_sources
+    validate_lease_scope = _range_binding_lease_scope_authority()
+    manifest_envelope_fields = tuple(manifest_type.__dataclass_fields__)
+    blob_envelope_fields = tuple(blob_type.__dataclass_fields__)
 
     module_globals = globals()
     # _range_catalog_from_source reads _load_canonical_object and the immutable
@@ -90,7 +99,7 @@ def _build_range_bindings_contract():
     dependencies = tuple((module_globals, name, module_globals[name]) for name in (
         "_load_canonical_object", "_LEGACY_CONFIG_FIELDS", "_canonical", "_freeze", "_text", "_exchange",
         "RangeConfig", "parse_range_entry", "MappingProxyType", "ContextVar", "json", "hashlib",
-        "threading", "weakref",
+        "sys", "threading", "weakref",
     )) + tuple((vars(format_module), name, vars(format_module)[name]) for name in (
         "RangeConfig", "parse_range_entry", "_range_config_to_dict", "_canonical",
         "_text", "_hash", "_exchange", "_positive_number", "_positive_integer",
@@ -377,6 +386,8 @@ def _build_range_bindings_contract():
         manifest: object
         blobs: object
         role_objects: tuple[tuple[str, object], ...]
+        manifest_envelope: tuple[tuple[str, type, object], ...]
+        role_envelopes: tuple[tuple[str, tuple[tuple[str, type, object], ...]], ...]
 
 
     @dataclass(frozen=True)
@@ -398,6 +409,11 @@ def _build_range_bindings_contract():
     _lease_records = {}
 
 
+    def _envelope(value, fields):
+        return tuple((name, type(object.__getattribute__(value, name)),
+                      object.__getattribute__(value, name)) for name in fields)
+
+
     def _lightweight_current(record: _BindingsRecord) -> None:
         """Recheck mutable current fields without repeating signed graph parsing."""
         _check_dependencies()
@@ -409,6 +425,9 @@ def _build_range_bindings_contract():
         blobs = object.__getattribute__(record.bundle, "blobs")
         if manifest is not record.manifest or blobs is not record.blobs:
             raise ValueError("range binding lease graph object changed")
+        if (type(manifest) is not manifest_type
+                or _envelope(manifest, manifest_envelope_fields) != record.manifest_envelope):
+            raise ValueError("range binding lease manifest envelope changed")
         manifest_bytes = object.__getattribute__(manifest, "canonical_json")
         if (type(manifest_bytes) is not bytes
                 or manifest_bytes != record.snapshot.manifest_bytes
@@ -416,12 +435,14 @@ def _build_range_bindings_contract():
                 or object.__getattribute__(manifest, "manifest_hash") != record.snapshot.root_hash):
             raise ValueError("range binding lease manifest changed")
         expected = {role: (raw, digest) for role, raw, digest in record.snapshot.roles}
+        expected_envelopes = dict(record.role_envelopes)
         if tuple(role for role, _ in record.role_objects) != tuple(expected):
             raise ValueError("range binding lease roles changed")
         for role, sealed_blob in record.role_objects:
             blob = blobs.get(role)
             raw, digest = expected[role]
-            if blob is not sealed_blob or type(raw) is not bytes:
+            if (blob is not sealed_blob or type(blob) is not blob_type or type(raw) is not bytes
+                    or _envelope(blob, blob_envelope_fields) != expected_envelopes.get(role)):
                 raise ValueError("range binding lease child object changed")
             current_raw = object.__getattribute__(blob, "canonical_json")
             if (type(current_raw) is not bytes or current_raw != raw
@@ -466,6 +487,10 @@ def _build_range_bindings_contract():
             if (threading.get_ident() != lease[0] or identity != lease[2]
                     or parent_record.snapshot != lease[5]):
                 raise ValueError("range binding lease is cross-thread, cross-binding, or stale")
+            current_owner, current_epoch, current_phase = validate_lease_scope(lease[1])
+            if ((current_owner, current_epoch, current_phase) != tuple(lease[6:9])):
+                raise ValueError("range binding lease owner phase changed")
+            _lightweight_current(lease[4])
             _lightweight_current(parent_record)
         else:
             parent_record = _bindings_record(parent, current=current)
@@ -503,16 +528,36 @@ def _build_range_bindings_contract():
 
     def open_current_binding_read_lease(value, owner_scope, operation_key):
         """Open one bounded owner operation; the returned token has no public behavior."""
-        if (type(operation_key) is not tuple or not operation_key
-                or any(type(item) is not str or not item for item in operation_key)):
+        caller = sys._getframe(1)
+        owner, epoch, phase = validate_lease_scope(owner_scope)
+        owner_type = type(owner)
+        calendar_code = vars(owner_type).get("select_calendar_batch_ticket")
+        market_code = vars(owner_type).get("select_current_batch_ticket")
+        calendar_code = None if calendar_code is None else calendar_code.__code__
+        market_code = None if market_code is None else market_code.__code__
+        if caller.f_locals.get("self") is not owner or caller.f_code not in {
+                calendar_code, market_code}:
             raise ValueError("range binding lease cannot be nested, copied, or unbound")
+        expected_key = (("calendar", caller.f_locals.get("as_of_utc"))
+                        if caller.f_code is calendar_code else
+                        ("market", caller.f_locals.get("security_id"),
+                         caller.f_locals.get("as_of_utc")))
+        if (operation_key != expected_key or any(type(item) is not str or not item
+                                                  for item in expected_key)):
+            raise ValueError("range binding lease operation key is not owner-derived")
         active = _binding_read_lease.get()
         if active is not None:
             _binding_record(value, current=True)
-            nested = (active[1] is owner_scope and active[3][0] == "market"
-                      and operation_key == ("calendar", active[3][-1]))
+            nested = (caller.f_code is calendar_code and active[1] is owner_scope
+                      and active[3][0] == "market"
+                      and operation_key == ("calendar", active[3][-1])
+                      and active[6] is owner and active[7] is epoch
+                      and active[8] == phase and active[9] is False
+                      and active[10] is False)
             if not nested:
                 raise ValueError("range binding lease cannot be nested, copied, or unbound")
+            active[9] = True
+            active[10] = True
             state, token = active, None
         else:
             child = _binding_record(value)
@@ -526,8 +571,8 @@ def _build_range_bindings_contract():
                 raise ValueError("range binding sources changed before owner operation")
             _lightweight_current(parent_record)
             identity = (parent_record.snapshot.root_hash, child.binding_hash, child.key)
-            state = (threading.get_ident(), owner_scope, identity, operation_key,
-                     parent_record, entry)
+            state = [threading.get_ident(), owner_scope, identity, operation_key,
+                     parent_record, entry, owner, epoch, phase, False, False]
             token = _binding_read_lease.set(state)
             nested = False
         lease = object.__new__(_BindingReadLease)
@@ -546,11 +591,32 @@ def _build_range_bindings_contract():
                 or saved[0]() is not lease or saved[4] is not True):
             raise ValueError("range binding read lease is forged, copied, or closed")
         state, token, nested = saved[1:4]
-        saved[4] = False
         if threading.get_ident() != state[0] or _binding_read_lease.get() is not state:
             raise ValueError("range binding read lease is cross-thread or out of order")
+        try:
+            current_scope = validate_lease_scope(state[1])
+        except BaseException:
+            saved[4] = False
+            if nested:
+                state[10] = False
+            else:
+                _binding_read_lease.reset(token)
+            raise
+        if current_scope != (state[6], state[7], state[8]):
+            saved[4] = False
+            if nested:
+                state[10] = False
+            else:
+                _binding_read_lease.reset(token)
+            raise ValueError("range binding read lease owner phase changed")
         if nested:
+            if state[10] is not True:
+                raise ValueError("range binding calendar child lease is out of order")
+            state[10] = False
+            saved[4] = False
             return
+        if state[10] is not False:
+            raise ValueError("range binding outer lease still owns a calendar child")
         parent_record, entry = state[4:6]
         try:
             exit_snapshot = _capture_graph_snapshot(
@@ -560,6 +626,7 @@ def _build_range_bindings_contract():
             if exit_snapshot != entry or exit_snapshot != parent_record.snapshot:
                 raise ValueError("range binding sources changed during owner operation")
         finally:
+            saved[4] = False
             _binding_read_lease.reset(token)
 
 
@@ -688,6 +755,9 @@ def _build_range_bindings_contract():
             object.__getattribute__(bundle, "manifest"),
             object.__getattribute__(bundle, "blobs"),
             tuple((role, blob_for(bundle, role)) for role, _, _ in snapshot.roles),
+            _envelope(object.__getattribute__(bundle, "manifest"), manifest_envelope_fields),
+            tuple((role, _envelope(blob_for(bundle, role), blob_envelope_fields))
+                  for role, _, _ in snapshot.roles),
         )
         return result
 

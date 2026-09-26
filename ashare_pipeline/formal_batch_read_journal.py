@@ -189,7 +189,7 @@ def _install_journal():
             scopes[scope_id] = [weakref.ref(result, lambda _, key=scope_id: scopes.pop(key, None)),
                 "active", threading.get_ident(), owner, kind, state, refs, signatures,
                 str(state.db_path.resolve()), registry_manifest_hash, as_of_utc, population,
-                frozenset(required_keys), {}, 0, {}, allowed, frozen_input_hash]
+                frozenset(required_keys), {}, 0, {}, allowed, frozen_input_hash, object()]
             return result
 
         def checkpoint(self):
@@ -362,9 +362,35 @@ def _install_journal():
             raise ValueError("current read ticket belongs to another owner")
         return saved[6], saved[3], saved[4]
 
-    return FormalBatchReadJournal, CurrentReadTicket, issue, require_scope, require_ticket
+    def range_binding_lease_scope(scope):
+        """Return an unforgeable current market-owner phase identity."""
+        record = _scope(scope)
+        owner = record[3]
+        if record[4] not in {"market", "policy", "valuation"}:
+            raise ValueError("range binding lease requires a market-owning scope")
+        market_owner = record[16].get("market")
+        if market_owner is None:
+            raise ValueError("range binding lease market owner is absent")
+        return market_owner, record[18], record[14]
+
+    return (FormalBatchReadJournal, CurrentReadTicket, issue, require_scope,
+            require_ticket, range_binding_lease_scope)
 
 
 (FormalBatchReadJournal, CurrentReadTicket,
- _issue_current_ticket, _require_current_scope, _require_current_ticket) = _install_journal()
+ _issue_current_ticket, _require_current_scope, _require_current_ticket,
+ _range_binding_lease_scope) = _install_journal()
 del _install_journal
+
+
+def _make_range_binding_lease_scope_authority():
+    validate = _range_binding_lease_scope
+
+    def authority():
+        return validate
+
+    return authority
+
+
+_range_binding_lease_scope_authority = _make_range_binding_lease_scope_authority()
+del _make_range_binding_lease_scope_authority, _range_binding_lease_scope
