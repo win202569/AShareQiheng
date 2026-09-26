@@ -1,9 +1,10 @@
 """Market owner tickets tie calendar and range requests to one selection."""
 
+import subprocess
 import sys
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
 
 from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
 from ashare_pipeline.formal_policy_market import (
@@ -15,6 +16,66 @@ from tests.test_formal_policy_market import trading_days
 
 
 FREEZE = "2026-08-31T07:00:00+00:00"
+_MISSING = object()
+
+
+@contextmanager
+def _temporary_attribute(owner, name, replacement):
+    original = vars(owner).get(name, _MISSING)
+    setattr(owner, name, replacement)
+    try:
+        yield
+    finally:
+        if original is _MISSING:
+            if name in vars(owner):
+                delattr(owner, name)
+        else:
+            setattr(owner, name, original)
+
+
+def _check_new_constructor_guard_in_child(phase, selection_name):
+    """A slots class cannot reliably recover its tp_new slot after deletion."""
+    selection_type = {"CalendarSelection": CalendarSelection,
+                      "MarketSelection": MarketSelection}[selection_name]
+    original_new = vars(selection_type).get("__new__", _MISSING)
+    fixture = RangeStoreFixture()
+    try:
+        repository = FormalPolicyMarketRepository(fixture.range_store)
+        args = dict(registry_manifest_hash=fixture.graph.manifest.manifest_hash,
+            as_of_utc=FREEZE, population=("SH600000",),
+            required_keys=(("SH600000",),))
+        if phase == "warm":
+            journal = FormalBatchReadJournal.open(repository, **args)
+            repository.select_current_batch_ticket(journal, "SH600000", FREEZE,
+                binding=fixture.binding)
+            journal.checkpoint()
+        replacement = staticmethod(lambda cls, *a, **k: object.__new__(cls))
+        with _temporary_attribute(selection_type, "__new__", replacement):
+            try:
+                if phase == "preopen":
+                    FormalBatchReadJournal.open(repository, **args)
+                else:
+                    journal.checkpoint()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("constructor replacement was accepted")
+        if vars(selection_type).get("__new__", _MISSING) is not original_new:
+            raise AssertionError("constructor patch left a class attribute behind")
+    finally:
+        fixture.close()
+
+
+def _check_new_constructor_guard(phase, selection_type):
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; from tests.test_formal_policy_market_ticket import "
+         "_check_new_constructor_guard_in_child; "
+         "_check_new_constructor_guard_in_child(*sys.argv[1:])",
+         phase, selection_type.__name__],
+        capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise AssertionError(result.stdout + result.stderr)
 
 
 class MarketTicketTests(unittest.TestCase):
@@ -178,16 +239,15 @@ class MarketTicketTests(unittest.TestCase):
         for selection_type in (CalendarSelection, MarketSelection):
             for name in ("__init__", "__new__"):
                 with self.subTest(selection=selection_type.__name__, method=name):
-                    had_local = name in vars(selection_type)
-                    replacement = (lambda self, *a, **k: None) if name == "__init__" else \
-                                  staticmethod(lambda cls, *a, **k: object.__new__(cls))
-                    try:
-                        with patch.object(selection_type, name, replacement):
+                    if name == "__new__":
+                        _check_new_constructor_guard("preopen", selection_type)
+                        self.assertIsInstance(
+                            selection_type(None, (), (), "probe", None), selection_type)
+                    else:
+                        with _temporary_attribute(selection_type, name,
+                                                  lambda self, *a, **k: None):
                             with self.assertRaises(ValueError):
                                 FormalBatchReadJournal.open(repository, **args)
-                    finally:
-                        if not had_local and name in vars(selection_type):
-                            delattr(selection_type, name)
 
     def test_warm_selection_constructor_replacement_is_rejected(self):
         fixture = self.fixture
@@ -202,16 +262,15 @@ class MarketTicketTests(unittest.TestCase):
                     repository.select_current_batch_ticket(journal, "SH600000", FREEZE,
                         binding=fixture.binding)
                     journal.checkpoint()
-                    had_local = name in vars(selection_type)
-                    replacement = (lambda self, *a, **k: None) if name == "__init__" else \
-                                  staticmethod(lambda cls, *a, **k: object.__new__(cls))
-                    try:
-                        with patch.object(selection_type, name, replacement):
+                    if name == "__new__":
+                        _check_new_constructor_guard("warm", selection_type)
+                        self.assertIsInstance(
+                            selection_type(None, (), (), "probe", None), selection_type)
+                    else:
+                        with _temporary_attribute(selection_type, name,
+                                                  lambda self, *a, **k: None):
                             with self.assertRaises(ValueError):
                                 journal.checkpoint()
-                    finally:
-                        if not had_local and name in vars(selection_type):
-                            delattr(selection_type, name)
 
     def test_constructor_result_pollution_cannot_become_ticket_baseline(self):
         fixture = self.fixture
@@ -250,7 +309,8 @@ class MarketTicketTests(unittest.TestCase):
         args = dict(registry_manifest_hash=fixture.graph.manifest.manifest_hash,
             as_of_utc=FREEZE, population=("SH600000",),
             required_keys=(("SH600000",),))
-        with patch.object(MarketSelection, "__repr__", lambda self: "market selection"):
+        with _temporary_attribute(MarketSelection, "__repr__",
+                                  lambda self: "market selection"):
             journal = FormalBatchReadJournal.open(repository, **args)
             ticket = repository.select_current_batch_ticket(journal, "SH600000", FREEZE,
                 binding=fixture.binding)
@@ -263,10 +323,11 @@ class MarketTicketTests(unittest.TestCase):
         args = dict(registry_manifest_hash=fixture.graph.manifest.manifest_hash,
             as_of_utc=FREEZE, population=("SH600000",),
             required_keys=(("SH600000",),))
-        with patch.object(market_module, "CalendarSelection", MarketSelection):
+        with _temporary_attribute(market_module, "CalendarSelection", MarketSelection):
             with self.assertRaises(ValueError):
                 FormalBatchReadJournal.open(repository, **args)
-        with patch.object(CalendarSelection, "pending", property(lambda self: ("forged",))):
+        with _temporary_attribute(CalendarSelection, "pending",
+                                  property(lambda self: ("forged",))):
             with self.assertRaises(ValueError):
                 FormalBatchReadJournal.open(repository, **args)
         fields = CalendarSelection.__dataclass_fields__
