@@ -44,10 +44,11 @@ class PolicyBatchGuardTests(unittest.TestCase):
         market_tickets = []
         market_assembled = []
         checked = {
-            FormalPolicyFinancialRepository._batch_recheck_ticket.__code__: 0,
-            FormalPolicyStateRepository._batch_recheck_ticket.__code__: 0,
-            FormalPolicyMarketRepository._batch_recheck_ticket.__code__: 0,
+            FormalPolicyFinancialRepository._batch_recheck_ticket.__code__: ("financial", 10),
+            FormalPolicyStateRepository._batch_recheck_ticket.__code__: ("state", 7),
+            FormalPolicyMarketRepository._batch_recheck_ticket.__code__: ("market", 12),
         }
+        phase_checks = set()
         checkpoints = []
         checkpoint_code = FormalBatchReadJournal.checkpoint.__code__
 
@@ -61,10 +62,13 @@ class PolicyBatchGuardTests(unittest.TestCase):
             if (frame.f_code.co_name == "assemble_market"
                     and frame.f_code.co_filename.endswith("formal_policy_market.py")):
                 market_assembled.append(1)
-            if frame.f_code in checked:
-                checked[frame.f_code] += 1
             if frame.f_code is checkpoint_code:
                 checkpoints.append(frame.f_locals["self"])
+            if frame.f_code in checked and checkpoints:
+                owner, request_index = checked[frame.f_code]
+                evidence = frame.f_locals["evidence"]
+                if owner != "market" or evidence[0] == "market":
+                    phase_checks.add((len(checkpoints), owner, evidence[request_index][0]))
 
         batch = self.run_hook(profile)
         batch.require_verified()
@@ -73,7 +77,12 @@ class PolicyBatchGuardTests(unittest.TestCase):
         self.assertEqual(len(market_assembled), 3)
         self.assertEqual(len(checkpoints), 2)
         self.assertIs(checkpoints[0], checkpoints[1])
-        self.assertTrue(all(count >= 6 for count in checked.values()))
+        self.assertEqual(phase_checks, {
+            (phase, owner, sid)
+            for phase in (1, 2)
+            for owner in ("financial", "state", "market")
+            for sid in ("BJ430001", "SH600000", "SZ000001")
+        })
         with self.assertRaises(ValueError):
             checkpoints[0].checkpoint()
 

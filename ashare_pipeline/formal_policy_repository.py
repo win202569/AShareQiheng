@@ -240,10 +240,11 @@ def _install_repository():
         def _build_batch_in_owner_scope(self, frozen_input_hash, *, scoring_registry,
                                         policy_registry, owner_scope):
             """Return a batch, coverage ticket, and revoker to an enclosing owner."""
-            batch, revoke, check_dependencies = self._build_batch(frozen_input_hash,
-                scoring_registry=scoring_registry, policy_registry=policy_registry,
-                owner_scope=owner_scope)
+            batch = revoke = None
             try:
+                batch, revoke, check_dependencies = self._build_batch(frozen_input_hash,
+                    scoring_registry=scoring_registry, policy_registry=policy_registry,
+                    owner_scope=owner_scope)
                 wire = record(batch)[2]
                 ticket = _issue_current_ticket(owner_scope, self, "policy",
                     (frozen_input_hash, batch.batch_hash), wire,
@@ -251,11 +252,13 @@ def _install_repository():
                     tuple((sid,) for sid in batch.security_ids), batch)
                 return batch, ticket, revoke
             except BaseException:
-                revoke(batch)
-                try:
-                    owner_scope.close()
-                except ValueError:
-                    pass
+                if revoke is not None:
+                    revoke(batch)
+                if type(owner_scope) is FormalBatchReadJournal:
+                    try:
+                        owner_scope.close()
+                    except ValueError:
+                        pass
                 raise
 
         def _batch_recheck_ticket(self, evidence):

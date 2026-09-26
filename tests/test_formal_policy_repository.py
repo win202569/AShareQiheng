@@ -134,6 +134,50 @@ class PolicyRepositoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             batch.require_verified()
 
+    def test_private_owner_scope_entry_failure_consumes_after_interface_restore(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+        from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
+
+        fixture = self.fixture()
+        universe = fixture.policy_context_repository.load_universe(
+            fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
+        scope = FormalBatchReadJournal.open(fixture.policy_repository,
+            registry_manifest_hash=universe.registry_manifest_hash,
+            as_of_utc=universe.as_of_utc,
+            population=tuple(universe.security_ids),
+            required_keys=tuple((sid,) for sid in universe.security_ids))
+        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
+        with patch.object(FormalPolicyFinancialRepository, "_batch_recheck_ticket", lambda *_: None):
+            with self.assertRaises(ValueError):
+                fixture.policy_repository._build_batch_in_owner_scope(
+                    fixture.frozen.frozen_input_hash, owner_scope=scope, **args)
+        with self.assertRaises(ValueError):
+            fixture.policy_repository._build_batch_in_owner_scope(
+                fixture.frozen.frozen_input_hash, owner_scope=scope, **args)
+        with self.assertRaises(ValueError):
+            scope.checkpoint()
+
+    def test_private_owner_scope_missing_frozen_input_consumes_before_prepare(self):
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        fixture = self.fixture()
+        universe = fixture.policy_context_repository.load_universe(
+            fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
+        scope = FormalBatchReadJournal.open(fixture.policy_repository,
+            registry_manifest_hash=universe.registry_manifest_hash,
+            as_of_utc=universe.as_of_utc,
+            population=tuple(universe.security_ids),
+            required_keys=tuple((sid,) for sid in universe.security_ids))
+        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
+        with self.assertRaises(ValueError):
+            fixture.policy_repository._build_batch_in_owner_scope(
+                "0" * 64, owner_scope=scope, **args)
+        with self.assertRaises(ValueError):
+            fixture.policy_repository._build_batch_in_owner_scope(
+                fixture.frozen.frozen_input_hash, owner_scope=scope, **args)
+        with self.assertRaises(ValueError):
+            scope.checkpoint()
+
     def test_unknown_membership_never_fabricates_five_template_decisions(self):
         fixture = self.fixture()
         batch = fixture.build_policy_batch()
