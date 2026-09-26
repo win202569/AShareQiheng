@@ -14,7 +14,9 @@ from types import MappingProxyType
 import weakref
 
 from .formal_policy_values import canonical_bytes
-from .formal_range_contract import _range_binding_planning_authority
+from .formal_range_contract import (
+    _range_binding_planning_authority, _range_binding_read_lease_authority,
+)
 from .formal_range_format import RangeConfig, _range_config_to_dict
 from .formal_time import FORMAL_FREEZE_AT_CN
 
@@ -23,6 +25,7 @@ _FREEZE_UTC = datetime.fromisoformat(FORMAL_FREEZE_AT_CN).astimezone(timezone.ut
 _FREEZE_DATE = datetime.fromisoformat(_FREEZE_UTC).date()
 _SECURITY = re.compile(r"^(?:SH|SZ|BJ)[0-9]{6}$")
 _binding_type, _read_binding = _range_binding_planning_authority()
+_open_binding_read_lease, _close_binding_read_lease = _range_binding_read_lease_authority()
 
 
 def _detached(value):
@@ -237,6 +240,8 @@ def _build_proof_types():
         selection_records = {}
         anchored_binding_identity = _binding_identity
         anchored_read_binding = _read_binding
+        anchored_open_binding_read_lease = _open_binding_read_lease
+        anchored_close_binding_read_lease = _close_binding_read_lease
         anchored_canonical = canonical_bytes
         selection_fields = {
             calendar_selection_type: ("coverage", "pending", "lineage", "selection_hash", "_check"),
@@ -316,6 +321,8 @@ def _build_proof_types():
             selection_interface()
             if (_binding_identity is not anchored_binding_identity
                     or _read_binding is not anchored_read_binding
+                    or _open_binding_read_lease is not anchored_open_binding_read_lease
+                    or _close_binding_read_lease is not anchored_close_binding_read_lease
                     or canonical_bytes is not anchored_canonical):
                 raise ValueError("market ticket binding interface changed")
             sealed = repository_records.get(id(value))
@@ -508,34 +515,69 @@ def _build_proof_types():
             def select_calendar_batch_ticket(self, journal, binding, as_of_utc):
                 from .formal_batch_read_journal import _require_current_scope
                 sealed = repository_record(self)
-                identity = _binding_identity(binding)
-                _require_current_scope(journal, self,
-                    root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
-                    population=(identity["exchange"],))
-                capture = {"journal": journal, "owner": self, "tickets": []}
-                reset = batch_capture.set(capture)
+                lease = None
                 try:
-                    selected = assemble_calendar(sealed, binding, as_of_utc)
-                finally:
-                    batch_capture.reset(reset)
-                return ticket_evidence(self, journal, "calendar", selected, binding,
-                                       as_of_utc, identity["exchange"], capture)
+                    lease = _open_binding_read_lease(
+                        binding, journal, ("calendar", as_of_utc))
+                    identity = _binding_identity(binding)
+                    _require_current_scope(journal, self,
+                        root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
+                        population=(identity["exchange"],))
+                    capture = {"journal": journal, "owner": self, "tickets": []}
+                    reset = batch_capture.set(capture)
+                    try:
+                        selected = assemble_calendar(sealed, binding, as_of_utc)
+                    finally:
+                        batch_capture.reset(reset)
+                    ticket = ticket_evidence(self, journal, "calendar", selected, binding,
+                                             as_of_utc, identity["exchange"], capture)
+                    _close_binding_read_lease(lease)
+                    return ticket
+                except BaseException:
+                    if lease is not None:
+                        try:
+                            _close_binding_read_lease(lease)
+                        except ValueError:
+                            pass
+                    try:
+                        journal.close()
+                    except ValueError:
+                        pass
+                    raise
 
             def select_current_batch_ticket(self, journal, security_id, as_of_utc, *, binding):
                 from .formal_batch_read_journal import _require_current_scope
                 sealed = repository_record(self)
-                identity = _binding_identity(binding)
-                _require_current_scope(journal, self,
-                    root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
-                    population=(security_id,))
-                capture = {"journal": journal, "owner": self, "tickets": []}
-                reset = batch_capture.set(capture)
+                lease = None
                 try:
-                    selected = assemble_market(sealed, security_id, as_of_utc, binding=binding)
-                finally:
-                    batch_capture.reset(reset)
-                return ticket_evidence(self, journal, "market", selected, binding,
-                                       as_of_utc, security_id, capture)
+                    lease = _open_binding_read_lease(
+                        binding, journal, ("market", security_id, as_of_utc))
+                    identity = _binding_identity(binding)
+                    _require_current_scope(journal, self,
+                        root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
+                        population=(security_id,))
+                    capture = {"journal": journal, "owner": self, "tickets": []}
+                    reset = batch_capture.set(capture)
+                    try:
+                        selected = assemble_market(
+                            sealed, security_id, as_of_utc, binding=binding)
+                    finally:
+                        batch_capture.reset(reset)
+                    ticket = ticket_evidence(self, journal, "market", selected, binding,
+                                             as_of_utc, security_id, capture)
+                    _close_binding_read_lease(lease)
+                    return ticket
+                except BaseException:
+                    if lease is not None:
+                        try:
+                            _close_binding_read_lease(lease)
+                        except ValueError:
+                            pass
+                    try:
+                        journal.close()
+                    except ValueError:
+                        pass
+                    raise
 
             def _batch_recheck_ticket(self, evidence):
                 from .formal_batch_read_journal import _require_current_ticket

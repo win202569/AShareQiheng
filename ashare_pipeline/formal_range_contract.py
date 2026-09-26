@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
 import json
+import threading
 from types import MappingProxyType
 import weakref
 
@@ -87,7 +89,8 @@ def _build_range_bindings_contract():
     # reached by those call chains, including the module aliases they use.
     dependencies = tuple((module_globals, name, module_globals[name]) for name in (
         "_load_canonical_object", "_LEGACY_CONFIG_FIELDS", "_canonical", "_freeze", "_text", "_exchange",
-        "RangeConfig", "parse_range_entry", "MappingProxyType", "json", "hashlib", "weakref",
+        "RangeConfig", "parse_range_entry", "MappingProxyType", "ContextVar", "json", "hashlib",
+        "threading", "weakref",
     )) + tuple((vars(format_module), name, vars(format_module)[name]) for name in (
         "RangeConfig", "parse_range_entry", "_range_config_to_dict", "_canonical",
         "_text", "_hash", "_exchange", "_positive_number", "_positive_integer",
@@ -371,6 +374,9 @@ def _build_range_bindings_contract():
         policy_registry: object
         snapshot: _GraphSnapshot
         bindings: dict[tuple[str, str], object]
+        manifest: object
+        blobs: object
+        role_objects: tuple[tuple[str, object], ...]
 
 
     @dataclass(frozen=True)
@@ -388,6 +394,42 @@ def _build_range_bindings_contract():
 
     _bindings_records: dict[int, _BindingsRecord] = {}
     _binding_records: dict[int, _BindingRecord] = {}
+    _binding_read_lease = ContextVar("formal_range_current_binding_read_lease", default=None)
+    _lease_records = {}
+
+
+    def _lightweight_current(record: _BindingsRecord) -> None:
+        """Recheck mutable current fields without repeating signed graph parsing."""
+        _check_dependencies()
+        if (type(record.bundle) is not bundle_type
+                or type(record.scoring_registry) is not scoring_type
+                or type(record.policy_registry) is not policy_type):
+            raise ValueError("range binding lease source identity changed")
+        manifest = object.__getattribute__(record.bundle, "manifest")
+        blobs = object.__getattribute__(record.bundle, "blobs")
+        if manifest is not record.manifest or blobs is not record.blobs:
+            raise ValueError("range binding lease graph object changed")
+        manifest_bytes = object.__getattribute__(manifest, "canonical_json")
+        if (type(manifest_bytes) is not bytes
+                or manifest_bytes != record.snapshot.manifest_bytes
+                or hashlib.sha256(manifest_bytes).hexdigest() != record.snapshot.root_hash
+                or object.__getattribute__(manifest, "manifest_hash") != record.snapshot.root_hash):
+            raise ValueError("range binding lease manifest changed")
+        expected = {role: (raw, digest) for role, raw, digest in record.snapshot.roles}
+        if tuple(role for role, _ in record.role_objects) != tuple(expected):
+            raise ValueError("range binding lease roles changed")
+        for role, sealed_blob in record.role_objects:
+            blob = blobs.get(role)
+            raw, digest = expected[role]
+            if blob is not sealed_blob or type(raw) is not bytes:
+                raise ValueError("range binding lease child object changed")
+            current_raw = object.__getattribute__(blob, "canonical_json")
+            if (type(current_raw) is not bytes or current_raw != raw
+                    or hashlib.sha256(current_raw).hexdigest() != digest
+                    or object.__getattribute__(blob, "registry_hash") != digest
+                    or object.__getattribute__(blob, "registry_role") != role
+                    or object.__getattribute__(manifest, role + "_registry_hash") != digest):
+                raise ValueError("range binding lease child bytes changed")
 
 
     def _bindings_record(value: object, *, current: bool = False) -> _BindingsRecord:
@@ -417,7 +459,16 @@ def _build_range_bindings_contract():
         parent = record.parent()
         if parent is None or object.__getattribute__(value, "_RangeBinding__parent") is not parent:
             raise ValueError("range binding parent changed")
-        parent_record = _bindings_record(parent, current=current)
+        lease = _binding_read_lease.get() if current else None
+        if lease is not None:
+            parent_record = _bindings_record(parent)
+            identity = (parent_record.snapshot.root_hash, record.binding_hash, record.key)
+            if (threading.get_ident() != lease[0] or identity != lease[2]
+                    or parent_record.snapshot != lease[5]):
+                raise ValueError("range binding lease is cross-thread, cross-binding, or stale")
+            _lightweight_current(parent_record)
+        else:
+            parent_record = _bindings_record(parent, current=current)
         child_reference = parent_record.bindings.get(record.key)
         if child_reference is None or child_reference() is not value:
             raise ValueError("range binding no longer belongs to its binding set")
@@ -429,6 +480,87 @@ def _build_range_bindings_contract():
         ):
             raise ValueError("range binding configuration changed")
         return record
+
+
+    class _BindingReadLease:
+        __slots__ = ("__weakref__",)
+
+        def __init__(self, *_args, **_kwargs):
+            raise TypeError("range binding read leases require their sealed owner")
+
+        def __copy__(self):
+            raise TypeError("range binding read leases cannot be copied")
+
+        def __deepcopy__(self, _memo):
+            raise TypeError("range binding read leases cannot be copied")
+
+        def __reduce__(self):
+            raise TypeError("range binding read leases cannot be exported")
+
+        def __reduce_ex__(self, _protocol):
+            raise TypeError("range binding read leases cannot be exported")
+
+
+    def open_current_binding_read_lease(value, owner_scope, operation_key):
+        """Open one bounded owner operation; the returned token has no public behavior."""
+        if (type(operation_key) is not tuple or not operation_key
+                or any(type(item) is not str or not item for item in operation_key)):
+            raise ValueError("range binding lease cannot be nested, copied, or unbound")
+        active = _binding_read_lease.get()
+        if active is not None:
+            _binding_record(value, current=True)
+            nested = (active[1] is owner_scope and active[3][0] == "market"
+                      and operation_key == ("calendar", active[3][-1]))
+            if not nested:
+                raise ValueError("range binding lease cannot be nested, copied, or unbound")
+            state, token = active, None
+        else:
+            child = _binding_record(value)
+            parent = child.parent()
+            parent_record = _bindings_record(parent)
+            entry = _capture_graph_snapshot(
+                parent_record.bundle, parent_record.scoring_registry,
+                parent_record.policy_registry
+            )
+            if entry != parent_record.snapshot:
+                raise ValueError("range binding sources changed before owner operation")
+            _lightweight_current(parent_record)
+            identity = (parent_record.snapshot.root_hash, child.binding_hash, child.key)
+            state = (threading.get_ident(), owner_scope, identity, operation_key,
+                     parent_record, entry)
+            token = _binding_read_lease.set(state)
+            nested = False
+        lease = object.__new__(_BindingReadLease)
+        identity = id(lease)
+        reference = weakref.ref(lease, lambda ref, key=identity:
+            _lease_records.pop(key, None)
+            if _lease_records.get(key) is not None
+            and _lease_records[key][0] is ref else None)
+        _lease_records[identity] = [reference, state, token, nested, True]
+        return lease
+
+
+    def close_current_binding_read_lease(lease):
+        saved = _lease_records.get(id(lease))
+        if (type(lease) is not _BindingReadLease or saved is None
+                or saved[0]() is not lease or saved[4] is not True):
+            raise ValueError("range binding read lease is forged, copied, or closed")
+        state, token, nested = saved[1:4]
+        saved[4] = False
+        if threading.get_ident() != state[0] or _binding_read_lease.get() is not state:
+            raise ValueError("range binding read lease is cross-thread or out of order")
+        if nested:
+            return
+        parent_record, entry = state[4:6]
+        try:
+            exit_snapshot = _capture_graph_snapshot(
+                parent_record.bundle, parent_record.scoring_registry,
+                parent_record.policy_registry
+            )
+            if exit_snapshot != entry or exit_snapshot != parent_record.snapshot:
+                raise ValueError("range binding sources changed during owner operation")
+        finally:
+            _binding_read_lease.reset(token)
 
 
     class RangeBinding:
@@ -553,6 +685,9 @@ def _build_range_bindings_contract():
             policy_registry,
             snapshot,
             {key: weakref.ref(binding) for key, binding in binding_objects.items()},
+            object.__getattribute__(bundle, "manifest"),
+            object.__getattribute__(bundle, "blobs"),
+            tuple((role, blob_for(bundle, role)) for role, _, _ in snapshot.roles),
         )
         return result
 
@@ -570,11 +705,34 @@ def _build_range_bindings_contract():
             "exchange": child.key[1],
         })
 
-    return RangeBinding, RangeBindings, load_policy_range_bindings, read_planning_binding
+    def lookup_planning_binding(bindings, binding_hash, exchange):
+        """Select one sealed binding without probing unrelated child bindings."""
+        parent = _bindings_record(bindings)
+        _text(binding_hash, "range binding hash")
+        if len(binding_hash) != 64 or any(c not in "0123456789abcdef" for c in binding_hash):
+            raise ValueError("range binding hash must be canonical sha256")
+        _exchange(exchange, "range binding exchange")
+        matches = []
+        for key, reference in parent.bindings.items():
+            child = reference()
+            record = None if child is None else _binding_records.get(id(child))
+            if (record is not None and record.reference() is child and key[1] == exchange
+                    and record.binding_hash == binding_hash):
+                matches.append(child)
+        if len(matches) != 1:
+            raise ValueError("range task binding absent or ambiguous")
+        _binding_record(matches[0], current=True)
+        return matches[0]
+
+    return (RangeBinding, RangeBindings, load_policy_range_bindings, read_planning_binding,
+            lookup_planning_binding, open_current_binding_read_lease,
+            close_current_binding_read_lease)
 
 
 (RangeBinding, RangeBindings, load_policy_range_bindings,
- _read_range_binding_planning) = _build_range_bindings_contract()
+ _read_range_binding_planning, _lookup_range_binding_planning,
+ _open_current_binding_read_lease,
+ _close_current_binding_read_lease) = _build_range_bindings_contract()
 del _build_range_bindings_contract
 
 
@@ -618,6 +776,34 @@ def _make_range_binding_planning_authority():
 
 _range_binding_planning_authority = _make_range_binding_planning_authority()
 del _make_range_binding_planning_authority, _read_range_binding_planning
+
+
+def _make_range_binding_lookup_authority():
+    lookup = _lookup_range_binding_planning
+
+    def authority():
+        return lookup
+
+    return authority
+
+
+_range_binding_lookup_authority = _make_range_binding_lookup_authority()
+del _make_range_binding_lookup_authority, _lookup_range_binding_planning
+
+
+def _make_range_binding_read_lease_authority():
+    open_lease = _open_current_binding_read_lease
+    close_lease = _close_current_binding_read_lease
+
+    def authority():
+        return open_lease, close_lease
+
+    return authority
+
+
+_range_binding_read_lease_authority = _make_range_binding_read_lease_authority()
+del (_make_range_binding_read_lease_authority, _open_current_binding_read_lease,
+     _close_current_binding_read_lease)
 
 
 __all__ = [

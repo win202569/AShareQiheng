@@ -116,7 +116,9 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             raise ValueError("range signature verifier changed")
         return state, root, verifier, factory, cache
 
+    from .formal_range_contract import _range_binding_lookup_authority
     planning_binding_type, read_planning_binding = _range_binding_planning_authority()
+    lookup_planning_binding = _range_binding_lookup_authority()
 
     def load_binding_identity(store, *, registry_manifest_hash, binding_hash, exchange):
         state, _, verifier, factory, cache = record(store)
@@ -131,19 +133,12 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                 bundle.manifest.approval_id), feature_registry=vocabulary)
             policy = load_formal_policy_registry(bundle, scoring_registry=scoring, feature_registry=vocabulary)
             bindings = load_policy_range_bindings(bundle, scoring_registry=scoring, policy_registry=policy)
-            matches = []
-            for rule in policy.to_dict()["rules"]:
-                if rule["kind"] == "market_liquidity":
-                    binding = bindings.for_rule(rule["rule_id"], exchange)
-                    if read_planning_binding(binding)["binding_hash"] == binding_hash:
-                        matches.append(binding)
-            if len(matches) != 1:
-                raise ValueError("range task binding absent or ambiguous")
-            source = factory(matches[0])
-            if type(source) is not source_type or source_binding(source) is not matches[0]:
+            binding = lookup_planning_binding(bindings, binding_hash, exchange)
+            source = factory(binding)
+            if type(source) is not source_type or source_binding(source) is not binding:
                 raise ValueError("range source factory returned a different binding")
             bind_source_store(source, store)
-            cache[key] = (matches[0], source)
+            cache[key] = (binding, source)
         binding, source = cache[key]
         binding.require_current()
         source_binding(source)
