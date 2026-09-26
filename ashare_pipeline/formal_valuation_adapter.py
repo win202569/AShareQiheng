@@ -5,6 +5,7 @@ from __future__ import annotations
 from decimal import (Context, Decimal, DivisionByZero, InvalidOperation, Overflow,
                      ROUND_HALF_EVEN, localcontext)
 
+from . import formal_policy_values as _policy_values_module
 from .formal_policy_values import digest
 
 
@@ -272,6 +273,42 @@ def evaluate_valuation_adjustment(*, metric: dict, policy_result: dict,
                     reason="cyclic_policy_matched", adjusted_value=_decimal_text(adjusted))
     result["result_hash"] = digest(result)
     return result
+
+
+def _install_valuation_adapter_owner():
+    """Keep C3's pure evaluator private dependency graph fixed for C4 owners."""
+    names = (
+        "Context", "Decimal", "DivisionByZero", "InvalidOperation", "Overflow",
+        "ROUND_HALF_EVEN", "localcontext", "digest", "_policy_values_module",
+        "_METRIC_KEYS", "_RESULT_KEYS", "_DECISION_KEYS", "_DEPENDENCY_KEYS",
+        "_ADAPTER_KEYS", "_BASIS_KEYS", "_PRECONDITIONS", "_arithmetic_context",
+        "profit_ratio_rescale", "_exact", "_hash", "_text", "_decimal",
+        "_decimal_text", "_definition_hash", "_dependencies", "_basis",
+        "evaluate_valuation_adjustment",
+    )
+    originals = tuple((name, globals()[name]) for name in names)
+    policy_values = _policy_values_module
+    policy_dependencies = tuple((name, getattr(policy_values, name)) for name in
+        ("digest", "canonical_bytes", "json", "hashlib"))
+    json_dumps = policy_values.json.dumps
+    sha256 = policy_values.hashlib.sha256
+    evaluator = evaluate_valuation_adjustment
+
+    def require_owner():
+        if (globals().get("_require_valuation_adapter_owner") is not require_owner
+                or any(globals().get(name) is not value for name, value in originals)
+                or any(getattr(policy_values, name, None) is not value
+                       for name, value in policy_dependencies)
+                or policy_values.json.dumps is not json_dumps
+                or policy_values.hashlib.sha256 is not sha256):
+            raise ValueError("valuation adapter dependency changed")
+        return evaluator
+
+    return require_owner
+
+
+_require_valuation_adapter_owner = _install_valuation_adapter_owner()
+del _install_valuation_adapter_owner
 
 
 __all__ = ["profit_ratio_rescale", "evaluate_valuation_adjustment"]

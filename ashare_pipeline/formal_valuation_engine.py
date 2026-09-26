@@ -17,7 +17,7 @@ from .formal_registry_manifest import FormalRegistryBundleLoader
 from .formal_scoring_registry import FormalScoringRegistry
 from .formal_policy_registry import FormalPolicyRegistry
 from .formal_valuation_adapter_contract import FormalValuationAdapterRegistry
-from .formal_valuation_adapter import evaluate_valuation_adjustment
+from . import formal_valuation_adapter as adapter_module
 from .formal_batch_read_journal import FormalBatchReadJournal, _issue_current_ticket
 
 
@@ -30,10 +30,12 @@ def _install_valuation_engine():
     repositories, proofs = {}, {}
     own_members = ()
     json_module, hashlib_module = json, hashlib
-    encode, decode, sha256 = json.dumps, json.loads, hashlib.sha256
+    encode, decode, sha256, hash_payload = json.dumps, json.loads, hashlib.sha256, digest
     guard_factory = _metric_batch_guard
     load_root = FormalRegistryBundleLoader.load
-    evaluate = evaluate_valuation_adjustment
+    adapter_source = adapter_module
+    adapter_owner = adapter_source._require_valuation_adapter_owner
+    evaluate = adapter_owner()
     metric_build = FormalMetricInputRepository._build_batch_in_owner_scope
     policy_build = FormalPolicyRepository._build_batch_in_owner_scope
     metric_verify = MetricInputBatch.require_verified
@@ -63,8 +65,10 @@ def _install_valuation_engine():
                 for cls, members in own_members):
             raise ValueError("valuation authority interface changed")
         if (globals().get("_metric_batch_guard") is not guard_factory
-                or globals().get("evaluate_valuation_adjustment") is not evaluate
-                or globals().get("digest") is not digest
+                or globals().get("adapter_module") is not adapter_source
+                or adapter_source._require_valuation_adapter_owner is not adapter_owner
+                or adapter_owner() is not evaluate
+                or globals().get("digest") is not hash_payload
                 or globals().get("json") is not json_module or json_module.dumps is not encode
                 or json_module.loads is not decode or globals().get("hashlib") is not hashlib_module
                 or hashlib_module.sha256 is not sha256):
@@ -123,7 +127,7 @@ def _install_valuation_engine():
             return record(self, type(self))[2]
 
         def to_dict(self):
-            return json.loads(record(self, type(self))[2])
+            return decode(record(self, type(self))[2])
 
         def __copy__(self):
             raise TypeError("adjusted valuation proofs cannot be copied")
@@ -149,7 +153,7 @@ def _install_valuation_engine():
         proof = object.__new__(cls)
         data = dict(payload)
         data.update(attributes or {})
-        wire = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+        wire = encode(payload, sort_keys=True, ensure_ascii=False,
             separators=(",", ":"), allow_nan=False).encode()
         identity = id(proof)
         proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)),
@@ -215,7 +219,7 @@ def _install_valuation_engine():
                 original_metric=metric, policy_result=result, adjustment=adjustment,
                 status=adjustment["status"], reason=adjustment["reason"],
                 adjusted_value=adjustment["adjusted_value"])
-            row["input_hash"] = digest(row)
+            row["input_hash"] = hash_payload(row)
             rows.append(row)
         return tuple(rows)
 
@@ -261,11 +265,11 @@ def _install_valuation_engine():
                         registry_manifest_hash=frozen.registry_manifest_hash,
                         as_of_utc=_FREEZE, population=population, required_keys=required,
                         frozen_input_hash=frozen_input_hash)
-                    policy, policy_ticket, policy_revoke = policy_build(policy_repo, frozen_input_hash,
-                        scoring_registry=scoring_registry, policy_registry=policy_registry,
-                        owner_scope=scope)
                     base, metric_ticket, metric_revoke = metric_build(metric_repo, frozen_input_hash,
                         scoring_registry=scoring_registry, metric_ids=_V_METRICS,
+                        owner_scope=scope)
+                    policy, policy_ticket, policy_revoke = policy_build(policy_repo, frozen_input_hash,
+                        scoring_registry=scoring_registry, policy_registry=policy_registry,
                         owner_scope=scope)
                     metric_verify(base)
                     policy_verify(policy)
@@ -287,13 +291,13 @@ def _install_valuation_engine():
                         policy_contract_hash=policy.policy_contract_hash,
                         valuation_adapter_registry_hash=bundle.manifest.valuation_adapter_registry_hash,
                         base_batch_hash=base.batch_hash,
-                        base_batch_canonical_sha256=hashlib.sha256(base_bytes).hexdigest(),
+                        base_batch_canonical_sha256=sha256(base_bytes).hexdigest(),
                         policy_batch_hash=policy.batch_hash,
-                        policy_batch_canonical_sha256=hashlib.sha256(policy_bytes).hexdigest(),
-                        adapter_definition_sha256=digest(adapter_wire),
+                        policy_batch_canonical_sha256=sha256(policy_bytes).hexdigest(),
+                        adapter_definition_sha256=hash_payload(adapter_wire),
                         security_ids=list(base.security_ids), metric_ids=list(_V_METRICS),
                         inputs=list(rows))
-                    common["batch_hash"] = digest(common)
+                    common["batch_hash"] = hash_payload(common)
                     children = tuple(mint(PolicyAdjustedValuationInput,
                         dict(row, batch_hash=common["batch_hash"]), publication,
                         attributes={"adjusted_value": None if row["adjusted_value"] is None

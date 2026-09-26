@@ -353,6 +353,8 @@ def _install_engine():
             groups=None, ranks={}, contexts={}), publication=publication)
 
         def publish_complete():
+            if owner_scope is not None:
+                owner_scope.checkpoint_metric(repo)
             publication[0] = True
             return prepared
 
@@ -401,11 +403,11 @@ def _install_engine():
 
         def _build_batch_in_owner_scope(self, frozen_input_hash, *, scoring_registry,
                                         metric_ids, owner_scope):
-            feature, _, _, _ = dependencies(self)
-            if type(owner_scope) is not FormalBatchReadJournal:
-                raise ValueError("metric batch requires an authentic owner scope")
             result = None
             try:
+                feature, _, _, _ = dependencies(self)
+                if type(owner_scope) is not FormalBatchReadJournal:
+                    raise ValueError("metric batch requires an authentic owner scope")
                 with batch_guard(feature._current_input_provider, feature._store) as guard:
                     result = build(self, frozen_input_hash, scoring_registry, metric_ids,
                         guard, owner_scope=owner_scope)
@@ -422,6 +424,11 @@ def _install_engine():
             except BaseException:
                 if result is not None:
                     proofs[id(result)][4][0] = False
+                if type(owner_scope) is FormalBatchReadJournal:
+                    try:
+                        owner_scope.close()
+                    except ValueError:
+                        pass
                 raise
 
         def __copy__(self):

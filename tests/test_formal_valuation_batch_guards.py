@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from ashare_pipeline.formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
-from ashare_pipeline.formal_metric_engine import FormalMetricInputRepository
+from ashare_pipeline.formal_metric_engine import FormalMetricInputRepository, MetricInputBatch
 from ashare_pipeline.formal_policy_repository import VerifiedPolicyResultBatch
 from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal, _require_current_scope
 from tests.formal_policy_fixtures import REGULATORY_SEMANTICS
@@ -157,6 +157,179 @@ class ValuationBatchGuardTests(unittest.TestCase):
             sys.setprofile(previous_profile)
             sys.settrace(previous_trace)
 
+    def test_digest_rebinding_after_adjusted_mint_revokes_unpublished_batch(self):
+        import ashare_pipeline.formal_valuation_engine as engine
+
+        original = engine.digest
+        captured = []
+
+        def hook(frame, event, result):
+            if (event == "return" and frame.f_code.co_name == "mint"
+                    and frame.f_code.co_filename.endswith("formal_valuation_engine.py")
+                    and type(result) is PolicyAdjustedValuationBatch and not captured):
+                captured.append(result)
+                engine.digest = lambda _wire: "0" * 64
+
+        try:
+            with self.assertRaises(ValueError):
+                self.run_with_trace(hook)
+        finally:
+            engine.digest = original
+        self.assertEqual(len(captured), 1)
+        with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
+            captured[0].require_verified()
+
+    def test_c3_dynamic_dependency_rebinding_blocks_formal_valuation_build(self):
+        import ashare_pipeline.formal_valuation_adapter as adapter
+        import ashare_pipeline.formal_policy_values as policy_values
+
+        changes = (
+            (adapter, "_decimal_text", lambda _value: "999"),
+            (adapter, "Decimal", object()),
+            (adapter, "localcontext", object()),
+            (adapter, "Context", object()),
+            (adapter, "ROUND_HALF_EVEN", "ROUND_DOWN"),
+            (adapter, "_hash", lambda *_args: None),
+            (adapter, "digest", lambda _wire: "0" * 64),
+            (policy_values, "json", object()),
+        )
+        for module, name, replacement in changes:
+            with self.subTest(module=module.__name__, name=name):
+                original = getattr(module, name)
+                try:
+                    setattr(module, name, replacement)
+                    with self.assertRaisesRegex(ValueError, "valuation adapter dependency"):
+                        self.build()
+                finally:
+                    setattr(module, name, original)
+        self.build().require_verified()
+
+    def test_metric_own_checkpoint_revokes_base_before_publication_on_last_v_source_change(self):
+        from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
+
+        fixture = ValuationRuntimeFixture(peer_count=3)
+        self.addCleanup(fixture.close)
+        fixture.put_financial("SH600000", {
+            "V.enterprise_value_or_sustainable_roe": 0.1,
+            "V.normalized_earnings_yield": 0.2,
+            "V.normalized_free_cash_flow_yield": 0.08})
+        fixture.persist_features("SH600000")
+        fact = next(item for item in fixture.store.list_formal_financial_facts(
+            security_id="SH600000") if item.metric_key == "V.normalized_earnings_yield")
+        source = Path(fixture.store.get_formal_snapshot(fact.source_snapshot_id).content_path)
+        original = source.read_bytes()
+        selected, bases = [], []
+
+        def hook(frame, event, result):
+            if event != "return":
+                return
+            if (frame.f_code is FormalFeatureRepository.select_current_metric_batch_ticket.__code__
+                    and frame.f_locals.get("security_id") == "SH600000"):
+                selected.append(frame.f_locals["metric_id"])
+                if len(selected) == 3:
+                    source.write_bytes(original + b"\nchanged-after-third-v-ticket")
+            elif (frame.f_code.co_name == "mint"
+                    and frame.f_code.co_filename.endswith("formal_metric_engine.py")
+                    and type(result) is MetricInputBatch):
+                bases.append(result)
+
+        try:
+            with self.assertRaises(ValueError):
+                self.run_with_trace(hook, fixture.build_adjusted_batch)
+            self.assertEqual(len(selected), 3)
+            self.assertEqual(len(bases), 1)
+            with self.assertRaisesRegex(ValueError, "forged or copied"):
+                bases[0].require_verified()
+        finally:
+            source.write_bytes(original)
+        fixture.build_adjusted_batch().require_verified()
+
+    def test_metric_checkpoint_rejects_one_missing_member_metric_ticket(self):
+        from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
+
+        fixture = ValuationRuntimeFixture(peer_count=3)
+        self.addCleanup(fixture.close)
+        observed = {"selected": 0}
+
+        def hook(frame, event, result):
+            if (event == "return" and frame.f_code.co_name == "open"
+                    and frame.f_code.co_filename.endswith("formal_batch_read_journal.py")
+                    and type(result) is FormalBatchReadJournal):
+                observed["scope"] = result
+            if (event == "return" and frame.f_code is
+                    FormalFeatureRepository.select_current_metric_batch_ticket.__code__):
+                observed["selected"] += 1
+                if observed["selected"] == 8:
+                    metric = fixture.repository._batch_journal_identity()[1][0]
+                    with self.assertRaisesRegex(ValueError, "metric V source ticket coverage"):
+                        observed["scope"].checkpoint_metric(metric)
+                    observed["incomplete_rejected"] = True
+
+        with self.assertRaises(ValueError):
+            self.run_with_trace(hook, fixture.build_adjusted_batch)
+        self.assertTrue(observed.get("incomplete_rejected"))
+        self.assertEqual(observed["selected"], 8)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            observed["scope"].checkpoint()
+        fixture.build_adjusted_batch().require_verified()
+
+    def test_metric_private_early_failures_consume_only_the_genuine_owner_scope(self):
+        from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
+
+        metric_ids = ("V.enterprise_value_or_sustainable_roe",
+                      "V.normalized_earnings_yield", "V.normalized_free_cash_flow_yield")
+        for failure in ("invalid_frozen", "interface_changed", "invalid_metrics"):
+            with self.subTest(failure=failure):
+                fixture = ValuationRuntimeFixture(peer_count=3)
+                self.addCleanup(fixture.close)
+                observed = {}
+
+                def hook(frame, event, result):
+                    if (event != "return" or frame.f_code.co_name != "open"
+                            or not frame.f_code.co_filename.endswith("formal_batch_read_journal.py")
+                            or type(result) is not FormalBatchReadJournal or observed):
+                        return
+                    scope = result
+                    _, (metric, _) = fixture.repository._batch_journal_identity()
+                    request = dict(scoring_registry=fixture.scoring, metric_ids=metric_ids)
+                    fake = object.__new__(FormalBatchReadJournal)
+                    try:
+                        metric._build_batch_in_owner_scope(fixture.frozen.frozen_input_hash,
+                            owner_scope=fake, **request)
+                    except ValueError:
+                        observed["fake_rejected"] = True
+                    try:
+                        scope.checkpoint()
+                        observed["fake_preserved_true_scope"] = True
+                    except ValueError:
+                        observed["fake_preserved_true_scope"] = False
+                    frozen = fixture.frozen.frozen_input_hash
+                    if failure == "invalid_frozen":
+                        frozen = "0" * 64
+                    elif failure == "invalid_metrics":
+                        request["metric_ids"] = ("V.missing_metric",)
+                    original = FormalFeatureRepository.select_current_metric_batch_ticket
+                    try:
+                        if failure == "interface_changed":
+                            FormalFeatureRepository.select_current_metric_batch_ticket = lambda *_a, **_k: None
+                        try:
+                            metric._build_batch_in_owner_scope(frozen, owner_scope=scope, **request)
+                        except ValueError:
+                            observed["entry_rejected"] = True
+                    finally:
+                        FormalFeatureRepository.select_current_metric_batch_ticket = original
+                    try:
+                        scope.checkpoint()
+                        observed["true_scope_consumed"] = False
+                    except ValueError:
+                        observed["true_scope_consumed"] = True
+
+                with self.assertRaises(ValueError):
+                    self.run_with_trace(hook, fixture.build_adjusted_batch)
+                self.assertEqual(observed, dict(fake_rejected=True,
+                    fake_preserved_true_scope=True, entry_rejected=True,
+                    true_scope_consumed=True))
+
     def test_outer_finalization_failure_revokes_only_adjusted_children(self):
         captured = {"adjusted": [], "base": [], "policy": []}
         closed = []
@@ -234,7 +407,6 @@ class ValuationSourceClosureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.fixture = ValuationRuntimeFixture(peer_count=3)
-        cls.fixture.populate_valuation_inputs()
 
     @classmethod
     def tearDownClass(cls):
@@ -380,14 +552,16 @@ class ValuationSourceClosureTests(unittest.TestCase):
         self.assertEqual(sorted(first_v), sorted((sid, mid) for sid in members for mid in batch.metric_ids))
         for kind, calls in selected.items():
             self.assertEqual(sorted(calls), sorted(members), kind)
-        self.assertEqual(len(checkpoints), 3)
+        self.assertEqual(len(checkpoints), 4)
         self.assertIs(checkpoints[0], checkpoints[1])
         self.assertIs(checkpoints[1], checkpoints[2])
-        for phase in (0, 1, 2):
+        self.assertIs(checkpoints[2], checkpoints[3])
+        for phase in (1, 2, 3):
             for kind in selected:
                 self.assertEqual(sorted(checked[(phase, kind)]), sorted(members), (phase, kind))
-        self.assertEqual(sorted(checked[(2, "feature")]),
-                         sorted(sid for sid in members for _ in batch.metric_ids))
+        for phase in (0, 1, 2, 3):
+            self.assertEqual(sorted(checked[(phase, "feature")]),
+                             sorted(sid for sid in members for _ in batch.metric_ids))
         self.assertEqual(forbidden, [])
         rereads = []
         previous = sys.getprofile()

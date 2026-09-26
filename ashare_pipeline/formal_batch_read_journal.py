@@ -209,6 +209,26 @@ def _install_journal():
                 record[1] = "consumed"
                 raise
 
+        def checkpoint_metric(self, owner):
+            """Close every V source ticket before its metric batch can publish."""
+            record = _scope(self)
+            if record[4] != "valuation" or record[16].get("metric") is not owner:
+                raise ValueError("metric checkpoint requires the valuation owner scope")
+            required = {key for key in record[12] if len(key) == 2}
+            feature = record[16].get("feature")
+            actual = set()
+            for ticket in record[13].values():
+                saved = _ticket(ticket, self)
+                issuer, kind, key = saved[2]
+                if (issuer == id(feature) and kind == "feature" and len(key) == 6
+                        and type(key[-1]) is str and key[-1].startswith("V.")):
+                    actual.add((key[0], key[-1]))
+            if not required or actual != required:
+                record[1] = "consumed"
+                raise ValueError("metric V source ticket coverage is incomplete")
+            self.checkpoint()
+            record[14] += 1
+
         def next_phase(self):
             record = _scope(self)
             record[14] += 1
