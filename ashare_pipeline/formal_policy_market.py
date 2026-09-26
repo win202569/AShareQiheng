@@ -847,16 +847,17 @@ class _MarketRepositoryImplementation:
         if as_of.date().isoformat() not in by_date or by_date[as_of.date().isoformat()]["is_open"] is not True:
             raise ValueError("formal freeze is not proven as a trading day")
         trading = tuple(day for day in expected_dates if by_date[day]["is_open"])[-250:]
-        config = _read_binding(owned_binding)["calendar_config"]
+        view = _read_binding(owned_binding)
+        config = view["calendar_config"]
         lineage = tuple(sealed.observation_to_dict(item)["observation_hash"]
                         for item in observations)
         wire = {
             "schema_version": "formal-calendar-coverage-v1",
-            "registry_manifest_hash": _read_binding(owned_binding)["registry_manifest_hash"],
-            "source_registry_hash": _read_binding(owned_binding)["source_registry_hash"],
-            "binding_hash": _read_binding(owned_binding)["binding_hash"],
-            "rule_id": _read_binding(owned_binding)["rule_id"],
-            "exchange": _read_binding(owned_binding)["exchange"],
+            "registry_manifest_hash": view["registry_manifest_hash"],
+            "source_registry_hash": view["source_registry_hash"],
+            "binding_hash": view["binding_hash"],
+            "rule_id": view["rule_id"],
+            "exchange": view["exchange"],
             "as_of_utc": as_of_utc,
             "calendar_descriptor_id": config.calendar_descriptor_id,
             "calendar_config_id": config.entry_id,
@@ -983,17 +984,18 @@ class _MarketRepositoryImplementation:
         pending = set(result["pending"])
         lineage = tuple(sealed.observation_to_dict(item)["observation_hash"]
                         for item in observations)
-        market_config = _read_binding(owned_binding)["market_config"]
-        calendar_config = _read_binding(owned_binding)["calendar_config"]
+        view = _read_binding(owned_binding)
+        market_config = view["market_config"]
+        calendar_config = view["calendar_config"]
         wire = {
             "schema_version": "verified-market-window-v1",
             "security_id": security_id,
-            "exchange": _read_binding(owned_binding)["exchange"],
+            "exchange": view["exchange"],
             "as_of_utc": as_of_utc,
-            "registry_manifest_hash": _read_binding(owned_binding)["registry_manifest_hash"],
-            "source_registry_hash": _read_binding(owned_binding)["source_registry_hash"],
-            "binding_hash": _read_binding(owned_binding)["binding_hash"],
-            "rule_id": _read_binding(owned_binding)["rule_id"],
+            "registry_manifest_hash": view["registry_manifest_hash"],
+            "source_registry_hash": view["source_registry_hash"],
+            "binding_hash": view["binding_hash"],
+            "rule_id": view["rule_id"],
             "market_descriptor_id": market_config.anchor_descriptor_id,
             "calendar_descriptor_id": calendar_config.calendar_descriptor_id,
             "market_config_id": market_config.entry_id,

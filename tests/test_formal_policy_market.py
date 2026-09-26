@@ -174,6 +174,49 @@ class MarketRepositoryTests(unittest.TestCase):
             normalizer_version=config.normalizer_version,
             request_version=config.request_version)
 
+    def test_successful_wire_assembly_reads_each_owned_binding_once(self):
+        from ashare_pipeline import formal_policy_market as market_module
+
+        fixture = self.fixture()
+        days = trading_days(20)
+        fixture.put_window("SH600000", trading_days=days,
+                           rows={day: quiet_row() for day in days})
+        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
+        reader_code = market_module._read_binding.__code__
+        calls = {"select_calendar": [], "select": []}
+
+        tool_id = next(identifier for identifier in range(6)
+                       if sys.monitoring.get_tool(identifier) is None)
+        sys.monitoring.use_tool_id(tool_id, "market-binding-read-test")
+
+        def monitor(code, instruction_offset):
+            self.assertIs(code, reader_code)
+            caller_frame = sys._getframe(2)
+            caller = caller_frame.f_code.co_name
+            if caller in calls:
+                for recorded in calls[caller]:
+                    if recorded[0] is caller_frame:
+                        recorded[1] += 1
+                        break
+                else:
+                    calls[caller].append([caller_frame, 1])
+
+        sys.monitoring.register_callback(tool_id, sys.monitoring.events.PY_START, monitor)
+        sys.monitoring.set_local_events(tool_id, reader_code, sys.monitoring.events.PY_START)
+        try:
+            calendar = repository.select_calendar(fixture.binding, FREEZE)
+            window = repository.select("SH600000", FREEZE, binding=fixture.binding)
+        finally:
+            sys.monitoring.set_local_events(tool_id, reader_code, 0)
+            sys.monitoring.free_tool_id(tool_id)
+
+        self.assertIsNotNone(calendar.coverage)
+        self.assertIsNotNone(window.window)
+        for operation in ("select_calendar", "select"):
+            with self.subTest(operation=operation):
+                self.assertTrue(calls[operation])
+                self.assertEqual({recorded[1] for recorded in calls[operation]}, {1})
+
     def test_no_module_global_proof_mint_survives_either_import_order(self):
         script = textwrap.dedent("""
             import importlib
