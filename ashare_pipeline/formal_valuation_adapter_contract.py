@@ -75,7 +75,7 @@ def _install_registry():
     definitions = _scoring_metric_definitions
     metric_owner = metric_module
     definition_guard = metric_owner._metric_definition_dependency_changes
-    definition_type, serialize_definition = ValuationAdapterDefinition, asdict
+    definition_type, serialize_definition, serialize_envelope = ValuationAdapterDefinition, asdict, asdict
     dumps, loads, sha256 = json.dumps, json.loads, hashlib.sha256
     parse = _load_canonical_object
 
@@ -247,6 +247,27 @@ def _install_registry():
 
         def require_official(self, bundle):
             record(self, bundle)
+
+        def require_current_bundle(self, bundle):
+            """Authenticate a fresh store load against the registry's original root.
+
+            This does not relax ``require_official``'s object-identity contract.
+            Both bundles must independently retain their loader seals, and the
+            currently loaded ten signed envelopes must match the original.
+            """
+            original = record(self)[1]
+            if type(bundle) is not bundle_type:
+                _fail("proof", "requires a loader-verified current bundle")
+            require_bundle(bundle)
+            if (bundle.manifest.schema_version != "formal-registry-manifest-v2"
+                    or serialize_envelope(bundle.manifest) != serialize_envelope(original.manifest)
+                    or tuple(bundle.roles) != tuple(original.roles)
+                    or len(bundle.roles) != 10):
+                _fail("proof", "current signed root or roles differ from original")
+            for role in original.roles:
+                left, right = blob_for(original, role), blob_for(bundle, role)
+                if serialize_envelope(left) != serialize_envelope(right):
+                    _fail("proof", "current signed child differs from original")
 
         def dependency_for(self, template_id, metric_id):
             found = record(self)

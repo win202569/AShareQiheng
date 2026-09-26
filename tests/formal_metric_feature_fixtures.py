@@ -31,7 +31,8 @@ def configuration(docs):
 
 class FinancialFixture(MetricFixture):
     def __init__(self, *, population=False, missing_memberships=False, mutate=None,
-                 calendar_binding_resolver=None, exchange_rows=None):
+                 calendar_binding_resolver=None, exchange_rows=None,
+                 manifest_version="formal-registry-manifest-v1"):
         rows = exchange_rows
         def configure(docs):
             configuration(docs)
@@ -52,7 +53,8 @@ class FinancialFixture(MetricFixture):
             rows = {exchange: [dict(security_id=sid, listing_status="listed", security_type="ordinary_a") for sid in ids]
                 for exchange, ids in {"BJ": ["BJ430001"], "SH": [f"SH{600000+i}" for i in range(20)], "SZ": ["SZ000001"]}.items()}
         super().__init__(mutate=configure, exchange_rows=rows, tempdir=project_temporary_directory(),
-            calendar_binding_resolver=calendar_binding_resolver)
+            calendar_binding_resolver=calendar_binding_resolver,
+            manifest_version=manifest_version)
         self.files = FormalFeatureBundleStore(self.root / "features")
         self.store._formal_feature_bundle_store = self.files
         self.issues = {}

@@ -39,7 +39,8 @@ def update_mapping_digest(doc):
 class MetricFixture:
     """A plain helper; no imported/inherited TestCase can duplicate suite discovery."""
 
-    def __init__(self, *, mutate=None, exchange_rows=None, tempdir=None, calendar_binding_resolver=None):
+    def __init__(self, *, mutate=None, exchange_rows=None, tempdir=None, calendar_binding_resolver=None,
+                 manifest_version="formal-registry-manifest-v1"):
         self.tempdir = tempdir or tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
         self.db_path = self.root / "metric.sqlite"
@@ -53,7 +54,8 @@ class MetricFixture:
             docs["feature"]["source_registry_hash"] = hashlib.sha256(canonical(docs["source"])).hexdigest()
             if mutate:
                 mutate(docs)
-        self.bundle, vocabulary, graph, self.verifier = signed_graph(mutate=configure)
+        self.bundle, vocabulary, graph, self.verifier = signed_graph(
+            mutate=configure, manifest_version=manifest_version)
         self.industry = __import__("json").loads(self.bundle.blob("industry").canonical_json)
         self.store, self.frozen, self.task_ids = test_state_store.StateStoreTestCase.task_backed_frozen_universe(
             self, registry_manifest_hash=self.bundle.manifest.manifest_hash,

@@ -18,7 +18,7 @@ from ashare_pipeline.formal_metric_context import FormalMetricContextRepository
 from ashare_pipeline.formal_universe import canonical_security_id
 from tests.formal_metric_feature_fixtures import FinancialFixture
 from tests.formal_metric_fixtures import FREEZE, update_mapping_digest
-from tests.formal_policy_fixtures import add_policy_documents, rehash_documents
+from tests.formal_policy_fixtures import add_policy_documents, add_valuation_adapter_document, rehash_documents
 from tests.test_formal_context_repository import descriptor, FixtureNormalizer
 from ashare_pipeline.formal_context_schema import FormalContextRegistry
 from tests.test_formal_feature_contract import formal_fact
@@ -126,7 +126,7 @@ class PolicyRuntimeFixture(FinancialFixture):
     """Small producer-backed graph; it does not confer production meaning."""
 
     def __init__(self, *, range_enabled=False, templates=None, cyclic=True, mutate=None,
-                 extra_members=(), noncyclic_ids=()):
+                 extra_members=(), noncyclic_ids=(), valuation_adapter=False):
         if type(range_enabled) is not bool or type(cyclic) is not bool:
             raise ValueError("range_enabled and cyclic must be exact bool")
         selected_templates = _templates(templates)
@@ -147,6 +147,8 @@ class PolicyRuntimeFixture(FinancialFixture):
                 for exchange in ("BJ", "SH", "SZ")
             )
             add_policy_documents(documents)
+            if valuation_adapter:
+                add_valuation_adapter_document(documents)
             _patch_current_policy_periods(documents)
             policy_financial_mapping_documents(documents)
             if range_enabled:
@@ -164,6 +166,8 @@ class PolicyRuntimeFixture(FinancialFixture):
             super().__init__(
                 mutate=configure,
                 exchange_rows=_exchange_rows(selected_templates, extra_members),
+                manifest_version=("formal-registry-manifest-v2" if valuation_adapter
+                                  else "formal-registry-manifest-v1"),
             )
             self.policy_registry = load_formal_policy_registry(
                 self.bundle,
@@ -201,6 +205,7 @@ class PolicyRuntimeFixture(FinancialFixture):
             registry_signature_verifier=self.verifier)
         self.policy_financial_repository = FormalPolicyFinancialRepository(self.feature_repository,
             current_input_provider=self.provider)
+        self._valuation_adapter_runtime = valuation_adapter
         self._policy_industry_ids = set()
         self._policy_context_generations = {}
         if range_enabled:
@@ -212,7 +217,8 @@ class PolicyRuntimeFixture(FinancialFixture):
         return self.policy_repository.build_batch(self.frozen.frozen_input_hash,
             scoring_registry=self.scoring, policy_registry=self.policy_registry)
 
-    def populate_policy_evidence(self, *, skip_financial=(), security_state_overrides=None):
+    def populate_policy_evidence(self, *, skip_financial=(), security_state_overrides=None,
+                                 financial_overrides=None):
         """Populate every frozen security through the genuine temporary producers."""
         from tests.formal_policy_fixtures import REGULATORY_SEMANTICS
         from ashare_pipeline.formal_range_contract import load_policy_range_bindings
@@ -222,8 +228,10 @@ class PolicyRuntimeFixture(FinancialFixture):
                                               policy_registry=self.policy_registry)
         rules = self.policy_registry.to_dict()["rules"]
         templates = {member["security_id"]: member["template_id"] for member in self.industry["memberships"]}
+        shared_calendars = {}
         skip_financial = set(skip_financial)
         security_state_overrides = dict(security_state_overrides or {})
+        financial_overrides = dict(financial_overrides or {})
         if not skip_financial <= set(templates) or not set(security_state_overrides) <= set(templates):
             raise ValueError("fixture evidence overrides require known members")
         for member in self.frozen.members:
@@ -239,35 +247,42 @@ class PolicyRuntimeFixture(FinancialFixture):
             self.put_policy_context(sid, "regulatory_state", dict(flags=[
                 dict(flag_id=flag, active=False) for flag in REGULATORY_SEMANTICS]))
             if sid not in skip_financial:
-                self.policy_financial_values(sid)
+                self.policy_financial_values(sid, **financial_overrides.get(sid, {}))
             rule = next(rule for rule in rules if rule["template_id"] == templates[sid]
                         and rule["kind"] == "market_liquidity")
-            self.binding = bindings.for_rule(rule["rule_id"], sid[:2])
-            self.source = self.source_factory(self.binding)
-            first = self.source.first_calendar_request(FREEZE)
-            cursor, end = date.fromisoformat(first.start_date), date.fromisoformat(first.end_date)
-            days = {}
-            while cursor <= end:
-                days[cursor.isoformat()] = cursor >= end - timedelta(days=19)
-                cursor += timedelta(days=1)
-            existing = self.range_store.select_current(first.request_fingerprint)
-            if existing is None:
-                self.produce_calendar(days=days)
+            calendar_key = (rule["rule_id"], sid[:2])
+            if self._valuation_adapter_runtime and calendar_key in shared_calendars:
+                self.binding, calendar = shared_calendars[calendar_key]
+                self.source = self.source_factory(self.binding)
             else:
-                existing.require_current()
-                wire = existing.to_dict()
-                document = wire["document"]
-                if (wire["request"] != first.to_dict()
-                        or wire["generation"]["refresh_generation"] != "g1"
-                        or document["coverage"] != dict(start_date=first.start_date,
-                                                         end_date=first.end_date, complete=True)
-                        or {row["date"]: row["is_open"] for row in document["rows"]} != days
-                        or len(document["rows"]) != len(days)):
-                    raise ValueError("fixture calendar request or current receipt differs")
-            calendar = FormalPolicyMarketRepository(self.range_store).select_calendar(self.binding, FREEZE)
-            if calendar.coverage is None:
-                raise ValueError("fixture calendar must have genuine current coverage")
-            calendar.coverage.require_current()
+                self.binding = bindings.for_rule(rule["rule_id"], sid[:2])
+                self.source = self.source_factory(self.binding)
+                first = self.source.first_calendar_request(FREEZE)
+                cursor, end = date.fromisoformat(first.start_date), date.fromisoformat(first.end_date)
+                days = {}
+                while cursor <= end:
+                    days[cursor.isoformat()] = cursor >= end - timedelta(days=19)
+                    cursor += timedelta(days=1)
+                existing = self.range_store.select_current(first.request_fingerprint)
+                if existing is None:
+                    self.produce_calendar(days=days)
+                else:
+                    existing.require_current()
+                    wire = existing.to_dict()
+                    document = wire["document"]
+                    if (wire["request"] != first.to_dict()
+                            or wire["generation"]["refresh_generation"] != "g1"
+                            or document["coverage"] != dict(start_date=first.start_date,
+                                                             end_date=first.end_date, complete=True)
+                            or {row["date"]: row["is_open"] for row in document["rows"]} != days
+                            or len(document["rows"]) != len(days)):
+                        raise ValueError("fixture calendar request or current receipt differs")
+                calendar = FormalPolicyMarketRepository(self.range_store).select_calendar(self.binding, FREEZE)
+                if calendar.coverage is None:
+                    raise ValueError("fixture calendar must have genuine current coverage")
+                calendar.coverage.require_current()
+                if self._valuation_adapter_runtime:
+                    shared_calendars[calendar_key] = (self.binding, calendar)
             _, source = self.range_store.resolve_planning_binding(self.binding)
             for request in source.market_requests(sid, calendar_coverage=calendar.coverage):
                 rows = []
@@ -291,6 +306,8 @@ class PolicyRuntimeFixture(FinancialFixture):
                 self.assertEqual(lease["id"], task["id"])
                 self.range_store.persist(task["id"], "policy-market-fixture", lease["attempt_id"],
                                          fetch=source.fetch_verified(request))
+            if self._valuation_adapter_runtime and callable(getattr(self, "_valuation_progress", None)):
+                self._valuation_progress("policy", sid)
 
     def source_factory(self, binding):
         from ashare_pipeline.formal_range_source import FormalRangeSource

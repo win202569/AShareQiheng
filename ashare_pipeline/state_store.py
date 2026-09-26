@@ -566,10 +566,11 @@ _V5_INDEX_DDL = {
 
 _FORMAL_REGISTRY_ROLES = (
     "source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event",
+    "valuation_adapter",
 )
 _FORMAL_ROOT_FIELDS = (
     "manifest_hash", "purpose", "approval_id", "canonical_json", "signature", "key_id",
-    *(f"{role}_registry_hash" for role in _FORMAL_REGISTRY_ROLES),
+    *(f"{role}_registry_hash" for role in _FORMAL_REGISTRY_ROLES if role != "valuation_adapter"),
 )
 _FORMAL_BLOB_FIELDS = (
     "registry_hash", "registry_role", "canonical_json", "signature", "key_id", "approval_id",
@@ -2076,7 +2077,8 @@ class StateStore:
         if type(manifest) is not FormalRegistryManifest:
             raise ValueError("formal registry manifest must have exact type")
         try:
-            hashes = {f"{role}_registry_hash": getattr(manifest, f"{role}_registry_hash") for role in _FORMAL_REGISTRY_ROLES}
+            active_roles = _FORMAL_REGISTRY_ROLES if manifest.schema_version == "formal-registry-manifest-v2" else _FORMAL_REGISTRY_ROLES[:-1]
+            hashes = {f"{role}_registry_hash": getattr(manifest, f"{role}_registry_hash") for role in active_roles}
             manifest.assert_member_hashes(**hashes)
             wire = {key: getattr(manifest, key) for key in _FORMAL_ROOT_FIELDS}
         except AttributeError as error:

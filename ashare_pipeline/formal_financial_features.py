@@ -556,7 +556,9 @@ def build_formal_feature_bundle(*, security_id: str, as_of_utc: str, template_id
     if type(registry_manifest) is not FormalRegistryManifest:
         raise ValueError("bundle requires exact sealed root")
     try:
-        hashes = {key: getattr(registry_manifest, key) for key in _ROOT_HASHES}
+        active = _ROOT_HASHES + (("valuation_adapter_registry_hash",)
+            if registry_manifest.schema_version == "formal-registry-manifest-v2" else ())
+        hashes = {key: getattr(registry_manifest, key) for key in active}
         registry_manifest.assert_member_hashes(**hashes)
     except (AttributeError, TypeError) as error:
         raise ValueError("invalid root manifest") from error

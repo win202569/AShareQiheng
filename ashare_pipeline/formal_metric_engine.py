@@ -14,6 +14,7 @@ from .formal_metric_context import FormalMetricContextRepository
 from .formal_metric_batch_guard import _metric_batch_guard
 from .formal_registry_manifest import FormalRegistryBundleLoader
 from .formal_scoring_registry import FormalScoringRegistry
+from .formal_batch_read_journal import FormalBatchReadJournal, _issue_current_ticket, _require_current_scope
 
 
 def _arithmetic_context():
@@ -140,6 +141,7 @@ def _install_engine():
     repositories, proofs = {}, {}
     context_type = FormalMetricContextRepository
     feature_read = FormalFeatureRepository.select_current_verified_metric_feature_state
+    feature_ticket = FormalFeatureRepository.select_current_metric_batch_ticket
     require_feature = _require_authentic_metric_feature_repository
     batch_guard = _metric_batch_guard
     load_root = FormalRegistryBundleLoader.load
@@ -236,7 +238,7 @@ def _install_engine():
             private, [True] if publication is None else publication)
         return proof
 
-    def build(repo, frozen_input_hash, scoring, metric_ids, guard):
+    def build(repo, frozen_input_hash, scoring, metric_ids, guard, owner_scope=None):
         feature, _, verifier, context = dependencies(repo)
         universe = context.load_universe(frozen_input_hash, scoring_registry=scoring)
         if universe is None:
@@ -252,6 +254,9 @@ def _install_engine():
             raise ValueError("metric IDs must be nonempty sorted unique registered dimension.metric_id strings")
         industry = context.resolve_industries(universe)
         industry.require_verified()
+        if owner_scope is not None:
+            _require_current_scope(owner_scope, repo, root=universe.registry_manifest_hash,
+                as_of_utc=universe.as_of_utc, population=tuple(universe.security_ids))
         common = dict(registry_manifest_hash=universe.registry_manifest_hash,
             frozen_input_hash=universe.frozen_input_hash, universe_hash=universe.universe_hash,
             population_hash=universe.population_hash, as_of_utc=universe.as_of_utc,
@@ -267,12 +272,26 @@ def _install_engine():
                 keys = tuple(sorted({key for mid in selected for key in defs[tid][mid]["definition"]["required_feature_keys"]}))
                 request = dict(security_id=sid, as_of_utc=universe.as_of_utc, template_id=tid,
                     registry_manifest_hash=universe.registry_manifest_hash, required_feature_keys=keys)
-                marker = feature_read(feature, **request)
-                if type(marker) not in (VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence):
-                    raise ValueError("metric feature current state requires a genuine present or absence proof")
-                marker.require_verified()
-                requests[sid] = request
-                markers[sid] = marker.canonical_bytes()
+                if owner_scope is None:
+                    marker = feature_read(feature, **request)
+                    if type(marker) not in (VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence):
+                        raise ValueError("metric feature current state requires a genuine present or absence proof")
+                    marker.require_verified()
+                    requests[sid] = request
+                    markers[sid] = marker.canonical_bytes()
+                else:
+                    for mid in selected:
+                        ticket = feature_ticket(feature, owner_scope, sid, universe.as_of_utc,
+                            template_id=tid, registry_manifest_hash=universe.registry_manifest_hash,
+                            required_feature_keys=keys, metric_id=mid)
+                        chosen = ticket.selected()
+                        if type(chosen) not in (VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence):
+                            raise ValueError("metric feature ticket requires a genuine present or absence proof")
+                        chosen.require_verified()
+                        if marker is not None and marker.canonical_bytes() != chosen.canonical_bytes():
+                            raise ValueError("metric feature changed between V selections")
+                        marker = chosen
+                    markers[sid] = marker.canonical_bytes()
             for mid in selected:
                 binding = None if tid is None else defs[tid][mid]
                 reason = "invalid_template" if tid is None else assignment["pending_reason"]
@@ -311,11 +330,12 @@ def _install_engine():
                 rows.append(payload)
         # Cross-member closure: every current state is re-read after the first
         # pass; both absence transitions and numeric corrections invalidate all.
-        for sid, request in requests.items():
-            current = feature_read(feature, **request)
-            current.require_verified()
-            if current.canonical_bytes() != markers[sid]:
-                raise ValueError("metric feature correction or absence changed during complete batch")
+        if owner_scope is None:
+            for sid, request in requests.items():
+                current = feature_read(feature, **request)
+                current.require_verified()
+                if current.canonical_bytes() != markers[sid]:
+                    raise ValueError("metric feature correction or absence changed during complete batch")
         context.recheck_batch(universe, industry)
         scoring.require_official(root)
         dependencies(repo)
@@ -368,6 +388,41 @@ def _install_engine():
                     proofs[id(result)][4][0] = False
                 raise
             return result
+
+        def _batch_journal_identity(self):
+            feature, context, _, _ = dependencies(self)
+            return feature._store, (feature, context)
+
+        def _batch_recheck_ticket(self, evidence):
+            batch, original = evidence
+            dependencies(self)
+            if record(batch, MetricInputBatch)[2] != original:
+                raise ValueError("metric batch ticket publication changed")
+
+        def _build_batch_in_owner_scope(self, frozen_input_hash, *, scoring_registry,
+                                        metric_ids, owner_scope):
+            feature, _, _, _ = dependencies(self)
+            if type(owner_scope) is not FormalBatchReadJournal:
+                raise ValueError("metric batch requires an authentic owner scope")
+            result = None
+            try:
+                with batch_guard(feature._current_input_provider, feature._store) as guard:
+                    result = build(self, frozen_input_hash, scoring_registry, metric_ids,
+                        guard, owner_scope=owner_scope)
+                if result is None:
+                    raise ValueError("metric frozen universe is absent")
+                original = record(result, MetricInputBatch)[2]
+                ticket = _issue_current_ticket(owner_scope, self, "metric",
+                    (frozen_input_hash, result.batch_hash), original, (result, original),
+                    tuple((sid, mid) for sid in result.security_ids for mid in result.metric_ids), result)
+                def revoke(batch):
+                    if batch is result:
+                        proofs[id(result)][4][0] = False
+                return result, ticket, revoke
+            except BaseException:
+                if result is not None:
+                    proofs[id(result)][4][0] = False
+                raise
 
         def __copy__(self):
             raise TypeError("metric input repository cannot be copied")

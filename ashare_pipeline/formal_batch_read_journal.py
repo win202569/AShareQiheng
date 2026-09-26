@@ -38,6 +38,14 @@ def _install_journal():
         from .formal_policy_financial import FormalPolicyFinancialRepository
         from .formal_policy_market import FormalPolicyMarketRepository
         from .formal_policy_repository import FormalPolicyRepository
+        from .formal_metric_engine import FormalMetricInputRepository
+        from .formal_valuation_engine import FormalValuationRepository
+        if type(owner) is FormalValuationRepository:
+            state, children = owner._batch_journal_identity()
+            return "valuation", state, children
+        if type(owner) is FormalMetricInputRepository:
+            state, children = owner._batch_journal_identity()
+            return "metric", state, children
         if type(owner) is FormalPolicyRepository:
             state, children = owner._batch_journal_identity()
             return "policy", state, children
@@ -51,14 +59,17 @@ def _install_journal():
 
     def _chain(owner):
         kind, state, refs = _owner_state(owner)
-        if kind == "policy":
+        if kind in {"policy", "metric", "valuation"}:
             allowed = {kind: owner}
             expanded = []
             for child in refs:
                 child_kind, child_state, child_refs, child_allowed = _chain(child)
                 if child_state is not state:
-                    raise ValueError("policy batch scope children have different StateStores")
-                allowed.update(child_allowed)
+                    raise ValueError("batch scope children have different StateStores")
+                for key, value in child_allowed.items():
+                    if key in allowed and allowed[key] is not value:
+                        raise ValueError("batch scope has conflicting owner dependencies")
+                    allowed[key] = value
                 expanded.extend((child, *child_refs))
             unique = tuple(dict.fromkeys((*refs, *expanded)))
             return kind, state, unique, allowed
@@ -137,7 +148,8 @@ def _install_journal():
             raise TypeError("batch scope cannot be copied")
 
         @classmethod
-        def open(cls, owner, *, registry_manifest_hash, as_of_utc, population, required_keys):
+        def open(cls, owner, *, registry_manifest_hash, as_of_utc, population, required_keys,
+                 frozen_input_hash=None):
             if cls is not FormalBatchReadJournal:
                 raise ValueError("batch scope type must be exact")
             if (globals().get("_issue_current_ticket") is not issue
@@ -158,8 +170,18 @@ def _install_journal():
                     or len(set(required_keys)) != len(required_keys)):
                 raise ValueError("batch scope requires exact mandatory coverage")
             kind, state, refs, allowed = _chain(owner)
+            if kind == "valuation":
+                if (type(frozen_input_hash) is not str or len(frozen_input_hash) != 64
+                        or any(c not in "0123456789abcdef" for c in frozen_input_hash)):
+                    raise ValueError("valuation scope requires an exact frozen input hash")
+            elif frozen_input_hash is not None:
+                raise ValueError("frozen input binding is reserved for the valuation owner")
             if not required_keys and kind != "policy":
                 raise ValueError("batch scope requires mandatory coverage")
+            if kind == "valuation":
+                from .formal_valuation_engine import FormalValuationRepository
+                if sys._getframe(1).f_code is not vars(FormalValuationRepository)["build_batch"].__code__:
+                    raise ValueError("valuation scope opens only inside its authentic owner build")
             signatures = tuple(item for instance in (owner, state, *refs) if instance is not None
                                for item in _methods(instance))
             result = object.__new__(FormalBatchReadJournal)
@@ -167,7 +189,7 @@ def _install_journal():
             scopes[scope_id] = [weakref.ref(result, lambda _, key=scope_id: scopes.pop(key, None)),
                 "active", threading.get_ident(), owner, kind, state, refs, signatures,
                 str(state.db_path.resolve()), registry_manifest_hash, as_of_utc, population,
-                frozenset(required_keys), {}, 0, {}, allowed]
+                frozenset(required_keys), {}, 0, {}, allowed, frozen_input_hash]
             return result
 
         def checkpoint(self):
@@ -230,6 +252,8 @@ def _install_journal():
         issuer_name = {"context": "select_current_batch_ticket",
                        "feature": "select_current_metric_batch_ticket",
                        "policy_feature": "select_current_policy_batch_ticket",
+                       "metric": "_build_batch_in_owner_scope",
+                       "valuation": "build_batch",
                        "range": "select_current_batch_ticket",
                        "state": "select_current_batch_ticket",
                        "financial": "select_current_batch_ticket",
@@ -244,12 +268,15 @@ def _install_journal():
                 raise ValueError("current ticket must be issued by the fixed owner selector")
         if type(key) is not tuple or type(baseline) is not bytes or type(coverage) is not tuple:
             raise ValueError("current ticket evidence shape invalid")
+        if record[4] == "valuation" and kind in {"metric", "policy", "valuation"} and (
+                not key or key[0] != record[17]):
+            raise ValueError("current batch ticket has a different frozen input")
         member_index = 2 if kind == "context" else 0
-        expected_length = 3 if kind in {"context", "feature", "policy_feature"} else 1
+        expected_length = 3 if kind in {"context", "feature", "policy_feature"} else (2 if kind == "metric" else 1)
         if any(type(item) is not tuple or len(item) != expected_length
                or type(item[member_index]) is not str
                or (item[member_index] not in record[11]
-                   and not (record[4] in {"market", "policy"}
+                   and not (record[4] in {"market", "policy", "valuation"}
                             and (kind == "range" or
                                  (kind == "calendar" and item[member_index] in {"SH", "SZ", "BJ"}))))
                for item in coverage):
@@ -274,12 +301,15 @@ def _install_journal():
                 or any(type(item) is not str for item in population)
                 or tuple(sorted(set(population))) != population):
             raise ValueError("current read population must be a sorted nonempty subset")
-        if (record[16].get(_owner_state(owner)[0]) is not owner
-                or root != record[9] or as_of_utc != record[10]
-                or (not set(population) <= set(record[11])
-                    and not (record[4] in {"market", "policy"} and (type(owner).__name__ == "FormalRangeStore"
-                                                           or set(population) <= {"SH", "SZ", "BJ"})))):
-            raise ValueError("current read does not match owner build scope")
+        if record[16].get(_owner_state(owner)[0]) is not owner:
+            raise ValueError("current read owner does not match build scope")
+        if root != record[9] or as_of_utc != record[10]:
+            raise ValueError("current read root or cutoff does not match build scope")
+        if (not set(population) <= set(record[11])
+                and not (record[4] in {"market", "policy", "valuation"}
+                         and (type(owner).__name__ == "FormalRangeStore"
+                              or set(population) <= {"SH", "SZ", "BJ"}))):
+            raise ValueError("current read population does not match build scope")
 
     def require_ticket(scope, ticket, owner, kind):
         record = _scope(scope)

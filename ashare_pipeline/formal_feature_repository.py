@@ -603,11 +603,13 @@ def _install_metric_projection():
         return None if type(result) is VerifiedMetricFeatureAbsence else result
 
     def select_metric_ticket(self, journal, security_id, as_of_utc, *, template_id,
-                             registry_manifest_hash, required_feature_keys):
+                             registry_manifest_hash, required_feature_keys, metric_id=None):
         from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
 
         _require_current_scope(journal, self, root=registry_manifest_hash,
                                as_of_utc=as_of_utc, population=(security_id,))
+        if metric_id is not None and (type(metric_id) is not str or not metric_id.startswith("V.")):
+            raise ValueError("metric ticket label requires an exact V metric ID")
         selected_receipt = {}
         capture_reset = ticket_capture.set(selected_receipt)
         try:
@@ -670,9 +672,13 @@ def _install_metric_projection():
             selected_input=selected_input_bytes.decode(),
             selected_bundle_hash=selected_bundle_hash,
             selected_receipt=None if selected_metadata_bytes is None else selected_metadata_bytes.decode()))
+        ticket_key = (security_id, as_of_utc, template_id, registry_manifest_hash,
+                      required_feature_keys) + (() if metric_id is None else (metric_id,))
+        if metric_id is not None:
+            baseline = _canonical_json_bytes({"metric_id": metric_id,
+                "selected_evidence": json.loads(baseline)})
         return _issue_current_ticket(journal, self, "feature",
-            (security_id, as_of_utc, template_id, registry_manifest_hash, required_feature_keys),
-            baseline, evidence,
+            ticket_key, baseline, evidence,
             tuple((security_id, template_id, key) for key in required_feature_keys), result)
 
     def recheck_metric_ticket(self, evidence):

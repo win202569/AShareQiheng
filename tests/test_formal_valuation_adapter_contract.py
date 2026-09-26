@@ -382,6 +382,28 @@ class ValuationAdapterContractTests(unittest.TestCase):
             load_formal_valuation_adapter_registry(bundle, scoring_registry=scoring,
                 policy_registry=policy)
 
+    def test_current_store_bundle_requires_a_fresh_loader_seal_and_all_ten_original_roles(self):
+        from ashare_pipeline.formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
+        from tests.formal_valuation_fixtures import ValuationRuntimeFixture
+
+        fixture = ValuationRuntimeFixture(peer_count=3)
+        self.addCleanup(fixture.close)
+        current = FormalRegistryBundleLoader(fixture.store, fixture.verifier).load(
+            fixture.bundle.manifest.manifest_hash)
+        fixture.valuation_registry.require_current_bundle(current)
+        with self.assertRaises(ValueError):
+            fixture.valuation_registry.require_official(current)
+        with self.assertRaises(ValueError):
+            fixture.valuation_registry.require_current_bundle(object.__new__(VerifiedRegistryBundle))
+        child = current.blob("valuation_adapter")
+        original = child.canonical_json
+        try:
+            object.__setattr__(child, "canonical_json", b"{}")
+            with self.assertRaises(ValueError):
+                fixture.valuation_registry.require_current_bundle(current)
+        finally:
+            object.__setattr__(child, "canonical_json", original)
+
     def test_fixture_requires_a_stage_c_root_for_adapter_document(self):
         with self.assertRaises(ValueError):
             policy_graph(with_valuation_adapter=True)
