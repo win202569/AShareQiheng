@@ -2,6 +2,8 @@
 
 import copy
 import importlib
+import sys
+import threading
 import unittest
 from dataclasses import replace
 from unittest.mock import patch
@@ -42,6 +44,95 @@ class PolicyRepositoryTests(unittest.TestCase):
             self.assertTrue(item.decisions)
             self.assertEqual(item.batch_hash, batch.batch_hash)
             self.assertTrue(all(decision.security_id == item.security_id for decision in item.decisions))
+
+    def test_public_recheck_independently_reselects_original_inputs(self):
+        fixture = self.fixture()
+        fixture.put_industry("SH600000")
+        batch = fixture.build_policy_batch()
+        from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
+        from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
+        calls = {FormalPolicyFinancialRepository.select.__code__: 0,
+                 FormalPolicyStateRepository.select.__code__: 0}
+
+        def profile(frame, event, result):
+            if event == "call" and frame.f_code in calls:
+                calls[frame.f_code] += 1
+
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            fixture.policy_repository.recheck_current(batch)
+        finally:
+            sys.setprofile(previous)
+        self.assertEqual(list(calls.values()), [1, 1])
+        foreign = self.fixture()
+        with self.assertRaises(ValueError):
+            foreign.policy_repository.recheck_current(batch)
+        with self.assertRaises(TypeError):
+            copy.copy(batch)
+
+    def test_private_owner_scope_stays_live_for_enclosing_batch_and_rejects_replay(self):
+        from ashare_pipeline.formal_batch_read_journal import (
+            FormalBatchReadJournal, _require_current_scope,
+        )
+        from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
+        from ashare_pipeline.formal_policy_repository import FormalPolicyRepository
+        fixture = self.fixture()
+        fixture.put_industry("SH600000")
+        universe = fixture.policy_context_repository.load_universe(
+            fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
+        scope = FormalBatchReadJournal.open(fixture.policy_repository,
+            registry_manifest_hash=universe.registry_manifest_hash,
+            as_of_utc=universe.as_of_utc,
+            population=tuple(universe.security_ids),
+            required_keys=tuple((sid,) for sid in universe.security_ids))
+        scope_args = dict(root=universe.registry_manifest_hash,
+                          as_of_utc=universe.as_of_utc,
+                          population=tuple(universe.security_ids))
+        stale = FormalBatchReadJournal.open(fixture.policy_repository,
+            registry_manifest_hash=universe.registry_manifest_hash,
+            as_of_utc=universe.as_of_utc,
+            population=tuple(universe.security_ids),
+            required_keys=(("SH600000",),))
+        with patch.object(FormalPolicyFinancialRepository, "_batch_recheck_ticket", lambda *_: None):
+            stale.close()
+        with self.assertRaises(ValueError):
+            stale.checkpoint()
+        with self.assertRaises(TypeError):
+            copy.copy(scope)
+        with self.assertRaises(ValueError):
+            _require_current_scope(scope, fixture.policy_repository,
+                **dict(scope_args, root="0" * 64))
+        other = FormalPolicyRepository(fixture.feature_repository, fixture.context,
+            fixture.range_store, registry_signature_verifier=fixture.verifier)
+        with self.assertRaises(ValueError):
+            _require_current_scope(scope, other, **scope_args)
+        thread_errors = []
+        # Keep the exception on the worker thread so the test can assert it.
+        def cross_thread_read():
+            try:
+                _require_current_scope(scope, fixture.policy_repository, **scope_args)
+            except ValueError as error:
+                thread_errors.append(error)
+        thread = threading.Thread(target=cross_thread_read)
+        thread.start()
+        thread.join()
+        self.assertEqual(len(thread_errors), 1)
+        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
+        with self.assertRaises(ValueError):
+            fixture.policy_repository._build_batch_in_owner_scope(
+                fixture.frozen.frozen_input_hash, owner_scope=object(), **args)
+        batch, ticket, revoke = fixture.policy_repository._build_batch_in_owner_scope(
+            fixture.frozen.frozen_input_hash, owner_scope=scope, **args)
+        batch.require_verified()
+        self.assertIs(ticket.selected(), batch)
+        scope.finalize()
+        with self.assertRaises(ValueError):
+            fixture.policy_repository._build_batch_in_owner_scope(
+                fixture.frozen.frozen_input_hash, owner_scope=scope, **args)
+        revoke(batch)
+        with self.assertRaises(ValueError):
+            batch.require_verified()
 
     def test_unknown_membership_never_fabricates_five_template_decisions(self):
         fixture = self.fixture()

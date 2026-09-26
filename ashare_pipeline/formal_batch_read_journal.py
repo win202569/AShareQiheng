@@ -37,6 +37,10 @@ def _install_journal():
         from .formal_policy_state import FormalPolicyStateRepository
         from .formal_policy_financial import FormalPolicyFinancialRepository
         from .formal_policy_market import FormalPolicyMarketRepository
+        from .formal_policy_repository import FormalPolicyRepository
+        if type(owner) is FormalPolicyRepository:
+            state, children = owner._batch_journal_identity()
+            return "policy", state, children
         for owner_type, kind in ((FormalPolicyStateRepository, "state"),
                                  (FormalPolicyFinancialRepository, "financial"),
                                  (FormalPolicyMarketRepository, "market")):
@@ -47,6 +51,17 @@ def _install_journal():
 
     def _chain(owner):
         kind, state, refs = _owner_state(owner)
+        if kind == "policy":
+            allowed = {kind: owner}
+            expanded = []
+            for child in refs:
+                child_kind, child_state, child_refs, child_allowed = _chain(child)
+                if child_state is not state:
+                    raise ValueError("policy batch scope children have different StateStores")
+                allowed.update(child_allowed)
+                expanded.extend((child, *child_refs))
+            unique = tuple(dict.fromkeys((*refs, *expanded)))
+            return kind, state, unique, allowed
         children = tuple(item for item in refs if item is not None
                          and type(item).__name__ in {
                              "FormalContextRepository", "FormalFeatureRepository", "FormalRangeStore"})
@@ -138,11 +153,13 @@ def _install_journal():
                     or any(type(x) is not str for x in population)
                     or tuple(sorted(set(population))) != population):
                 raise ValueError("batch scope requires sorted unique population")
-            if (type(required_keys) is not tuple or not required_keys
+            if (type(required_keys) is not tuple
                     or any(type(x) is not tuple or not x for x in required_keys)
                     or len(set(required_keys)) != len(required_keys)):
                 raise ValueError("batch scope requires exact mandatory coverage")
             kind, state, refs, allowed = _chain(owner)
+            if not required_keys and kind != "policy":
+                raise ValueError("batch scope requires mandatory coverage")
             signatures = tuple(item for instance in (owner, state, *refs) if instance is not None
                                for item in _methods(instance))
             result = object.__new__(FormalBatchReadJournal)
@@ -173,6 +190,16 @@ def _install_journal():
         def next_phase(self):
             record = _scope(self)
             record[14] += 1
+
+        def close(self):
+            # Revocation must still work when the owner graph is no longer
+            # valid; ordinary scope reads intentionally reject that graph.
+            record = scopes.get(id(self))
+            if (type(self) is not FormalBatchReadJournal or record is None
+                    or record[0]() is not self or record[1] != "active"
+                    or threading.get_ident() != record[2]):
+                raise ValueError("batch scope is closed, forged, or cross-thread")
+            record[1] = "consumed"
 
         def finalize(self):
             record = _scope(self)
@@ -206,6 +233,7 @@ def _install_journal():
                        "range": "select_current_batch_ticket",
                        "state": "select_current_batch_ticket",
                        "financial": "select_current_batch_ticket",
+                       "policy": "_build_batch_in_owner_scope",
                        "calendar": "select_calendar_batch_ticket",
                        "market": "select_current_batch_ticket"}[kind]
         caller = sys._getframe(1)
@@ -221,7 +249,10 @@ def _install_journal():
         if any(type(item) is not tuple or len(item) != expected_length
                or type(item[member_index]) is not str
                or (item[member_index] not in record[11]
-                   and not (record[4] == "market" and kind == "range")) for item in coverage):
+                   and not (record[4] in {"market", "policy"}
+                            and (kind == "range" or
+                                 (kind == "calendar" and item[member_index] in {"SH", "SZ", "BJ"}))))
+               for item in coverage):
             raise ValueError("current ticket coverage is outside frozen population")
         identity = (id(owner), kind, key)
         previous = record[13].get(identity)
@@ -246,7 +277,7 @@ def _install_journal():
         if (record[16].get(_owner_state(owner)[0]) is not owner
                 or root != record[9] or as_of_utc != record[10]
                 or (not set(population) <= set(record[11])
-                    and not (record[4] == "market" and (type(owner).__name__ == "FormalRangeStore"
+                    and not (record[4] in {"market", "policy"} and (type(owner).__name__ == "FormalRangeStore"
                                                            or set(population) <= {"SH", "SZ", "BJ"})))):
             raise ValueError("current read does not match owner build scope")
 

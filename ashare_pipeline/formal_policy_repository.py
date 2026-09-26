@@ -26,10 +26,13 @@ from .formal_policy_values import PolicyValue, canonical_bytes, digest, _policy_
 from .formal_range_contract import load_policy_range_bindings
 from .formal_registry_manifest import FormalRegistryBundleLoader
 from .formal_scoring_registry import FormalScoringRegistry
+from .formal_batch_read_journal import (
+    FormalBatchReadJournal, _issue_current_ticket, _require_current_scope,
+)
 
 
 def _install_repository():
-    repositories, proofs = {}, {}
+    repositories, proofs, rechecks = {}, {}, {}
     owner = globals()
     encode, hash_payload = canonical_bytes, digest
     parse_value, serialize_value, check_values = _policy_value_operations()
@@ -219,13 +222,62 @@ def _install_repository():
         def __deepcopy__(self, memo):
             raise TypeError("policy repositories cannot be copied")
 
+        def recheck_current(self, batch):
+            """Recheck the published batch's original source selections in place."""
+            dependencies(self)
+            if type(batch) is not VerifiedPolicyResultBatch:
+                raise ValueError("policy current recheck needs an original result batch")
+            record(batch)
+            saved = rechecks.get(id(batch))
+            if (saved is None or saved[0]() is not batch or saved[1]() is not self):
+                raise ValueError("policy result batch has no original current-state recheck")
+            saved[2](batch)
+
         def build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry):
+            return self._build_batch(frozen_input_hash, scoring_registry=scoring_registry,
+                                     policy_registry=policy_registry, owner_scope=None)[0]
+
+        def _build_batch_in_owner_scope(self, frozen_input_hash, *, scoring_registry,
+                                        policy_registry, owner_scope):
+            """Return a batch, coverage ticket, and revoker to an enclosing owner."""
+            batch, revoke, check_dependencies = self._build_batch(frozen_input_hash,
+                scoring_registry=scoring_registry, policy_registry=policy_registry,
+                owner_scope=owner_scope)
+            try:
+                wire = record(batch)[2]
+                ticket = _issue_current_ticket(owner_scope, self, "policy",
+                    (frozen_input_hash, batch.batch_hash), wire,
+                    (batch, wire, check_dependencies),
+                    tuple((sid,) for sid in batch.security_ids), batch)
+                return batch, ticket, revoke
+            except BaseException:
+                revoke(batch)
+                try:
+                    owner_scope.close()
+                except ValueError:
+                    pass
+                raise
+
+        def _batch_recheck_ticket(self, evidence):
+            batch, wire, check_dependencies = evidence
+            dependencies(self)
+            if record(batch)[2] != wire:
+                raise ValueError("policy result ticket publication changed")
+            check_dependencies()
+
+        def _batch_journal_identity(self):
+            saved = dependencies(self)
+            return saved[1]._store, (saved[7], saved[8], saved[9])
+
+        def _build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry,
+                         owner_scope):
             saved = dependencies(self)
             feature, _, ranges, verifier, context = saved[1:6]
             financial, states, market = saved[7:]
             if type(frozen_input_hash) is not str or type(scoring_registry) is not FormalScoringRegistry:
                 raise ValueError("policy publication requires exact frozen and registry identities")
             prepared = None
+            scope = None
             selections = []
             market_markers = []
             publication = dict(published=False, parent_link=object(), batch_hash=None)
@@ -243,7 +295,7 @@ def _install_repository():
                 return bundle, policy, role_bytes
 
             def prepare():
-                nonlocal universe, industry, policy_wire, source_bytes, root_hash
+                nonlocal universe, industry, policy_wire, source_bytes, root_hash, scope
                 universe = context.load_universe(frozen_input_hash, scoring_registry=scoring_registry)
                 if universe is None:
                     raise ValueError("policy frozen universe is absent")
@@ -251,6 +303,16 @@ def _install_repository():
                 bundle, policy_wire, source_bytes = registry_snapshot(root_hash)
                 bindings = load_bindings(bundle, scoring_registry=scoring_registry, policy_registry=policy_registry)
                 industry = context.resolve_industries(universe)
+                required = tuple((sid,) for sid in universe.security_ids
+                                 if industry.entries[sid]["status"] == "assigned")
+                if owner_scope is None:
+                    scope = FormalBatchReadJournal.open(self, registry_manifest_hash=root_hash,
+                        as_of_utc=universe.as_of_utc, population=tuple(universe.security_ids),
+                        required_keys=required)
+                else:
+                    _require_current_scope(owner_scope, self, root=root_hash,
+                        as_of_utc=universe.as_of_utc, population=tuple(universe.security_ids))
+                    scope = owner_scope
                 common = dict(registry_manifest_hash=root_hash, frozen_input_hash=frozen_input_hash,
                     universe_hash=universe.universe_hash, as_of_utc=universe.as_of_utc,
                     policy_contract_hash=policy_wire["contract_hash"], role_hashes=policy_wire["role_hashes"])
@@ -264,8 +326,11 @@ def _install_repository():
                     if entry["status"] == "assigned":
                         template = entry["template_id"]
                         args = dict(template_id=template, policy_registry=policy_registry)
-                        fin = financial.select(sid, universe.as_of_utc, industry_batch=industry, **args)
-                        state_selection = states.select(sid, universe.as_of_utc, **args)
+                        fin_ticket = financial.select_current_batch_ticket(scope, sid,
+                            universe.as_of_utc, industry_batch=industry, **args)
+                        state_ticket = states.select_current_batch_ticket(scope, sid,
+                            universe.as_of_utc, **args)
+                        fin, state_selection = fin_ticket.selected(), state_ticket.selected()
                         selections.extend((fin, state_selection))
                         values = dict(fin.values)
                         values.update(dict(state_selection.values))
@@ -283,7 +348,8 @@ def _install_repository():
                             market_wire = None
                             if rule["kind"] == "market_liquidity":
                                 binding = bindings.for_rule(rule["rule_id"], sid[:2])
-                                selected = market.select(sid, universe.as_of_utc, binding=binding)
+                                selected = market.select_current_batch_ticket(scope, sid,
+                                    universe.as_of_utc, binding=binding).selected()
                                 if type(selected) is not MarketSelection:
                                     raise ValueError("market repository returned an unknown selection")
                                 market_markers.append((selected, selected.window, selected.pending,
@@ -338,6 +404,22 @@ def _install_repository():
                     selection.recheck()
                 dependencies(self)
 
+            def checkpoint(*, final=False):
+                check_dependencies()
+                if final:
+                    scope.finalize()
+                else:
+                    scope.checkpoint()
+                check_dependencies()
+
+            def check_dependencies():
+                dependencies(self)
+                _, current_policy, current_bytes = registry_snapshot(root_hash)
+                if current_policy != policy_wire or current_bytes != source_bytes:
+                    raise ValueError("policy signed source configuration changed")
+                context.recheck_batch(universe, industry)
+                dependencies(self)
+
             def mark_published(batch):
                 publication["published"] = True
 
@@ -348,16 +430,28 @@ def _install_repository():
             try:
                 with guard_factory(feature._current_input_provider, feature._store) as guard:
                     prepared = prepare()
-                    read_and_recheck(prepared)
+                    key = id(prepared)
+                    rechecks[key] = (weakref.ref(prepared,
+                        lambda reference: rechecks.pop(key, None)), weakref.ref(self), read_and_recheck)
+                    checkpoint()
                     def finalize():
-                        read_and_recheck(prepared)
+                        if owner_scope is None:
+                            checkpoint(final=True)
+                        else:
+                            scope.next_phase()
+                            checkpoint()
                         mark_published(prepared)
                         return prepared
                     result = guard.finalize(finalize)
-                return result
+                return result, revoke, check_dependencies
             except BaseException:
                 # Also revoke children if prepare failed after its first mint.
                 revoke(prepared)
+                if scope is not None:
+                    try:
+                        scope.close()
+                    except ValueError:
+                        pass
                 raise
 
     entries = tuple((cls.__name__, cls) for cls in (FormalPolicyRepository, *proof_types))

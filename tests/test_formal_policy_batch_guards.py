@@ -27,6 +27,56 @@ class PolicyBatchGuardTests(unittest.TestCase):
         finally:
             sys.setprofile(previous)
 
+    def test_policy_checks_ticketed_selections_in_two_phases_without_reselection(self):
+        for security_id in ("BJ430001", "SH600000", "SZ000001"):
+            self.fixture.put_industry(security_id)
+        from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
+        from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+
+        selected = {
+            FormalPolicyFinancialRepository.select.__code__: 0,
+            FormalPolicyStateRepository.select.__code__: 0,
+            FormalPolicyMarketRepository.select.__code__: 0,
+        }
+        market_ticket_code = FormalPolicyMarketRepository.select_current_batch_ticket.__code__
+        market_tickets = []
+        market_assembled = []
+        checked = {
+            FormalPolicyFinancialRepository._batch_recheck_ticket.__code__: 0,
+            FormalPolicyStateRepository._batch_recheck_ticket.__code__: 0,
+            FormalPolicyMarketRepository._batch_recheck_ticket.__code__: 0,
+        }
+        checkpoints = []
+        checkpoint_code = FormalBatchReadJournal.checkpoint.__code__
+
+        def profile(frame, event, result):
+            if event != "call":
+                return
+            if frame.f_code in selected:
+                selected[frame.f_code] += 1
+            if frame.f_code is market_ticket_code:
+                market_tickets.append(1)
+            if (frame.f_code.co_name == "assemble_market"
+                    and frame.f_code.co_filename.endswith("formal_policy_market.py")):
+                market_assembled.append(1)
+            if frame.f_code in checked:
+                checked[frame.f_code] += 1
+            if frame.f_code is checkpoint_code:
+                checkpoints.append(frame.f_locals["self"])
+
+        batch = self.run_hook(profile)
+        batch.require_verified()
+        self.assertEqual(list(selected.values()), [3, 3, 0])
+        self.assertEqual(len(market_tickets), 3)
+        self.assertEqual(len(market_assembled), 3)
+        self.assertEqual(len(checkpoints), 2)
+        self.assertIs(checkpoints[0], checkpoints[1])
+        self.assertTrue(all(count >= 6 for count in checked.values()))
+        with self.assertRaises(ValueError):
+            checkpoints[0].checkpoint()
+
     def test_after_first_security_read_second_security_provider_changes(self):
         self.fixture.put_industry("BJ430001")
         self.fixture.put_industry("SH600000")
@@ -82,6 +132,34 @@ class PolicyBatchGuardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_hook(hook)
         self.assertEqual(touched, [True])
+
+    def test_source_delete_after_first_checkpoint_revokes_final_phase(self):
+        _, ref = self.fixture.put_industry("SH600000")
+        touched = []
+        def hook(frame, event, result):
+            if (not touched and event == "return" and frame.f_code.co_name == "checkpoint"
+                    and frame.f_code.co_filename.endswith("formal_policy_repository.py")):
+                touched.append(True)
+                Path(ref.content_path).unlink()
+        with self.assertRaises(ValueError):
+            self.run_hook(hook)
+        self.assertEqual(touched, [True])
+
+    def test_source_delete_after_final_journal_checkpoint_revokes_publication(self):
+        _, ref = self.fixture.put_industry("SH600000")
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+        checkpoint_code = FormalBatchReadJournal.checkpoint.__code__
+        checkpoints = []
+
+        def hook(frame, event, result):
+            if event == "return" and frame.f_code is checkpoint_code:
+                checkpoints.append(True)
+                if len(checkpoints) == 2:
+                    Path(ref.content_path).unlink()
+
+        with self.assertRaises(ValueError):
+            self.run_hook(hook)
+        self.assertEqual(checkpoints, [True, True])
 
     def test_signed_source_configuration_replacement_revokes_prepared_children(self):
         blob = self.fixture.bundle.blob("source")
