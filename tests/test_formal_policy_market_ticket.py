@@ -67,13 +67,18 @@ def _check_new_constructor_guard_in_child(phase, selection_name):
 
 
 def _check_new_constructor_guard(phase, selection_type):
-    result = subprocess.run(
-        [sys.executable, "-c",
-         "import sys; from tests.test_formal_policy_market_ticket import "
-         "_check_new_constructor_guard_in_child; "
-         "_check_new_constructor_guard_in_child(*sys.argv[1:])",
-         phase, selection_type.__name__],
-        capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; from tests.test_formal_policy_market_ticket import "
+             "_check_new_constructor_guard_in_child; "
+             "_check_new_constructor_guard_in_child(*sys.argv[1:])",
+             phase, selection_type.__name__],
+            capture_output=True, text=True, check=False, timeout=60)
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError(
+            f"constructor guard timed out after {error.timeout}s; "
+            f"stdout={error.stdout!r}; stderr={error.stderr!r}") from error
     if result.returncode:
         raise AssertionError(result.stdout + result.stderr)
 
@@ -82,6 +87,22 @@ class MarketTicketTests(unittest.TestCase):
     def setUp(self):
         self.fixture = RangeStoreFixture()
         self.addCleanup(self.fixture.close)
+
+    def test_new_constructor_guard_timeout_fails_with_child_diagnostics(self):
+        def expire(command, **kwargs):
+            timeout = kwargs.get("timeout")
+            self.assertIsInstance(timeout, (int, float))
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 60)
+            raise subprocess.TimeoutExpired(command, timeout,
+                output=b"child-progress", stderr=b"child-stalled")
+
+        with _temporary_attribute(subprocess, "run", expire):
+            with self.assertRaisesRegex(AssertionError, "constructor guard timed out") as caught:
+                _check_new_constructor_guard("preopen", CalendarSelection)
+        self.assertIn("child-progress", str(caught.exception))
+        self.assertIn("child-stalled", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, subprocess.TimeoutExpired)
 
     def test_absent_calendar_is_bound_without_reselection_at_checkpoint(self):
         fixture = self.fixture
