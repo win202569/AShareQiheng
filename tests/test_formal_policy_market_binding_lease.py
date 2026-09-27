@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import copy_context
 from datetime import date, timedelta
 from pathlib import Path
 from types import FunctionType
@@ -296,6 +297,85 @@ class MarketBindingLeaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             close_lease(captured[0])
         journal.close()
+
+        fresh = self._journal(fixture, repository)
+        repository.select_current_batch_ticket(
+            fresh, "SH600000", FREEZE, binding=fixture.binding)
+        fresh.close()
+
+    def test_copied_context_close_rejection_keeps_real_token_live_for_owner_context(self):
+        from ashare_pipeline import formal_range_contract as contract
+
+        fixture = self._fixture()
+        days = _trading_days(20)
+        fixture.put_window("SH600000", trading_days=days,
+                           rows={day: quiet_row() for day in days})
+        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
+        journal = self._journal(fixture, repository)
+        open_lease, close_lease = contract._range_binding_read_lease_authority()
+        captured = []
+        copied_failures = []
+
+        def inject(frame, event, arg):
+            if event == "return" and frame.f_code is open_lease.__code__ and not captured:
+                sys.setprofile(None)
+                captured.append(arg)
+                try:
+                    copy_context().run(close_lease, arg)
+                except Exception as error:
+                    copied_failures.append(type(error))
+
+        sys.setprofile(inject)
+        try:
+            ticket = repository.select_current_batch_ticket(
+                journal, "SH600000", FREEZE, binding=fixture.binding)
+        finally:
+            sys.setprofile(None)
+        self.assertIsNotNone(ticket.selected().window)
+        self.assertEqual(copied_failures, [ValueError])
+        self.assertEqual(len(captured), 1)
+        with self.assertRaises(ValueError):
+            close_lease(captured[0])
+        journal.close()
+
+        fresh = self._journal(fixture, repository)
+        repository.select_current_batch_ticket(
+            fresh, "SH600000", FREEZE, binding=fixture.binding)
+        fresh.close()
+
+    def test_replaced_sys_getframe_cannot_forge_owner_entry_or_issue_ticket(self):
+        from ashare_pipeline import formal_batch_read_journal as journal_module
+
+        fixture = self._fixture()
+        days = _trading_days(20)
+        fixture.put_window("SH600000", trading_days=days,
+                           rows={day: quiet_row() for day in days})
+        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
+        journal = self._journal(fixture, repository)
+        genuine_getframe = sys._getframe
+        issue_code = journal_module._issue_current_ticket.__code__
+        market_issues = []
+
+        def forged_getframe(depth=0):
+            return genuine_getframe(depth + 1)
+
+        def monitor(frame, event, arg):
+            if (event == "call" and frame.f_code is issue_code
+                    and frame.f_locals.get("kind") == "market"):
+                market_issues.append(True)
+
+        sys.setprofile(monitor)
+        sys._getframe = forged_getframe
+        try:
+            with self.assertRaises(ValueError):
+                repository.select_current_batch_ticket(
+                    journal, "SH600000", FREEZE, binding=fixture.binding)
+        finally:
+            sys._getframe = genuine_getframe
+            sys.setprofile(None)
+        self.assertEqual(market_issues, [])
+        with self.assertRaisesRegex(ValueError, "closed"):
+            journal.checkpoint()
 
         fresh = self._journal(fixture, repository)
         repository.select_current_batch_ticket(

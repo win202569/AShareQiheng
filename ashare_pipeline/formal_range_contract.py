@@ -85,6 +85,8 @@ def _build_range_bindings_contract():
     require_scoring = scoring_type.require_official
     read_policy_sources = policy_module._read_authenticated_policy_sources
     validate_lease_scope = _range_binding_lease_scope_authority()
+    get_frame = sys._getframe
+    get_thread_identity = threading.get_ident
     manifest_envelope_fields = tuple(manifest_type.__dataclass_fields__)
     blob_envelope_fields = tuple(blob_type.__dataclass_fields__)
 
@@ -100,7 +102,8 @@ def _build_range_bindings_contract():
         "_load_canonical_object", "_LEGACY_CONFIG_FIELDS", "_canonical", "_freeze", "_text", "_exchange",
         "RangeConfig", "parse_range_entry", "MappingProxyType", "ContextVar", "json", "hashlib",
         "sys", "threading", "weakref",
-    )) + tuple((vars(format_module), name, vars(format_module)[name]) for name in (
+    )) + ((vars(sys), "_getframe", get_frame),
+          (vars(threading), "get_ident", get_thread_identity)) + tuple((vars(format_module), name, vars(format_module)[name]) for name in (
         "RangeConfig", "parse_range_entry", "_range_config_to_dict", "_canonical",
         "_text", "_hash", "_exchange", "_positive_number", "_positive_integer",
         "_https_url", "_placeholder_text", "_template_tree", "_request_template",
@@ -484,7 +487,7 @@ def _build_range_bindings_contract():
         if lease is not None:
             parent_record = _bindings_record(parent)
             identity = (parent_record.snapshot.root_hash, record.binding_hash, record.key)
-            if (threading.get_ident() != lease[0] or identity != lease[2]
+            if (get_thread_identity() != lease[0] or identity != lease[2]
                     or parent_record.snapshot != lease[5]):
                 raise ValueError("range binding lease is cross-thread, cross-binding, or stale")
             current_owner, current_epoch, current_phase = validate_lease_scope(lease[1])
@@ -528,7 +531,8 @@ def _build_range_bindings_contract():
 
     def open_current_binding_read_lease(value, owner_scope, operation_key):
         """Open one bounded owner operation; the returned token has no public behavior."""
-        caller = sys._getframe(1)
+        _check_dependencies()
+        caller = get_frame(1)
         owner, epoch, phase = validate_lease_scope(owner_scope)
         owner_type = type(owner)
         calendar_code = vars(owner_type).get("select_calendar_batch_ticket")
@@ -558,7 +562,8 @@ def _build_range_bindings_contract():
                 raise ValueError("range binding lease cannot be nested, copied, or unbound")
             active[9] = True
             active[10] = True
-            state, token = active, None
+            state = active
+            token = _binding_read_lease.set(state)
         else:
             child = _binding_record(value)
             parent = child.parent()
@@ -571,7 +576,7 @@ def _build_range_bindings_contract():
                 raise ValueError("range binding sources changed before owner operation")
             _lightweight_current(parent_record)
             identity = (parent_record.snapshot.root_hash, child.binding_hash, child.key)
-            state = [threading.get_ident(), owner_scope, identity, operation_key,
+            state = [get_thread_identity(), owner_scope, identity, operation_key,
                      parent_record, entry, owner, epoch, phase, False, False]
             token = _binding_read_lease.set(state)
             nested = False
@@ -591,29 +596,23 @@ def _build_range_bindings_contract():
                 or saved[0]() is not lease or saved[4] is not True):
             raise ValueError("range binding read lease is forged, copied, or closed")
         state, token, nested = saved[1:4]
-        if threading.get_ident() != state[0] or _binding_read_lease.get() is not state:
+        if get_thread_identity() != state[0] or _binding_read_lease.get() is not state:
             raise ValueError("range binding read lease is cross-thread or out of order")
+        pending = None
         try:
             current_scope = validate_lease_scope(state[1])
-        except BaseException:
-            saved[4] = False
-            if nested:
-                state[10] = False
-            else:
-                _binding_read_lease.reset(token)
-            raise
-        if current_scope != (state[6], state[7], state[8]):
-            saved[4] = False
-            if nested:
-                state[10] = False
-            else:
-                _binding_read_lease.reset(token)
-            raise ValueError("range binding read lease owner phase changed")
+            if current_scope != (state[6], state[7], state[8]):
+                raise ValueError("range binding read lease owner phase changed")
+        except BaseException as error:
+            pending = error
         if nested:
             if state[10] is not True:
                 raise ValueError("range binding calendar child lease is out of order")
+            _binding_read_lease.reset(token)
             state[10] = False
             saved[4] = False
+            if pending is not None:
+                raise pending
             return
         if state[10] is not False:
             raise ValueError("range binding outer lease still owns a calendar child")
@@ -625,9 +624,13 @@ def _build_range_bindings_contract():
             )
             if exit_snapshot != entry or exit_snapshot != parent_record.snapshot:
                 raise ValueError("range binding sources changed during owner operation")
-        finally:
-            saved[4] = False
-            _binding_read_lease.reset(token)
+        except BaseException as error:
+            if pending is None:
+                pending = error
+        _binding_read_lease.reset(token)
+        saved[4] = False
+        if pending is not None:
+            raise pending
 
 
     class RangeBinding:
