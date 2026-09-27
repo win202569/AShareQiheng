@@ -96,6 +96,7 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
     from .formal_range_contract import (
         load_policy_range_bindings,
         _range_binding_planning_authority,
+        _range_binding_sibling_read_authority,
     )
     from .formal_range_format import _canonical as canonical_range, _range_config_to_dict
 
@@ -119,6 +120,7 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
     from .formal_range_contract import _range_binding_lookup_authority
     planning_binding_type, read_planning_binding = _range_binding_planning_authority()
     lookup_planning_binding = _range_binding_lookup_authority()
+    open_sibling_read, _ = _range_binding_sibling_read_authority()
 
     def load_binding_identity(store, *, registry_manifest_hash, binding_hash, exchange):
         state, _, verifier, factory, cache = record(store)
@@ -604,7 +606,19 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
 
             fingerprint = _text(request_fingerprint)
+            request_description = None if request is None else describe_request(request)
+            if (request_description is not None
+                    and _digest(request_description["request"]) != fingerprint):
+                raise ValueError("range bound request fingerprint differs")
+            if request_description is not None:
+                open_sibling_read(request_description, fingerprint)
             selected, snapshots = self._select_current_with_token(fingerprint)
+            if selected is not None and request_description is not None:
+                selected_wire = observation_wire(selected)[0]
+                stored = selected_wire["snapshot"]["task_payload"]
+                if any(_canonical(stored[key]) != _canonical(request_description[key])
+                       for key in ("request", "config", "source_registry_hash", "parent")):
+                    raise ValueError("range persisted task differs from bound request")
             if selected is None:
                 if request is None:
                     raise ValueError("range absence needs a bound request before ticket issuance")
@@ -635,7 +649,9 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                     check_candidate_snapshots(connection, snapshots)
                     for item in authenticated:
                         check_read_evidence(connection, root, item)
-                baseline = _canonical(dict(fingerprint=fingerprint, request=request_description,
+                request_identity = {key: request_description[key]
+                                    for key in ("request", "config", "source_registry_hash", "parent")}
+                baseline = _canonical(dict(fingerprint=fingerprint, request=request_identity,
                     selected_hash=None,
                     candidates=[(key, [row.decode() for row in rows]) for key, rows in snapshots],
                     sources=[[_canonical(value).decode() if type(value) is dict else value.hex()
