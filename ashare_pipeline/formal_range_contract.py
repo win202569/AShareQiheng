@@ -499,12 +499,25 @@ def _build_range_bindings_contract():
             raise ValueError("range binding parent changed")
         lease = _binding_read_lease.get() if current else None
         if lease is not None:
+            _require_live_lease(lease)
             parent_record = _bindings_record(parent)
             identity = (parent_record.snapshot.root_hash, record.binding_hash, record.key)
             exact_binding = identity == lease[2]
+            exact_only = _sibling_exact_only.get()
+            if exact_only is not None:
+                _require_live_context(_exact_records, exact_only, 2, 3,
+                                      "exact sibling mask")
+                if exact_only[1] is not lease:
+                    raise ValueError("exact sibling mask belongs to another owner lease")
             sibling = (_sibling_request_read.get()
-                       if not exact_binding and _sibling_exact_only.get() is None else None)
+                       if not exact_binding and exact_only is None else None)
+            if sibling is not None:
+                _require_live_context(_sibling_records, sibling, 12, 13,
+                                      "sibling request read")
             target = _sibling_target_read.get() if sibling is not None else None
+            if target is not None:
+                _require_live_context(_target_records, target, 6, 7,
+                                      "sibling target read")
             sibling_matches = (
                 sibling is not None
                 and target is not None
@@ -518,6 +531,8 @@ def _build_range_bindings_contract():
                          if role == "source") == sibling[6]
                 and record.key[1] == sibling[8]
                 and target[0] == get_thread_identity()
+                and target[3] is lease
+                and target[4:6] == tuple(lease[7:9])
                 and (target[1] == sibling[9]
                      or (type(sibling[11]) is dict
                          and sibling[11].get("task_id") == target[2]))
@@ -600,6 +615,31 @@ def _build_range_bindings_contract():
             raise TypeError("exact sibling masks require their sealed range Store")
 
 
+    def _require_live_lease(state):
+        if type(state) is not list or len(state) != 14:
+            raise ValueError("range binding read lease is unpublished or stale")
+        capability, generation = state[12:14]
+        saved = _lease_records.get(id(capability))
+        if (type(capability) is not _BindingReadLease or saved is None
+                or saved[0]() is not capability or saved[1] is not state
+                or saved[3] is not False or saved[4] is not True
+                or saved[5] is not generation):
+            raise ValueError("range binding read lease is unpublished or stale")
+        return saved
+
+
+    def _require_live_context(records, state, capability_index, generation_index, label):
+        if type(state) is not tuple or len(state) <= generation_index:
+            raise ValueError(label + " is unpublished or stale")
+        capability = state[capability_index]
+        generation = state[generation_index]
+        saved = records.get(id(capability))
+        if (saved is None or saved[0]() is not capability or saved[1] is not state
+                or saved[3] is not True or saved[4] is not generation):
+            raise ValueError(label + " is unpublished or stale")
+        return saved
+
+
     def install_sibling_request_read(
             prover, selector_code, read_code, current_code, recheck_code):
         caller = get_frame(1)
@@ -634,15 +674,21 @@ def _build_range_bindings_contract():
                        for character in request_fingerprint)
                 or type(task_id) is not str or not task_id):
             raise ValueError("sibling target identity is invalid")
-        state = (get_thread_identity(), request_fingerprint, task_id)
-        context_token = _sibling_target_read.set(state)
+        lease = _binding_read_lease.get()
+        if lease is not None:
+            _require_live_lease(lease)
         result = object.__new__(_SiblingTargetRead)
+        generation = object()
+        state = (get_thread_identity(), request_fingerprint, task_id,
+                 lease, None if lease is None else lease[7],
+                 None if lease is None else lease[8], result, generation)
+        context_token = _sibling_target_read.set(state)
         identity = id(result)
         reference = weakref.ref(result, lambda ref, key=identity:
             _target_records.pop(key, None)
             if _target_records.get(key) is not None
             and _target_records[key][0] is ref else None)
-        _target_records[identity] = [reference, state, context_token, True]
+        _target_records[identity] = [reference, state, context_token, True, generation]
         return result
 
 
@@ -657,6 +703,7 @@ def _build_range_bindings_contract():
             raise ValueError("sibling target read is cross-thread or out of order")
         _sibling_target_read.reset(token)
         saved[3] = False
+        _target_records.pop(id(capability), None)
 
 
     def enter_sibling_exact_only():
@@ -664,15 +711,19 @@ def _build_range_bindings_contract():
         caller = get_frame(1)
         if codes is None or caller.f_code not in (codes[0], codes[3]):
             raise ValueError("exact sibling masks require their fixed range Store entry")
-        state = (get_thread_identity(), _binding_read_lease.get())
-        context_token = _sibling_exact_only.set(state)
+        lease = _binding_read_lease.get()
+        if lease is not None:
+            _require_live_lease(lease)
         result = object.__new__(_SiblingExactOnly)
+        generation = object()
+        state = (get_thread_identity(), lease, result, generation)
+        context_token = _sibling_exact_only.set(state)
         identity = id(result)
         reference = weakref.ref(result, lambda ref, key=identity:
             _exact_records.pop(key, None)
             if _exact_records.get(key) is not None
             and _exact_records[key][0] is ref else None)
-        _exact_records[identity] = [reference, state, context_token, True]
+        _exact_records[identity] = [reference, state, context_token, True, generation]
         return result
 
 
@@ -688,6 +739,7 @@ def _build_range_bindings_contract():
             raise ValueError("exact sibling mask is cross-thread or out of order")
         _sibling_exact_only.reset(token)
         saved[3] = False
+        _exact_records.pop(id(capability), None)
 
 
     def _open_sibling_description(
@@ -695,9 +747,12 @@ def _build_range_bindings_contract():
         lease = _binding_read_lease.get()
         if lease is None:
             return None
+        _require_live_lease(lease)
         prior = _sibling_request_read.get()
         prior_capability = None
         if prior is not None:
+            _require_live_context(_sibling_records, prior, 12, 13,
+                                  "sibling request read")
             if prior[0] is not lease:
                 raise ValueError("sibling request read belongs to another owner lease")
             prior_capability = lease[11]
@@ -750,18 +805,20 @@ def _build_range_bindings_contract():
             raise ValueError(
                 "sibling request differs from owner binding contract: "
                 + ",".join(differences))
+        result = object.__new__(_SiblingRequestRead)
+        generation = object()
         state = (lease, get_thread_identity(), lease[1], current_epoch, current_phase,
                  config_bytes, source_hash, lease[2][0], owner_record.key[1],
-                 request_fingerprint, kind, request_description["parent"])
+                 request_fingerprint, kind, request_description["parent"],
+                 result, generation)
         context_token = _sibling_request_read.set(state)
-        result = object.__new__(_SiblingRequestRead)
         identity = id(result)
         reference = weakref.ref(result, lambda ref, key=identity:
             _sibling_records.pop(key, None)
             if _sibling_records.get(key) is not None
             and _sibling_records[key][0] is ref else None)
         _sibling_records[identity] = [
-            reference, state, context_token, True, prior_capability]
+            reference, state, context_token, True, generation, prior_capability]
         lease[11] = result
         return result
 
@@ -822,7 +879,8 @@ def _build_range_bindings_contract():
             raise ValueError("sibling request read is cross-thread or out of order")
         _sibling_request_read.reset(token)
         saved[3] = False
-        state[0][11] = saved[4]
+        state[0][11] = saved[5]
+        _sibling_records.pop(id(capability), None)
 
 
     def open_current_binding_read_lease(value, owner_scope, operation_key):
@@ -847,6 +905,7 @@ def _build_range_bindings_contract():
             raise ValueError("range binding lease operation key is not owner-derived")
         active = _binding_read_lease.get()
         if active is not None:
+            _require_live_lease(active)
             _binding_record(value, current=True)
             nested = (caller.f_code is calendar_code and active[1] is owner_scope
                       and active[3][0] == "market"
@@ -872,17 +931,22 @@ def _build_range_bindings_contract():
                 raise ValueError("range binding sources changed before owner operation")
             _lightweight_current(parent_record)
             identity = (parent_record.snapshot.root_hash, child.binding_hash, child.key)
+            lease = object.__new__(_BindingReadLease)
+            generation = object()
             state = [get_thread_identity(), owner_scope, identity, operation_key,
-                     parent_record, entry, owner, epoch, phase, False, False, None]
+                     parent_record, entry, owner, epoch, phase, False, False, None,
+                     lease, generation]
             token = _binding_read_lease.set(state)
             nested = False
-        lease = object.__new__(_BindingReadLease)
+        if nested:
+            lease = object.__new__(_BindingReadLease)
+            generation = object()
         identity = id(lease)
         reference = weakref.ref(lease, lambda ref, key=identity:
             _lease_records.pop(key, None)
             if _lease_records.get(key) is not None
             and _lease_records[key][0] is ref else None)
-        _lease_records[identity] = [reference, state, token, nested, True]
+        _lease_records[identity] = [reference, state, token, nested, True, generation]
         return lease
 
 
@@ -909,6 +973,7 @@ def _build_range_bindings_contract():
             _binding_read_lease.reset(token)
             state[10] = False
             saved[4] = False
+            _lease_records.pop(id(lease), None)
             if pending is not None:
                 raise pending
             return
@@ -929,6 +994,7 @@ def _build_range_bindings_contract():
                 pending = error
         _binding_read_lease.reset(token)
         saved[4] = False
+        _lease_records.pop(id(lease), None)
         if pending is not None:
             raise pending
 

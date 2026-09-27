@@ -143,6 +143,7 @@ class MarketBindingLeaseTests(unittest.TestCase):
 
     def test_signed_sibling_binding_reuses_one_exact_calendar_request_lineage(self):
         from contextlib import closing
+        from ashare_pipeline import formal_range_contract as contract
         from ashare_pipeline.formal_range_contract import load_policy_range_bindings
         from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
         from tests.test_formal_policy_market import FREEZE
@@ -189,8 +190,58 @@ class MarketBindingLeaseTests(unittest.TestCase):
         )
         bank_calendar_ticket = repository.select_calendar_batch_ticket(
             calendar_scope, bank, FREEZE)
-        broker_calendar_ticket = repository.select_calendar_batch_ticket(
-            calendar_scope, broker, FREEZE)
+        open_lease, close_lease = contract._range_binding_read_lease_authority()
+        (install_sibling, open_sibling, open_record, open_ticket, close_sibling,
+         enter_target, close_target, enter_exact,
+         close_exact) = contract._range_binding_sibling_read_authority()
+        del install_sibling
+        copied = {"lease": [], "sibling": [], "target": [], "exact": []}
+        tokens = {"lease": [], "sibling": [], "target": [], "exact": []}
+        copied_close_failures = []
+        openings = {
+            open_lease.__code__: ("lease", close_lease),
+            open_sibling.__code__: ("sibling", close_sibling),
+            open_record.__code__: ("sibling", close_sibling),
+            open_ticket.__code__: ("sibling", close_sibling),
+            enter_target.__code__: ("target", close_target),
+            enter_exact.__code__: ("exact", close_exact),
+        }
+
+        def capture_capability_context(frame, event, arg):
+            entry = openings.get(frame.f_code) if event == "return" else None
+            if entry is None or arg is None:
+                return
+            label, close = entry
+            copied[label].append(copy_context())
+            tokens[label].append((close, arg))
+            try:
+                copy_context().run(close, arg)
+            except ValueError:
+                copied_close_failures.append(label)
+
+        sys.setprofile(capture_capability_context)
+        try:
+            broker_calendar_ticket = repository.select_calendar_batch_ticket(
+                calendar_scope, broker, FREEZE)
+        finally:
+            sys.setprofile(None)
+        self.assertTrue(all(copied.values()), copied)
+        self.assertTrue(set(copied) <= set(copied_close_failures),
+                        copied_close_failures)
+        for entries in tokens.values():
+            for close, capability in entries:
+                with self.assertRaisesRegex(ValueError, "closed"):
+                    close(capability)
+        for context in copied["lease"]:
+            with self.assertRaisesRegex(ValueError, "closed|stale|unpublished"):
+                context.run(broker.require_current)
+        for label in ("sibling", "target"):
+            for context in copied[label]:
+                with self.assertRaisesRegex(ValueError, "closed|stale|unpublished"):
+                    context.run(bank.require_current)
+        for context in copied["exact"]:
+            with self.assertRaisesRegex(ValueError, "closed|stale|unpublished"):
+                context.run(broker.require_current)
         self.assertEqual(
             bank_calendar_ticket.selected().coverage.lineage,
             broker_calendar_ticket.selected().coverage.lineage,
