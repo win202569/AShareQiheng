@@ -727,3 +727,19 @@ git commit -m "feat: rerank policy-adjusted valuation peers"
 ```
 
 最终完成条件：所有计划框勾选；工作区无意外文件；提交不含生产数据、SQLite、WAL/SHM 或进度文件；未获用户单独授权时不推送、不合并 main、不开始 Stage D。
+
+### C5 implementation evidence (review candidate)
+
+- RED observed: the ranking module could not import the peer-context API; the
+  Decimal rank-kernel and signed cyclic-membership fixture tests failed because
+  their requested interfaces did not exist; peer identity and phased diagnostic
+  tests then failed on the exact missing fields.
+- Focused GREEN at the candidate: 7 genuine three-member ranking/diagnostic
+  tests passed in 126.715s; 4 rank-kernel/fixture/proof-forgery tests passed in
+  6.096s; the final diagnostic/repository-binding pair passed in 61.810s and
+  the expanded five-test rank-kernel/fixture/proof set passed in 4.397s;
+  15 adapter and selected C4 guard regressions passed in 48.635s.
+- The producer-backed 23-member cohort and integration acceptance is authored
+  once and shared across the two C5 modules, but the root agent deliberately
+  retains Step 6/7 authorization and fresh long-run evidence after independent
+  review. No 20/23-member acceptance is claimed by this candidate.

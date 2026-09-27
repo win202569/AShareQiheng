@@ -7,13 +7,17 @@ from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
 
 
 class ValuationRuntimeFixture(PolicyRuntimeFixture):
-    def __init__(self, *, peer_count=20, extra_members=()):
+    def __init__(self, *, peer_count=20, extra_members=(), cyclic_ids=("BJ430001",)):
         if type(peer_count) is not int or peer_count < 3:
             raise ValueError("valuation fixture requires all three exchanges")
         securities = {"BJ430001": "general_nonfinancial"}
         securities.update({f"SH{600000 + index}": "general_nonfinancial"
                            for index in range(peer_count - 2)})
         securities["SZ000001"] = "general_nonfinancial"
+        cyclic_ids = tuple(cyclic_ids)
+        if (not cyclic_ids or len(set(cyclic_ids)) != len(cyclic_ids)
+                or any(security_id not in securities for security_id in cyclic_ids)):
+            raise ValueError("valuation fixture cyclic_ids must be distinct signed members")
 
         def choose_earnings_adapter(documents):
             rule = documents["cyclic"]["rules"]["general_nonfinancial_cyclic_top"]
@@ -32,7 +36,7 @@ class ValuationRuntimeFixture(PolicyRuntimeFixture):
                 config["max_calendar_days_per_request"] = 1
 
         super().__init__(range_enabled=True, templates=securities, extra_members=extra_members, cyclic=True,
-            noncyclic_ids=tuple(sorted(set(securities) - {"BJ430001"})),
+            noncyclic_ids=tuple(sorted(set(securities) - set(cyclic_ids))),
             valuation_adapter=True, mutate=choose_earnings_adapter)
         self.templates = securities
         self.valuation_registry = load_formal_valuation_adapter_registry(self.bundle,
