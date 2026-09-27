@@ -63,7 +63,7 @@
 - Consumes: 现有规范 JSON、根签名、child 签名和外层 root/child/role binding。
 - Produces: `formal-registry-manifest-v2`；`FormalRegistryManifest.schema_version: str`；`FormalRegistryManifest.valuation_adapter_registry_hash: str | None`；`VerifiedRegistryBundle.roles: tuple[str, ...]`；v1 精确九角色、v2 精确十角色。
 
-- [ ] **Step 1: 写 v1/v2 失败测试。**
+- [x] **Step 1: 写 v1/v2 失败测试。**
 
 ```python
 def test_v1_bundle_remains_valid_but_has_no_valuation_adapter_role(self):
@@ -84,13 +84,13 @@ def test_v2_requires_exact_ten_roles_and_signed_adapter_binding(self):
 
 同时加入：v2 缺 child、重复 child hash、adapter child 自报错 role、错 root binding、错 approval ID、v1 偷带第十字段、未知 v3 schema、`object.__setattr__` 修改 schema/adapter hash 后 seal 失效。
 
-- [ ] **Step 2: 运行 RED。**
+- [x] **Step 2: 运行 RED。**
 
 Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_registry_manifest -v`
 
 Expected: 新 v2 测试因 schema 和字段不存在而失败；既有 v1 测试仍通过到原断言位置。
 
-- [ ] **Step 3: 实现版本化角色集合。**
+- [x] **Step 3: 实现版本化角色集合。**
 
 ```python
 _ROLE_FIELDS_V1 = {
@@ -116,7 +116,7 @@ def role_fields_for_schema(schema_version):
 
 把 schema_version 和可空 adapter hash 纳入 manifest snapshot/fingerprint；`from_signed_bytes` 先读 schema 再计算精确 keys；v1 构造时 adapter hash 固定为 `None`，v2 必须是唯一 SHA-256。bundle 的 `roles` 从 manifest schema 导出，`require_official`、`blob`、`load` 和 `assert_member_hashes` 只接受该 schema 的精确角色集合。
 
-- [ ] **Step 4: 更新签名图夹具，保持默认 v1。**
+- [x] **Step 4: 更新签名图夹具，保持默认 v1。**
 
 ```python
 def signed_graph(*, mutate=None, context=False,
@@ -188,13 +188,13 @@ def signed_graph(*, mutate=None, context=False,
 
 默认参数必须让现有测试继续得到 v1；v2 的 mutate 必须显式加入 `documents["valuation_adapter"]`，否则精确集合检查失败。
 
-- [ ] **Step 5: 运行 GREEN 和旧图回归。**
+- [x] **Step 5: 运行 GREEN 和旧图回归。**
 
 Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_registry_manifest tests.test_formal_scoring_registry tests.test_formal_policy_registry tests.test_formal_feature_contract tests.test_formal_sources -v`
 
 Expected: 全部 PASS；v1 和 v2 的角色数、签名、seal 与篡改路径均有明确断言。
 
-- [ ] **Step 6: 提交 C1。**
+- [x] **Step 6: 提交 C1。**
 
 ```powershell
 git add ashare_pipeline/formal_registry_manifest.py tests/test_formal_registry_manifest.py tests/test_formal_scoring_registry.py
@@ -214,7 +214,7 @@ git commit -m "feat: version the formal registry root for valuation adapters"
 - Consumes: genuine v2 `VerifiedRegistryBundle`、`FormalScoringRegistry`、`FormalPolicyRegistry` 和 `valuation_adapter` child 原始规范字节。
 - Produces: `ValuationAdapterDefinition`；`FormalValuationAdapterRegistry`；`load_formal_valuation_adapter_registry(bundle, *, scoring_registry, policy_registry) -> FormalValuationAdapterRegistry`；`.dependency_for(template_id, metric_id)`；`.adapter_for(template_id, metric_id)`；`.require_official(bundle)`；`.to_dict()`；fixture helper `add_valuation_adapter_document(documents) -> None`。
 
-- [ ] **Step 1: 写合同 RED 测试和十角色 fixture 文档。**
+- [x] **Step 1: 写合同 RED 测试和十角色 fixture 文档。**
 
 ```python
 def valuation_adapter_document(scoring, cyclic_rules):
@@ -252,13 +252,13 @@ def valuation_adapter_document(scoring, cyclic_rules):
 
 测试精确覆盖五模板 × 三 V 指标、每个 affected 唯一 adapter、unaffected 不得有 adapter、operation 白名单、定义哈希、利润语义、rule/template/metric/unit、Decimal contract 和 preconditions。逐项 mutation 必须报稳定的合同错误。
 
-- [ ] **Step 2: 运行 RED。**
+- [x] **Step 2: 运行 RED。**
 
 Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_adapter_contract -v`
 
 Expected: FAIL with `ModuleNotFoundError: ashare_pipeline.formal_valuation_adapter_contract`。
 
-- [ ] **Step 3: 实现严格 parser 和不可伪造 registry。**
+- [x] **Step 3: 实现严格 parser 和不可伪造 registry。**
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -314,7 +314,7 @@ def policy_graph(*, version="v1", manifest_version="formal-registry-manifest-v1"
 
 `with_valuation_adapter=True` 必须同时要求 manifest v2；其他组合明确报错。现有 scoring wrapper v2 fixture 继续使用九角色 manifest v1，不扩大本阶段改动面。
 
-- [ ] **Step 4: 证明旧 v1 不能进入 Stage C。**
+- [x] **Step 4: 证明旧 v1 不能进入 Stage C。**
 
 ```python
 def test_v1_graph_cannot_load_a_formal_valuation_adapter(self):
@@ -327,13 +327,13 @@ def test_v1_graph_cannot_load_a_formal_valuation_adapter(self):
                                                policy_registry=policy)
 ```
 
-- [ ] **Step 5: 运行 GREEN 和注册表兼容回归。**
+- [x] **Step 5: 运行 GREEN 和注册表兼容回归。**
 
 Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_adapter_contract tests.test_formal_registry_manifest tests.test_formal_scoring_registry tests.test_formal_policy_registry tests.test_formal_policy_registry_guards -v`
 
 Expected: 全部 PASS；现有 v1 policy/scoring 图不需要 adapter 即可继续通过旧测试。
 
-- [ ] **Step 6: 提交 C2。**
+- [x] **Step 6: 提交 C2。**
 
 ```powershell
 git add ashare_pipeline/formal_valuation_adapter_contract.py ashare_pipeline/formal_metric_engine.py tests/test_formal_valuation_adapter_contract.py tests/test_formal_metric_engine.py tests/formal_policy_fixtures.py
@@ -350,7 +350,7 @@ git commit -m "feat: validate signed valuation adapter contracts"
 - Consumes: detached canonical dicts for one base metric row, one policy result, one cyclic decision, one dependency and optional adapter definition。
 - Produces: `profit_ratio_rescale(original_metric_value: Decimal, original_current_profit: Decimal, normalized_profit: Decimal) -> Decimal`；`evaluate_valuation_adjustment(*, metric: dict, policy_result: dict, cyclic_decision: dict, dependency: dict, adapter: dict | None) -> dict`。纯结果不能自称正式证明。
 
-- [ ] **Step 1: 写数值与状态 RED 测试。**
+- [x] **Step 1: 写数值与状态 RED 测试。**
 
 ```python
 def test_matched_affected_uses_normalized_profit_ratio(self):
@@ -377,7 +377,7 @@ def test_pending_policy_blocks_only_affected_metric(self):
 
 加入 clear、not_applicable、matched/unaffected、adjusted_no_numeric_change、错误模板/指标/利润语义、缺 normalization basis、多 basis、非 affected 却给 adapter 的精确测试。
 
-- [ ] **Step 2: 写非法操作数 Review Focus 测试并运行 RED。**
+- [x] **Step 2: 写非法操作数 Review Focus 测试并运行 RED。**
 
 ```python
 def test_invalid_adapter_operands_fail_closed_without_numeric_output(self):
@@ -400,7 +400,7 @@ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test
 
 Expected: FAIL because the module does not exist。
 
-- [ ] **Step 3: 实现固定 Decimal 内核。**
+- [x] **Step 3: 实现固定 Decimal 内核。**
 
 ```python
 def _arithmetic_context():
@@ -421,7 +421,7 @@ def profit_ratio_rescale(original_metric_value, original_current_profit,
 
 状态机先校验所有 detached dict 的精确 keys 和跨对象身份，再根据 decision/dependency 选择透传、待补或 adjustment。输出 Decimal 使用规范字符串，并包含 operation、输入、结果、reason、decision_hash、result_hash、adapter definition hash；不接受调用者提供 status 或 adjusted_value。
 
-- [ ] **Step 4: 验证全局 Decimal 污染和确定性。**
+- [x] **Step 4: 验证全局 Decimal 污染和确定性。**
 
 ```python
 def test_ambient_decimal_context_cannot_change_adjustment(self):
@@ -435,13 +435,13 @@ def test_ambient_decimal_context_cannot_change_adjustment(self):
     self.assertEqual(first, second)
 ```
 
-- [ ] **Step 5: 运行 GREEN。**
+- [x] **Step 5: 运行 GREEN。**
 
 Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_adapter tests.test_formal_policy_evaluator tests.test_formal_metric_engine -v`
 
 Expected: 全部 PASS。
 
-- [ ] **Step 6: 提交 C3。**
+- [x] **Step 6: 提交 C3。**
 
 ```powershell
 git add ashare_pipeline/formal_valuation_adapter.py tests/test_formal_valuation_adapter.py
@@ -463,7 +463,7 @@ git commit -m "feat: evaluate deterministic valuation policy adjustments"
 - Consumes: exact `FormalFeatureRepository`、`FormalContextRepository`、`FormalRangeStore`、签名 verifier、`FormalScoringRegistry`、`FormalPolicyRegistry`、`FormalValuationAdapterRegistry`。
 - Produces: `FormalValuationRepository(feature_repository, context_repository, range_store, *, registry_signature_verifier)`；`.build_batch(frozen_input_hash, *, scoring_registry, policy_registry, valuation_adapter_registry) -> PolicyAdjustedValuationBatch`；`PolicyAdjustedValuationInput`；batch `.input_for(security_id, metric_id)`、`.require_verified()`、`.canonical_bytes()`、`.to_dict()`。闭包私有 `prepare_adjusted_rows(base_batch, policy_batch, adapter_registry) -> tuple[dict, ...]` 只组装规范行，不发布证明。
 
-- [ ] **Step 1: 建立 20 人十角色真实 fixture。**
+- [x] **Step 1: 建立 20 人十角色真实 fixture。**
 
 ```python
 class ValuationRuntimeFixture(PolicyRuntimeFixture):
@@ -484,7 +484,7 @@ fixture 的 `populate_valuation_inputs()` 必须通过现有 `put_financial`、`
 
 为支持该 fixture，给 `MetricFixture.__init__`、`FinancialFixture.__init__` 增加默认 `manifest_version="formal-registry-manifest-v1"` 并原样向下传递；给 `PolicyRuntimeFixture.__init__` 增加默认 `valuation_adapter=False`。只有该值为 true 时，configure 在 `add_policy_documents` 之后调用 `add_valuation_adapter_document(documents)`，并以 manifest v2 构图。所有现有调用因默认值继续使用 v1。
 
-- [ ] **Step 2: 写完整批次 RED 测试。**
+- [x] **Step 2: 写完整批次 RED 测试。**
 
 ```python
 def test_complete_batch_contains_every_security_and_three_v_metrics(self):
@@ -503,13 +503,13 @@ def test_complete_batch_contains_every_security_and_three_v_metrics(self):
 
 加入：原始指标不合格保留行、pending affected 保留行、pending unaffected 透传、无模板/行业仍枚举、证券/指标顺序规范、base/policy/adapter hash 全绑定、原始 base 和 policy 规范字节构建前后相同。
 
-- [ ] **Step 3: 运行 RED。**
+- [x] **Step 3: 运行 RED。**
 
 Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_batch -v`
 
 Expected: FAIL with missing `formal_valuation_engine`。
 
-- [ ] **Step 4: 实现仓库、证明和外层 guard。**
+- [x] **Step 4: 实现仓库、证明和外层 guard。**
 
 ```python
 _V_METRICS = (
@@ -545,7 +545,7 @@ class FormalValuationRepository:
 
 `mint_complete_batch`、`publication_for`、`dependencies` 和 bundle 记录均在 `_install_valuation_engine()` 闭包内定义并捕获；示例中的 `self._bundle` 在实际实现中从闭包 repository record 取出，不能成为可替换实例属性。构造器拒绝外部调用，records 以 weakref 身份登记，payload 深冻结，规范字节只含确定性字段，所有 child 共用外层 `[False]` publication capability。内部创建真实 metric/policy repository并验证它们与同一个 feature provider/store、Context、range store 和 verifier 绑定。nested guard 只允许相同 owner。
 
-- [ ] **Step 5: 写 guard、篡改和恢复测试。**
+- [x] **Step 5: 写 guard、篡改和恢复测试。**
 
 ```python
 def test_outer_finalization_failure_revokes_only_adjusted_children(self):
@@ -577,13 +577,13 @@ def test_outer_finalization_failure_revokes_only_adjusted_children(self):
 
 `run_with_trace` 按现有 batch-guard 测试的 `sys.settrace`/`sys.setprofile` 配对实现，并在 `finally` 中恢复原 hook；它只观察真实闭包 mint 和 guard frame，不改变生产依赖。生产对象不得公开 base/policy 私有属性。另测 provider reentrant publication、数据库 data_version 改变、注册表替换、range selection 更正、final rollback/close 异常、跨根批次、伪造/复制/继承/方法替换，以及失败后下一次干净构建可恢复。
 
-- [ ] **Step 6: 运行 GREEN 和 Stage B/metric guard 回归。**
+- [x] **Step 6: 运行 GREEN 和 Stage B/metric guard 回归。**
 
 Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_batch tests.test_formal_valuation_batch_guards tests.test_formal_metric_batch_guard tests.test_formal_policy_batch_guards tests.test_formal_policy_repository -v`
 
 Expected: 全部 PASS；任何失败路径都无可用的部分调整证明。
 
-- [ ] **Step 7: 提交 C4。**
+- [x] **Step 7: 提交 C4。**
 
 ```powershell
 git add ashare_pipeline/formal_valuation_engine.py tests/formal_valuation_fixtures.py tests/test_formal_valuation_batch.py tests/test_formal_valuation_batch_guards.py
@@ -602,7 +602,7 @@ git commit -m "feat: publish complete policy-adjusted valuation batches"
 - Consumes: genuine published `PolicyAdjustedValuationBatch`。
 - Produces: `PolicyAdjustedValuationPeerContext`；`PolicyAdjustedValuationScore`；`valuation_peer_eligible(item) -> bool`；`build_valuation_peer_context(batch, *, metric_id, security_id)`；`score_valuation_percentile(batch, context)`；`FormalValuationRepository.diagnostic_report(batch) -> MappingProxyType`。
 
-- [ ] **Step 1: 写同行语义 RED 测试。**
+- [x] **Step 1: 写同行语义 RED 测试。**
 
 ```python
 def test_one_adjustment_reranks_every_member_in_the_cohort(self):
@@ -622,7 +622,7 @@ def test_one_adjustment_reranks_every_member_in_the_cohort(self):
 
 加入：二级 20、二级 19 回退一级 20、一级仍 19、焦点入样、并列平均秩、lower 只反转分位数、负/零/极值、pending affected 排除、pending unaffected 保留、跨批次 context 拒绝、同 cohort context 共享同一不可变同行 tuple。
 
-- [ ] **Step 2: 写确定性计数和一次排序测试。**
+- [x] **Step 2: 写确定性计数和一次排序测试。**
 
 ```python
 def test_each_cohort_is_grouped_and_sorted_once(self):
@@ -643,13 +643,13 @@ def test_each_cohort_is_grouped_and_sorted_once(self):
 
 规范 payload 只保存确定性计数；墙钟耗时由 `repository.diagnostic_report(batch)` 的非规范、只读报告返回，并绑定 `batch_hash`。测试不得对毫秒阈值作脆弱断言。
 
-- [ ] **Step 3: 运行 RED。**
+- [x] **Step 3: 运行 RED。**
 
 Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_ranking -v`
 
 Expected: peer/score API 尚不存在或没有 cohort cache，测试失败。
 
-- [ ] **Step 4: 实现一次分组、一次排序和独立证明。**
+- [x] **Step 4: 实现一次分组、一次排序和独立证明。**
 
 ```python
 def build_groups(rows):
@@ -683,7 +683,7 @@ def rank_values(values, direction):
 
 cohort hash 必须覆盖 adjusted batch hash、metric、definition、adapter registry、direction、scope 和同行 ID；score hash 覆盖焦点 adjusted input hash、平均秩、分位数和完整 peer context。所有证明复用 batch publication capability，不能脱离所属 batch 使用。
 
-- [ ] **Step 5: 写端到端与诊断验收。**
+- [x] **Step 5: 写端到端与诊断验收。**
 
 ```python
 def test_signed_policy_to_adjusted_value_to_peer_score_is_replayable(self):
@@ -703,13 +703,13 @@ def test_signed_policy_to_adjusted_value_to_peer_score_is_replayable(self):
 
 集成测试还要从 score 反向核对 peer context、adjusted row、policy decision、normalization basis、base metric input、adapter definition 和根角色哈希；证明没有 G/M cap、Sc/B/R、eligibility 或 pool 字段。
 
-- [ ] **Step 6: 运行 Stage C GREEN。**
+- [x] **Step 6: 运行 Stage C GREEN。**
 
 Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_adapter_contract tests.test_formal_valuation_adapter tests.test_formal_valuation_batch tests.test_formal_valuation_batch_guards tests.test_formal_valuation_ranking tests.test_formal_valuation_integration -v`
 
 Expected: 全部 PASS，0 failure，0 error。
 
-- [ ] **Step 7: 运行受影响完整回归并保存诊断。**
+- [x] **Step 7: 运行受影响完整回归并保存诊断。**
 
 Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_registry_manifest tests.test_formal_scoring_registry tests.test_formal_policy_contract tests.test_formal_policy_registry tests.test_formal_policy_registry_guards tests.test_formal_policy_evaluator tests.test_formal_policy_repository tests.test_formal_policy_batch_guards tests.test_formal_policy_integration tests.test_formal_metric_context tests.test_formal_metric_features tests.test_formal_metric_engine tests.test_formal_metric_batch_guard tests.test_formal_score_inputs tests.test_formal_scoring tests.test_formal_valuation_adapter_contract tests.test_formal_valuation_adapter tests.test_formal_valuation_batch tests.test_formal_valuation_batch_guards tests.test_formal_valuation_ranking tests.test_formal_valuation_integration -v`
 
