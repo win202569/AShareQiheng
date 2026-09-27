@@ -743,3 +743,14 @@ git commit -m "feat: rerank policy-adjusted valuation peers"
   once and shared across the two C5 modules, but the root agent deliberately
   retains Step 6/7 authorization and fresh long-run evidence after independent
   review. No 20/23-member acceptance is claimed by this candidate.
+
+Review fix evidence (`2607305` follow-up): weak-reference authority is now
+captured and guarded; every context/score verification recloses the complete
+batch, publication capability and canonical proof chain. Grouping, every focal
+fallback decision, every unique-cohort sort and all derived proofs are prepared
+before publication; a derived-proof injection failure revoked every captured
+object. The canonical batch now includes a deterministic ranking summary, while
+only phase timings remain noncanonical. Focused results: 14 ranking/kernel tests
+PASS in 279.549s, including two independent small builds and immutable diagnostic
+order; adapter plus selected C4 Decimal/publication guards 17 PASS in 519.148s.
+The 23-member eligible-score replay remains intentionally pending root approval.

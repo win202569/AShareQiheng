@@ -32,6 +32,7 @@ def _install_valuation_engine():
     own_members = ()
     json_module, hashlib_module = json, hashlib
     time_module, clock = time, time.perf_counter
+    weakref_module, weakref_ref, reference_type = weakref, weakref.ref, weakref.ReferenceType
     encode, decode, sha256, hash_payload, decimal_type = (
         json.dumps, json.loads, hashlib.sha256, digest, Decimal)
     guard_factory = _metric_batch_guard
@@ -81,6 +82,9 @@ def _install_valuation_engine():
                 or globals().get("localcontext") is not local_context
                 or globals().get("MappingProxyType") is not mapping_proxy
                 or globals().get("time") is not time_module or time_module.perf_counter is not clock
+                or globals().get("weakref") is not weakref_module
+                or weakref_module.ref is not weakref_ref
+                or weakref_module.ReferenceType is not reference_type
                 or adapter_source._arithmetic_context is not arithmetic_context
                 or globals().get("json") is not json_module or json_module.dumps is not encode
                 or json_module.loads is not decode or globals().get("hashlib") is not hashlib_module
@@ -134,21 +138,108 @@ def _install_valuation_engine():
             check_decimal(saved)
         elif cls is PolicyAdjustedValuationBatch:
             if (saved[1]["inputs"] is not seal[7]
-                    or saved[3]["index"] is not seal[8]):
+                    or saved[3]["index"] is not seal[8]
+                    or type(saved[3]["repository"]) is not reference_type
+                    or saved[3]["repository"]() is None):
                 raise ValueError("adjusted valuation proof batch index changed")
         elif cls is PolicyAdjustedValuationPeerContext:
-            if saved[3]["batch"]() is None:
-                raise ValueError("adjusted valuation peer context lost its complete batch")
+            batch_ref = saved[3].get("batch")
+            if type(batch_ref) is not reference_type or batch_ref() is None:
+                raise ValueError("adjusted valuation peer context proof chain changed")
+            batch = batch_ref()
+            batch_saved = saved_proof(batch, PolicyAdjustedValuationBatch, saved[4])
+            key = (saved[1]["security_id"], saved[1]["metric_id"])
+            focal = batch_saved[3]["index"].get(key)
+            focal_saved = saved_proof(focal, PolicyAdjustedValuationInput, saved[4])
+            canonical = decode(saved[2])
+            context_body = dict(canonical)
+            context_hash = context_body.pop("context_hash")
+            cohort_hash = hash_payload(dict(batch_hash=canonical["batch_hash"],
+                metric_id=canonical["metric_id"], definition_hash=canonical["definition_hash"],
+                valuation_adapter_registry_hash=canonical["valuation_adapter_registry_hash"],
+                direction=canonical["direction"], template_id=canonical["template_id"],
+                scope=canonical["scope"], industry_id=canonical["industry_id"],
+                peer_security_ids=canonical["peer_security_ids"]))
+            focal_data = focal_saved[1]
+            expected_reason, expected_scope, expected_industry, expected_peers = (
+                focal_data["reason"], None, None, ())
+            if eligible_data(focal_data):
+                expected_reason = None
+                for candidate, candidate_industry in (
+                        ("template_secondary_industry", focal_data["secondary_industry"]),
+                        ("template_primary_industry", focal_data["primary_industry"])):
+                    expected_peers = batch_saved[3]["groups"].get((canonical["metric_id"],
+                        focal_data["template_id"], candidate, candidate_industry), ())
+                    expected_industry = candidate_industry
+                    if len(expected_peers) >= 20:
+                        expected_scope = candidate
+                        break
+                if expected_scope is None:
+                    expected_reason = "peer_count_below_20"
+            if (batch_saved[3]["contexts"].get(key) is not proof
+                    or saved[1]["batch_hash"] != batch_saved[1]["batch_hash"]
+                    or saved[1]["registry_manifest_hash"] != batch_saved[1]["registry_manifest_hash"]
+                    or saved[1]["valuation_adapter_registry_hash"]
+                        != batch_saved[1]["valuation_adapter_registry_hash"]
+                    or saved[1]["definition_hash"]
+                        != focal_saved[1]["original_metric"]["definition_hash"]
+                    or saved[1]["direction"] != focal_saved[1]["original_metric"]["direction"]
+                    or tuple(saved[1]["peer_security_ids"]) is not saved[1]["peer_security_ids"]
+                    or canonical["peer_security_ids"] != list(expected_peers)
+                    or saved[1]["peer_security_ids"] != expected_peers
+                    or canonical["peer_count"] != len(expected_peers)
+                    or canonical["scope"] != expected_scope
+                    or canonical["industry_id"] != expected_industry
+                    or canonical["reason"] != expected_reason
+                    or canonical["cohort_hash"] != cohort_hash
+                    or context_hash != hash_payload(context_body)):
+                raise ValueError("adjusted valuation peer context proof chain changed")
         elif cls is PolicyAdjustedValuationScore:
-            if saved[3]["batch"]() is None or saved[3]["context"]() is None:
-                raise ValueError("adjusted valuation score lost its proof chain")
+            batch_ref, context_ref = saved[3].get("batch"), saved[3].get("context")
+            if (type(batch_ref) is not reference_type or type(context_ref) is not reference_type
+                    or batch_ref() is None or context_ref() is None):
+                raise ValueError("adjusted valuation score proof chain changed")
+            batch, context = batch_ref(), context_ref()
+            batch_saved = saved_proof(batch, PolicyAdjustedValuationBatch, saved[4])
+            context_saved = saved_proof(context, PolicyAdjustedValuationPeerContext, saved[4])
+            key = (saved[1]["security_id"], saved[1]["metric_id"])
+            focal = batch_saved[3]["index"].get(key)
+            focal_saved = saved_proof(focal, PolicyAdjustedValuationInput, saved[4])
+            score_wire = decode(saved[2])
+            score_body = dict(score_wire)
+            score_hash = score_body.pop("score_hash")
+            rank_map = batch_saved[3]["ranks"].get(context_saved[1]["cohort_hash"])
+            value = decimal_type(score_wire["adjusted_value"])
+            expected_rank = None if rank_map is None else rank_map.get(value)
+            if (batch_saved[3]["scores"].get(key) is not proof
+                    or score_wire["peer_context"] != decode(context_saved[2])
+                    or saved[1]["batch_hash"] != batch_saved[1]["batch_hash"]
+                    or saved[1]["adjusted_input_hash"] != focal_saved[1]["input_hash"]
+                    or saved[1]["definition_hash"] != context_saved[1]["definition_hash"]
+                    or saved[1]["valuation_adapter_registry_hash"]
+                        != batch_saved[1]["valuation_adapter_registry_hash"]
+                    or saved[1]["peer_count"] != context_saved[1]["peer_count"]
+                    or score_wire["peer_context"]["context_hash"] != context_saved[1]["context_hash"]
+                    or saved[1].get("peer_context") is not context
+                    or seal[9] != freeze(score_wire["peer_context"])
+                    or expected_rank is None
+                    or type(saved[1]["adjusted_value"]) is not decimal_type
+                    or saved[1]["adjusted_value"].as_tuple() != value.as_tuple()
+                    or score_wire["average_rank"] != str(expected_rank[0])
+                    or score_wire["percentile"] != str(expected_rank[1])
+                    or type(saved[1]["average_rank"]) is not decimal_type
+                    or type(saved[1]["percentile"]) is not decimal_type
+                    or saved[1]["average_rank"].as_tuple() != expected_rank[0].as_tuple()
+                    or saved[1]["percentile"].as_tuple() != expected_rank[1].as_tuple()
+                    or score_hash != hash_payload(score_body)):
+                raise ValueError("adjusted valuation score proof chain changed")
         return saved
 
     def record(proof, cls):
         interfaces()
         return saved_proof(proof, cls)
 
-    def validate_prepared(batch, children, publication):
+    def validate_prepared(batch, children, contexts, scores, publication):
         """Close the whole unpublished child set before final source checkpoint."""
         interfaces()
         saved = saved_proof(batch, PolicyAdjustedValuationBatch, publication)
@@ -164,6 +255,18 @@ def _install_valuation_engine():
                     allow_nan=False).encode()
                     or index.get((row["security_id"], row["metric_id"])) is not child):
                 raise ValueError("adjusted valuation proof children differ from canonical batch")
+        summary = batch_wire["ranking_summary"]
+        if (len(contexts) != summary["context_count"]
+                or len(scores) != summary["scored_input_count"]
+                or len(saved[3]["contexts"]) != len(contexts)
+                or len(saved[3]["scores"]) != len(scores)
+                or len(saved[3]["ranks"]) != summary["cohort_count"]
+                or sum(saved[3]["sorts_by_cohort"].values()) != summary["sort_count"]):
+            raise ValueError("adjusted valuation derived proofs differ from canonical summary")
+        for context in contexts:
+            saved_proof(context, PolicyAdjustedValuationPeerContext, publication)
+        for score in scores:
+            saved_proof(score, PolicyAdjustedValuationScore, publication)
 
     class SealedMeta(type):
         def __setattr__(cls, name, value):
@@ -245,8 +348,9 @@ def _install_valuation_engine():
         seal = (wire, payload["batch_hash"], payload.get("security_id"),
             payload.get("metric_id"), payload["registry_manifest_hash"],
             payload["frozen_input_hash"], payload.get("adjusted_value"),
-            frozen.get("inputs"), None if sealed_private is None else sealed_private.get("index"))
-        proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)),
+            frozen.get("inputs"), None if sealed_private is None else sealed_private.get("index"),
+            freeze(payload.get("peer_context")))
+        proofs[identity] = (weakref_ref(proof, lambda _: proofs.pop(identity, None)),
             frozen, wire, sealed_private, publication, seal)
         return proof
 
@@ -313,6 +417,150 @@ def _install_valuation_engine():
             rows.append(row)
         return tuple(rows)
 
+    def eligible_data(data):
+        return (data["status"] in {"adjusted", "adjusted_no_numeric_change",
+                    "passthrough_clear", "passthrough_not_applicable",
+                    "passthrough_unaffected"}
+                and data["adjusted_value"] is not None
+                and data["original_metric"]["invalid_reason"] is None)
+
+    def prepare_ranking(rows):
+        """Prepare the complete immutable ranking plan before any publication."""
+        grouping_started = clock()
+        by_key = {(row["security_id"], row["metric_id"]): row for row in rows}
+        groups = {}
+        for row in rows:
+            if not eligible_data(row):
+                continue
+            for scope_name, industry_id in (
+                    ("template_secondary_industry", row["secondary_industry"]),
+                    ("template_primary_industry", row["primary_industry"])):
+                key = (row["metric_id"], row["template_id"], scope_name, industry_id)
+                groups.setdefault(key, []).append(row["security_id"])
+        groups = {key: tuple(sorted(ids)) for key, ids in groups.items()}
+        decisions = []
+        cohort_keys = {}
+        for row in rows:
+            reason, scope_name, industry_id, peers = row["reason"], None, None, ()
+            if eligible_data(row):
+                reason = None
+                for candidate, candidate_industry in (
+                        ("template_secondary_industry", row["secondary_industry"]),
+                        ("template_primary_industry", row["primary_industry"])):
+                    peers = groups.get((row["metric_id"], row["template_id"],
+                        candidate, candidate_industry), ())
+                    industry_id = candidate_industry
+                    if len(peers) >= 20:
+                        scope_name = candidate
+                        break
+                if scope_name is None:
+                    reason = "peer_count_below_20"
+            cohort_key = None
+            if reason is None:
+                cohort_key = (row["metric_id"], row["original_metric"]["definition_hash"],
+                    row["original_metric"]["direction"], row["template_id"],
+                    scope_name, industry_id, peers)
+                cohort_keys[cohort_key] = None
+            decisions.append(dict(security_id=row["security_id"], metric_id=row["metric_id"],
+                scope=scope_name, industry_id=industry_id, peer_security_ids=peers,
+                peer_count=len(peers), reason=reason, cohort_key=cohort_key))
+        grouping_seconds = clock() - grouping_started
+        sorting_started = clock()
+        ranks = {}
+        for cohort_key in cohort_keys:
+            metric_id, _, direction, _, _, _, peers = cohort_key
+            values = tuple(decimal_type(by_key[(sid, metric_id)]["adjusted_value"])
+                           for sid in peers)
+            ranks[cohort_key] = rank_values(values, direction)
+        sorting_seconds = clock() - sorting_started
+        status_counts, pending_reason_counts = {}, {}
+        for row in rows:
+            status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
+            if row["adjusted_value"] is None:
+                pending_reason_counts[row["reason"]] = pending_reason_counts.get(row["reason"], 0) + 1
+        summary = dict(group_index_builds=1, security_count=len({row["security_id"] for row in rows}),
+            valuation_row_count=len(rows), eligible_count=sum(eligible_data(row) for row in rows),
+            context_count=len(decisions), cohort_count=len(cohort_keys), sort_count=len(ranks),
+            scored_input_count=sum(item["reason"] is None for item in decisions),
+            secondary_scope_count=sum(item["scope"] == "template_secondary_industry"
+                                      for item in decisions),
+            primary_scope_count=sum(item["scope"] == "template_primary_industry"
+                                    for item in decisions),
+            peer_count_below_20=sum(item["reason"] == "peer_count_below_20"
+                                    for item in decisions),
+            status_counts=[dict(status=key, count=value)
+                           for key, value in sorted(status_counts.items())],
+            pending_reason_counts=[dict(reason=key, count=value)
+                                   for key, value in sorted(pending_reason_counts.items())],
+            full_financial_rederivations=0)
+        return (mapping_proxy(groups), tuple(decisions), mapping_proxy(ranks),
+                summary, grouping_seconds, sorting_seconds)
+
+    def mint_derived(batch, children, rows, ranking, publication):
+        groups, decisions, prepared_ranks, _, _, _ = ranking
+        batch_saved = saved_proof(batch, PolicyAdjustedValuationBatch, publication)
+        batch_data, private = batch_saved[1], batch_saved[3]
+        contexts, scores, ranks_by_hash, sorts_by_cohort = {}, {}, {}, {}
+        for row, decision in zip(rows, decisions, strict=True):
+            original = row["original_metric"]
+            payload = dict(schema_version="policy-adjusted-valuation-peer-context-v1",
+                batch_hash=batch_data["batch_hash"],
+                registry_manifest_hash=batch_data["registry_manifest_hash"],
+                frozen_input_hash=batch_data["frozen_input_hash"],
+                universe_hash=batch_data["universe_hash"],
+                valuation_adapter_registry_hash=batch_data["valuation_adapter_registry_hash"],
+                metric_id=row["metric_id"], security_id=row["security_id"],
+                template_id=row["template_id"], industry_id=decision["industry_id"],
+                primary_industry=row["primary_industry"],
+                secondary_industry=row["secondary_industry"],
+                definition_hash=original["definition_hash"], direction=original["direction"],
+                scope=decision["scope"], peer_security_ids=decision["peer_security_ids"],
+                peer_count=decision["peer_count"], reason=decision["reason"])
+            payload["cohort_hash"] = hash_payload(dict(batch_hash=batch_data["batch_hash"],
+                metric_id=row["metric_id"], definition_hash=payload["definition_hash"],
+                valuation_adapter_registry_hash=batch_data["valuation_adapter_registry_hash"],
+                direction=payload["direction"], template_id=payload["template_id"],
+                scope=payload["scope"], industry_id=payload["industry_id"],
+                peer_security_ids=payload["peer_security_ids"]))
+            payload["context_hash"] = hash_payload(payload)
+            context = mint(PolicyAdjustedValuationPeerContext, payload, publication,
+                attributes={"peer_security_ids": decision["peer_security_ids"]},
+                private={"batch": weakref_ref(batch)})
+            key = (row["security_id"], row["metric_id"])
+            contexts[key] = context
+            if decision["reason"] is not None:
+                continue
+            cohort = payload["cohort_hash"]
+            rank_map = prepared_ranks[decision["cohort_key"]]
+            existing = ranks_by_hash.setdefault(cohort, rank_map)
+            if existing is not rank_map:
+                raise ValueError("valuation cohort hash collision")
+            sorts_by_cohort[cohort] = 1
+            value_text = row["adjusted_value"]
+            value = decimal_type(value_text)
+            rank, percentile = rank_map[value]
+            score_payload = dict(schema_version="policy-adjusted-valuation-score-v1",
+                batch_hash=batch_data["batch_hash"],
+                registry_manifest_hash=batch_data["registry_manifest_hash"],
+                frozen_input_hash=batch_data["frozen_input_hash"],
+                universe_hash=batch_data["universe_hash"], metric_id=row["metric_id"],
+                security_id=row["security_id"], definition_hash=payload["definition_hash"],
+                valuation_adapter_registry_hash=batch_data["valuation_adapter_registry_hash"],
+                adjusted_input_hash=row["input_hash"], adjusted_value=value_text,
+                average_rank=str(rank), percentile=str(percentile),
+                peer_count=decision["peer_count"], peer_context=decode(proofs[id(context)][2]))
+            score_payload["score_hash"] = hash_payload(score_payload)
+            scores[key] = mint(PolicyAdjustedValuationScore, score_payload, publication,
+                attributes={"adjusted_value": value, "average_rank": rank,
+                    "percentile": percentile, "peer_context": context},
+                private={"batch": weakref_ref(batch), "context": weakref_ref(context)})
+        private["groups"] = groups
+        private["contexts"] = mapping_proxy(contexts)
+        private["ranks"] = mapping_proxy(ranks_by_hash)
+        private["scores"] = mapping_proxy(scores)
+        private["sorts_by_cohort"] = mapping_proxy(sorts_by_cohort)
+        return tuple(contexts.values()), tuple(scores.values())
+
     class FormalValuationRepository(metaclass=SealedMeta):
         __slots__ = ("__weakref__",)
 
@@ -329,7 +577,7 @@ def _install_valuation_engine():
                 id(feature_repository._bundle_store), id(feature_repository._current_input_provider),
                 id(context_repository._snapshots))
             identity = id(self)
-            repositories[identity] = (weakref.ref(self, lambda _: repositories.pop(identity, None)),
+            repositories[identity] = (weakref_ref(self, lambda _: repositories.pop(identity, None)),
                 feature_repository, context_repository, range_store, registry_signature_verifier,
                 metric_repo, policy_repo, original)
 
@@ -380,6 +628,8 @@ def _install_valuation_engine():
                     identity_done = clock()
                     rows = prepare_adjusted_rows(base, policy, valuation_adapter_registry)
                     rows_done = clock()
+                    ranking = prepare_ranking(rows)
+                    ranking_summary = dict(ranking[3], **validation_counts)
                     adapter_wire = valuation_adapter_registry.to_dict()
                     common = dict(schema_version="policy-adjusted-valuation-batch-v1",
                         registry_manifest_hash=root_hash,
@@ -395,7 +645,7 @@ def _install_valuation_engine():
                         policy_batch_canonical_sha256=sha256(policy_bytes).hexdigest(),
                         adapter_definition_sha256=hash_payload(adapter_wire),
                         security_ids=list(base.security_ids), metric_ids=list(_V_METRICS),
-                        inputs=list(rows))
+                        ranking_summary=ranking_summary, inputs=list(rows))
                     common["batch_hash"] = hash_payload(common)
                     children = tuple(mint(PolicyAdjustedValuationInput,
                         dict(row, batch_hash=common["batch_hash"]), publication,
@@ -405,16 +655,18 @@ def _install_valuation_engine():
                              for row, item in zip(rows, children, strict=True)}
                     prepared = mint(PolicyAdjustedValuationBatch, common, publication,
                         attributes={"inputs": children}, private={"index": index,
-                            "repository": weakref.ref(self),
+                            "repository": weakref_ref(self),
                             "groups": None, "contexts": {}, "ranks": {}, "scores": {},
-                            "group_index_builds": 0, "sorts_by_cohort": {},
+                            "sorts_by_cohort": {},
                             "validation_counts": dict(validation_counts),
                             "phase_seconds": {
                                 "input_registry_validation": validation_done - build_started,
                                 "identity_closure": identity_done - validation_done,
                                 "row_adjustment": rows_done - identity_done,
-                                "peer_grouping": 0.0, "peer_sorting": 0.0,
+                                "peer_grouping": ranking[4], "peer_sorting": ranking[5],
                                 "final_verification": 0.0, "publication": 0.0}})
+                    contexts, scores = mint_derived(
+                        prepared, children, rows, ranking, publication)
 
                     root_wire = tuple((role, bundle.blob(role).canonical_json) for role in bundle.roles)
                     root_ticket = _issue_current_ticket(scope, self, "valuation",
@@ -431,7 +683,7 @@ def _install_valuation_engine():
                         policy_verify(policy)
                         if base.canonical_bytes() != base_bytes or policy.canonical_bytes() != policy_bytes:
                             raise ValueError("valuation source batches changed before publication")
-                        validate_prepared(prepared, children, publication)
+                        validate_prepared(prepared, children, contexts, scores, publication)
                         scope.finalize()
                         prepared_private = proofs[id(prepared)][3]
                         prepared_private["phase_seconds"]["final_verification"] += clock() - final_started
@@ -473,30 +725,42 @@ def _install_valuation_engine():
             private = saved[3]
             if private["repository"]() is not self:
                 raise ValueError("adjusted batch belongs to another valuation repository")
-            canonical_rows = decode(saved[2])["inputs"]
-            status_counts = {}
-            pending_reason_counts = {}
-            for row in canonical_rows:
-                status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
-                if row["adjusted_value"] is None:
-                    pending_reason_counts[row["reason"]] = pending_reason_counts.get(row["reason"], 0) + 1
-            contexts = tuple(record(value, PolicyAdjustedValuationPeerContext)[1]
-                             for value in private["contexts"].values())
-            scored_cohorts = {item["cohort_hash"] for item in contexts if item["reason"] is None}
-            scope_counts = {scope: sum(item["scope"] == scope for item in contexts) for scope in
-                ("template_secondary_industry", "template_primary_industry")}
+            wire = decode(saved[2])
+            summary = wire["ranking_summary"]
+            contexts = tuple(private["contexts"].values())
+            scores = tuple(private["scores"].values())
+            if (len(contexts) != summary["context_count"]
+                    or len(scores) != summary["scored_input_count"]
+                    or len(private["ranks"]) != summary["cohort_count"]
+                    or sum(private["sorts_by_cohort"].values()) != summary["sort_count"]):
+                raise ValueError("valuation diagnostic cache differs from canonical summary")
+            for value in contexts:
+                record(value, PolicyAdjustedValuationPeerContext)
+            for value in scores:
+                record(value, PolicyAdjustedValuationScore)
+            status_counts = {item["status"]: item["count"] for item in summary["status_counts"]}
+            pending_reason_counts = {item["reason"]: item["count"]
+                                     for item in summary["pending_reason_counts"]}
             return MappingProxyType(dict(batch_hash=saved[1]["batch_hash"],
-                security_count=len(saved[1]["security_ids"]),
-                valuation_row_count=len(saved[1]["inputs"]),
-                group_index_builds=private["group_index_builds"],
+                security_count=summary["security_count"],
+                valuation_row_count=summary["valuation_row_count"],
+                eligible_count=summary["eligible_count"],
+                context_count=summary["context_count"],
+                scored_input_count=summary["scored_input_count"],
+                group_index_builds=summary["group_index_builds"],
                 sorts_by_cohort=MappingProxyType(dict(private["sorts_by_cohort"])),
-                cohort_count=len(scored_cohorts), sort_count=sum(private["sorts_by_cohort"].values()),
-                scope_counts=MappingProxyType(scope_counts),
-                peer_count_below_20=sum(item["reason"] == "peer_count_below_20" for item in contexts),
+                cohort_count=summary["cohort_count"], sort_count=summary["sort_count"],
+                scope_counts=MappingProxyType({
+                    "template_secondary_industry": summary["secondary_scope_count"],
+                    "template_primary_industry": summary["primary_scope_count"]}),
+                peer_count_below_20=summary["peer_count_below_20"],
                 status_counts=MappingProxyType(status_counts),
                 pending_reason_counts=MappingProxyType(pending_reason_counts),
                 phase_seconds=MappingProxyType(dict(private["phase_seconds"])),
-                full_financial_rederivations=0, **private["validation_counts"]))
+                full_financial_rederivations=summary["full_financial_rederivations"],
+                registry_full_parses=summary["registry_full_parses"],
+                base_batch_full_validations=summary["base_batch_full_validations"],
+                policy_batch_full_validations=summary["policy_batch_full_validations"]))
 
         def __copy__(self):
             raise TypeError("valuation repositories cannot be copied")
@@ -505,12 +769,7 @@ def _install_valuation_engine():
             raise TypeError("valuation repositories cannot be copied")
 
     def eligible(item):
-        data = record(item, PolicyAdjustedValuationInput)[1]
-        return (data["status"] in {"adjusted", "adjusted_no_numeric_change",
-                    "passthrough_clear", "passthrough_not_applicable",
-                    "passthrough_unaffected"}
-                and data["adjusted_value"] is not None
-                and data["original_metric"]["invalid_reason"] is None)
+        return eligible_data(record(item, PolicyAdjustedValuationInput)[1])
 
     def rank_values(values, direction):
         interfaces()
@@ -539,107 +798,33 @@ def _install_valuation_engine():
         if type(security_id) is not str or type(metric_id) is not str:
             raise ValueError("valuation selectors require exact strings")
         batch_saved = record(batch, PolicyAdjustedValuationBatch)
-        data, private = batch_saved[1], batch_saved[3]
+        private = batch_saved[3]
         focal = private["index"].get((security_id, metric_id))
         if focal is None:
             raise ValueError("security or V metric is outside complete adjusted batch")
         key = (security_id, metric_id)
-        if key in private["contexts"]:
-            return private["contexts"][key]
-        if private["groups"] is None:
-            grouping_started = clock()
-            groups = {}
-            for proof in private["index"].values():
-                item = record(proof, PolicyAdjustedValuationInput)[1]
-                if not eligible(proof):
-                    continue
-                for scope_name, industry_id in (
-                        ("template_secondary_industry", item["secondary_industry"]),
-                        ("template_primary_industry", item["primary_industry"])):
-                    group = (item["metric_id"], item["template_id"], scope_name, industry_id)
-                    groups.setdefault(group, []).append(item["security_id"])
-            private["groups"] = {group: tuple(sorted(ids)) for group, ids in groups.items()}
-            private["group_index_builds"] += 1
-            private["phase_seconds"]["peer_grouping"] += clock() - grouping_started
-        focal_data = record(focal, PolicyAdjustedValuationInput)[1]
-        original = focal_data["original_metric"]
-        reason, scope_name, industry_id, peers = focal_data["reason"], None, None, ()
-        if eligible(focal):
-            reason = None
-            for candidate, industry_id in (
-                    ("template_secondary_industry", focal_data["secondary_industry"]),
-                    ("template_primary_industry", focal_data["primary_industry"])):
-                peers = private["groups"].get(
-                    (metric_id, focal_data["template_id"], candidate, industry_id), ())
-                if len(peers) >= 20:
-                    scope_name = candidate
-                    break
-            if scope_name is None:
-                reason = "peer_count_below_20"
-        payload = dict(schema_version="policy-adjusted-valuation-peer-context-v1",
-            batch_hash=data["batch_hash"], registry_manifest_hash=data["registry_manifest_hash"],
-            frozen_input_hash=data["frozen_input_hash"], universe_hash=data["universe_hash"],
-            valuation_adapter_registry_hash=data["valuation_adapter_registry_hash"],
-            metric_id=metric_id, security_id=security_id,
-            template_id=focal_data["template_id"], industry_id=industry_id,
-            primary_industry=focal_data["primary_industry"],
-            secondary_industry=focal_data["secondary_industry"],
-            definition_hash=original["definition_hash"], direction=original["direction"],
-            scope=scope_name, peer_security_ids=peers, peer_count=len(peers), reason=reason)
-        payload["cohort_hash"] = hash_payload(dict(batch_hash=data["batch_hash"],
-            metric_id=metric_id, definition_hash=payload["definition_hash"],
-            valuation_adapter_registry_hash=data["valuation_adapter_registry_hash"],
-            direction=payload["direction"], template_id=payload["template_id"],
-            scope=scope_name, industry_id=industry_id, peer_security_ids=peers))
-        payload["context_hash"] = hash_payload(payload)
-        result = mint(PolicyAdjustedValuationPeerContext, payload, batch_saved[4],
-            attributes={"peer_security_ids": peers}, private={"batch": weakref.ref(batch)})
-        private["contexts"][key] = result
+        result = private["contexts"].get(key)
+        if result is None:
+            raise ValueError("complete adjusted batch lacks a prepared peer context")
+        saved_proof(result, PolicyAdjustedValuationPeerContext, batch_saved[4])
         return result
 
     def score(batch, context):
         batch_saved = record(batch, PolicyAdjustedValuationBatch)
         context_saved = record(context, PolicyAdjustedValuationPeerContext)
-        if context_saved[3]["batch"]() is not batch:
+        if (type(context_saved[3]["batch"]) is not reference_type
+                or context_saved[3]["batch"]() is not batch
+                or context_saved[4] is not batch_saved[4]
+                or context_saved[1]["batch_hash"] != batch_saved[1]["batch_hash"]):
             raise ValueError("valuation peer context belongs to another complete adjusted batch")
         c, private = context_saved[1], batch_saved[3]
         if c["reason"] is not None:
             return None
-        if c["peer_count"] < 20:
-            raise ValueError("formal valuation percentile requires at least twenty peers")
         score_key = (c["security_id"], c["metric_id"])
-        if score_key in private["scores"]:
-            return private["scores"][score_key]
-        cohort = c["cohort_hash"]
-        if cohort not in private["ranks"]:
-            sorting_started = clock()
-            values = tuple(decimal_type(record(private["index"][(sid, c["metric_id"])] ,
-                PolicyAdjustedValuationInput)[1]["adjusted_value"])
-                for sid in c["peer_security_ids"])
-            private["ranks"][cohort] = rank_values(values, c["direction"])
-            private["sorts_by_cohort"][cohort] = 1
-            private["phase_seconds"]["peer_sorting"] += clock() - sorting_started
-        focal = private["index"][(c["security_id"], c["metric_id"])]
-        focal_saved = record(focal, PolicyAdjustedValuationInput)
-        value_text = focal_saved[1]["adjusted_value"]
-        value = decimal_type(value_text)
-        rank, percentile = private["ranks"][cohort][value]
-        payload = dict(schema_version="policy-adjusted-valuation-score-v1",
-            batch_hash=batch_saved[1]["batch_hash"],
-            registry_manifest_hash=batch_saved[1]["registry_manifest_hash"],
-            frozen_input_hash=batch_saved[1]["frozen_input_hash"],
-            universe_hash=batch_saved[1]["universe_hash"], metric_id=c["metric_id"],
-            security_id=c["security_id"], definition_hash=c["definition_hash"],
-            valuation_adapter_registry_hash=batch_saved[1]["valuation_adapter_registry_hash"],
-            adjusted_input_hash=focal_saved[1]["input_hash"], adjusted_value=value_text,
-            average_rank=str(rank), percentile=str(percentile), peer_count=c["peer_count"],
-            peer_context=context.to_dict())
-        payload["score_hash"] = hash_payload(payload)
-        result = mint(PolicyAdjustedValuationScore, payload, batch_saved[4],
-            attributes={"adjusted_value": value, "average_rank": rank,
-                "percentile": percentile, "peer_context": context},
-            private={"batch": weakref.ref(batch), "context": weakref.ref(context)})
-        private["scores"][score_key] = result
+        result = private["scores"].get(score_key)
+        if result is None:
+            raise ValueError("complete adjusted batch lacks a prepared valuation score")
+        saved_proof(result, PolicyAdjustedValuationScore, batch_saved[4])
         return result
 
     own_members = tuple((cls, tuple(vars(cls).items())) for cls in
@@ -648,14 +833,15 @@ def _install_valuation_engine():
          FormalValuationRepository))
     return (FormalValuationRepository, PolicyAdjustedValuationInput,
         PolicyAdjustedValuationBatch, PolicyAdjustedValuationPeerContext,
-        PolicyAdjustedValuationScore, eligible, peer_context, score, rank_values)
+        PolicyAdjustedValuationScore, eligible, peer_context, score, rank_values,
+        prepare_ranking)
 
 
 (FormalValuationRepository, PolicyAdjustedValuationInput,
  PolicyAdjustedValuationBatch, PolicyAdjustedValuationPeerContext,
  PolicyAdjustedValuationScore, valuation_peer_eligible,
  build_valuation_peer_context, score_valuation_percentile,
- _rank_valuation_values) = _install_valuation_engine()
+ _rank_valuation_values, _prepare_valuation_ranking) = _install_valuation_engine()
 del _install_valuation_engine
 
 __all__ = ["FormalValuationRepository", "PolicyAdjustedValuationInput",

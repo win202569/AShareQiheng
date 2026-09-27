@@ -35,7 +35,14 @@ class ValuationIntegrationTests(unittest.TestCase):
         context = build_valuation_peer_context(self.batch,
             security_id="BJ430001", metric_id="V.normalized_earnings_yield")
         first = score_valuation_percentile(self.batch, context)
-        second = score_valuation_percentile(self.batch, context)
+        owner = ranking.FullValuationRankingTests
+        if not hasattr(owner, "second_batch"):
+            owner.second_batch = self.fixture.build_adjusted_batch()
+        second_context = build_valuation_peer_context(owner.second_batch,
+            security_id="BJ430001", metric_id="V.normalized_earnings_yield")
+        second = score_valuation_percentile(owner.second_batch, second_context)
+        self.assertIsNot(self.batch, owner.second_batch)
+        self.assertEqual(self.batch.canonical_bytes(), owner.second_batch.canonical_bytes())
         self.assertEqual(first.canonical_bytes(), second.canonical_bytes())
         self.assertIs(first.peer_context, context)
 

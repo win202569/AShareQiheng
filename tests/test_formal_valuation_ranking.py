@@ -2,6 +2,7 @@
 
 import atexit
 import json
+import sys
 import unittest
 from decimal import Decimal, ROUND_DOWN, localcontext
 from types import MappingProxyType
@@ -9,6 +10,8 @@ from types import MappingProxyType
 from ashare_pipeline import formal_valuation_engine as valuation_engine
 from ashare_pipeline.formal_valuation_engine import (
     FormalValuationRepository,
+    PolicyAdjustedValuationBatch,
+    PolicyAdjustedValuationInput,
     PolicyAdjustedValuationPeerContext,
     PolicyAdjustedValuationScore,
     build_valuation_peer_context,
@@ -27,6 +30,7 @@ class SmallValuationRankingTests(unittest.TestCase):
         for security_id in cls.fixture.templates:
             cls.fixture.put_industry(security_id)
         cls.batch = cls.fixture.build_adjusted_batch()
+        cls.second_batch = cls.fixture.build_adjusted_batch()
 
     @classmethod
     def tearDownClass(cls):
@@ -53,11 +57,43 @@ class SmallValuationRankingTests(unittest.TestCase):
             security_id="BJ430001",
             metric_id="V.normalized_earnings_yield",
         )
-        second = self.fixture.build_adjusted_batch()
         with self.assertRaisesRegex(ValueError, "another complete adjusted batch"):
-            score_valuation_percentile(second, context)
+            score_valuation_percentile(self.second_batch, context)
+
+    def test_weakref_retargeting_cannot_rebind_context_to_another_batch(self):
+        original_ref = valuation_engine.weakref.ref
+
+        def retarget(value, callback=None):
+            if value is self.second_batch:
+                return original_ref(self.batch)
+            return original_ref(value) if callback is None else original_ref(value, callback)
+
+        valuation_engine.weakref.ref = retarget
+        try:
+            with self.assertRaisesRegex(ValueError, "dependency"):
+                build_valuation_peer_context(self.second_batch,
+                    security_id="SH600000", metric_id="V.normalized_earnings_yield")
+        finally:
+            valuation_engine.weakref.ref = original_ref
+        context = build_valuation_peer_context(self.second_batch,
+            security_id="SH600000", metric_id="V.normalized_earnings_yield")
+        context.require_verified()
+        with self.assertRaisesRegex(ValueError, "another complete adjusted batch|proof chain"):
+            score_valuation_percentile(self.batch, context)
+
+    def test_independent_rebuild_replays_batch_and_context_bytes(self):
+        self.assertIsNot(self.batch, self.second_batch)
+        self.assertEqual(self.batch.canonical_bytes(), self.second_batch.canonical_bytes())
+        first = build_valuation_peer_context(self.batch,
+            security_id="BJ430001", metric_id="V.normalized_earnings_yield")
+        second = build_valuation_peer_context(self.second_batch,
+            security_id="BJ430001", metric_id="V.normalized_earnings_yield")
+        self.assertIsNot(first, second)
+        self.assertEqual(first.canonical_bytes(), second.canonical_bytes())
 
     def test_diagnostics_bind_the_batch_and_count_one_group_index(self):
+        before = self.fixture.repository.diagnostic_report(self.batch)
+        self.assertEqual(before["group_index_builds"], 1)
         for security_id in self.batch.security_ids:
             build_valuation_peer_context(
                 self.batch,
@@ -65,6 +101,9 @@ class SmallValuationRankingTests(unittest.TestCase):
                 metric_id="V.normalized_earnings_yield",
             )
         report = self.fixture.repository.diagnostic_report(self.batch)
+        deterministic = {key: value for key, value in before.items() if key != "phase_seconds"}
+        self.assertEqual(deterministic,
+            {key: value for key, value in report.items() if key != "phase_seconds"})
         self.assertEqual(report["batch_hash"], self.batch.batch_hash)
         self.assertEqual(report["security_count"], 3)
         self.assertEqual(report["valuation_row_count"], 9)
@@ -91,7 +130,57 @@ class SmallValuationRankingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "another valuation repository"):
             foreign.diagnostic_report(self.batch)
 
+    def test_derived_proof_failure_revokes_batch_rows_and_contexts(self):
+        captured = []
+
+        def hook(frame, event, result):
+            if (event == "return" and frame.f_code.co_name == "mint"
+                    and frame.f_code.co_filename.endswith("formal_valuation_engine.py")):
+                captured.append(result)
+                if type(result) is PolicyAdjustedValuationPeerContext:
+                    raise RuntimeError("injected derived proof failure")
+            return hook
+
+        previous = sys.gettrace()
+        try:
+            sys.settrace(hook)
+            with self.assertRaisesRegex(RuntimeError, "injected derived proof failure"):
+                self.fixture.build_adjusted_batch()
+        finally:
+            sys.settrace(previous)
+        self.assertTrue(any(type(item) is PolicyAdjustedValuationBatch for item in captured))
+        self.assertTrue(any(type(item) is PolicyAdjustedValuationInput for item in captured))
+        self.assertTrue(any(type(item) is PolicyAdjustedValuationPeerContext for item in captured))
+        for item in captured:
+            with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
+                item.require_verified()
+
 class ValuationRankKernelTests(unittest.TestCase):
+    @staticmethod
+    def synthetic_rows(count=20, *, bad_value=None):
+        rows = []
+        for index in range(count):
+            value = bad_value if index == 0 and bad_value is not None else str(index + 1)
+            rows.append(dict(security_id=f"SH{600000 + index}", metric_id="V.synthetic",
+                template_id="general_nonfinancial", primary_industry="primary",
+                secondary_industry="secondary", status="passthrough_clear", reason=None,
+                adjusted_value=value, original_metric=dict(invalid_reason=None,
+                    definition_hash="a" * 64, direction="higher")))
+        return tuple(rows)
+
+    def test_synthetic_twenty_builds_one_group_and_sorts_one_cohort(self):
+        ranking_plan = valuation_engine._prepare_valuation_ranking(self.synthetic_rows())
+        summary = ranking_plan[3]
+        self.assertEqual(summary["group_index_builds"], 1)
+        self.assertEqual(summary["context_count"], 20)
+        self.assertEqual(summary["cohort_count"], 1)
+        self.assertEqual(summary["sort_count"], 1)
+
+    def test_synthetic_sort_failure_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "finite exact Decimal peers"):
+            valuation_engine._prepare_valuation_ranking(
+                self.synthetic_rows(bad_value="NaN"))
+
     def test_peer_and_score_proofs_cannot_be_constructed_or_forged(self):
         for cls in (PolicyAdjustedValuationPeerContext, PolicyAdjustedValuationScore):
             with self.assertRaises(TypeError):
