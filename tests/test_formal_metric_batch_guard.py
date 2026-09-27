@@ -126,7 +126,7 @@ class MetricBatchReviewTests(unittest.TestCase):
         observed = 0
         def profile(frame, event, result):
             nonlocal observed
-            if (event == "call" and frame.f_code.co_name == "_canonical"
+            if (event == "call" and frame.f_code.co_name == "canonical"
                     and frame.f_code.co_filename.endswith("formal_metric_engine.py")):
                 observed += 1
                 connection = sqlite3.connect(fixture.db_path, timeout=0, isolation_level=None)
