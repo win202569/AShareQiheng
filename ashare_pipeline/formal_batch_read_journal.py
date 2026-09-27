@@ -15,6 +15,11 @@ import weakref
 def _install_journal():
     scopes = {}
     tickets = {}
+    get_thread_identity = threading.get_ident
+
+    def _check_runtime_dependencies():
+        if vars(threading).get("get_ident") is not get_thread_identity:
+            raise ValueError("batch journal dependency changed")
 
     def _methods(instance):
         target = instance if isinstance(instance, type) else type(instance)
@@ -86,6 +91,7 @@ def _install_journal():
         return kind, state, refs + expanded, allowed
 
     def _scope(scope, *, active=True):
+        _check_runtime_dependencies()
         if (globals().get("_issue_current_ticket") is not issue
                 or globals().get("_require_current_scope") is not require_scope
                 or globals().get("_require_current_ticket") is not require_ticket):
@@ -95,7 +101,7 @@ def _install_journal():
             raise ValueError("batch scope is forged or copied")
         if active and record[1] != "active":
             raise ValueError("batch scope is closed")
-        if threading.get_ident() != record[2]:
+        if get_thread_identity() != record[2]:
             raise ValueError("batch scope belongs to a different thread")
         owner, kind, state, refs, signatures = record[3:8]
         current_kind, current_state, current_refs, current_allowed = _chain(owner)
@@ -150,6 +156,7 @@ def _install_journal():
         @classmethod
         def open(cls, owner, *, registry_manifest_hash, as_of_utc, population, required_keys,
                  frozen_input_hash=None):
+            _check_runtime_dependencies()
             if cls is not FormalBatchReadJournal:
                 raise ValueError("batch scope type must be exact")
             if (globals().get("_issue_current_ticket") is not issue
@@ -187,7 +194,7 @@ def _install_journal():
             result = object.__new__(FormalBatchReadJournal)
             scope_id = id(result)
             scopes[scope_id] = [weakref.ref(result, lambda _, key=scope_id: scopes.pop(key, None)),
-                "active", threading.get_ident(), owner, kind, state, refs, signatures,
+                "active", get_thread_identity(), owner, kind, state, refs, signatures,
                 str(state.db_path.resolve()), registry_manifest_hash, as_of_utc, population,
                 frozenset(required_keys), {}, 0, {}, allowed, frozen_input_hash, object()]
             return result
@@ -263,7 +270,7 @@ def _install_journal():
             record = scopes.get(id(self))
             if (type(self) is not FormalBatchReadJournal or record is None
                     or record[0]() is not self or record[1] != "active"
-                    or threading.get_ident() != record[2]):
+                    or get_thread_identity() != record[2]):
                 raise ValueError("batch scope is closed, forged, or cross-thread")
             record[1] = "consumed"
 

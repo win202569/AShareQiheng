@@ -8,6 +8,7 @@ from pathlib import Path
 from types import FunctionType
 import sqlite3
 import sys
+import threading
 import unittest
 
 from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
@@ -376,6 +377,33 @@ class MarketBindingLeaseTests(unittest.TestCase):
         self.assertEqual(market_issues, [])
         with self.assertRaisesRegex(ValueError, "closed"):
             journal.checkpoint()
+
+        fresh = self._journal(fixture, repository)
+        repository.select_current_batch_ticket(
+            fresh, "SH600000", FREEZE, binding=fixture.binding)
+        fresh.close()
+
+    def test_replaced_thread_identity_cannot_leave_rejected_owner_scope_replayable(self):
+        fixture = self._fixture()
+        days = _trading_days(20)
+        fixture.put_window("SH600000", trading_days=days,
+                           rows={day: quiet_row() for day in days})
+        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
+        journal = self._journal(fixture, repository)
+        genuine_get_ident = threading.get_ident
+        threading.get_ident = lambda: -1
+        try:
+            with self.assertRaisesRegex(ValueError, "dependency changed"):
+                repository.select_current_batch_ticket(
+                    journal, "SH600000", FREEZE, binding=fixture.binding)
+        finally:
+            threading.get_ident = genuine_get_ident
+
+        with self.assertRaisesRegex(ValueError, "closed"):
+            journal.checkpoint()
+        with self.assertRaisesRegex(ValueError, "closed"):
+            repository.select_current_batch_ticket(
+                journal, "SH600000", FREEZE, binding=fixture.binding)
 
         fresh = self._journal(fixture, repository)
         repository.select_current_batch_ticket(
