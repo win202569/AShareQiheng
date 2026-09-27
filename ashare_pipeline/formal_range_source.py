@@ -176,6 +176,7 @@ def _build_request_authority():
         fingerprint: str
         config_wire: dict[str, object]
         source_registry_hash: str
+        binding_hash: str
         previous: object = None
         parent: object = None
         owner_store: object = None
@@ -253,6 +254,23 @@ def _build_request_authority():
             raise ValueError("formal range request binding, root, or config changed")
         return record
 
+    def request_proof(request: object) -> dict[str, object]:
+        """Read only the immutable sealed request record, without a current binding read."""
+        record = records.get(id(request))
+        if (type(request) is not FormalRangeRequestV1 or record is None
+                or record.reference() is not request):
+            raise ValueError("formal range request is forged, copied, or unregistered")
+        current = {
+            field: object.__getattribute__(request, field) for field in _REQUEST_FIELDS
+        }
+        if (any(type(current[field]) is not type(record.wire[field])
+                or current[field] != record.wire[field] for field in _REQUEST_FIELDS)
+                or hashlib.sha256(_canonical(current)).hexdigest() != record.fingerprint):
+            raise ValueError("formal range request fields changed")
+        return dict(request=dict(record.wire), config=dict(record.config_wire),
+                    source_registry_hash=record.source_registry_hash,
+                    binding_hash=record.binding_hash, parent=record.parent)
+
     def seal(binding, wire, config, *, previous=None, parent=None, owner_store=None):
         if ((wire["kind"] == "market_range" and previous is None)
                 != (owner_store is not None)):
@@ -270,8 +288,8 @@ def _build_request_authority():
         fingerprint = hashlib.sha256(_canonical(wire)).hexdigest()
         records[identity] = _RequestRecord(
             weakref.ref(request, forget), binding, dict(wire), fingerprint,
-            _range_config_to_dict(config), _source_hash_get(binding), previous, parent,
-            owner_store,
+            _range_config_to_dict(config), _source_hash_get(binding),
+            _read_planning_binding(binding)["binding_hash"], previous, parent, owner_store,
         )
         request_record(request)
         return request
@@ -383,7 +401,7 @@ def _build_request_authority():
         return dict(record.wire), dict(record.config_wire), record.source_registry_hash
 
     return (FormalRangeRequestV1, mint_first_calendar, mint_market,
-            mint_continuation, snapshot, request_record)
+            mint_continuation, snapshot, request_record, request_proof)
 
 
 (
@@ -393,6 +411,7 @@ def _build_request_authority():
     _mint_range_continuation,
     _trusted_range_request_snapshot,
     _range_request_record,
+    _trusted_range_request_proof,
 ) = _build_request_authority()
 del _build_request_authority
 
@@ -1309,7 +1328,8 @@ def _build_source_type():
     trusted_parse = FormalRangeSource._parse
     from . import formal_range_store as store_module
     Store, store_read, store_require_current, store_record, store_identity = store_module._build_range_store_type(
-        describe_request=describe_request, restore_request=restore_request,
+        describe_request=describe_request, request_proof=_trusted_range_request_proof,
+        restore_request=restore_request,
         source_type=FormalRangeSource, source_binding=lambda source: source_record(source).binding,
         bind_source_store=bind_source_store,
         source_parse=FormalRangeSource.parse_verified_snapshot, fetch_type=fetch_type,

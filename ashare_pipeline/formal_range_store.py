@@ -82,7 +82,7 @@ def _read_content(root, path_text, digest, suffix):
     return data
 
 
-def _build_range_store_type(*, describe_request, restore_request, source_type,
+def _build_range_store_type(*, describe_request, request_proof, restore_request, source_type,
                            source_binding, bind_source_store, source_parse,
                            fetch_type, fetch_snapshot,
                            mint_observation, observation_wire, require_execution):
@@ -120,7 +120,9 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
     from .formal_range_contract import _range_binding_lookup_authority
     planning_binding_type, read_planning_binding = _range_binding_planning_authority()
     lookup_planning_binding = _range_binding_lookup_authority()
-    open_sibling_read, _ = _range_binding_sibling_read_authority()
+    (install_sibling_read, open_sibling_read, open_sibling_record,
+     open_sibling_ticket, close_sibling_read,
+     enter_sibling_target, close_sibling_target) = _range_binding_sibling_read_authority()
 
     def load_binding_identity(store, *, registry_manifest_hash, binding_hash, exchange):
         state, _, verifier, factory, cache = record(store)
@@ -286,26 +288,40 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                 raise ValueError("range manifest producer mismatch")
             task_copy, snapshot_copy, receipt_copy = dict(task), dict(snapshot), dict(receipt)
             attempt_copy = dict(attempt)
-        request, source = request_for(store, task_copy, (*seen, task_id), evidence=evidence)
-        document = source_parse(source, request, raw_bytes=raw, manifest=manifest["fetch"]).to_dict()
-        expected_receipt = dict(schema_version="formal-range-normalization-receipt-v1", task_id=task_id,
-            snapshot_id=snapshot_copy["id"], attempt_id=attempt["id"], worker_id=attempt["worker_id"],
-            task_payload_hash=task_copy["payload_hash"], manifest_sha256=snapshot_copy["manifest_sha256"],
-            content_sha256=snapshot_copy["content_sha256"], normalization_hash=_digest(document),
-            fetch=manifest["fetch"], refresh_generation=task_copy["refresh_generation"])
-        if _canonical(receipt_wire) != _canonical(expected_receipt) or receipt_copy["normalization_hash"] != _digest(document):
-            raise ValueError("range normalization receipt differs from actual output")
-        if task_copy["result_json"] != _canonical(dict(snapshot_id=snapshot_copy["id"], receipt_hash=receipt_copy["payload_hash"])).decode():
-            raise ValueError("range verified result differs")
-        authenticated = (task_copy, snapshot_copy, receipt_copy, attempt_copy, raw, manifest_bytes)
-        with transaction(state) as connection:
-            check_read_evidence(connection, root, authenticated)
-        if evidence is not None:
-            evidence.append(authenticated)
-        wire = dict(request=payload["request"], document=document, receipt=dict(receipt_wire, recorded_at=receipt_copy["recorded_at"]),
-            snapshot=dict(manifest, **{key: snapshot_copy[key] for key in ("id", "content_path", "manifest_path", "content_sha256", "manifest_sha256")}),
-            task=public(task_copy, attempt), generation=dict(refresh_generation=task_copy["refresh_generation"], upstream_generation=document["upstream_generation"]))
-        return mint_observation(store, wire, historical)
+        target = enter_sibling_target(task_copy["request_fingerprint"], task_id)
+        try:
+            request, source = request_for(
+                store, task_copy, (*seen, task_id), evidence=evidence)
+            document = source_parse(
+                source, request, raw_bytes=raw, manifest=manifest["fetch"]).to_dict()
+            expected_receipt = dict(schema_version="formal-range-normalization-receipt-v1", task_id=task_id,
+                snapshot_id=snapshot_copy["id"], attempt_id=attempt["id"], worker_id=attempt["worker_id"],
+                task_payload_hash=task_copy["payload_hash"], manifest_sha256=snapshot_copy["manifest_sha256"],
+                content_sha256=snapshot_copy["content_sha256"], normalization_hash=_digest(document),
+                fetch=manifest["fetch"], refresh_generation=task_copy["refresh_generation"])
+            if (_canonical(receipt_wire) != _canonical(expected_receipt)
+                    or receipt_copy["normalization_hash"] != _digest(document)):
+                raise ValueError("range normalization receipt differs from actual output")
+            if task_copy["result_json"] != _canonical(dict(
+                    snapshot_id=snapshot_copy["id"],
+                    receipt_hash=receipt_copy["payload_hash"])).decode():
+                raise ValueError("range verified result differs")
+            authenticated = (
+                task_copy, snapshot_copy, receipt_copy, attempt_copy, raw, manifest_bytes)
+            with transaction(state) as connection:
+                check_read_evidence(connection, root, authenticated)
+            if evidence is not None:
+                evidence.append(authenticated)
+            wire = dict(request=payload["request"], document=document,
+                receipt=dict(receipt_wire, recorded_at=receipt_copy["recorded_at"]),
+                snapshot=dict(manifest, **{key: snapshot_copy[key] for key in (
+                    "id", "content_path", "manifest_path", "content_sha256", "manifest_sha256")}),
+                task=public(task_copy, attempt),
+                generation=dict(refresh_generation=task_copy["refresh_generation"],
+                                upstream_generation=document["upstream_generation"]))
+            return mint_observation(store, wire, historical)
+        finally:
+            close_sibling_target(target)
 
     def candidate_snapshot(connection, fingerprint):
         rows = connection.execute("SELECT * FROM formal_range_task WHERE request_fingerprint=? AND status='verified' ORDER BY id", (fingerprint,)).fetchall()
@@ -371,23 +387,31 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
         require_parent_chain(store, wire, snapshots)
 
     def require_current(store, wire, digest):
-        capture = parent_ticket_capture.get()
-        authenticated = []
-        if capture is not None:
-            reread = read(store, wire["task"]["id"], evidence=authenticated)
-            if observation_wire(reread)[1] != digest:
-                raise ValueError("range parent source changed before current check")
-        snapshots = []
-        qualify_current(store, wire, digest, snapshots)
-        if capture is None:
-            finish_current_check(store, snapshots)
-        else:
-            state, root, _, _, _ = record(store)
-            with transaction(state) as connection:
-                check_candidate_snapshots(connection, snapshots)
-                for item in authenticated:
-                    check_read_evidence(connection, root, item)
-            capture.append((tuple(snapshots), tuple(authenticated), digest))
+        payload = wire["snapshot"]["task_payload"]
+        description = {key: payload[key] for key in (
+            "request", "config", "source_registry_hash", "binding_hash", "parent")}
+        sibling_read = open_sibling_record(description, _digest(wire["request"]))
+        try:
+            capture = parent_ticket_capture.get()
+            authenticated = []
+            if capture is not None:
+                reread = read(store, wire["task"]["id"], evidence=authenticated)
+                if observation_wire(reread)[1] != digest:
+                    raise ValueError("range parent source changed before current check")
+            snapshots = []
+            qualify_current(store, wire, digest, snapshots)
+            if capture is None:
+                finish_current_check(store, snapshots)
+            else:
+                state, root, _, _, _ = record(store)
+                with transaction(state) as connection:
+                    check_candidate_snapshots(connection, snapshots)
+                    for item in authenticated:
+                        check_read_evidence(connection, root, item)
+                capture.append((tuple(snapshots), tuple(authenticated), digest))
+        finally:
+            if sibling_read is not None:
+                close_sibling_read(sibling_read)
 
     def parent_candidate_snapshots(connection, task):
         snapshots, seen = [], {task["id"]}
@@ -610,8 +634,8 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
             if (request_description is not None
                     and _digest(request_description["request"]) != fingerprint):
                 raise ValueError("range bound request fingerprint differs")
-            if request_description is not None:
-                open_sibling_read(request_description, fingerprint)
+            sibling_read = (None if request is None else
+                            open_sibling_read(request, fingerprint))
             selected, snapshots = self._select_current_with_token(fingerprint)
             if selected is not None and request_description is not None:
                 selected_wire = observation_wire(selected)[0]
@@ -658,6 +682,8 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                               for value in item] for item in authenticated]))
                 evidence = (fingerprint, None, tuple(authenticated), snapshots, request,
                             _canonical(request_description))
+                if sibling_read is not None:
+                    close_sibling_read(sibling_read)
                 return _issue_current_ticket(journal, self, "range", (fingerprint,),
                     baseline, evidence, ((fingerprint,),), None)
             wire, digest = observation_wire(selected)
@@ -683,26 +709,44 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
                 candidates=[(key, [row.decode() for row in rows]) for key, rows in snapshots],
                 sources=[[_canonical(value).decode() if type(value) is dict else value.hex()
                           for value in item] for item in authenticated]))
+            if sibling_read is not None:
+                close_sibling_read(sibling_read)
             return _issue_current_ticket(journal, self, "range", (fingerprint,),
                                          baseline, evidence, ((fingerprint,),), selected)
 
         def _batch_recheck_ticket(self, evidence):
             """Compare the original six authenticated records and candidate sets."""
             fingerprint, digest, authenticated, snapshots, request, request_bytes = evidence
-            state, root, _, _, _ = record(self)
-            if fingerprint not in dict(snapshots):
-                raise ValueError("range ticket evidence is incomplete")
-            if digest is None:
-                if (request is None or request_bytes != _canonical(describe_request(request))
-                        or _digest(describe_request(request)["request"]) != fingerprint
-                        or dict(snapshots)[fingerprint]):
-                    raise ValueError("range absence request or candidates changed")
-            elif not digest or not authenticated or request is not None:
-                raise ValueError("range present ticket evidence is incomplete")
-            with transaction(state) as connection:
-                check_candidate_snapshots(connection, snapshots)
-                for item in authenticated:
-                    check_read_evidence(connection, root, item)
+            sibling_read = (None if request is None else
+                            open_sibling_ticket(request, fingerprint))
+            target = (None if request is None else
+                      enter_sibling_target(fingerprint, "ticket:" + fingerprint))
+            try:
+                state, root, _, _, _ = record(self)
+                if fingerprint not in dict(snapshots):
+                    raise ValueError("range ticket evidence is incomplete")
+                if digest is None:
+                    if (request is None
+                            or request_bytes != _canonical(describe_request(request))
+                            or _digest(describe_request(request)["request"]) != fingerprint
+                            or dict(snapshots)[fingerprint]):
+                        raise ValueError("range absence request or candidates changed")
+                elif not digest or not authenticated or request is not None:
+                    raise ValueError("range present ticket evidence is incomplete")
+                with transaction(state) as connection:
+                    check_candidate_snapshots(connection, snapshots)
+                    for item in authenticated:
+                        check_read_evidence(connection, root, item)
+            finally:
+                if target is not None:
+                    close_sibling_target(target)
+                if sibling_read is not None:
+                    close_sibling_read(sibling_read)
+
+    install_sibling_read(request_proof,
+                         FormalRangeStore.select_current_batch_ticket.__code__,
+                         read.__code__, require_current.__code__,
+                         FormalRangeStore._batch_recheck_ticket.__code__)
 
     batch_methods = tuple((cls, name, value)
         for cls in (FormalRangeStore, source_type, StateStore)

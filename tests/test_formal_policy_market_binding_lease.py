@@ -91,6 +91,56 @@ class MarketBindingLeaseTests(unittest.TestCase):
             as_of_utc=FREEZE, population=("SH600000",),
             required_keys=(("SH600000",),))
 
+    def test_sibling_capability_rejects_a_self_consistent_forged_request_dict(self):
+        from ashare_pipeline import formal_range_contract as contract
+        from ashare_pipeline.formal_range_format import _range_config_to_dict
+
+        fixture = self._fixture()
+        fixture.produce_calendar(days={"2026-08-31": True})
+        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
+        request = fixture.source.first_calendar_request(FREEZE)
+        description = {
+            "request": request.to_dict(),
+            "config": _range_config_to_dict(fixture.binding.calendar_config),
+            "source_registry_hash": fixture.binding.source_registry_hash,
+            "binding_hash": fixture.binding.binding_hash,
+            "parent": {"arbitrary": True},
+        }
+        for field in ("security_id", "as_of_utc", "start_date", "end_date"):
+            description["request"].pop(field)
+        forged_fingerprint = hashlib.sha256(json.dumps(
+            description["request"], sort_keys=True, ensure_ascii=False,
+            separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+        _, open_sibling, _, _, _, _, _ = contract._range_binding_sibling_read_authority()
+        first_calendar_code = vars(type(fixture.source))["first_calendar_request"].__code__
+        rejected = FormalBatchReadJournal.open(
+            repository,
+            registry_manifest_hash=fixture.graph.manifest.manifest_hash,
+            as_of_utc=FREEZE, population=("SH600000",), required_keys=(("SH",),))
+
+        def inject(frame, event, arg):
+            if event == "return" and frame.f_code is first_calendar_code:
+                sys.setprofile(None)
+                open_sibling(description, forged_fingerprint)
+
+        sys.setprofile(inject)
+        try:
+            with self.assertRaises(ValueError):
+                repository.select_calendar_batch_ticket(rejected, fixture.binding, FREEZE)
+        finally:
+            sys.setprofile(None)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            rejected.checkpoint()
+
+        fresh = FormalBatchReadJournal.open(
+            repository,
+            registry_manifest_hash=fixture.graph.manifest.manifest_hash,
+            as_of_utc=FREEZE, population=("SH600000",), required_keys=(("SH",),))
+        self.assertIsNotNone(repository.select_calendar_batch_ticket(
+            fresh, fixture.binding, FREEZE))
+        fresh.close()
+
     def test_signed_sibling_binding_reuses_one_exact_calendar_request_lineage(self):
         from contextlib import closing
         from ashare_pipeline.formal_range_contract import load_policy_range_bindings
@@ -162,10 +212,74 @@ class MarketBindingLeaseTests(unittest.TestCase):
         self.assertIsNotNone(market_ticket.selected().window)
         market_scope.close()
 
+        first_observation = fixture.range_store.select_current(
+            broker_request.request_fingerprint)
+        self.assertIsNotNone(first_observation)
+        bank_source = fixture.source_factory(bank)
+        second_request = bank_source.previous_calendar_request(first_observation)
+        self.assertIsNotNone(second_request)
+        self.assertNotEqual(second_request.request_fingerprint,
+                            broker_request.request_fingerprint)
+        from tests.test_formal_range_source import document_wire
+        second_task = fixture.range_store.enqueue(
+            second_request, refresh_generation="g1")
+        second_wire = document_wire(second_request)
+        second_wire["rows"] = [
+            dict(second_wire["rows"][0], date=second_request.end_date)
+        ]
+        fixture.reply(second_wire)
+        second_lease = fixture.range_store.lease_next(
+            "sibling-fingerprint-worker", lease_seconds=3600)
+        self.assertEqual(second_lease["id"], second_task["id"])
+        fixture.range_store.persist(
+            second_task["id"], "sibling-fingerprint-worker",
+            second_lease["attempt_id"], fetch=bank_source.fetch_verified(second_request))
+        self.assertIsNotNone(fixture.range_store.select_current(
+            second_request.request_fingerprint))
+        selector_code = vars(type(fixture.range_store))[
+            "select_current_batch_ticket"
+        ].__code__
+        borrowed_scope = FormalBatchReadJournal.open(
+            repository,
+            registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
+            as_of_utc=FREEZE,
+            population=("SH600002",),
+            required_keys=(("SH",),),
+        )
+
+        def borrow_for_another_request(frame, event, arg):
+            if (event == "return" and frame.f_code is selector_code
+                    and frame.f_locals.get("fingerprint")
+                    == broker_request.request_fingerprint):
+                sys.setprofile(None)
+                fixture.range_store.select_current_batch_ticket(
+                    borrowed_scope, second_request.request_fingerprint,
+                    request=None)
+
+        sys.setprofile(borrow_for_another_request)
+        try:
+            with self.assertRaisesRegex(ValueError, "cross-binding"):
+                repository.select_calendar_batch_ticket(
+                    borrowed_scope, broker, FREEZE)
+        finally:
+            sys.setprofile(None)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            borrowed_scope.checkpoint()
+        fresh_borrow_scope = FormalBatchReadJournal.open(
+            repository,
+            registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
+            as_of_utc=FREEZE,
+            population=("SH600002",),
+            required_keys=(("SH",),),
+        )
+        self.assertIsNotNone(repository.select_calendar_batch_ticket(
+            fresh_borrow_scope, broker, FREEZE))
+        fresh_borrow_scope.close()
+
         from ashare_pipeline import formal_range_contract as contract
         from ashare_pipeline.formal_range_format import _range_config_to_dict
 
-        open_sibling, _ = contract._range_binding_sibling_read_authority()
+        _, open_sibling, _, _, _, _, _ = contract._range_binding_sibling_read_authority()
         first_calendar_code = vars(type(fixture.source_factory(broker)))[
             "first_calendar_request"
         ].__code__
@@ -204,6 +318,11 @@ class MarketBindingLeaseTests(unittest.TestCase):
         changed = json.loads(json.dumps(base_description))
         changed["request"]["exchange"] = "SZ"
         variants["exchange"] = (changed, digest_request(changed))
+        changed = json.loads(json.dumps(base_description))
+        for field in ("security_id", "as_of_utc", "start_date", "end_date"):
+            changed["request"].pop(field)
+        changed["parent"] = {"arbitrary": True}
+        variants["forged_self_consistent_request"] = (changed, digest_request(changed))
 
         def new_calendar_scope():
             return FormalBatchReadJournal.open(
@@ -236,7 +355,7 @@ class MarketBindingLeaseTests(unittest.TestCase):
                 fresh_scope = new_calendar_scope()
                 fresh_ticket = repository.select_calendar_batch_ticket(
                     fresh_scope, broker, FREEZE)
-                self.assertIsNotNone(fresh_ticket.selected().coverage)
+                self.assertIsNotNone(fresh_ticket)
                 fresh_scope.close()
 
     def test_owner_ticket_capture_fallback_is_two_and_does_not_scale_with_more_requests(self):

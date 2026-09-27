@@ -410,8 +410,12 @@ def _build_range_bindings_contract():
     _binding_records: dict[int, _BindingRecord] = {}
     _binding_read_lease = ContextVar("formal_range_current_binding_read_lease", default=None)
     _sibling_request_read = ContextVar("formal_range_sibling_request_read", default=None)
+    _sibling_target_read = ContextVar("formal_range_sibling_target_read", default=None)
     _lease_records = {}
     _sibling_records = {}
+    _target_records = {}
+    _sibling_request_prover = [None]
+    _sibling_store_codes = [None]
 
 
     def _envelope(value, fields):
@@ -491,8 +495,10 @@ def _build_range_bindings_contract():
             identity = (parent_record.snapshot.root_hash, record.binding_hash, record.key)
             exact_binding = identity == lease[2]
             sibling = _sibling_request_read.get() if not exact_binding else None
+            target = _sibling_target_read.get() if sibling is not None else None
             sibling_matches = (
                 sibling is not None
+                and target is not None
                 and sibling[0] is lease
                 and sibling[1] == get_thread_identity()
                 and sibling[2] is lease[1]
@@ -502,6 +508,10 @@ def _build_range_bindings_contract():
                 and next(digest for role, _, digest in parent_record.snapshot.roles
                          if role == "source") == sibling[6]
                 and record.key[1] == sibling[8]
+                and target[0] == get_thread_identity()
+                and (target[1] == sibling[9]
+                     or (type(sibling[11]) is dict
+                         and sibling[11].get("task_id") == target[2]))
                 and (record.calendar_bytes if sibling[10] == "calendar_range"
                      else record.market_bytes) == sibling[5]
             )
@@ -567,18 +577,83 @@ def _build_range_bindings_contract():
             raise TypeError("sibling request reads cannot be exported")
 
 
-    def open_sibling_request_read(request_description, request_fingerprint):
-        """Authorize one genuine request to read an identical persisted sibling."""
-        _check_dependencies()
+    class _SiblingTargetRead:
+        __slots__ = ("__weakref__",)
+
+        def __init__(self, *_args, **_kwargs):
+            raise TypeError("sibling targets require their sealed range Store")
+
+
+    def install_sibling_request_read(
+            prover, selector_code, read_code, current_code, recheck_code):
+        caller = get_frame(1)
+        if (caller.f_code.co_name != "_build_range_store_type"
+                or caller.f_globals.get("__name__") != "ashare_pipeline.formal_range_store"
+                or _sibling_request_prover[0] is not None
+                or not callable(prover)
+                or type(selector_code) is not type(install_sibling_request_read.__code__)
+                or type(read_code) is not type(install_sibling_request_read.__code__)
+                or type(current_code) is not type(install_sibling_request_read.__code__)
+                or type(recheck_code) is not type(install_sibling_request_read.__code__)):
+            raise ValueError("sibling request authority installation is invalid")
+        _sibling_request_prover[0] = prover
+        _sibling_store_codes[0] = (
+            selector_code, read_code, current_code, recheck_code)
+
+
+    def _require_sibling_store_entry(index):
+        codes = _sibling_store_codes[0]
+        caller = get_frame(2)
+        if codes is None or caller.f_code is not codes[index]:
+            raise ValueError("sibling request reads require their fixed range Store entry")
+
+
+    def enter_sibling_target_read(request_fingerprint, task_id):
+        codes = _sibling_store_codes[0]
+        caller = get_frame(1)
+        if codes is None or caller.f_code not in (codes[1], codes[3]):
+            raise ValueError("sibling targets require their fixed range Store entry")
+        if (type(request_fingerprint) is not str or len(request_fingerprint) != 64
+                or any(character not in "0123456789abcdef"
+                       for character in request_fingerprint)
+                or type(task_id) is not str or not task_id):
+            raise ValueError("sibling target identity is invalid")
+        state = (get_thread_identity(), request_fingerprint, task_id)
+        context_token = _sibling_target_read.set(state)
+        result = object.__new__(_SiblingTargetRead)
+        identity = id(result)
+        reference = weakref.ref(result, lambda ref, key=identity:
+            _target_records.pop(key, None)
+            if _target_records.get(key) is not None
+            and _target_records[key][0] is ref else None)
+        _target_records[identity] = [reference, state, context_token, True]
+        return result
+
+
+    def close_sibling_target_read(capability):
+        saved = _target_records.get(id(capability))
+        if (type(capability) is not _SiblingTargetRead or saved is None
+                or saved[0]() is not capability or saved[3] is not True):
+            raise ValueError("sibling target read is forged, copied, or closed")
+        state, token = saved[1:3]
+        if (get_thread_identity() != state[0]
+                or _sibling_target_read.get() is not state):
+            raise ValueError("sibling target read is cross-thread or out of order")
+        _sibling_target_read.reset(token)
+        saved[3] = False
+
+
+    def _open_sibling_description(
+            request_description, request_fingerprint, *, require_owner_binding):
         lease = _binding_read_lease.get()
         if lease is None:
-            raise ValueError("sibling request read requires one active owner lease")
+            return None
         prior = _sibling_request_read.get()
+        prior_capability = None
         if prior is not None:
             if prior[0] is not lease:
                 raise ValueError("sibling request read belongs to another owner lease")
             prior_capability = lease[11]
-            close_sibling_request_read(prior_capability)
         current_owner, current_epoch, current_phase = validate_lease_scope(lease[1])
         if ((current_owner, current_epoch, current_phase) != tuple(lease[6:9])
                 or get_thread_identity() != lease[0]):
@@ -597,8 +672,8 @@ def _build_range_bindings_contract():
                 or hashlib.sha256(_canonical(request)).hexdigest() != request_fingerprint):
             raise ValueError("sibling request fingerprint differs")
         owner_reference = lease[4].bindings.get(lease[2][2])
-        owner_binding = None if owner_reference is None else owner_reference()
-        owner_record = _binding_record(owner_binding)
+        lease_binding = None if owner_reference is None else owner_reference()
+        owner_record = _binding_record(lease_binding)
         kind = request["kind"]
         config_bytes = _canonical(request_description["config"])
         expected_config = (owner_record.calendar_config if kind == "calendar_range"
@@ -607,16 +682,22 @@ def _build_range_bindings_contract():
                           else owner_record.market_bytes)
         source_hash = next(digest for role, _, digest in lease[4].snapshot.roles
                            if role == "source")
-        if (config_bytes != expected_bytes
-                or request_description["binding_hash"] != owner_record.binding_hash
-                or request_description["source_registry_hash"] != source_hash
-                or request.get("registry_manifest_hash") != lease[2][0]
-                or request.get("exchange") != owner_record.key[1]
-                or request.get("range_config_id") != expected_config.entry_id):
-            raise ValueError("sibling request differs from owner binding contract")
+        differences = tuple(label for label, changed in (
+            ("config", config_bytes != expected_bytes),
+            ("binding", require_owner_binding
+             and request_description["binding_hash"] != owner_record.binding_hash),
+            ("source", request_description["source_registry_hash"] != source_hash),
+            ("root", request.get("registry_manifest_hash") != lease[2][0]),
+            ("exchange", request.get("exchange") != owner_record.key[1]),
+            ("range_config", request.get("range_config_id") != expected_config.entry_id),
+        ) if changed)
+        if differences:
+            raise ValueError(
+                "sibling request differs from owner binding contract: "
+                + ",".join(differences))
         state = (lease, get_thread_identity(), lease[1], current_epoch, current_phase,
                  config_bytes, source_hash, lease[2][0], owner_record.key[1],
-                 request_fingerprint, kind)
+                 request_fingerprint, kind, request_description["parent"])
         context_token = _sibling_request_read.set(state)
         result = object.__new__(_SiblingRequestRead)
         identity = id(result)
@@ -624,9 +705,54 @@ def _build_range_bindings_contract():
             _sibling_records.pop(key, None)
             if _sibling_records.get(key) is not None
             and _sibling_records[key][0] is ref else None)
-        _sibling_records[identity] = [reference, state, context_token, True]
+        _sibling_records[identity] = [
+            reference, state, context_token, True, prior_capability]
         lease[11] = result
         return result
+
+
+    def open_sibling_request_read(request_value, request_fingerprint):
+        """Authorize one genuine request to read an identical persisted sibling."""
+        _check_dependencies()
+        _require_sibling_store_entry(0)
+        prover = _sibling_request_prover[0]
+        if prover is None:
+            raise ValueError("sibling request authority is not installed")
+        request_description = prover(request_value)
+        if (type(request_description) is not dict
+                or hashlib.sha256(_canonical(request_description.get("request"))).hexdigest()
+                != request_fingerprint):
+            raise ValueError("sibling request proof differs")
+        return _open_sibling_description(
+            request_description, request_fingerprint, require_owner_binding=True)
+
+
+    def open_sibling_record_read(request_description, request_fingerprint):
+        """Authorize one genuine persisted observation while it is revalidated."""
+        _check_dependencies()
+        _require_sibling_store_entry(2)
+        if (type(request_description) is not dict
+                or set(request_description) != {"request", "config", "source_registry_hash",
+                                                "binding_hash", "parent"}
+                or hashlib.sha256(_canonical(request_description.get("request"))).hexdigest()
+                != request_fingerprint):
+            raise ValueError("sibling record proof differs")
+        return _open_sibling_description(
+            request_description, request_fingerprint, require_owner_binding=False)
+
+
+    def open_sibling_ticket_read(request_value, request_fingerprint):
+        """Authorize the genuine request retained by one current ticket."""
+        _check_dependencies()
+        _require_sibling_store_entry(3)
+        prover = _sibling_request_prover[0]
+        if prover is None:
+            raise ValueError("sibling request authority is not installed")
+        request_description = prover(request_value)
+        if hashlib.sha256(_canonical(request_description.get("request"))).hexdigest() != request_fingerprint:
+            raise ValueError("sibling ticket request proof differs")
+        return _open_sibling_description(
+            request_description, request_fingerprint, require_owner_binding=False)
 
 
     def close_sibling_request_read(capability):
@@ -641,7 +767,7 @@ def _build_range_bindings_contract():
             raise ValueError("sibling request read is cross-thread or out of order")
         _sibling_request_read.reset(token)
         saved[3] = False
-        state[0][11] = None
+        state[0][11] = saved[4]
 
 
     def open_current_binding_read_lease(value, owner_scope, operation_key):
@@ -723,7 +849,7 @@ def _build_range_bindings_contract():
         if nested:
             if state[10] is not True:
                 raise ValueError("range binding calendar child lease is out of order")
-            if state[11] is not None:
+            while state[11] is not None:
                 close_sibling_request_read(state[11])
             _binding_read_lease.reset(token)
             state[10] = False
@@ -733,7 +859,7 @@ def _build_range_bindings_contract():
             return
         if state[10] is not False:
             raise ValueError("range binding outer lease still owns a calendar child")
-        if state[11] is not None:
+        while state[11] is not None:
             close_sibling_request_read(state[11])
         parent_record, entry = state[4:6]
         try:
@@ -918,15 +1044,19 @@ def _build_range_bindings_contract():
 
     return (RangeBinding, RangeBindings, load_policy_range_bindings, read_planning_binding,
             lookup_planning_binding, open_current_binding_read_lease,
-            close_current_binding_read_lease, open_sibling_request_read,
-            close_sibling_request_read)
+            close_current_binding_read_lease, install_sibling_request_read,
+            open_sibling_request_read, open_sibling_record_read,
+            open_sibling_ticket_read, close_sibling_request_read,
+            enter_sibling_target_read, close_sibling_target_read)
 
 
 (RangeBinding, RangeBindings, load_policy_range_bindings,
  _read_range_binding_planning, _lookup_range_binding_planning,
  _open_current_binding_read_lease,
- _close_current_binding_read_lease, _open_sibling_request_read,
- _close_sibling_request_read) = _build_range_bindings_contract()
+ _close_current_binding_read_lease, _install_sibling_request_read,
+ _open_sibling_request_read, _open_sibling_record_read,
+ _open_sibling_ticket_read, _close_sibling_request_read,
+ _enter_sibling_target_read, _close_sibling_target_read) = _build_range_bindings_contract()
 del _build_range_bindings_contract
 
 
@@ -1001,18 +1131,26 @@ del (_make_range_binding_read_lease_authority, _open_current_binding_read_lease,
 
 
 def _make_range_binding_sibling_read_authority():
+    install = _install_sibling_request_read
     open_read = _open_sibling_request_read
+    open_record = _open_sibling_record_read
+    open_ticket = _open_sibling_ticket_read
     close_read = _close_sibling_request_read
+    enter_target = _enter_sibling_target_read
+    close_target = _close_sibling_target_read
 
     def authority():
-        return open_read, close_read
+        return (install, open_read, open_record, open_ticket, close_read,
+                enter_target, close_target)
 
     return authority
 
 
 _range_binding_sibling_read_authority = _make_range_binding_sibling_read_authority()
-del (_make_range_binding_sibling_read_authority, _open_sibling_request_read,
-     _close_sibling_request_read)
+del (_make_range_binding_sibling_read_authority, _install_sibling_request_read,
+     _open_sibling_request_read, _open_sibling_record_read,
+     _open_sibling_ticket_read, _close_sibling_request_read,
+     _enter_sibling_target_read, _close_sibling_target_read)
 
 
 __all__ = [
