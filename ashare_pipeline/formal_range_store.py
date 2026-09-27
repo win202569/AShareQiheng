@@ -122,7 +122,8 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
     lookup_planning_binding = _range_binding_lookup_authority()
     (install_sibling_read, open_sibling_read, open_sibling_record,
      open_sibling_ticket, close_sibling_read,
-     enter_sibling_target, close_sibling_target) = _range_binding_sibling_read_authority()
+     enter_sibling_target, close_sibling_target,
+     enter_sibling_exact, close_sibling_exact) = _range_binding_sibling_read_authority()
 
     def load_binding_identity(store, *, registry_manifest_hash, binding_hash, exchange):
         state, _, verifier, factory, cache = record(store)
@@ -636,7 +637,12 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                 raise ValueError("range bound request fingerprint differs")
             sibling_read = (None if request is None else
                             open_sibling_read(request, fingerprint))
-            selected, snapshots = self._select_current_with_token(fingerprint)
+            exact_only = enter_sibling_exact() if request is None else None
+            try:
+                selected, snapshots = self._select_current_with_token(fingerprint)
+            finally:
+                if exact_only is not None:
+                    close_sibling_exact(exact_only)
             if selected is not None and request_description is not None:
                 selected_wire = observation_wire(selected)[0]
                 stored = selected_wire["snapshot"]["task_payload"]
@@ -693,7 +699,12 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                 root=wire["request"]["registry_manifest_hash"],
                 as_of_utc=wire["request"]["as_of_utc"], population=(fingerprint,))
             authenticated = []
-            reread = read(self, wire["task"]["id"], evidence=authenticated)
+            exact_only = enter_sibling_exact() if request is None else None
+            try:
+                reread = read(self, wire["task"]["id"], evidence=authenticated)
+            finally:
+                if exact_only is not None:
+                    close_sibling_exact(exact_only)
             if observation_wire(reread)[1] != digest:
                 raise ValueError("range selected observation changed during ticket issuance")
             state, root, _, _, _ = record(self)
@@ -719,6 +730,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
             fingerprint, digest, authenticated, snapshots, request, request_bytes = evidence
             sibling_read = (None if request is None else
                             open_sibling_ticket(request, fingerprint))
+            exact_only = enter_sibling_exact() if request is None else None
             target = (None if request is None else
                       enter_sibling_target(fingerprint, "ticket:" + fingerprint))
             try:
@@ -742,6 +754,8 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                     close_sibling_target(target)
                 if sibling_read is not None:
                     close_sibling_read(sibling_read)
+                if exact_only is not None:
+                    close_sibling_exact(exact_only)
 
     install_sibling_read(request_proof,
                          FormalRangeStore.select_current_batch_ticket.__code__,

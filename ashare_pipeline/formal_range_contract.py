@@ -411,11 +411,19 @@ def _build_range_bindings_contract():
     _binding_read_lease = ContextVar("formal_range_current_binding_read_lease", default=None)
     _sibling_request_read = ContextVar("formal_range_sibling_request_read", default=None)
     _sibling_target_read = ContextVar("formal_range_sibling_target_read", default=None)
+    _sibling_exact_only = ContextVar("formal_range_sibling_exact_only", default=None)
     _lease_records = {}
     _sibling_records = {}
     _target_records = {}
+    _exact_records = {}
     _sibling_request_prover = [None]
     _sibling_store_codes = [None]
+    request_fields = frozenset({
+        "schema_version", "kind", "source", "dataset", "security_id", "exchange",
+        "as_of_utc", "start_date", "end_date", "anchor_descriptor_id",
+        "calendar_descriptor_id", "range_config_id", "registry_manifest_hash",
+        "page_index", "calendar_coverage_hash",
+    })
 
 
     def _envelope(value, fields):
@@ -494,7 +502,8 @@ def _build_range_bindings_contract():
             parent_record = _bindings_record(parent)
             identity = (parent_record.snapshot.root_hash, record.binding_hash, record.key)
             exact_binding = identity == lease[2]
-            sibling = _sibling_request_read.get() if not exact_binding else None
+            sibling = (_sibling_request_read.get()
+                       if not exact_binding and _sibling_exact_only.get() is None else None)
             target = _sibling_target_read.get() if sibling is not None else None
             sibling_matches = (
                 sibling is not None
@@ -584,6 +593,13 @@ def _build_range_bindings_contract():
             raise TypeError("sibling targets require their sealed range Store")
 
 
+    class _SiblingExactOnly:
+        __slots__ = ("__weakref__",)
+
+        def __init__(self, *_args, **_kwargs):
+            raise TypeError("exact sibling masks require their sealed range Store")
+
+
     def install_sibling_request_read(
             prover, selector_code, read_code, current_code, recheck_code):
         caller = get_frame(1)
@@ -643,6 +659,37 @@ def _build_range_bindings_contract():
         saved[3] = False
 
 
+    def enter_sibling_exact_only():
+        codes = _sibling_store_codes[0]
+        caller = get_frame(1)
+        if codes is None or caller.f_code not in (codes[0], codes[3]):
+            raise ValueError("exact sibling masks require their fixed range Store entry")
+        state = (get_thread_identity(), _binding_read_lease.get())
+        context_token = _sibling_exact_only.set(state)
+        result = object.__new__(_SiblingExactOnly)
+        identity = id(result)
+        reference = weakref.ref(result, lambda ref, key=identity:
+            _exact_records.pop(key, None)
+            if _exact_records.get(key) is not None
+            and _exact_records[key][0] is ref else None)
+        _exact_records[identity] = [reference, state, context_token, True]
+        return result
+
+
+    def close_sibling_exact_only(capability):
+        saved = _exact_records.get(id(capability))
+        if (type(capability) is not _SiblingExactOnly or saved is None
+                or saved[0]() is not capability or saved[3] is not True):
+            raise ValueError("exact sibling mask is forged, copied, or closed")
+        state, token = saved[1:3]
+        if (get_thread_identity() != state[0]
+                or _sibling_exact_only.get() is not state
+                or _binding_read_lease.get() is not state[1]):
+            raise ValueError("exact sibling mask is cross-thread or out of order")
+        _sibling_exact_only.reset(token)
+        saved[3] = False
+
+
     def _open_sibling_description(
             request_description, request_fingerprint, *, require_owner_binding):
         lease = _binding_read_lease.get()
@@ -668,6 +715,14 @@ def _build_range_bindings_contract():
                 or type(request_fingerprint) is not str):
             raise ValueError("sibling request read contract is invalid")
         request = request_description["request"]
+        parent = request_description["parent"]
+        if (set(request) != request_fields
+                or (parent is not None
+                    and (type(parent) is not dict
+                         or set(parent) != {"task_id", "observation_hash", "mode"}
+                         or any(type(parent[key]) is not str or not parent[key]
+                                for key in parent)))):
+            raise ValueError("sibling request fields or parent are invalid")
         if (request.get("kind") not in {"calendar_range", "market_range"}
                 or hashlib.sha256(_canonical(request)).hexdigest() != request_fingerprint):
             raise ValueError("sibling request fingerprint differs")
@@ -1047,7 +1102,8 @@ def _build_range_bindings_contract():
             close_current_binding_read_lease, install_sibling_request_read,
             open_sibling_request_read, open_sibling_record_read,
             open_sibling_ticket_read, close_sibling_request_read,
-            enter_sibling_target_read, close_sibling_target_read)
+            enter_sibling_target_read, close_sibling_target_read,
+            enter_sibling_exact_only, close_sibling_exact_only)
 
 
 (RangeBinding, RangeBindings, load_policy_range_bindings,
@@ -1056,7 +1112,8 @@ def _build_range_bindings_contract():
  _close_current_binding_read_lease, _install_sibling_request_read,
  _open_sibling_request_read, _open_sibling_record_read,
  _open_sibling_ticket_read, _close_sibling_request_read,
- _enter_sibling_target_read, _close_sibling_target_read) = _build_range_bindings_contract()
+ _enter_sibling_target_read, _close_sibling_target_read,
+ _enter_sibling_exact_only, _close_sibling_exact_only) = _build_range_bindings_contract()
 del _build_range_bindings_contract
 
 
@@ -1138,10 +1195,12 @@ def _make_range_binding_sibling_read_authority():
     close_read = _close_sibling_request_read
     enter_target = _enter_sibling_target_read
     close_target = _close_sibling_target_read
+    enter_exact = _enter_sibling_exact_only
+    close_exact = _close_sibling_exact_only
 
     def authority():
         return (install, open_read, open_record, open_ticket, close_read,
-                enter_target, close_target)
+                enter_target, close_target, enter_exact, close_exact)
 
     return authority
 
@@ -1150,7 +1209,8 @@ _range_binding_sibling_read_authority = _make_range_binding_sibling_read_authori
 del (_make_range_binding_sibling_read_authority, _install_sibling_request_read,
      _open_sibling_request_read, _open_sibling_record_read,
      _open_sibling_ticket_read, _close_sibling_request_read,
-     _enter_sibling_target_read, _close_sibling_target_read)
+     _enter_sibling_target_read, _close_sibling_target_read,
+     _enter_sibling_exact_only, _close_sibling_exact_only)
 
 
 __all__ = [

@@ -112,7 +112,7 @@ class MarketBindingLeaseTests(unittest.TestCase):
             description["request"], sort_keys=True, ensure_ascii=False,
             separators=(",", ":"), allow_nan=False,
         ).encode("utf-8")).hexdigest()
-        _, open_sibling, _, _, _, _, _ = contract._range_binding_sibling_read_authority()
+        _, open_sibling, _, _, _, _, _, _, _ = contract._range_binding_sibling_read_authority()
         first_calendar_code = vars(type(fixture.source))["first_calendar_request"].__code__
         rejected = FormalBatchReadJournal.open(
             repository,
@@ -239,6 +239,36 @@ class MarketBindingLeaseTests(unittest.TestCase):
         selector_code = vars(type(fixture.range_store))[
             "select_current_batch_ticket"
         ].__code__
+        select_with_token_code = vars(type(fixture.range_store))[
+            "_select_current_with_token"
+        ].__code__
+        same_request_scope = FormalBatchReadJournal.open(
+            repository,
+            registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
+            as_of_utc=FREEZE,
+            population=("SH600002",),
+            required_keys=(("SH",),),
+        )
+
+        def borrow_for_same_request(frame, event, arg):
+            if (event == "return" and frame.f_code is select_with_token_code
+                    and frame.f_locals.get("request_fingerprint")
+                    == broker_request.request_fingerprint):
+                sys.setprofile(None)
+                fixture.range_store.select_current_batch_ticket(
+                    same_request_scope, broker_request.request_fingerprint,
+                    request=None)
+
+        sys.setprofile(borrow_for_same_request)
+        try:
+            with self.assertRaisesRegex(ValueError, "cross-binding"):
+                repository.select_calendar_batch_ticket(
+                    same_request_scope, broker, FREEZE)
+        finally:
+            sys.setprofile(None)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            same_request_scope.checkpoint()
+
         borrowed_scope = FormalBatchReadJournal.open(
             repository,
             registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
@@ -276,53 +306,47 @@ class MarketBindingLeaseTests(unittest.TestCase):
             fresh_borrow_scope, broker, FREEZE))
         fresh_borrow_scope.close()
 
-        from ashare_pipeline import formal_range_contract as contract
-        from ashare_pipeline.formal_range_format import _range_config_to_dict
+        require_current_code = _closure_function(
+            vars(type(fixture.source_factory(broker)))["next_page"],
+            "require_current",
+        ).__code__
 
-        _, open_sibling, _, _, _, _, _ = contract._range_binding_sibling_read_authority()
-        first_calendar_code = vars(type(fixture.source_factory(broker)))[
-            "first_calendar_request"
-        ].__code__
-        base_description = {
-            "request": broker_request.to_dict(),
-            "config": _range_config_to_dict(broker.calendar_config),
-            "source_registry_hash": broker.source_registry_hash,
-            "binding_hash": broker.binding_hash,
-            "parent": None,
+        def request_bytes(wire, payload):
+            payload["request"]["start_date"] = "2026-01-01"
+
+        def request_fingerprint(wire, payload):
+            wire["request"]["start_date"] = "2026-01-01"
+
+        def config_bytes(wire, payload):
+            payload["config"]["max_pages"] += 1
+
+        def request_field(field, value):
+            def mutate(wire, payload):
+                wire["request"][field] = value
+                payload["request"][field] = value
+            return mutate
+
+        def source_hash(wire, payload):
+            payload["source_registry_hash"] = "0" * 64
+
+        def forged_shape(wire, payload):
+            for field in ("security_id", "as_of_utc", "start_date", "end_date"):
+                wire["request"].pop(field)
+                payload["request"].pop(field)
+            payload["parent"] = {"arbitrary": True}
+
+        variants = {
+            "request_bytes": (request_bytes, "sibling record proof differs"),
+            "request_fingerprint": (request_fingerprint, "sibling record proof differs"),
+            "config_bytes": (config_bytes, "contract: config"),
+            "range_config_id": (request_field("range_config_id", "0" * 64),
+                                "contract: range_config"),
+            "source_registry_hash": (source_hash, "contract: source"),
+            "registry_root": (request_field("registry_manifest_hash", "0" * 64),
+                              "contract: root"),
+            "exchange": (request_field("exchange", "SZ"), "contract: exchange"),
+            "forged_self_consistent_request": (forged_shape, "sibling request fields"),
         }
-
-        def digest_request(description):
-            wire = json.dumps(
-                description["request"], sort_keys=True, ensure_ascii=False,
-                separators=(",", ":"), allow_nan=False,
-            ).encode("utf-8")
-            return hashlib.sha256(wire).hexdigest()
-
-        variants = {}
-        changed = json.loads(json.dumps(base_description))
-        changed["request"]["start_date"] = "2026-01-01"
-        variants["request_bytes"] = (changed, broker_request.request_fingerprint)
-        variants["request_fingerprint"] = (base_description, "f" * 64)
-        changed = json.loads(json.dumps(base_description))
-        changed["config"]["max_pages"] += 1
-        variants["config_bytes"] = (changed, broker_request.request_fingerprint)
-        changed = json.loads(json.dumps(base_description))
-        changed["request"]["range_config_id"] = "0" * 64
-        variants["range_config_id"] = (changed, digest_request(changed))
-        changed = json.loads(json.dumps(base_description))
-        changed["source_registry_hash"] = "0" * 64
-        variants["source_registry_hash"] = (changed, broker_request.request_fingerprint)
-        changed = json.loads(json.dumps(base_description))
-        changed["request"]["registry_manifest_hash"] = "0" * 64
-        variants["registry_root"] = (changed, digest_request(changed))
-        changed = json.loads(json.dumps(base_description))
-        changed["request"]["exchange"] = "SZ"
-        variants["exchange"] = (changed, digest_request(changed))
-        changed = json.loads(json.dumps(base_description))
-        for field in ("security_id", "as_of_utc", "start_date", "end_date"):
-            changed["request"].pop(field)
-        changed["parent"] = {"arbitrary": True}
-        variants["forged_self_consistent_request"] = (changed, digest_request(changed))
 
         def new_calendar_scope():
             return FormalBatchReadJournal.open(
@@ -333,18 +357,19 @@ class MarketBindingLeaseTests(unittest.TestCase):
                 required_keys=(("SH",),),
             )
 
-        for label, (description, fingerprint) in variants.items():
+        for label, (mutate, message) in variants.items():
             with self.subTest(label=label):
                 rejected_scope = new_calendar_scope()
 
                 def reject_sibling(frame, event, arg):
-                    if event == "return" and frame.f_code is first_calendar_code:
+                    if event == "call" and frame.f_code is require_current_code:
                         sys.setprofile(None)
-                        open_sibling(description, fingerprint)
+                        wire = frame.f_locals["wire"]
+                        mutate(wire, wire["snapshot"]["task_payload"])
 
                 sys.setprofile(reject_sibling)
                 try:
-                    with self.assertRaises(ValueError):
+                    with self.assertRaisesRegex(ValueError, message):
                         repository.select_calendar_batch_ticket(
                             rejected_scope, broker, FREEZE)
                 finally:
