@@ -3,10 +3,14 @@
 from collections import namedtuple
 import hashlib
 
+from ashare_pipeline.formal_evidence import (
+    OfficialFetch, OfficialRequest, SourcePolicy, verify_official_fetch,
+)
 from ashare_pipeline.formal_score_inputs import FormalScoreInputRepository
 from tests.formal_score_input_fixtures import ScoreFixture
 from tests.formal_valuation_fixtures import ValuationRuntimeFixture
 from tests.test_formal_context_repository import descriptor
+from tests.test_formal_feature_contract import formal_fact
 from tests.test_formal_scoring_registry import canonical
 from tests.test_formal_sources import config
 
@@ -46,6 +50,74 @@ class FinalScoringFixture(ValuationRuntimeFixture):
 
     put_context = ScoreFixture.put_context
     put_consensus = ScoreFixture.put_consensus
+
+    def _put_policy_quarter(self, sid, values, units, year, kind, end):
+        period_end = f"{year}-{end}"
+        generation = f"stage-d-policy-quarter-{year}-{kind}"
+        raw = canonical(values)
+        task = self.store.enqueue_formal_task("formal_statement",
+            f"{sid}:{generation}", generation, {})
+        leased = self.store.lease_next_formal_task(
+            ("formal_statement",), "stage-d-policy-quarter-fixture", 300)
+        self.assertEqual(leased["id"], task)
+        fetch = OfficialFetch(
+            request=OfficialRequest("cninfo", "annual_report", sid, period_end, sid[:2]),
+            raw_bytes=raw,
+            original_url="https://www.cninfo.com.cn/fixture/annual.json",
+            published_at_utc="2026-03-20T08:00:00+00:00",
+            published_precision="timestamp",
+            source_updated_at_utc=None,
+            captured_at_utc="2026-09-04T07:00:00+00:00",
+            effective_at_utc="2026-03-20T08:00:00+00:00",
+            effective_time_evidence_hash=None,
+            refresh_generation=generation,
+            parser_id="fixture-annual",
+            parser_version="fixture-annual-v1",
+            mapping_version="fixture-annual-map-v1",
+            declared_security_id=sid,
+            declared_period=period_end,
+        )
+        ref = self.snapshots.persist_verified(fetch, verify_official_fetch(
+            fetch, SourcePolicy.cninfo()), producing_task_id=task,
+            worker_id="stage-d-policy-quarter-fixture")
+        self.store.insert_formal_financial_facts(tuple(formal_fact(
+            security_id=sid, statement="income", metric_key=key,
+            period_start=f"{year}-01-01", period_end=period_end,
+            period_kind=kind, value=value, unit=units[key], nature="duration",
+            published_at_utc=ref.published_at_utc,
+            published_precision=ref.published_precision,
+            effective_at_utc=ref.effective_at_utc,
+            effective_time_evidence_hash=ref.effective_time_evidence_hash,
+            source_updated_at_utc=ref.source_updated_at_utc,
+            captured_at_utc=ref.captured_at_utc,
+            source_snapshot_id=ref.snapshot_id,
+            source_content_sha256=ref.content_sha256,
+            source_refresh_generation=ref.refresh_generation,
+            source_producing_task_id=ref.producing_task_id,
+            source_field=key,
+            raw_value_sha256=hashlib.sha256(canonical(value)).hexdigest(),
+            parser_id=ref.parser_id, parser_version=ref.parser_version,
+            mapping_version=ref.mapping_version,
+        ) for key, value in values.items()))
+        self.store.complete_formal_task(task, "stage-d-policy-quarter-fixture",
+            {"snapshot": ref.snapshot_id})
+
+    def _populate_policy_quarter_prerequisites(self, sid):
+        facts = [fact.to_dict() for fact in self.store.list_formal_financial_facts(
+            security_id=sid)]
+        for year in (2024, 2025):
+            annual = {wire["metric_key"]: wire for wire in facts
+                if wire["period_end"] == f"{year}-12-31"
+                and wire["period_kind"] == "FY"
+                and wire["nature"] == "duration"
+                and wire["metric_key"].startswith("fixture.policy.")}
+            units = {key: wire["unit"] for key, wire in annual.items()}
+            for index, (kind, end) in enumerate((
+                    ("Q1", "03-31"), ("H1", "06-30"), ("Q3", "09-30")), 1):
+                values = {key: wire["value"] * index / 4
+                    for key, wire in annual.items()}
+                self._put_policy_quarter(sid, values, units, year, kind, end)
+        self.publish_current(sid)
 
     def __init__(self, *, peer_count=3, pending_ids=None, cap_ids=(FOCAL,),
                  prohibition_ids=(), veto_ids=(), consensus_no_coverage=False):
@@ -90,6 +162,8 @@ class FinalScoringFixture(ValuationRuntimeFixture):
             self.populate_policy_evidence(financial_overrides=financial_overrides)
         finally:
             self.industry = original_industry
+        for sid in sorted(active_policy_ids):
+            self._populate_policy_quarter_prerequisites(sid)
         for index, sid in enumerate(sorted(self.templates)):
             if sid not in active_policy_ids:
                 self.put_industry(sid)
@@ -97,7 +171,7 @@ class FinalScoringFixture(ValuationRuntimeFixture):
                 "V.enterprise_value_or_sustainable_roe": 0.1 + index / 1000,
                 "V.normalized_earnings_yield": 0.20 if sid == FOCAL else 0.1 + index / 1000,
                 "V.normalized_free_cash_flow_yield": 0.08 + index / 1000,
-            }, generation="stage-d-valuation")
+            }, generation="stage-d-valuation", nature="instant")
             score_values = {"score_leaf": index + 10}
             if not (sid == FOCAL and self.consensus_no_coverage):
                 score_values["T.expectation_change"] = index + 10

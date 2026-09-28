@@ -46,6 +46,16 @@ class FinalScoringFixtureTests(unittest.TestCase):
             self.assertIs(type(proof), proof_type)
             proof.require_verified()
 
+    def test_focal_full_feature_bundle_has_trustworthy_required_slots(self):
+        bundle = self.fixture.valuation_feature_bundles["BJ430001"]
+        self.assertEqual(bundle.blockers, ())
+        required = {slot.slot_id for slot in self.fixture.vocabulary.slots_for_template(
+            "general_nonfinancial") if slot.required}
+        actual = {value.slot_id: value.status for value in bundle.values
+            if value.slot_id in required}
+        self.assertEqual(len(required), 25)
+        self.assertEqual(actual, {slot_id: "derived" for slot_id in required})
+
 
 if __name__ == "__main__":
     unittest.main()
