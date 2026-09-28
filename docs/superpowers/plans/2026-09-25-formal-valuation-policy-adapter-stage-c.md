@@ -715,11 +715,11 @@ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test
 
 Expected: 全部 PASS；把模块数、测试数、耗时、失败/错误/跳过、五个分阶段耗时、cohort/排序/待补计数写入 `.superpowers/sdd/2026-09-25-formal-valuation-policy-adapter-stage-c/task-C5-report.md`。报告不纳入正式证明哈希。
 
-- [ ] **Step 8: 独立审查、修复并作根级新鲜复验。**
+- [x] **Step 8: 独立审查、修复并作根级新鲜复验。**
 
 审查白名单为本计划列出的生产、测试、fixture、spec 和 plan 文件。审查必须核对：v1/v2 兼容边界、证明伪造面、跨根/跨批次、pending affected/unaffected、Decimal 失败关闭、整组重排、缓存失效、外层回滚和无最终评分越界。每个审查发现用单独失败测试复现后修复；修复后重跑 Step 6、Step 7，并在最终 HEAD 上由根代理再跑 Stage C 六模块验收。
 
-- [ ] **Step 9: 更新计划证据并提交 C5。**
+- [x] **Step 9: 更新计划证据并提交 C5。**
 
 ```powershell
 git add ashare_pipeline/formal_valuation_engine.py tests/test_formal_valuation_ranking.py tests/test_formal_valuation_integration.py docs/superpowers/plans/2026-09-25-formal-valuation-policy-adapter-stage-c.md
