@@ -7,7 +7,8 @@ from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
 
 
 class ValuationRuntimeFixture(PolicyRuntimeFixture):
-    def __init__(self, *, peer_count=20, extra_members=(), cyclic_ids=("BJ430001",)):
+    def __init__(self, *, peer_count=20, extra_members=(), cyclic_ids=("BJ430001",),
+                 signature_documents_configurator=None):
         if type(peer_count) is not int or peer_count < 3:
             raise ValueError("valuation fixture requires all three exchanges")
         securities = {"BJ430001": "general_nonfinancial"}
@@ -34,6 +35,8 @@ class ValuationRuntimeFixture(PolicyRuntimeFixture):
             # clears the independent no-effective-trade rule.
             for config in documents["source"]["range_configs"]:
                 config["max_calendar_days_per_request"] = 1
+            if signature_documents_configurator is not None:
+                signature_documents_configurator(documents)
 
         super().__init__(range_enabled=True, templates=securities, extra_members=extra_members, cyclic=True,
             noncyclic_ids=tuple(sorted(set(securities) - set(cyclic_ids))),

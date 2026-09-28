@@ -1,0 +1,51 @@
+"""One signed Stage D root feeding all three genuine scoring inputs."""
+
+import unittest
+
+from ashare_pipeline.formal_policy_repository import VerifiedPolicyResultBatch
+from ashare_pipeline.formal_score_inputs import FormalScoreInputBatch
+from ashare_pipeline.formal_valuation_engine import PolicyAdjustedValuationBatch
+from tests.formal_final_scoring_fixtures import FinalScoringFixture
+
+
+class FinalScoringFixtureTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = FinalScoringFixture(peer_count=3)
+        try:
+            cls.fixture.populate_final_inputs()
+            cls.sources = cls.fixture.build_d1_sources()
+        except BaseException:
+            cls.fixture.close()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture.close()
+
+    def test_one_v2_root_builds_base_policy_and_adjusted_valuation_batches(self):
+        fixture, sources = self.fixture, self.sources
+        expected_ids = tuple(member.security_id for member in fixture.frozen.members)
+        expected_identity = (fixture.bundle.manifest.manifest_hash,
+            fixture.frozen.frozen_input_hash, fixture.frozen.universe_hash, expected_ids)
+        for batch in (sources.base, sources.policy, sources.valuation):
+            batch.require_verified()
+            self.assertEqual((batch.registry_manifest_hash, batch.frozen_input_hash,
+                batch.universe_hash, batch.security_ids), expected_identity)
+        self.assertEqual(len(expected_ids), 3)
+        score_slots = [slot for slot in fixture.vocabulary.slots_for_template(
+            "general_nonfinancial") if ".policy." not in slot.slot_id]
+        self.assertEqual(len(score_slots), 25)
+
+    def test_fixture_never_exposes_proof_mint_or_plain_proof_double(self):
+        fixture, sources = self.fixture, self.sources
+        self.assertFalse(any("mint" in name.lower() for name in dir(fixture)))
+        for proof, proof_type in ((sources.base, FormalScoreInputBatch),
+                (sources.policy, VerifiedPolicyResultBatch),
+                (sources.valuation, PolicyAdjustedValuationBatch)):
+            self.assertIs(type(proof), proof_type)
+            proof.require_verified()
+
+
+if __name__ == "__main__":
+    unittest.main()
