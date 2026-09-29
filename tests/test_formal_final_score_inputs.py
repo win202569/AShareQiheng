@@ -1,0 +1,158 @@
+"""D1 composition over genuine, signed repository outputs."""
+
+from decimal import Decimal
+import hashlib
+import unittest
+
+from ashare_pipeline.formal_final_score_inputs import (
+    FormalFinalScoreInputRepository, PolicyAdjustedScoreInput,
+)
+from ashare_pipeline.formal_valuation_engine import (
+    build_valuation_peer_context, score_valuation_percentile,
+)
+from tests.formal_final_scoring_fixtures import FinalScoringFixture, FOCAL
+
+
+V_METRICS = (
+    "V.enterprise_value_or_sustainable_roe", "V.normalized_earnings_yield",
+    "V.normalized_free_cash_flow_yield",
+)
+
+
+def build(fixture):
+    repository = FormalFinalScoreInputRepository(fixture.feature_repository,
+        fixture.context, fixture.range_store, registry_signature_verifier=fixture.verifier)
+    return repository.build_batch(fixture.frozen.frozen_input_hash,
+        scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry,
+        valuation_adapter_registry=fixture.valuation_registry)
+
+
+class FinalScoreInputContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = FinalScoringFixture()
+        cls.addClassCleanup(cls.fixture.close)
+        cls.fixture.populate_final_inputs()
+        cls.sources = cls.fixture.build_d1_sources()
+        cls.batch = build(cls.fixture)
+
+    def test_batch_enumerates_every_frozen_member_in_canonical_order(self):
+        expected = ("BJ430001", "SH600000", "SZ000001")
+        self.assertEqual(self.batch.security_ids, expected)
+        self.assertEqual(tuple(row.security_id for row in self.batch.inputs), expected)
+        for sid in expected:
+            self.assertIsInstance(self.batch.input_for(sid), PolicyAdjustedScoreInput)
+            self.assertEqual(self.batch.input_for(sid).security_id, sid)
+        with self.assertRaises(ValueError):
+            self.batch.input_for("SH999999")
+
+    def test_member_business_gaps_become_explicit_pending_entries_not_none(self):
+        policy = {row.security_id: row for row in self.sources.policy.results}
+        for sid in self.batch.security_ids:
+            row = self.batch.input_for(sid)
+            self.assertIsInstance(row, PolicyAdjustedScoreInput)
+            row.require_verified()
+            self.assertEqual(row.status, "pending_evidence")
+            self.assertEqual(len(row.entry_hash), 64)
+            self.assertTrue(row.reasons)
+            self.assertEqual(row.base_pending_reasons, self.sources.base.pending_reasons[sid])
+            self.assertEqual(row.policy_result_hash, policy[sid].result_hash)
+            self.assertEqual(row.to_dict()["policy_pending_requirements"],
+                policy[sid].to_dict()["pending_requirements"])
+        self.assertTrue(self.batch.input_for("SH600000").policy_pending_requirements)
+        self.assertTrue(self.batch.input_for(FOCAL).valuation_pending_reasons)
+
+    def test_batch_binds_root_frozen_universe_policy_and_valuation_hashes(self):
+        batch, sources = self.batch, self.sources
+        self.assertEqual(batch.registry_manifest_hash, self.fixture.bundle.manifest.manifest_hash)
+        self.assertEqual(batch.frozen_input_hash, self.fixture.frozen.frozen_input_hash)
+        self.assertEqual(batch.universe_hash, sources.base.universe_hash)
+        for prefix, source in zip(("base", "policy", "valuation"), sources):
+            self.assertEqual(getattr(batch, prefix + "_batch_hash"), source.batch_hash)
+            self.assertEqual(getattr(batch, prefix + "_batch_canonical_sha256"),
+                hashlib.sha256(source.canonical_bytes()).hexdigest())
+        self.assertEqual(batch.policy_contract_hash, sources.policy.policy_contract_hash)
+        self.assertEqual(batch.valuation_adapter_registry_hash,
+            sources.valuation.valuation_adapter_registry_hash)
+        for row in batch.inputs:
+            self.assertEqual(row.batch_hash, batch.batch_hash)
+            self.assertEqual(row.registry_manifest_hash, batch.registry_manifest_hash)
+            self.assertEqual(row.frozen_input_hash, batch.frozen_input_hash)
+            self.assertEqual(row.universe_hash, batch.universe_hash)
+
+    def test_identical_inputs_replay_to_identical_canonical_bytes_and_hash(self):
+        replay = build(self.fixture)
+        self.assertEqual(replay.canonical_bytes(), self.batch.canonical_bytes())
+        self.assertEqual(replay.batch_hash, self.batch.batch_hash)
+        for sid in replay.security_ids:
+            self.assertEqual(replay.input_for(sid).canonical_bytes(),
+                self.batch.input_for(sid).canonical_bytes())
+            self.assertEqual(replay.input_for(sid).entry_hash, self.batch.input_for(sid).entry_hash)
+
+
+class FinalScoreInputReadyTests(unittest.TestCase):
+    def test_ready_input_contains_22_base_slots_and_exactly_three_stage_c_scores(self):
+        fixture = FinalScoringFixture(peer_count=20)
+        self.addCleanup(fixture.close)
+        fixture.populate_final_inputs()
+        sources = fixture.build_d1_sources()
+        batch = build(fixture)
+        self.assertEqual(batch.security_ids, tuple(sorted(fixture.templates)))
+        self.assertEqual(len(batch.security_ids), 20)
+        for sid in batch.security_ids:
+            if sid != FOCAL:
+                peer = batch.input_for(sid)
+                self.assertEqual(peer.status, "pending_evidence")
+                self.assertTrue(peer.policy_pending_requirements)
+        for value in sources.valuation.inputs:
+            if value.security_id != FOCAL:
+                self.assertEqual(value.status, "passthrough_not_applicable")
+        row = batch.input_for(FOCAL)
+        self.assertEqual(row.status, "ready")
+        self.assertEqual(row.reasons, ())
+        self.assertEqual(len(row.slots), 25)
+        base = sources.base.input_for(FOCAL)
+        non_v = set(row.slots) - set(V_METRICS)
+        self.assertEqual(len(non_v), 22)
+        for mid in non_v:
+            self.assertEqual(row.slots[mid], base.slots[mid])
+        for mid in V_METRICS:
+            context = build_valuation_peer_context(sources.valuation, metric_id=mid, security_id=FOCAL)
+            score = score_valuation_percentile(sources.valuation, context)
+            self.assertIsNotNone(score)
+            self.assertEqual(score.peer_count, 20)
+            slot = row.slots[mid]
+            self.assertEqual(slot["evidence_kind"], "policy_adjusted_valuation")
+            self.assertEqual(slot["value"], score.percentile)
+            self.assertEqual(row.to_dict()["slots"][mid]["valuation_score"], score.to_dict())
+            self.assertEqual(row.to_dict()["slots"][mid]["valuation_context"], context.to_dict())
+            self.assertEqual(slot["valuation_score_hash"], score.score_hash)
+            self.assertEqual(slot["valuation_context_hash"], context.context_hash)
+            self.assertIsNone(slot["metric_score"])
+        earnings = row.slots["V.normalized_earnings_yield"]
+        # 0.20 * median(4, 5, 6, 7, 8) / 10 = 0.12, still above
+        # the nineteen peers (0.101 through 0.119): rank 20 => 97.5.
+        self.assertEqual(Decimal(earnings["valuation_score"]["adjusted_value"]), Decimal("0.12"))
+        self.assertEqual(earnings["value"], Decimal("97.5"))
+
+
+class FinalScoreInputTypeSealTests(unittest.TestCase):
+    def test_minted_entry_relabelled_as_batch_is_rejected(self):
+        fixture = FinalScoringFixture()
+        self.addCleanup(fixture.close)
+        fixture.populate_final_inputs()
+        batch = build(fixture)
+        proof = batch.input_for(FOCAL)
+        proof.require_verified()
+        minted_type = type(proof)
+        object.__setattr__(proof, "__class__", type(batch))
+        try:
+            with self.assertRaises(ValueError):
+                proof.require_verified()
+        finally:
+            object.__setattr__(proof, "__class__", minted_type)
+        proof.require_verified()
+
+
+if __name__ == "__main__":
+    unittest.main()
