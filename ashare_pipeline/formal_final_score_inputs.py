@@ -79,6 +79,8 @@ def _install_final_inputs():
         if (type(proof) is not cls or saved is None or saved[0]() is not proof
                 or not saved[4][0] or saved[6] is not cls):
             raise ValueError("final score proof is forged, copied, unpublished or revoked")
+        if cls is PolicyAdjustedScoreInput and encode(saved[1]) != saved[2]:
+            raise ValueError("final score entry differs from its published canonical bytes")
         return saved
 
     class SealedMeta(type):

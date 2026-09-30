@@ -1,6 +1,7 @@
 """Attack matrix for the genuine D1 publication boundary."""
 
 import copy
+from decimal import Decimal
 import inspect
 import json
 import pickle
@@ -28,6 +29,15 @@ V_METRICS = (
 )
 
 
+class CrossoverFinalScoringFixture(FinalScoringFixture):
+    """A genuine ready universe whose raw and adjusted V ranks diverge."""
+
+    def put_financial(self, sid, values, *args, **kwargs):
+        if sid == "SH600017" and kwargs.get("generation") == "stage-d-valuation":
+            values = dict(values, **{"V.normalized_earnings_yield": 0.13})
+        return super().put_financial(sid, values, *args, **kwargs)
+
+
 class FinalScoreInputGuardTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -47,6 +57,16 @@ class FinalScoreInputGuardTests(unittest.TestCase):
             scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry,
             valuation_adapter_registry=fixture.valuation_registry)
 
+    @classmethod
+    def distinct_root(cls):
+        if not hasattr(cls, "other_fixture"):
+            fixture = FinalScoringFixture(peer_count=3, cap_ids=(FOCAL, "SH600000"))
+            cls.addClassCleanup(fixture.close)
+            fixture.populate_final_inputs()
+            cls.other_fixture = fixture
+            cls.other_sources = fixture.build_d1_sources()
+        return cls.other_fixture, cls.other_sources
+
     def test_cross_root_frozen_security_and_source_batch_are_rejected(self):
         other = ValuationRuntimeFixture(peer_count=3)
         self.addCleanup(other.close)
@@ -63,17 +83,57 @@ class FinalScoreInputGuardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             closure["close_identity"](other.frozen, other.frozen.frozen_input_hash,
                 self.sources, self.fixture.bundle, self.fixture.policy_registry)
+        foreign, foreign_sources = self.distinct_root()
+        self.assertNotEqual(foreign.bundle.manifest.manifest_hash,
+            self.fixture.bundle.manifest.manifest_hash)
+        for source in foreign_sources:
+            source.require_verified()
+        swapped = (foreign_sources.base, self.sources.policy, self.sources.valuation)
+        closure["verify_sources"](swapped)
+        with self.assertRaises(ValueError):
+            closure["close_identity"](self.fixture.frozen,
+                self.fixture.frozen.frozen_input_hash, swapped,
+                self.fixture.bundle, self.fixture.policy_registry)
 
     def test_raw_v_percentile_cannot_replace_stage_c_score(self):
-        row = self.batch.input_for(FOCAL)
-        self.assertEqual(row.status, "pending_evidence")
-        self.assertTrue(all(mid not in row.slots for mid in V_METRICS))
-        raw = self.sources.valuation.input_for(FOCAL, V_METRICS[0])
-        raw.require_verified()
-        with self.assertRaises(TypeError):
-            PolicyAdjustedScoreInput(**raw.to_dict())
-        with self.assertRaises(TypeError):
-            row.slots[V_METRICS[0]] = {"value": raw.adjusted_value}
+        fixture = CrossoverFinalScoringFixture(peer_count=20)
+        self.addCleanup(fixture.close)
+        fixture.populate_final_inputs()
+        repository = FormalFinalScoreInputRepository(
+            fixture.feature_repository, fixture.context, fixture.range_store,
+            registry_signature_verifier=fixture.verifier)
+        batch = repository.build_batch(fixture.frozen.frozen_input_hash,
+            scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry,
+            valuation_adapter_registry=fixture.valuation_registry)
+        self.assertEqual(len(batch.security_ids), 20)
+        row = batch.input_for(FOCAL)
+        self.assertEqual(row.status, "ready")
+        self.assertEqual(len(row.slots), 25)
+        record = inspect.getclosurevars(type(row).require_verified).nonlocals["record"]
+        proofs = inspect.getclosurevars(record).nonlocals["proofs"]
+        saved = proofs[id(row)]
+        sources = saved[5][1]
+        for source in sources:
+            source.require_verified()
+        mid = "V.normalized_earnings_yield"
+        raw_percentile = sources[0].input_for(FOCAL).slots[mid]["value"]
+        stage_c_percentile = row.slots[mid]["value"]
+        self.assertNotEqual(Decimal(str(raw_percentile)),
+            Decimal(str(stage_c_percentile)))
+        self.assertEqual(Decimal(str(row.slots[mid]["valuation_score"]["percentile"])),
+            Decimal(str(stage_c_percentile)))
+
+        tampered = row.to_dict()
+        tampered["slots"][mid]["value"] = raw_percentile
+        proofs[id(row)] = (saved[0], formal_metric_engine._freeze(tampered),
+            saved[2], *saved[3:])
+        try:
+            with self.assertRaises(ValueError):
+                row.require_verified()
+            with self.assertRaises(ValueError):
+                batch.input_for(FOCAL)
+        finally:
+            proofs[id(row)] = saved
         row.require_verified()
 
     def test_forged_copied_pickled_inherited_or_weakref_redirected_proofs_are_rejected(self):
@@ -190,23 +250,36 @@ class FinalScoreInputGuardTests(unittest.TestCase):
                     child.require_verified()
 
     def test_capability_cannot_be_replayed_across_batch_or_context(self):
-        revoked = self._revoked_children()
+        foreign_fixture, _ = self.distinct_root()
+        foreign_repository = FormalFinalScoreInputRepository(
+            foreign_fixture.feature_repository, foreign_fixture.context,
+            foreign_fixture.range_store,
+            registry_signature_verifier=foreign_fixture.verifier)
+        foreign_batch = foreign_repository.build_batch(
+            foreign_fixture.frozen.frozen_input_hash,
+            scoring_registry=foreign_fixture.scoring,
+            policy_registry=foreign_fixture.policy_registry,
+            valuation_adapter_registry=foreign_fixture.valuation_registry)
+        foreign_child = foreign_batch.input_for(FOCAL)
+        foreign_batch.require_verified()
+        foreign_child.require_verified()
+        self.assertNotEqual(foreign_batch.registry_manifest_hash,
+            self.batch.registry_manifest_hash)
         self.batch.require_verified()
-        for child in revoked:
-            with self.assertRaises(ValueError):
-                child.require_verified()
-        self.assertIsNot(revoked[0], self.batch.input_for(FOCAL))
+        self.assertIsNot(foreign_child, self.batch.input_for(FOCAL))
         record = inspect.getclosurevars(type(self.batch).input_for).nonlocals["record"]
         proofs = inspect.getclosurevars(record).nonlocals["proofs"]
         saved = proofs[id(self.batch)]
         crossed = dict(saved[3])
-        crossed[FOCAL] = revoked[0]
+        crossed[FOCAL] = foreign_child
         proofs[id(self.batch)] = saved[:3] + (MappingProxyType(crossed),) + saved[4:]
         try:
             with self.assertRaises(ValueError):
                 self.batch.input_for(FOCAL)
         finally:
             proofs[id(self.batch)] = saved
+        foreign_child.require_verified()
+        foreign_batch.require_verified()
         with self.assertRaises(ValueError):
             self.batch.input_for(123)
 
