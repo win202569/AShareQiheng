@@ -188,6 +188,19 @@ def _install_final_inputs():
             raise ValueError("final score base batch membership is incomplete")
         return ids
 
+    def member_identity(sid, industry, valuation_inputs, original):
+        fields = ("template_id", "primary_industry", "secondary_industry")
+        identity = {field: industry.get(field) for field in fields}
+        if industry["security_id"] != sid:
+            raise ValueError("final score member identity mismatch")
+        inputs = valuation_inputs + (() if original is None else (original,))
+        for item in inputs:
+            item.require_verified()
+            if (any(getattr(item, field) != identity[field] for field in fields)
+                    or item.security_id != sid):
+                raise ValueError("final score member identity mismatch")
+        return identity
+
     class FormalFinalScoreInputRepository(metaclass=SealedMeta):
         __slots__ = ("__weakref__",)
 
@@ -258,8 +271,10 @@ def _install_final_inputs():
                             if type(original) is not FormalScoreInput or original.security_id != sid:
                                 raise ValueError("final score base entry identity mismatch")
                             original.require_verified()
-                        for mid in v_metrics:
-                            adjusted = valuation.input_for(sid, mid)
+                        valuation_inputs = tuple(valuation.input_for(sid, mid) for mid in v_metrics)
+                        identity = member_identity(sid, policy.evidence_batch.industry["entries"][sid],
+                            valuation_inputs, original)
+                        for mid, adjusted in zip(v_metrics, valuation_inputs, strict=True):
                             context = peer_context(valuation, metric_id=mid, security_id=sid)
                             context.require_verified()
                             if adjusted.adjustment["policy_result_hash"] != policy_result.result_hash:
@@ -300,6 +315,7 @@ def _install_final_inputs():
                         payload = {} if original is None else original.to_dict()
                         payload.pop("batch_hash", None)
                         payload.pop("input_hash", None)
+                        payload.update(identity)
                         payload.update(common, schema_version="policy-adjusted-score-input-v1",
                             security_id=sid, status="pending_evidence" if reasons else "ready",
                             reasons=tuple(sorted(reasons)), slots=slots,

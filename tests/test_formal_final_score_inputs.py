@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 import hashlib
+import inspect
 import unittest
 
 from ashare_pipeline.formal_final_score_inputs import (
@@ -61,6 +62,35 @@ class FinalScoreInputContractTests(unittest.TestCase):
                 policy[sid].to_dict()["pending_requirements"])
         self.assertTrue(self.batch.input_for("SH600000").policy_pending_requirements)
         self.assertTrue(self.batch.input_for(FOCAL).valuation_pending_reasons)
+
+    def test_pending_without_base_retains_authenticated_member_identity(self):
+        industry = self.sources.policy.evidence_batch.industry["entries"]
+        for sid in self.batch.security_ids:
+            self.assertIsNone(self.sources.base.input_for(sid))
+            row = self.batch.input_for(sid)
+            self.assertEqual(row.status, "pending_evidence")
+            for field in ("template_id", "primary_industry", "secondary_industry"):
+                self.assertIn(field, tuple(row.to_dict()))
+                self.assertEqual(getattr(row, field), industry[sid][field])
+
+    def test_member_identity_rejects_inconsistent_genuine_valuation_inputs(self):
+        # Inspect only the composition closure; never mint or alter a source proof.
+        validate = inspect.getclosurevars(
+            FormalFinalScoreInputRepository.build_batch).nonlocals["member_identity"]
+        industry = self.sources.policy.evidence_batch.industry["entries"][FOCAL]
+        genuine = tuple(self.sources.valuation.input_for(FOCAL, mid) for mid in V_METRICS)
+        expected = {field: industry[field] for field in
+            ("template_id", "primary_industry", "secondary_industry")}
+        self.assertEqual(validate(FOCAL, industry, genuine, None), expected)
+        for index, mid in enumerate(V_METRICS):
+            with self.subTest(metric=mid):
+                other = self.sources.valuation.input_for("SH600000", mid)
+                other.require_verified()
+                self.assertNotEqual(other.secondary_industry, expected["secondary_industry"])
+                conflicting = list(genuine)
+                conflicting[index] = other
+                with self.assertRaisesRegex(ValueError, "member identity mismatch"):
+                    validate(FOCAL, industry, tuple(conflicting), None)
 
     def test_batch_binds_root_frozen_universe_policy_and_valuation_hashes(self):
         batch, sources = self.batch, self.sources
