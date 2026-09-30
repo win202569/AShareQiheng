@@ -9,6 +9,7 @@ import json
 import weakref
 from types import MappingProxyType
 
+from . import formal_metric_engine as metric_engine
 from .formal_metric_batch_guard import _metric_batch_guard
 from .formal_metric_engine import _canonical, _digest, _freeze
 from .formal_policy_registry import FormalPolicyRegistry
@@ -33,6 +34,8 @@ def _install_final_inputs():
     policy_build = FormalPolicyRepository.build_batch
     valuation_build = FormalValuationRepository.build_batch
     peer_context, percentile = build_valuation_peer_context, score_valuation_percentile
+    metric_owner = vars(metric_engine)
+    metric_dependencies = metric_engine._metric_definition_dependency_changes
     v_metrics = ("V.enterprise_value_or_sustainable_roe", "V.normalized_earnings_yield",
                  "V.normalized_free_cash_flow_yield")
     source_types = (FormalScoreInputBatch, VerifiedPolicyResultBatch, PolicyAdjustedValuationBatch)
@@ -48,7 +51,10 @@ def _install_final_inputs():
         if callable(value) or isinstance(value, (staticmethod, classmethod)))
 
     def interfaces():
-        if (any(owner.get(name) is not value for name, value in captured)
+        if (metric_owner.get("_freeze") is not freeze
+                or metric_owner.get("_metric_definition_dependency_changes") is not metric_dependencies
+                or metric_dependencies()
+                or any(owner.get(name) is not value for name, value in captured)
                 or any(vars(cls).get(name) is not value for cls, name, value in checked)
                 or any(tuple(vars(cls).items()) != members for cls, members in own_members)):
             raise ValueError("final score authority dependency changed")
@@ -82,8 +88,14 @@ def _install_final_inputs():
         def __delattr__(cls, name):
             raise TypeError("final score authority types are immutable")
 
+    subclass_open = [True]
+
     class Proof(metaclass=SealedMeta):
         __slots__ = ("__weakref__",)
+
+        def __init_subclass__(cls, **kwargs):
+            if not subclass_open[0]:
+                raise TypeError("final score proof types cannot be inherited")
 
         def __init__(self, *args, **kwargs):
             raise TypeError("final score proofs require an authenticated complete batch")
@@ -122,7 +134,16 @@ def _install_final_inputs():
             saved = record(self, PolicyAdjustedScoreInputBatch)
             if type(security_id) is not str or security_id not in saved[3]:
                 raise ValueError("final score selector is outside the canonical universe")
-            return saved[3][security_id]
+            child = saved[3][security_id]
+            child_state = record(child, PolicyAdjustedScoreInput)
+            if (child_state[4] is not saved[4] or child_state[5] is not saved[5]
+                    or child_state[1]["security_id"] != security_id
+                    or any(child_state[1][key] != saved[1][key] for key in
+                        ("batch_hash", "registry_manifest_hash", "frozen_input_hash", "universe_hash"))):
+                raise ValueError("final score selector is not bound to this publication")
+            return child
+
+    subclass_open[0] = False
 
     def mint(cls, payload, publication, retention, *, attributes=None, index=None):
         result = object.__new__(cls)
