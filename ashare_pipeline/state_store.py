@@ -88,7 +88,88 @@ SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
 SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
 RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
 _OWNED_JOB_KINDS = frozenset({"deep_financial", "deep_statement", "feature_build"})
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
+
+# Stage D writes are owned by its repository and use _transaction; no table-level
+# public mutation API is exposed. Canonical payloads and Decimal projections are
+# text, while replay identity/time are separate from the canonical result hash.
+_V8_TABLE_DDL = {
+    "formal_final_run": """CREATE TABLE formal_final_run (
+ run_id TEXT NOT NULL PRIMARY KEY,
+ mode TEXT NOT NULL CHECK(mode IN ('test_preview','official_candidate')),
+ status TEXT NOT NULL CHECK(status IN ('preview_ready','blocked')),
+ input_manifest_hash TEXT NOT NULL, result_hash TEXT NOT NULL,
+ registry_manifest_hash TEXT NOT NULL, frozen_input_hash TEXT NOT NULL,
+ universe_hash TEXT NOT NULL, coverage_manifest_hash TEXT NOT NULL,
+ as_of_utc TEXT NOT NULL, code_version TEXT NOT NULL,
+ contract_version TEXT NOT NULL, created_at TEXT NOT NULL
+)""",
+    "formal_final_artifact": """CREATE TABLE formal_final_artifact (
+ run_id TEXT NOT NULL REFERENCES formal_final_run(run_id),
+ artifact_kind TEXT NOT NULL, payload_json TEXT NOT NULL, artifact_hash TEXT NOT NULL,
+ PRIMARY KEY(run_id,artifact_kind)
+)""",
+    "formal_final_input": """CREATE TABLE formal_final_input (
+ run_id TEXT NOT NULL REFERENCES formal_final_run(run_id),
+ security_id TEXT NOT NULL, entry_hash TEXT NOT NULL,
+ payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ PRIMARY KEY(run_id,security_id)
+)""",
+    "formal_final_scorecard": """CREATE TABLE formal_final_scorecard (
+ run_id TEXT NOT NULL, security_id TEXT NOT NULL, card_hash TEXT NOT NULL,
+ S0 TEXT NOT NULL, Sc TEXT NOT NULL, Sbase TEXT NOT NULL,
+ B TEXT NOT NULL, R_safety TEXT NOT NULL, C TEXT NOT NULL, grade TEXT NOT NULL,
+ payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ PRIMARY KEY(run_id,security_id),
+ FOREIGN KEY(run_id,security_id) REFERENCES formal_final_input(run_id,security_id)
+)""",
+    "formal_final_status": """CREATE TABLE formal_final_status (
+ run_id TEXT NOT NULL, security_id TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('out_of_scope','pending_evidence','pool_vetoed','formal_scored')),
+ reason_codes_json TEXT NOT NULL, payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ PRIMARY KEY(run_id,security_id),
+ FOREIGN KEY(run_id,security_id) REFERENCES formal_final_input(run_id,security_id)
+)""",
+    "formal_final_eligibility": """CREATE TABLE formal_final_eligibility (
+ run_id TEXT NOT NULL, security_id TEXT NOT NULL, eligibility_hash TEXT NOT NULL,
+ strong_qualified INTEGER NOT NULL CHECK(strong_qualified IN (0,1)),
+ wait_qualified INTEGER NOT NULL CHECK(wait_qualified IN (0,1)),
+ hard_veto INTEGER NOT NULL CHECK(hard_veto IN (0,1)),
+ strong_prohibited INTEGER NOT NULL CHECK(strong_prohibited IN (0,1)),
+ wait_prohibited INTEGER NOT NULL CHECK(wait_prohibited IN (0,1)),
+ payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ PRIMARY KEY(run_id,security_id), CHECK(strong_qualified+wait_qualified<=1),
+ CHECK(strong_qualified=0 OR (hard_veto=0 AND strong_prohibited=0)),
+ CHECK(wait_qualified=0 OR (hard_veto=0 AND wait_prohibited=0)),
+ FOREIGN KEY(run_id,security_id) REFERENCES formal_final_input(run_id,security_id)
+)""",
+    "formal_final_pool_decision": """CREATE TABLE formal_final_pool_decision (
+ run_id TEXT NOT NULL, security_id TEXT NOT NULL,
+ pool_name TEXT NOT NULL CHECK(pool_name IN ('strong','wait')),
+ decision TEXT NOT NULL CHECK(decision IN ('selected','not_qualified','overall_capacity_reached','industry_cap_reached')),
+ selected_ordinal INTEGER, decision_hash TEXT NOT NULL,
+ payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ PRIMARY KEY(run_id,security_id,pool_name),
+ CHECK((decision='selected' AND selected_ordinal IS NOT NULL
+        AND typeof(selected_ordinal)='integer' AND selected_ordinal>0)
+       OR (decision<>'selected' AND selected_ordinal IS NULL)),
+ FOREIGN KEY(run_id,security_id) REFERENCES formal_final_eligibility(run_id,security_id)
+)""",
+    "formal_final_dependency": """CREATE TABLE formal_final_dependency (
+ run_id TEXT NOT NULL REFERENCES formal_final_run(run_id), security_id TEXT,
+ source_kind TEXT NOT NULL, source_id TEXT NOT NULL, source_hash TEXT NOT NULL,
+ effect_scope TEXT NOT NULL, dependent_key TEXT NOT NULL,
+ payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ PRIMARY KEY(run_id,source_kind,source_id,effect_scope,dependent_key),
+ FOREIGN KEY(run_id,security_id) REFERENCES formal_final_input(run_id,security_id)
+)""",
+}
+_V8_INDEX_DDL = {
+    "formal_final_run_input": "CREATE INDEX formal_final_run_input ON formal_final_run(input_manifest_hash,run_id)",
+    "formal_final_selected_ordinal": "CREATE UNIQUE INDEX formal_final_selected_ordinal ON formal_final_pool_decision(run_id,pool_name,selected_ordinal) WHERE decision='selected'",
+    "formal_final_dependency_source": "CREATE INDEX formal_final_dependency_source ON formal_final_dependency(source_kind,source_id,source_hash,run_id)",
+    "formal_final_dependency_effect": "CREATE INDEX formal_final_dependency_effect ON formal_final_dependency(effect_scope,dependent_key,run_id)",
+}
 
 _V7_TABLE_DDL = {
     "formal_range_task": """CREATE TABLE formal_range_task (
@@ -1657,6 +1738,7 @@ class StateStore:
                 5: (_V5_TABLE_DDL, _V5_INDEX_DDL),
                 6: (_V6_TABLE_DDL, _V6_INDEX_DDL),
                 7: (_V7_TABLE_DDL, _V7_INDEX_DDL),
+                8: (_V8_TABLE_DDL, _V8_INDEX_DDL),
             }
             if not tables:
                 self._create_v2_schema(connection)
@@ -1674,16 +1756,18 @@ class StateStore:
                 self._assert_schema_ddl(connection, {"schema_migration": _MIGRATION_TABLE_DDL}, {}, "migration ledger")
                 versions = {row[0] for row in connection.execute("SELECT version FROM schema_migration")}
                 if any(type(v) is not int for v in versions) or versions not in (
-                    {2}, {2, 3}, {2, 3, 4}, {2, 3, 4, 5}, {2, 3, 4, 5, 6}, {2, 3, 4, 5, 6, 7}
+                    {2}, {2, 3}, {2, 3, 4}, {2, 3, 4, 5}, {2, 3, 4, 5, 6}, {2, 3, 4, 5, 6, 7},
+                    {2, 3, 4, 5, 6, 7, 8}
                 ):
                     raise RuntimeError(f"unsupported migration versions: {sorted(versions, key=str)}")
             objects = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
+            self._assert_v8_objects(connection, applied=8 in versions)
             for version, (table_ddl, index_ddl) in schemas.items():
                 if version in versions:
                     self._assert_schema_ddl(connection, table_ddl, index_ddl, f"v{version} schema")
                 elif objects & (set(table_ddl) | set(index_ddl)):
                     raise RuntimeError(f"unexpected v{version} schema before its migration ledger")
-            for version in range(max(versions) + 1, 8):
+            for version in range(max(versions) + 1, SCHEMA_VERSION + 1):
                 getattr(self, f"_apply_v{version}_migration")(connection)
 
     @contextmanager
@@ -1850,6 +1934,28 @@ class StateStore:
             connection.execute(statement)
         cls._assert_schema_ddl(connection, _V7_TABLE_DDL, _V7_INDEX_DDL, "v7 schema")
         connection.execute("INSERT INTO schema_migration VALUES (7, ?)", (_utc_now(),))
+
+    @classmethod
+    def _assert_v8_objects(cls, connection: sqlite3.Connection, *, applied: bool) -> None:
+        approved = set(_V8_TABLE_DDL) | set(_V8_INDEX_DDL)
+        for row in connection.execute("SELECT type,name,tbl_name,sql FROM sqlite_master"):
+            kind, name, table, sql = row
+            if name.lower().startswith("formal_final_") or table.lower() in _V8_TABLE_DDL:
+                # SQLite creates only primary-key autoindexes for the V8 tables.
+                if (applied and kind == "index" and sql is None
+                        and name == f"sqlite_autoindex_{table}_1"):
+                    continue
+                if not applied or name not in approved:
+                    raise RuntimeError(f"unexpected v8 schema object {name}")
+
+    @classmethod
+    def _apply_v8_migration(cls, connection: sqlite3.Connection) -> None:
+        cls._assert_v8_objects(connection, applied=False)
+        for statement in (*_V8_TABLE_DDL.values(), *_V8_INDEX_DDL.values()):
+            connection.execute(statement)
+        cls._assert_schema_ddl(connection, _V8_TABLE_DDL, _V8_INDEX_DDL, "v8 schema")
+        cls._assert_v8_objects(connection, applied=True)
+        connection.execute("INSERT INTO schema_migration VALUES (8, ?)", (_utc_now(),))
 
     @staticmethod
     def _formal_insert_row(connection, table: str, row: dict[str, object]) -> None:
