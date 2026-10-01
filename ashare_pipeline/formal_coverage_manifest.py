@@ -14,6 +14,7 @@ import hashlib
 import json
 import pickle
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import weakref
@@ -21,7 +22,10 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
 from .formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
+from .formal_snapshot_repository import FormalSnapshotRepository
+from .formal_repository_identity import _require_repository_initialization
 from .formal_universe import FormalFrozenUniverseInput, _validate_frozen_universe_input
+from . import state_store as _state_schema
 
 
 COVERAGE_CLASSES = (
@@ -32,8 +36,6 @@ COVERAGE_CLASSES = (
     "blocked_ambiguous", "blocked_dependency",
 )
 _COVERAGE_SET = frozenset(COVERAGE_CLASSES)
-_SEALS: dict[int, tuple[weakref.ReferenceType[Any], bytes, type]] = {}
-_LIVE_CONTEXTS: dict[int, tuple[weakref.ReferenceType[Any], dict[str, Any]]] = {}
 _AUDIT_ROW_FIELDS = (
     "required", "applicability_rule_hash", "source", "dataset",
     "request_fingerprint", "refresh_generation", "task_id", "collection_state",
@@ -47,7 +49,10 @@ _VERIFIED_LINEAGE_FIELDS = (
     "source", "dataset", "request_fingerprint", "selected_snapshot_id",
     "content_sha256", "manifest_sha256", "parser_id", "parser_version",
     "mapping_version", "published_at_utc", "effective_at_utc",
+    "refresh_generation", "task_id", "collection_state", "captured_at_utc",
+    "source_updated_at_utc",
 )
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _canonical(value: Any) -> bytes:
@@ -57,6 +62,13 @@ def _canonical(value: Any) -> bytes:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _record_digest(value: Any) -> str:
+    if isinstance(value, Mapping):
+        value = {key: item for key, item in value.items()
+                 if key not in {"rechecked_at_utc", "timing_diagnostics"}}
+    return _digest(value)
 
 
 def _key(row: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -83,7 +95,8 @@ _CONTRACT_FIELDS = frozenset({
 
 
 def _official_inputs(contract: Any, verifier: Any, bundle: Any, loader: Any, frozen: Any,
-                     reqs: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+                     reqs: Sequence[Mapping[str, Any]], db_path: Any,
+                     snapshot_repository: Any) -> dict[str, Any] | None:
     """Accept only a signed requirement catalog tied to genuine root proofs."""
     if not isinstance(contract, Mapping) or "canonical_json" not in contract:
         return None
@@ -91,6 +104,16 @@ def _official_inputs(contract: Any, verifier: Any, bundle: Any, loader: Any, fro
         raise ValueError("official coverage requires a verified registry bundle")
     if type(loader) is not FormalRegistryBundleLoader or verifier is not loader._verifier:
         raise ValueError("official coverage requires a trusted registry loader and verifier")
+    if (type(loader._repository) is not _state_schema.StateStore
+            or type(snapshot_repository) is not FormalSnapshotRepository):
+        raise ValueError("official coverage requires owning production repositories")
+    store = loader._repository
+    _require_repository_initialization(store)
+    _require_repository_initialization(snapshot_repository)
+    if (snapshot_repository._state_store is not store
+            or Path(store.db_path).resolve() != Path(db_path).resolve()
+            or verifier is not store._require_registry_verifier()):
+        raise ValueError("official coverage repository authority or database identity mismatch")
     bundle.require_official()
     current_bundle = loader.load(bundle.manifest.manifest_hash)
     current_bundle.require_official()
@@ -182,26 +205,52 @@ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
     before = db_hashes()
     db_sha256 = before[""]
     try:
-        connection = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
+        connection = sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)
         try:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
+            # StateStore owns schema_migration, not SQLite user_version. A
+            # foreign nonzero marker means another schema authority touched it.
+            if version != 0:
+                raise ValueError("official coverage database schema user_version mismatch")
+            versions = tuple(row[0] for row in connection.execute(
+                "SELECT version FROM schema_migration ORDER BY version"))
+            expected_versions = tuple(range(2, _state_schema.SCHEMA_VERSION + 1))
+            if versions != expected_versions or expected_schema_version != _state_schema.SCHEMA_VERSION:
+                raise ValueError("official coverage database schema migrations mismatch")
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            expected_tables = {"schema_migration"}
+            for schema_version in expected_versions:
+                table_ddl = getattr(_state_schema, f"_V{schema_version}_TABLE_DDL")
+                index_ddl = getattr(_state_schema, f"_V{schema_version}_INDEX_DDL")
+                _state_schema.StateStore._assert_schema_ddl(
+                    connection, table_ddl, index_ddl, f"v{schema_version} schema")
+                expected_tables.update(table_ddl)
+            _state_schema.StateStore._assert_schema_ddl(
+                connection, {"schema_migration": _state_schema._MIGRATION_TABLE_DDL},
+                {}, "migration ledger")
+            if tables != expected_tables:
+                raise ValueError("official coverage database schema tables mismatch")
         finally:
             connection.close()
         status_wire = json.loads(status.read_text(encoding="utf-8"))
-    except (sqlite3.Error, OSError, ValueError) as exc:
-        raise ValueError("official coverage database or status could not be read") from exc
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
+        raise ValueError("official coverage database schema or status could not be read") from exc
     if db_hashes() != before:
         raise ValueError("official coverage database changed during identity read")
     status_schema_version = status_wire.get("schema_version") if type(status_wire) is dict else None
     if status_schema_version != expected_schema_version:
         raise ValueError("official coverage database schema version mismatch")
     if (type(status_wire) is not dict or status_wire.get("db_sha256") != db_sha256
+            or status_wire.get("db_generation_hash") != _digest(before)
+            or status_wire.get("schema_versions") != list(versions)
             or _aware(status_wire.get("generated_at_utc")) is None):
         raise ValueError("official coverage database status identity mismatch")
     return {"workspace_revision": revision.stdout.strip(), "db_path": str(db),
             "db_sha256": db_sha256,
             "db_sidecar_sha256": {suffix: before[suffix] for suffix in ("-wal", "-shm")},
             "db_schema_versions": {"user_version": version,
+                                   "migrations": list(versions),
                                    "status_schema_version": status_schema_version},
             "expected_schema_version": expected_schema_version,
             "status_generated_at_utc": status_wire["generated_at_utc"],
@@ -209,13 +258,55 @@ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
 
 
 def _repository_provenance(req: Mapping[str, Any], source: Any,
-                           owner: str, validator: Callable[..., Any]) -> dict[str, Any]:
+                           owner: str, validator: Callable[..., Any],
+                           snapshots: FormalSnapshotRepository) -> dict[str, Any]:
+    if owner != "formal_snapshot_repository":
+        raise ValueError("official coverage repository owner has no authenticated adapter")
+    if not isinstance(source, Mapping) or source.get("coverage_class") not in {
+            "verified_complete", "verified_partial", "verified_no_coverage"}:
+        raise ValueError("official coverage requires verified source repository evidence")
+    try:
+        ref = snapshots.get_verified_by_manifest(source["manifest_sha256"])
+        raw = snapshots.read_verified_raw(ref)
+    except Exception as exc:
+        raise ValueError("official coverage source repository evidence is missing") from exc
+    bindings = {
+        "snapshot_id": "selected_snapshot_id", "source": "source", "dataset": "dataset",
+        "request_fingerprint": "request_fingerprint", "security_id": "security_id",
+        "period_or_date": "period_or_window", "exchange": "exchange",
+        "content_sha256": "content_sha256", "manifest_sha256": "manifest_sha256",
+        "parser_id": "parser_id", "parser_version": "parser_version",
+        "mapping_version": "mapping_version", "published_at_utc": "published_at_utc",
+        "effective_at_utc": "effective_at_utc", "captured_at_utc": "captured_at_utc",
+        "source_updated_at_utc": "source_updated_at_utc",
+        "refresh_generation": "refresh_generation", "producing_task_id": "task_id",
+    }
+    if (any(getattr(ref, attribute) != source.get(field) if field not in req
+            else getattr(ref, attribute) != req[field]
+            for attribute, field in bindings.items())
+            or ref.verification_status != "verified"
+            or hashlib.sha256(raw).hexdigest() != ref.content_sha256):
+        raise ValueError("official coverage source repository lineage mismatch")
+    facts = tuple(fact for fact in snapshots._state_store.list_formal_financial_facts(
+        security_id=req["security_id"])
+        if fact.source_snapshot_id == ref.snapshot_id
+        and fact.period_end == req["period_or_window"])
+    actual_units = {fact.unit for fact in facts}
+    if (source.get("coverage_class") != "verified_complete"
+            or not facts
+            or actual_units != set(source.get("observed_units", ()))
+            or not set(req.get("expected_units", ())) <= actual_units):
+        raise ValueError("official coverage owning financial repository unit proof is incomplete")
+    evidence_hash = _digest({"manifest_sha256": ref.manifest_sha256,
+                             "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                             "facts": [fact.to_dict() for fact in facts]})
     try:
         result = validator(req, source)
     except Exception as exc:
         raise ValueError("official coverage repository validation failed") from exc
     expected = {"domain": req["domain"], "owner": owner,
-                "requirement_hash": _digest(req), "record_hash": _digest(source)}
+                "requirement_hash": _digest(req), "record_hash": _record_digest(source),
+                "evidence_hash": evidence_hash}
     if (type(result) is not dict or set(result) != set(expected) | {"evidence_hash"}
             or any(result.get(field) != value for field, value in expected.items())
             or type(result.get("evidence_hash")) is not str
@@ -223,21 +314,6 @@ def _repository_provenance(req: Mapping[str, Any], source: Any,
             or any(char not in "0123456789abcdef" for char in result["evidence_hash"])):
         raise ValueError("official coverage repository provenance mismatch")
     return dict(result)
-
-
-def _seal(obj: Any, payload: Mapping[str, Any]) -> None:
-    raw = _canonical(payload)
-    identity = id(obj)
-    _SEALS[identity] = (weakref.ref(obj, lambda _: (_SEALS.pop(identity, None),
-                                                  _LIVE_CONTEXTS.pop(identity, None))),
-                       raw, type(obj))
-
-
-def _require(obj: Any) -> Mapping[str, Any]:
-    item = _SEALS.get(id(obj))
-    if item is None or item[0]() is not obj or item[2] is not type(obj):
-        raise ValueError("coverage proof is not a genuine verified manifest")
-    return json.loads(item[1])
 
 
 @dataclass(frozen=True)
@@ -274,7 +350,7 @@ class _Proof(metaclass=_SealedProofType):
         raise TypeError("coverage manifests must be minted by FormalCoverageAuditor")
 
     def _data(self) -> Mapping[str, Any]:
-        return _require(self)
+        raise ValueError("coverage proof authority is unavailable")
 
     def to_dict(self) -> dict[str, Any]:
         return copy.deepcopy(dict(self._data()))
@@ -296,7 +372,7 @@ class _Proof(metaclass=_SealedProofType):
         return MappingProxyType(copy.deepcopy(self._data()["diagnostics"]))
 
     def require_verified(self) -> None:
-        _require(self)
+        self._data()
 
     def canonical_bytes(self) -> bytes:
         data = self._data()
@@ -328,34 +404,7 @@ class VerifiedCoverageManifest(_Proof):
             raise ValueError("coverage preview blocked: " + ",".join(data["blockers"]))
 
     def require_official_ready(self) -> None:
-        data = self._data()
-        if not data.get("authenticated_context"):
-            raise ValueError("official coverage requires authenticated production contract")
-        if data["blockers"]:
-            raise ValueError("official coverage blocked: " + ",".join(data["blockers"]))
-        live = _LIVE_CONTEXTS.get(id(self))
-        if live is None or live[0]() is not self:
-            raise ValueError("official coverage live proof context was revoked")
-        context = live[1]
-        wire = _official_inputs(context["contract"], context["verifier"],
-                                context["bundle"], context["registry_loader"],
-                                context["frozen"],
-                                context["requirements"])
-        if wire is None:
-            raise ValueError("official coverage authenticated contract was revoked")
-        paths = data["diagnostics"]["identity_paths"]
-        current = _read_environment(paths["workspace_root"], paths["db_path"],
-                                    paths["status_path"], data["expected_schema_version"])
-        if any(data[field] != value for field, value in current.items()):
-            raise ValueError("official coverage database or workspace identity changed")
-        for row, req, source in zip(data["rows"], context["requirements"],
-                                    context["sources"], strict=True):
-            provenance = _repository_provenance(
-                req, source, wire["domain_owners"][req["domain"]],
-                context["validators"][req["domain"]],
-            )
-            if row.get("repository_provenance") != provenance:
-                raise ValueError("official coverage repository provenance changed")
+        raise ValueError("coverage proof authority is unavailable")
 
 
 class FormalCoverageAuditor:
@@ -371,24 +420,21 @@ class FormalCoverageAuditor:
 
     @staticmethod
     def revoke(manifest: VerifiedCoverageManifest) -> None:
-        if type(manifest) is not VerifiedCoverageManifest:
-            raise ValueError("coverage proof is not a genuine verified manifest")
-        _require(manifest)
-        _SEALS.pop(id(manifest), None)
-        _LIVE_CONTEXTS.pop(id(manifest), None)
+        raise ValueError("coverage proof authority is unavailable")
 
-    def audit(self, requirements: Sequence[CoverageRequirement | Mapping[str, Any]],
+    def _audit_payload(self, requirements: Sequence[CoverageRequirement | Mapping[str, Any]],
               records: Sequence[Mapping[str, Any]] | Mapping[Any, Mapping[str, Any]] = (),
               *, repository_validators: Mapping[str, Callable[..., Any]] | None = None,
               validators: Mapping[str, Callable[..., Any]] | None = None,
               production_contract: Any = None, registry: Mapping[str, Any] | None = None,
               contract_verifier: Any = None, registry_bundle: Any = None,
               registry_loader: Any = None,
+              snapshot_repository: Any = None,
               frozen_universe: Any = None, workspace_root: Any = None,
               db_path: Any = None, status_path: Any = None,
               db_diagnostics: Mapping[str, Any] | None = None,
               audit_at_utc: str | None = None,
-              timing_diagnostics: Mapping[str, Any] | None = None) -> VerifiedCoverageManifest:
+              timing_diagnostics: Mapping[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
         reqs = [r.to_dict() if isinstance(r, CoverageRequirement) else dict(r)
                 for r in requirements]
         if not reqs:
@@ -399,7 +445,8 @@ class FormalCoverageAuditor:
         contract = self.production_contract if production_contract is None else production_contract
         official_wire = _official_inputs(contract, contract_verifier, registry_bundle,
                                          registry_loader,
-                                         frozen_universe, reqs)
+                                         frozen_universe, reqs, db_path,
+                                         snapshot_repository)
         if official_wire is not None and _aware(self.freeze_at_utc) != _aware(frozen_universe.as_of_utc):
             raise ValueError("coverage freeze does not match frozen universe")
         environment = (_read_environment(workspace_root, db_path, status_path,
@@ -460,19 +507,41 @@ class FormalCoverageAuditor:
                 if cls == "verified_no_coverage" and not (
                     source.get("authenticated") and source.get("explicit_source_statement")):
                     cls = "blocked_integrity"; reasons.append("no_coverage_not_authenticated")
+                if cls == "not_applicable_signed" and not (
+                    source.get("authenticated") is True
+                    and source.get("explicit_source_statement") is True
+                    and source.get("signature_ok") is True
+                    and source.get("hash_ok") is True
+                    and type(source.get("applicability_rule_hash")) is str
+                    and _SHA256.fullmatch(source["applicability_rule_hash"])):
+                    cls = "blocked_integrity"; reasons.append("applicability_not_authenticated")
                 if cls in {"verified_complete", "verified_partial", "verified_no_coverage"}:
                     if any(type(source.get(field)) is not str or not source[field].strip()
                            for field in _VERIFIED_LINEAGE_FIELDS):
                         cls = "blocked_integrity"; reasons.append("incomplete_verified_lineage")
+                    elif (source.get("authenticated") is not True
+                          or source.get("signature_ok") is not True
+                          or source.get("hash_ok") is not True
+                          or any(type(source.get(field)) is not str
+                                 or _SHA256.fullmatch(source[field]) is None
+                                 for field in ("request_fingerprint", "content_sha256", "manifest_sha256"))
+                          or not isinstance(source.get("evidence_hashes"), Mapping)
+                          or not source["evidence_hashes"]
+                          or any(type(value) is not str or _SHA256.fullmatch(value) is None
+                                 for value in source["evidence_hashes"].values())):
+                        cls = "blocked_integrity"; reasons.append("source_hash_or_signature_invalid")
                     elif source.get("verification_state") != "verified" or source.get("temporal_state") != "visible":
                         cls = "blocked_integrity"; reasons.append("unverified_source_state")
                     elif not isinstance(source.get("observed_units"), (list, tuple)):
                         cls = "blocked_integrity"; reasons.append("missing_observed_units")
                     elif cls == "verified_complete" and set(source["observed_units"]) != set(req.get("expected_units", ())):
                         cls = "blocked_integrity"; reasons.append("units_mismatch")
-                if source.get("effective_at_utc") and (_aware(source["effective_at_utc"]) is None or
-                        _aware(source["effective_at_utc"]) > _aware(self.freeze_at_utc)):
+                if any(source.get(field) is not None and
+                       (_aware(source[field]) is None or _aware(source[field]) > _aware(self.freeze_at_utc))
+                       for field in ("published_at_utc", "effective_at_utc", "source_updated_at_utc")):
                     cls = "blocked_temporal"; reasons.append("after_temporal_cutoff")
+                if source.get("captured_at_utc") is not None and _aware(source["captured_at_utc"]) is None:
+                    cls = "blocked_temporal"; reasons.append("invalid_capture_time")
                 if source.get("units_ok") is False:
                     cls = "blocked_integrity"; reasons.append("units_mismatch")
                 if source.get("parser_mapping_ok") is False:
@@ -493,7 +562,7 @@ class FormalCoverageAuditor:
             if official_wire is not None:
                 row["repository_provenance"] = _repository_provenance(
                     req, source, official_wire["domain_owners"][req["domain"]],
-                    callback_map[str(req["domain"])],
+                    callback_map[str(req["domain"])], snapshot_repository,
                 )
             row["coverage_class"] = cls
             row["reason_codes"] = tuple(sorted(set(str(x) for x in reasons)))
@@ -503,6 +572,8 @@ class FormalCoverageAuditor:
             rows.append(row)
             if cls.startswith("blocked") or cls in {"missing", "pending", "retryable_failed", "terminal_failed"}:
                 blockers.add(f"{req['security_id']}:{req['domain']}:{cls}")
+            if cls == "verified_partial" and row["missing_units"]:
+                blockers.add(f"{req['security_id']}:{req['domain']}:required_units_incomplete")
         official_contract = ({"contract_hash": hashlib.sha256(contract["canonical_json"]).hexdigest(),
                               "approval_id": official_wire["approval_id"],
                               "signing_identity": official_wire["signing_identity"]}
@@ -538,20 +609,91 @@ class FormalCoverageAuditor:
                                                         "db_path": environment["db_path"],
                                                         "status_path": environment["status_path"]}
                                                        if environment is not None else None)})
-        result = object.__new__(VerifiedCoverageManifest)
-        _seal(result, payload)
+        context = None
         if official_wire is not None:
-            _LIVE_CONTEXTS[id(result)] = (
-                weakref.ref(result),
-                {"contract": dict(contract), "verifier": contract_verifier,
+            context = {"contract": dict(contract), "verifier": contract_verifier,
                  "bundle": registry_bundle, "registry_loader": registry_loader,
+                 "snapshot_repository": snapshot_repository, "db_path": db_path,
                  "frozen": frozen_universe,
                  "requirements": copy.deepcopy(reqs),
                  "sources": copy.deepcopy([by_key.get(key) for key in keys]),
                  "validators": {domain: callback_map[domain]
-                                for domain in official_wire["domain_owners"]}},
-            )
+                                for domain in official_wire["domain_owners"]}}
+        return payload, context
+
+
+def _install_coverage_authority() -> None:
+    # The only minting/revocation state lives in this closure. In particular,
+    # there is no module-level seal registry or callable resealing a proof.
+    seals: dict[int, tuple[weakref.ReferenceType[Any], bytes, type]] = {}
+    live_contexts: dict[int, tuple[weakref.ReferenceType[Any], dict[str, Any]]] = {}
+    build_payload = FormalCoverageAuditor._audit_payload
+
+    def read(obj: Any) -> Mapping[str, Any]:
+        item = seals.get(id(obj))
+        if item is None or item[0]() is not obj or item[2] is not type(obj):
+            raise ValueError("coverage proof is not a genuine verified manifest")
+        return json.loads(item[1])
+
+    def audit(self: FormalCoverageAuditor, *args: Any, **kwargs: Any) -> VerifiedCoverageManifest:
+        payload, context = build_payload(self, *args, **kwargs)
+        result = object.__new__(VerifiedCoverageManifest)
+        identity = id(result)
+        raw = _canonical(payload)
+        seals[identity] = (
+            weakref.ref(result, lambda _: (seals.pop(identity, None),
+                                           live_contexts.pop(identity, None))),
+            raw, type(result),
+        )
+        if context is not None:
+            live_contexts[identity] = (weakref.ref(result), context)
         return result
+
+    def revoke(manifest: VerifiedCoverageManifest) -> None:
+        if type(manifest) is not VerifiedCoverageManifest:
+            raise ValueError("coverage proof is not a genuine verified manifest")
+        read(manifest)
+        seals.pop(id(manifest), None)
+        live_contexts.pop(id(manifest), None)
+
+    def official_gate(self: VerifiedCoverageManifest) -> None:
+        data = read(self)
+        if not data.get("authenticated_context"):
+            raise ValueError("official coverage requires authenticated production contract")
+        if data["blockers"]:
+            raise ValueError("official coverage blocked: " + ",".join(data["blockers"]))
+        live = live_contexts.get(id(self))
+        if live is None or live[0]() is not self:
+            raise ValueError("official coverage live proof context was revoked")
+        context = live[1]
+        paths = data["diagnostics"]["identity_paths"]
+        current = _read_environment(paths["workspace_root"], paths["db_path"],
+                                    paths["status_path"], data["expected_schema_version"])
+        if any(data[field] != value for field, value in current.items()):
+            raise ValueError("official coverage database or workspace identity changed")
+        wire = _official_inputs(context["contract"], context["verifier"],
+                                context["bundle"], context["registry_loader"],
+                                context["frozen"], context["requirements"],
+                                context["db_path"], context["snapshot_repository"])
+        if wire is None:
+            raise ValueError("official coverage authenticated contract was revoked")
+        for row, req, source in zip(data["rows"], context["requirements"],
+                                    context["sources"], strict=True):
+            provenance = _repository_provenance(
+                req, source, wire["domain_owners"][req["domain"]],
+                context["validators"][req["domain"]], context["snapshot_repository"],
+            )
+            if row.get("repository_provenance") != provenance:
+                raise ValueError("official coverage repository provenance changed")
+
+    type.__setattr__(_Proof, "_data", read)
+    type.__setattr__(VerifiedCoverageManifest, "require_official_ready", official_gate)
+    FormalCoverageAuditor.audit = audit
+    FormalCoverageAuditor.revoke = staticmethod(revoke)
+
+
+_install_coverage_authority()
+del _install_coverage_authority
 
 
 __all__ = ["COVERAGE_CLASSES", "CoverageRequirement", "FormalCoverageAuditor",

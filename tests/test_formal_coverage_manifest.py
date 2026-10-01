@@ -12,13 +12,18 @@ def req(domain="financial", sid="SH600000", exchange="SH"):
 
 def good(r, cls="verified_complete", **extra):
     return dict(r.to_dict(), coverage_class=cls, authenticated=True,
-                explicit_source_statement=True, units_ok=True,
-                parser_mapping_ok=True, evidence_hashes={"content": "h"},
-                source="official", dataset="annual_report", request_fingerprint="request",
-                selected_snapshot_id="snapshot", content_sha256="content",
-                manifest_sha256="manifest", parser_id="parser", parser_version="1",
+                explicit_source_statement=True, units_ok=True, signature_ok=True,
+                hash_ok=True, parser_mapping_ok=True,
+                evidence_hashes={"content": "4" * 64},
+                source="official", dataset="annual_report", request_fingerprint="1" * 64,
+                selected_snapshot_id="snapshot", content_sha256="2" * 64,
+                manifest_sha256="3" * 64, parser_id="parser", parser_version="1",
                 mapping_version="1", published_at_utc="2026-08-01T00:00:00+00:00",
                 effective_at_utc="2026-08-01T00:00:00+00:00",
+                source_updated_at_utc="2026-08-01T00:00:00+00:00",
+                captured_at_utc="2026-08-02T00:00:00+00:00",
+                refresh_generation="generation-1", task_id="task-1",
+                collection_state="complete",
                 verification_state="verified", temporal_state="visible",
                 observed_units=list(r.expected_units), **extra)
 

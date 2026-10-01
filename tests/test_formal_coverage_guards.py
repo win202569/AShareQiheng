@@ -9,12 +9,19 @@ import tempfile
 import unittest
 import weakref
 
+import ashare_pipeline.formal_coverage_manifest as coverage_module
 from ashare_pipeline.formal_coverage_manifest import CoverageRequirement, FormalCoverageAuditor
 from ashare_pipeline.formal_registry_manifest import FormalRegistryBundleLoader
+from ashare_pipeline.formal_snapshot_repository import FormalSnapshotRepository
+from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore
+from ashare_pipeline.formal_evidence import OfficialRequest
 from ashare_pipeline.formal_universe import FormalUniverseIngestor
+from ashare_pipeline.state_store import StateStore
 from tests.test_formal_coverage_manifest import good
 from tests.test_formal_registry_manifest import AcceptingVerifier, fixture_repository
 from tests.test_formal_universe import verified_listing_documents
+from tests.test_formal_snapshot_repository import cninfo_fetch, verified
+from tests.test_formal_feature_contract import formal_fact
 
 
 def canonical(value):
@@ -26,17 +33,29 @@ def digest(value):
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+def db_generation(path):
+    return {suffix: (hashlib.sha256(candidate.read_bytes()).hexdigest()
+                     if candidate.is_file() else None)
+            for suffix in ("", "-wal", "-shm")
+            for candidate in (path.with_name(path.name + suffix),)}
+
+
 class CoverageGuardTests(unittest.TestCase):
     def setUp(self):
         self.r = CoverageRequirement("f", "SH600000", "financial", "s", "2025", "SH")
         self.a = FormalCoverageAuditor(production_contract={"approved": True}, repository_validators={"financial": lambda *_: True})
         self.row = dict(self.r.to_dict(), coverage_class="verified_complete", authenticated=True,
-                        units_ok=True, parser_mapping_ok=True, source="official",
-                        dataset="annual_report", request_fingerprint="request",
-                        selected_snapshot_id="snapshot", content_sha256="content",
-                        manifest_sha256="manifest", parser_id="parser", parser_version="1",
+                        units_ok=True, parser_mapping_ok=True, signature_ok=True,
+                        hash_ok=True, evidence_hashes={"content": "4" * 64},
+                        source="official", dataset="annual_report", request_fingerprint="1" * 64,
+                        selected_snapshot_id="snapshot", content_sha256="2" * 64,
+                        manifest_sha256="3" * 64, parser_id="parser", parser_version="1",
                         mapping_version="1", published_at_utc="2026-08-01T00:00:00+00:00",
                         effective_at_utc="2026-08-01T00:00:00+00:00",
+                        source_updated_at_utc="2026-08-01T00:00:00+00:00",
+                        captured_at_utc="2026-08-02T00:00:00+00:00",
+                        refresh_generation="generation-1", task_id="task-1",
+                        collection_state="complete",
                         verification_state="verified", temporal_state="visible",
                         observed_units=[])
         self.m = self.a.audit([self.r], [self.row])
@@ -142,6 +161,41 @@ class CoverageGuardTests(unittest.TestCase):
         gc.collect()
         self.assertIsNone(reference())
 
+    def test_revoked_proof_cannot_be_reactivated_through_module_seal_state(self):
+        manifest = self.a.audit([self.r], [self.row])
+        self.a.revoke(manifest)
+        for name in ("_SEALS", "_LIVE_CONTEXTS", "_seal"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(coverage_module, name))
+        with self.assertRaises(ValueError):
+            manifest.require_verified()
+
+    def test_signed_applicability_and_partial_required_units_fail_closed(self):
+        not_applicable = dict(self.row, coverage_class="not_applicable_signed")
+        manifest = self.a.audit([self.r], [not_applicable])
+        self.assertEqual(manifest.rows[0]["coverage_class"], "blocked_integrity")
+        partial = dict(self.row, coverage_class="verified_partial",
+                       expected_units=["CNY"], observed_units=[])
+        required = CoverageRequirement("f", "SH600000", "financial", "s", "2025", "SH", ("CNY",))
+        manifest = self.a.audit([required], [partial])
+        with self.assertRaises(ValueError):
+            manifest.require_preview_ready()
+
+    def test_verified_lineage_hashes_and_publication_cutoff_are_required(self):
+        for field in ("refresh_generation", "task_id", "collection_state",
+                      "captured_at_utc", "source_updated_at_utc"):
+            with self.subTest(field=field):
+                row = dict(self.row); row.pop(field, None)
+                manifest = self.a.audit([self.r], [row])
+                self.assertEqual(manifest.rows[0]["coverage_class"], "blocked_integrity")
+        for field in ("content_sha256", "manifest_sha256", "request_fingerprint"):
+            with self.subTest(field=field):
+                manifest = self.a.audit([self.r], [dict(self.row, **{field: "not-a-hash"})])
+                self.assertEqual(manifest.rows[0]["coverage_class"], "blocked_integrity")
+        future = dict(self.row, published_at_utc="2026-09-01T00:00:00+00:00")
+        self.assertEqual(self.a.audit([self.r], [future]).rows[0]["coverage_class"],
+                         "blocked_temporal")
+
 
 class OfficialCoverageBoundaryTests(unittest.TestCase):
     def setUp(self):
@@ -149,26 +203,81 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.temp_path = Path(self.temp.name)
         repository, manifest, _ = fixture_repository(purpose="official")
-        self.registry_repository = repository
         self.verifier = AcceptingVerifier()
-        self.registry_loader = FormalRegistryBundleLoader(repository, self.verifier)
+        self.db_path = self.temp_path / "formal.db"
+        self.raw_store = FormalSnapshotStore(self.temp_path / "raw")
+        self.registry_repository = StateStore(
+            self.db_path, formal_snapshot_store=self.raw_store,
+            registry_signature_verifier=self.verifier)
+        self.registry_repository.initialize()
+        for blob in repository.blobs.values():
+            self.registry_repository.put_formal_registry_blob(blob)
+        self.registry_repository.put_formal_registry_manifest(manifest)
+        self.registry_loader = FormalRegistryBundleLoader(self.registry_repository, self.verifier)
         self.bundle = self.registry_loader.load(manifest.manifest_hash)
+        self.snapshot_repository = FormalSnapshotRepository(self.raw_store.root, self.registry_repository)
         self.frozen = FormalUniverseIngestor().build(
             "2026-08-31T07:00:00+00:00", manifest.manifest_hash,
             verified_listing_documents("SH", "SZ", "BJ"),
         )
         self.requirements = [CoverageRequirement(self.frozen.frozen_input_hash, member.security_id,
-                                                 "financial", "selector", "2025", member.exchange,
+                                                 "financial", "selector", "2025-12-31", member.exchange,
                                                  ("CNY",)) for member in self.frozen.members]
-        self.records = [good(req) for req in self.requirements]
-        self.db_path = self.temp_path / "formal.db"
-        connection = sqlite3.connect(self.db_path)
-        connection.close()
+        self.records = []
+        for req in self.requirements:
+            key = req.security_id
+            generation = f"coverage-{key}"
+            task_id = self.registry_repository.enqueue_formal_task(
+                "formal_statement", key, generation, {"key": key})
+            leased = self.registry_repository.lease_next_formal_task(
+                ("formal_statement",), f"worker-{key}", 300)
+            self.assertEqual(leased["id"], task_id)
+            fetch = cninfo_fetch(
+                raw_bytes=f"verified coverage evidence {key}".encode(),
+                refresh_generation=generation,
+                published_at_utc="2026-08-20T08:00:00+00:00",
+                source_updated_at_utc="2026-08-20T08:00:00+00:00",
+                captured_at_utc="2026-08-21T08:00:00+00:00",
+                request=OfficialRequest("cninfo", "annual_report", key, "2025-12-31", req.exchange),
+            )
+            ref = self.snapshot_repository.persist_verified(
+                fetch, verified(fetch), producing_task_id=task_id,
+                worker_id=f"worker-{key}")
+            self.registry_repository.insert_formal_financial_facts((formal_fact(
+                security_id=key, period_end="2025-12-31",
+                published_at_utc=ref.published_at_utc,
+                published_precision=ref.published_precision,
+                effective_at_utc=ref.effective_at_utc,
+                effective_time_evidence_hash=ref.effective_time_evidence_hash,
+                source_updated_at_utc=ref.source_updated_at_utc,
+                captured_at_utc=ref.captured_at_utc,
+                source_snapshot_id=ref.snapshot_id,
+                source_content_sha256=ref.content_sha256,
+                source_refresh_generation=ref.refresh_generation,
+                source_producing_task_id=ref.producing_task_id,
+                parser_id=ref.parser_id, parser_version=ref.parser_version,
+                mapping_version=ref.mapping_version,
+            ),))
+            self.records.append(dict(good(req),
+                source=ref.source, dataset=ref.dataset,
+                request_fingerprint=ref.request_fingerprint,
+                selected_snapshot_id=ref.snapshot_id,
+                content_sha256=ref.content_sha256, manifest_sha256=ref.manifest_sha256,
+                parser_id=ref.parser_id, parser_version=ref.parser_version,
+                mapping_version=ref.mapping_version,
+                published_at_utc=ref.published_at_utc,
+                effective_at_utc=ref.effective_at_utc,
+                source_updated_at_utc=ref.source_updated_at_utc,
+                captured_at_utc=ref.captured_at_utc,
+                refresh_generation=ref.refresh_generation, task_id=ref.producing_task_id,
+                evidence_hashes={"content": ref.content_sha256}))
         self.status_path = self.temp_path / "status.json"
         self.status_path.write_text(json.dumps({
             "generated_at_utc": "2026-09-01T00:00:00+00:00",
             "schema_version": 7,
             "db_sha256": hashlib.sha256(self.db_path.read_bytes()).hexdigest(),
+            "db_generation_hash": digest(db_generation(self.db_path)),
+            "schema_versions": [2, 3, 4, 5, 6, 7],
         }), encoding="utf-8")
         self.contract_wire = {
             "schema_version": "formal-coverage-contract-v1",
@@ -191,9 +300,20 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
 
     def validate(self, req, record):
         self.calls.append(req["security_id"])
+        ref = self.snapshot_repository.get_verified_by_manifest(record["manifest_sha256"])
+        facts = tuple(fact for fact in self.registry_repository.list_formal_financial_facts(
+            security_id=req["security_id"])
+            if fact.source_snapshot_id == ref.snapshot_id
+            and fact.period_end == req["period_or_window"])
+        evidence_hash = digest({"manifest_sha256": ref.manifest_sha256,
+                                "raw_sha256": hashlib.sha256(
+                                    self.snapshot_repository.read_verified_raw(ref)).hexdigest(),
+                                "facts": [fact.to_dict() for fact in facts]})
         return {"domain": req["domain"], "owner": "formal_snapshot_repository",
-                "requirement_hash": digest(req), "record_hash": digest(record),
-                "evidence_hash": "a" * 64}
+                "requirement_hash": digest(req),
+                "record_hash": digest({key: value for key, value in record.items()
+                                       if key not in {"rechecked_at_utc", "timing_diagnostics"}}),
+                "evidence_hash": evidence_hash}
 
     def audit(self, *, requirements=None, records=None, contract=None, registry_bundle=None,
               validators=None, frozen_universe=None, db_path=None, status_path=None):
@@ -203,6 +323,7 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
             production_contract=self.contract if contract is None else contract,
             contract_verifier=self.verifier,
             registry_loader=self.registry_loader,
+            snapshot_repository=self.snapshot_repository,
             frozen_universe=self.frozen if frozen_universe is None else frozen_universe,
             registry_bundle=self.bundle if registry_bundle is None else registry_bundle,
             workspace_root=Path(__file__).resolve().parents[1],
@@ -273,17 +394,19 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
         def context_validator(req, record):
             calls.append(req["security_id"])
             return {"domain": "context", "owner": "formal_context_repository",
-                    "requirement_hash": digest(req), "record_hash": digest(record),
+                    "requirement_hash": digest(req),
+                    "record_hash": digest({key: value for key, value in record.items()
+                                           if key not in {"rechecked_at_utc", "timing_diagnostics"}}),
                     "evidence_hash": "b" * 64}
         with self.assertRaisesRegex(ValueError, "repository"):
             self.audit(requirements=requirements, records=records,
                        contract=self.signed_contract(contract),
                        validators={"financial": self.validate})
-        result = self.audit(requirements=requirements, records=records,
-                            contract=self.signed_contract(contract),
-                            validators={"financial": self.validate, "context": context_validator})
-        result.require_official_ready()
-        self.assertEqual(set(calls), {member.security_id for member in self.frozen.members})
+        with self.assertRaisesRegex(ValueError, "repository owner"):
+            self.audit(requirements=requirements, records=records,
+                       contract=self.signed_contract(contract),
+                       validators={"financial": self.validate, "context": context_validator})
+        self.assertEqual(calls, [])
         with self.assertRaisesRegex(ValueError, "requirements"):
             self.audit(requirements=requirements[:-1], records=records,
                        contract=self.signed_contract(contract),
@@ -305,6 +428,45 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
         }), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "database status"):
             self.audit()
+
+    def test_empty_sqlite_schema_is_not_a_formal_state_store(self):
+        empty_db = self.temp_path / "empty.sqlite3"
+        sqlite3.connect(empty_db).close()
+        empty_status = self.temp_path / "empty-status.json"
+        empty_status.write_text(json.dumps({
+            "generated_at_utc": "2026-09-01T00:00:00+00:00",
+            "schema_version": 7,
+            "db_sha256": hashlib.sha256(empty_db.read_bytes()).hexdigest(),
+            "db_generation_hash": digest(db_generation(empty_db)),
+            "schema_versions": [2, 3, 4, 5, 6, 7],
+        }), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "repository|schema"):
+            self.audit(db_path=empty_db, status_path=empty_status)
+
+    def test_foreign_sqlite_user_version_is_not_formal_schema(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute("PRAGMA user_version=999")
+            connection.commit()
+        finally:
+            connection.close()
+        status = json.loads(self.status_path.read_text(encoding="utf-8"))
+        status["db_sha256"] = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+        status["db_generation_hash"] = digest(db_generation(self.db_path))
+        self.status_path.write_text(json.dumps(status), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "schema"):
+            self.audit()
+
+    def test_recheck_timestamp_is_noncanonical_even_in_repository_receipt(self):
+        early = [dict(row, rechecked_at_utc="2026-10-01T00:00:00+00:00") for row in self.records]
+        late = [dict(row, rechecked_at_utc="2026-10-02T00:00:00+00:00") for row in self.records]
+        self.assertEqual(self.audit(records=early).manifest_hash,
+                         self.audit(records=late).manifest_hash)
+
+    def test_fabricated_callback_and_empty_database_cannot_grant_official(self):
+        fabricated = [dict(row, selected_snapshot_id="fabricated") for row in self.records]
+        with self.assertRaisesRegex(ValueError, "repository|schema|authority"):
+            self.audit(records=fabricated).require_official_ready()
 
     def test_database_sidecar_changes_invalidate_official_gate(self):
         result = self.audit()
@@ -329,8 +491,8 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
     def test_official_gate_reloads_registry_from_read_only_repository(self):
         result = self.audit()
         result.require_official_ready()
-        object.__setattr__(self.registry_repository.manifest, "signature", "tampered")
-        with self.assertRaisesRegex(ValueError, "registry"):
+        self.verifier.verify = lambda *_args, **_kwargs: False
+        with self.assertRaisesRegex(ValueError, "registry|signature"):
             result.require_official_ready()
 
 
