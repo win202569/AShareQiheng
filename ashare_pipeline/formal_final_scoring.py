@@ -8,6 +8,8 @@ import weakref
 from decimal import Decimal, InvalidOperation, localcontext
 from types import MappingProxyType
 
+from .formal_final_publication import _claim_preparation
+
 from . import formal_final_score_inputs as input_module
 from . import formal_scoring as scoring_module
 from .formal_final_score_inputs import PolicyAdjustedScoreInput, PolicyAdjustedScoreInputBatch
@@ -185,7 +187,8 @@ def _calculate_untrusted_final(wire, *, _context=_arithmetic_context,
 
 
 def _install_final_scoring():
-    proofs = {}
+    proofs, prepared_gates = {}, {}
+    claim = _claim_preparation
     source_batch_type, source_row_type = PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput
     source_batch_verify = source_batch_type.require_verified
     source_batch_bytes = source_batch_type.canonical_bytes
@@ -207,7 +210,8 @@ def _install_final_scoring():
     sha256, decode, reference = hashlib.sha256, json.loads, weakref.ref
 
     def dependencies():
-        if (owner.get("PolicyAdjustedScoreInputBatch") is not source_batch_type
+        if (owner.get("_prepare_final_scores") is not prepare
+                or owner.get("PolicyAdjustedScoreInputBatch") is not source_batch_type
                 or owner.get("PolicyAdjustedScoreInput") is not source_row_type
                 or input_owner.get("PolicyAdjustedScoreInputBatch") is not source_batch_type
                 or input_owner.get("PolicyAdjustedScoreInput") is not source_row_type
@@ -247,6 +251,9 @@ def _install_final_scoring():
         if (type(proof) is not cls or saved is None or saved[0]() is not proof
                 or saved[5] is not cls):
             raise ValueError("final score proof is forged, copied or unregistered")
+        gate = prepared_gates.get(id(proof))
+        if gate is not None and not gate():
+            raise ValueError("final score proof is unpublished or revoked")
         source_batch, source_bytes, source_row, row_bytes = saved[3], saved[4][0], saved[4][1], saved[4][2]
         if verify_source(source_batch) != source_bytes:
             raise ValueError("final score source batch has changed or been revoked")
@@ -339,7 +346,7 @@ def _install_final_scoring():
         data = dict(payload)
         if cards is not None:
             data["cards"] = tuple(card for card in cards.values() if card is not None)
-        proofs[key] = (reference(result, lambda _: proofs.pop(key, None)), freeze(data),
+        proofs[key] = (reference(result, lambda _: (proofs.pop(key, None), prepared_gates.pop(key, None))), freeze(data),
             encode(payload), source_batch, (source_bytes, source_row, row_bytes), cls,
             MappingProxyType(cards or {}), MappingProxyType(pending or {}))
         return result
@@ -412,12 +419,32 @@ def _install_final_scoring():
             raise ValueError("final score D1 batch changed during calculation")
         return result
 
+    def prepare(source, inputs, input_rows, capability, *, source_input):
+        gate = claim(capability, source, "scores")
+        saved = record(source, FinalScoreCardBatch)
+        if saved[3] is not source_input:
+            raise ValueError("prepared D2 source is not the supplied D1 publication")
+        cards = {}
+        for sid, card in saved[6].items():
+            if card is None:
+                cards[sid] = None
+                continue
+            row = record(card, FinalScoreCard)
+            child = mint(FinalScoreCard, dict(row[1]), inputs, saved[4][0],
+                input_rows[sid], row[4][2])
+            prepared_gates[id(child)] = gate
+            cards[sid] = child
+        result = mint(FinalScoreCardBatch, decode(saved[2]), inputs, saved[4][0],
+            cards=cards, pending=saved[7])
+        prepared_gates[id(result)] = gate
+        return result, MappingProxyType(cards)
+
     own_members = tuple((cls, tuple(vars(cls).items())) for cls in
         (Proof, FinalScoreCard, FinalScoreCardBatch))
-    return FinalScoreCard, FinalScoreCardBatch, build
+    return FinalScoreCard, FinalScoreCardBatch, build, prepare
 
 
-FinalScoreCard, FinalScoreCardBatch, build_final_score_card_batch = _install_final_scoring()
+FinalScoreCard, FinalScoreCardBatch, build_final_score_card_batch, _prepare_final_scores = _install_final_scoring()
 del _install_final_scoring
 
 __all__ = ["FinalScoreCard", "FinalScoreCardBatch", "build_final_score_card_batch"]

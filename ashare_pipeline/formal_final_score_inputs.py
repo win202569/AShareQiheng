@@ -9,6 +9,8 @@ import json
 import weakref
 from types import MappingProxyType
 
+from .formal_final_publication import _claim_preparation
+
 from . import formal_metric_engine as metric_engine
 from .formal_metric_batch_guard import _metric_batch_guard
 from .formal_metric_engine import _canonical, _digest, _freeze
@@ -26,7 +28,8 @@ from .formal_valuation_engine import (
 
 
 def _install_final_inputs():
-    repositories, proofs = {}, {}
+    repositories, proofs, prepared_gates, prepared_origins = {}, {}, {}, {}
+    claim = _claim_preparation
     encode, digest, freeze = _canonical, _digest, _freeze
     decode, sha256, reference = json.loads, hashlib.sha256, weakref.ref
     guard_factory, load_root = _metric_batch_guard, FormalRegistryBundleLoader.load
@@ -51,7 +54,8 @@ def _install_final_inputs():
         if callable(value) or isinstance(value, (staticmethod, classmethod)))
 
     def interfaces():
-        if (metric_owner.get("_freeze") is not freeze
+        if (owner.get("_prepare_final_inputs") is not prepare
+                or metric_owner.get("_freeze") is not freeze
                 or metric_owner.get("_metric_definition_dependency_changes") is not metric_dependencies
                 or metric_dependencies()
                 or any(owner.get(name) is not value for name, value in captured)
@@ -79,6 +83,12 @@ def _install_final_inputs():
         if (type(proof) is not cls or saved is None or saved[0]() is not proof
                 or not saved[4][0] or saved[6] is not cls):
             raise ValueError("final score proof is forged, copied, unpublished or revoked")
+        gate = prepared_gates.get(id(proof))
+        if gate is not None and not gate():
+            raise ValueError("final score proof is unpublished or revoked")
+        original = prepared_origins.get(id(proof))
+        if original is not None:
+            record(original, cls)
         if cls is PolicyAdjustedScoreInput and encode(saved[1]) != saved[2]:
             raise ValueError("final score entry differs from its published canonical bytes")
         return saved
@@ -101,6 +111,10 @@ def _install_final_inputs():
 
         def __init__(self, *args, **kwargs):
             raise TypeError("final score proofs require an authenticated complete batch")
+
+        def __getattribute__(self, name):
+            record(self, type(self))
+            return object.__getattribute__(self, name)
 
         def __getattr__(self, name):
             data = record(self, type(self))[1]
@@ -152,7 +166,8 @@ def _install_final_inputs():
         key = id(result)
         data = dict(payload)
         data.update(attributes or {})
-        proofs[key] = (reference(result, lambda _: proofs.pop(key, None)), freeze(data),
+        proofs[key] = (reference(result, lambda _: (proofs.pop(key, None), prepared_gates.pop(key, None),
+            prepared_origins.pop(key, None))), freeze(data),
             encode(payload), index, publication, retention, cls)
         return result
 
@@ -393,12 +408,40 @@ def _install_final_inputs():
         def __deepcopy__(self, memo):
             raise TypeError("final score repositories cannot be copied")
 
+    def prepare(source, capability):
+        gate = claim(capability, source, "inputs")
+        saved = record(source, PolicyAdjustedScoreInputBatch)
+        original_rows = {sid: record(source.input_for(sid), PolicyAdjustedScoreInput)
+            for sid in saved[3]}
+        publication, retention = [True], saved[5]
+        index = {}
+        for sid, row in original_rows.items():
+            child = mint(PolicyAdjustedScoreInput, dict(row[1]), publication, retention)
+            prepared_gates[id(child)] = gate
+            prepared_origins[id(child)] = source.input_for(sid)
+            index[sid] = child
+        result = mint(PolicyAdjustedScoreInputBatch, decode(saved[2]), publication, retention,
+            attributes={"inputs": tuple(index.values())}, index=MappingProxyType(index))
+        prepared_gates[id(result)] = gate
+        prepared_origins[id(result)] = source
+        source_bytes = verify_sources(retention[1])
+
+        def recheck():
+            record(source, PolicyAdjustedScoreInputBatch)
+            dependencies(retention[0])
+            if verify_sources(retention[1]) != source_bytes:
+                raise ValueError("final input dependencies changed before commit")
+            for proof in retention[2]:
+                proof.require_verified()
+
+        return result, MappingProxyType(index), recheck
+
     own_members = tuple((cls, tuple(vars(cls).items())) for cls in
         (Proof, PolicyAdjustedScoreInput, PolicyAdjustedScoreInputBatch, FormalFinalScoreInputRepository))
-    return FormalFinalScoreInputRepository, PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput
+    return FormalFinalScoreInputRepository, PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput, prepare
 
 
-FormalFinalScoreInputRepository, PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput = _install_final_inputs()
+FormalFinalScoreInputRepository, PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput, _prepare_final_inputs = _install_final_inputs()
 del _install_final_inputs
 
 __all__ = ["FormalFinalScoreInputRepository", "PolicyAdjustedScoreInputBatch", "PolicyAdjustedScoreInput"]

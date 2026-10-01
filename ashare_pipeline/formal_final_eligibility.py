@@ -8,6 +8,9 @@ import json
 import weakref
 from decimal import Decimal
 from types import MappingProxyType
+from weakref import ref as _reference
+
+from .formal_final_publication import _claim_preparation
 
 from .formal_final_score_inputs import PolicyAdjustedScoreInputBatch
 from .formal_final_scoring import FinalScoreCardBatch
@@ -70,7 +73,8 @@ def _validate_ready_card_provenance(card_wire, row_wire, security_id, input_batc
 
 
 def _install_eligibility():
-    proofs = {}
+    proofs, prepared_gates = {}, {}
+    claim, reference = _claim_preparation, _reference
     d2_record = inspect.getclosurevars(FinalScoreCardBatch.require_verified).nonlocals["record"]
 
     def d2_source(scores):
@@ -79,9 +83,15 @@ def _install_eligibility():
         return d2_record(scores, FinalScoreCardBatch)[3]
 
     def record(item, cls):
+        if (globals().get("_prepare_final_eligibility") is not prepare
+                or any(tuple(vars(kind).items()) != members for kind, members in own_members)):
+            raise ValueError("formal eligibility authority methods changed")
         saved = proofs.get(id(item))
         if type(item) is not cls or saved is None or saved[0]() is not item or saved[4] is not cls:
             raise ValueError("formal eligibility proof is forged or revoked")
+        gate = prepared_gates.get(id(item))
+        if gate is not None and not gate():
+            raise ValueError("formal eligibility proof is unpublished or revoked")
         inputs, scores, input_bytes, score_bytes = saved[2]
         inputs.require_verified()
         scores.require_verified()
@@ -147,7 +157,7 @@ def _install_eligibility():
         key = id(result)
         data = dict(payload)
         data.update(attributes or {})
-        proofs[key] = (weakref.ref(result, lambda _: proofs.pop(key, None)),
+        proofs[key] = (reference(result, lambda _: (proofs.pop(key, None), prepared_gates.pop(key, None))),
             _freeze(data), sources, _canonical(payload), cls, MappingProxyType(index or {}))
         return result
 
@@ -266,10 +276,28 @@ def _install_eligibility():
         result.require_verified()
         return result
 
-    return FormalEligibility, FormalEligibilityBatch, build, d2_source
+    def prepare(source, inputs, scores, capability, *, source_inputs, source_scores):
+        gate = claim(capability, source, "eligibility")
+        saved = record(source, FormalEligibilityBatch)
+        if saved[2][0] is not source_inputs or saved[2][1] is not source_scores:
+            raise ValueError("prepared eligibility sources differ from D1/D2")
+        sources = (inputs, scores, saved[2][2], saved[2][3])
+        index = {}
+        for sid, original in saved[5].items():
+            child = mint(FormalEligibility, dict(record(original, FormalEligibility)[1]), sources)
+            prepared_gates[id(child)] = gate
+            index[sid] = child
+        result = mint(FormalEligibilityBatch, json.loads(saved[3]), sources, index=index,
+            attributes={"eligibilities": tuple(index.values())})
+        prepared_gates[id(result)] = gate
+        return result, MappingProxyType(index)
+
+    own_members = tuple((kind, tuple(vars(kind).items())) for kind in
+        (Proof, FormalEligibility, FormalEligibilityBatch))
+    return FormalEligibility, FormalEligibilityBatch, build, d2_source, prepare
 
 
-FormalEligibility, FormalEligibilityBatch, build_formal_eligibility_batch, _d2_source = _install_eligibility()
+FormalEligibility, FormalEligibilityBatch, build_formal_eligibility_batch, _d2_source, _prepare_final_eligibility = _install_eligibility()
 del _install_eligibility
 
 __all__ = ["FormalEligibility", "FormalEligibilityBatch", "build_formal_eligibility_batch"]

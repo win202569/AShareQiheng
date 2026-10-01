@@ -7,6 +7,9 @@ import weakref
 from dataclasses import dataclass
 from decimal import Decimal
 from types import MappingProxyType
+from weakref import ref as _reference
+
+from .formal_final_publication import _claim_preparation
 
 from .formal_final_eligibility import FormalEligibilityBatch
 from .formal_scoring import _canonical, _digest, _freeze
@@ -115,7 +118,8 @@ def _select_detached_rows(rows, *, strong_industry_cap=4, wait_industry_cap=10,
 
 
 def _install_pool_proofs():
-    proofs = {}
+    proofs, prepared_gates = {}, {}
+    claim, reference = _claim_preparation, _reference
     eligibility_type = FormalEligibilityBatch
     eligibility_verify = eligibility_type.require_verified
     eligibility_to_dict = eligibility_type.to_dict
@@ -131,9 +135,10 @@ def _install_pool_proofs():
 
     class ProofMeta(type):
         def __setattr__(cls, name, value):
-            if name in ("__getattribute__", "__bases__"):
-                raise TypeError("pool proof guard cannot be replaced")
-            super().__setattr__(name, value)
+            raise TypeError("pool proof methods cannot be replaced")
+
+        def __delattr__(cls, name):
+            raise TypeError("pool proof methods cannot be removed")
 
     class Proof(metaclass=ProofMeta):
         __slots__ = ("__weakref__",)
@@ -167,6 +172,9 @@ def _install_pool_proofs():
         def __deepcopy__(self, memo):
             raise TypeError("pool proofs cannot be copied")
 
+        def __reduce_ex__(self, protocol):
+            raise TypeError("pool proofs cannot be reconstructed")
+
     class PoolSelectionDecision(Proof):
         __slots__ = ()
 
@@ -184,9 +192,15 @@ def _install_pool_proofs():
             return decision
 
     def record(item, cls):
+        if (globals().get("_prepare_final_pools") is not prepare
+                or any(tuple(vars(kind).items()) != members for kind, members in own_members)):
+            raise ValueError("pool proof authority methods changed")
         saved = proofs.get(id(item))
-        if type(item) is not cls or saved is None or saved[0]() is not item:
+        if type(item) is not cls or saved is None or saved[0]() is not item or saved[6] is not cls:
             raise ValueError("pool proof is forged or revoked")
+        gate = prepared_gates.get(id(item))
+        if gate is not None and not gate():
+            raise ValueError("pool proof is unpublished or revoked")
         source, source_bytes = saved[3], saved[5]
         wire = verify_source(source)
         if source_bytes != source.canonical_bytes() or _canonical(wire) != source_bytes:
@@ -195,12 +209,13 @@ def _install_pool_proofs():
             raise ValueError("pool proof payload was tampered")
         return saved
 
-    def mint(cls, payload, source, *, decision_map=None):
+    def mint(cls, payload, source, *, decision_map=None, source_bytes=None):
         result = object.__new__(cls)
         identity = id(result)
         canonical = _canonical(payload)
-        proofs[identity] = (weakref.ref(result, lambda _: proofs.pop(identity, None)),
-            _freeze(payload), canonical, source, decision_map, source.canonical_bytes())
+        proofs[identity] = (reference(result, lambda _: (proofs.pop(identity, None), prepared_gates.pop(identity, None))),
+            _freeze(payload), canonical, source, decision_map,
+            source.canonical_bytes() if source_bytes is None else source_bytes, cls)
         return result
 
     def build(eligibility):
@@ -239,10 +254,28 @@ def _install_pool_proofs():
     def public(eligibility):
         return build(eligibility)
 
-    return PoolSelectionDecision, PoolSelectionBatch, public
+    def prepare(source, eligibility, capability, *, source_eligibility):
+        gate = claim(capability, source, "pools")
+        saved = record(source, PoolSelectionBatch)
+        if saved[3] is not source_eligibility:
+            raise ValueError("prepared pool source differs from eligibility")
+        index = {}
+        for key, original in saved[4].items():
+            child = mint(PoolSelectionDecision, dict(record(original, PoolSelectionDecision)[1]),
+                eligibility, source_bytes=saved[5])
+            prepared_gates[id(child)] = gate
+            index[key] = child
+        result = mint(PoolSelectionBatch, json.loads(saved[2]), eligibility,
+            decision_map=MappingProxyType(index), source_bytes=saved[5])
+        prepared_gates[id(result)] = gate
+        return result, tuple(index.values())
+
+    own_members = tuple((kind, tuple(vars(kind).items())) for kind in
+        (Proof, PoolSelectionDecision, PoolSelectionBatch))
+    return PoolSelectionDecision, PoolSelectionBatch, public, prepare
 
 
-PoolSelectionDecision, PoolSelectionBatch, select_formal_pools = _install_pool_proofs()
+PoolSelectionDecision, PoolSelectionBatch, select_formal_pools, _prepare_final_pools = _install_pool_proofs()
 del _install_pool_proofs
 
 __all__ = ["PoolSelectionDecision", "PoolSelectionBatch", "select_formal_pools"]
