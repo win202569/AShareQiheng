@@ -46,6 +46,16 @@ class FormalPoolGuardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _select_detached_rows([dict(base, eligibility_hash="")])
 
+    def test_qualified_member_still_requires_industry_and_sort_fields(self):
+        base = {"security_id": "SH000001", "secondary_industry": None, "state": "pending_evidence",
+            "strong_qualified": False, "wait_qualified": False, "sort_fields": None,
+            "eligibility_hash": "h", "source_entry_hash": "e", "source_batch_hash": "b", "score_batch_hash": "s"}
+        self.assertEqual(_select_detached_rows([base]).strong_ids, ())
+        with self.assertRaises(ValueError):
+            _select_detached_rows([dict(base, strong_qualified=True, secondary_industry="i")])
+        with self.assertRaises(ValueError):
+            _select_detached_rows([dict(base, secondary_industry="i", sort_fields={})])
+
 
 if __name__ == "__main__":
     unittest.main()

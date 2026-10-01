@@ -53,11 +53,14 @@ def _validate_row(row, seen, source_hash=None):
             and (row["strong_qualified"] or row["wait_qualified"])):
         raise ValueError("qualified pool member requires a nonempty secondary industry")
     fields = row["sort_fields"]
-    if (type(fields) is not dict or set(fields) != _SORT_KEYS):
-        raise ValueError("pool sort fields are incomplete")
-    for key, value in fields.items():
-        if type(value) is not Decimal or not value.is_finite():
-            raise ValueError("pool sort fields require finite exact Decimal values")
+    if row["strong_qualified"] or row["wait_qualified"]:
+        if (type(fields) is not dict or set(fields) != _SORT_KEYS):
+            raise ValueError("pool sort fields are incomplete")
+        for key, value in fields.items():
+            if type(value) is not Decimal or not value.is_finite():
+                raise ValueError("pool sort fields require finite exact Decimal values")
+    elif fields is not None and (type(fields) is not dict or set(fields) != _SORT_KEYS):
+        raise ValueError("non-qualified pool trace has malformed sort fields")
     for key in ("eligibility_hash", "source_entry_hash", "source_batch_hash", "score_batch_hash"):
         if type(row[key]) is not str or not row[key]:
             raise ValueError("pool provenance hash is malformed")

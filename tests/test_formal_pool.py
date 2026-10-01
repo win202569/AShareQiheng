@@ -67,6 +67,16 @@ class FormalPoolSelectionTests(unittest.TestCase):
         self.assertEqual(set(result.strong_decisions), {r["security_id"] for r in rows})
         self.assertEqual(set(result.wait_decisions), {r["security_id"] for r in rows})
 
+    def test_pending_nonqualified_member_without_industry_or_sort_fields_is_trace_only(self):
+        pending = row("SH000004", industry=None, strong=False, wait=False)
+        pending["state"] = "pending_evidence"
+        pending["sort_fields"] = None
+        result = _select_detached_rows([row("SH000001", strong=True), pending])
+        self.assertEqual(result.strong_ids, ("SH000001",))
+        self.assertEqual(result.wait_ids, ())
+        self.assertEqual(result.strong_decisions["SH000004"], "not_qualified")
+        self.assertEqual(result.wait_decisions["SH000004"], "not_qualified")
+
 
 if __name__ == "__main__":
     unittest.main()
