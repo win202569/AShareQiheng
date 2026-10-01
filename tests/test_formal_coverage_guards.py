@@ -36,7 +36,7 @@ def digest(value):
 def db_generation(path):
     return {suffix: (hashlib.sha256(candidate.read_bytes()).hexdigest()
                      if candidate.is_file() else None)
-            for suffix in ("", "-wal", "-shm")
+            for suffix in ("", "-wal")
             for candidate in (path.with_name(path.name + suffix),)}
 
 
@@ -231,9 +231,19 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
             "2026-08-31T07:00:00+00:00", manifest.manifest_hash,
             verified_listing_documents("SH", "SZ", "BJ"),
         )
-        self.requirements = [CoverageRequirement(self.frozen.frozen_input_hash, member.security_id,
-                                                 "financial", "selector", "2025-12-31", member.exchange,
-                                                 ("CNY",)) for member in self.frozen.members]
+        self.selector_descriptors = {}
+        self.requirements = []
+        for member in self.frozen.members:
+            descriptor = {"owner": "formal_snapshot_repository", "domain": "financial",
+                          "security_id": member.security_id, "exchange": member.exchange,
+                          "period_or_window": "2025-12-31", "source": "cninfo",
+                          "dataset": "annual_report"}
+            selector_hash = digest(descriptor)
+            self.selector_descriptors[selector_hash] = descriptor
+            self.requirements.append(CoverageRequirement(
+                self.frozen.frozen_input_hash, member.security_id,
+                "financial", selector_hash, "2025-12-31", member.exchange,
+                ("CNY",)))
         self.records = []
         for req in self.requirements:
             key = req.security_id
@@ -298,6 +308,7 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
             "frozen_input_hash": self.frozen.frozen_input_hash,
             "requirements": [req.to_dict() for req in self.requirements],
             "domain_owners": {"financial": "formal_snapshot_repository"},
+            "selector_descriptors": self.selector_descriptors,
             "expected_schema_version": 7, "report_period": "2025",
             "query_version": "coverage-v1",
         }
@@ -366,6 +377,18 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "member"):
             self.audit(contract=self.signed_contract(incomplete))
 
+    def test_signed_selector_descriptor_must_match_canonical_hash_and_owner(self):
+        bad = dict(self.contract_wire, selector_descriptors={
+            key: dict(value, source="fabricated")
+            for key, value in self.selector_descriptors.items()})
+        with self.assertRaisesRegex(ValueError, "selector"):
+            self.audit(contract=self.signed_contract(bad))
+        wrong_owner = dict(self.contract_wire, selector_descriptors={
+            key: dict(value, owner="formal_context_repository")
+            for key, value in self.selector_descriptors.items()})
+        with self.assertRaisesRegex(ValueError, "selector"):
+            self.audit(contract=self.signed_contract(wrong_owner))
+
     def test_plain_or_unapproved_registry_and_unsigned_contract_cannot_authorize_official(self):
         with self.assertRaisesRegex(ValueError, "registry"):
             self.audit(registry_bundle={"approved": True, "purpose": "official"})
@@ -392,13 +415,23 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
             self.audit(validators={"financial": wrong_record})
 
     def test_signed_catalog_enumerates_each_domain_and_invokes_each_owner(self):
-        extra = [CoverageRequirement(self.frozen.frozen_input_hash, member.security_id,
-                                     "context", "context-selector", "2025", member.exchange)
-                 for member in self.frozen.members]
+        extra_descriptors = {}
+        extra = []
+        for member in self.frozen.members:
+            descriptor = {"owner": "formal_context_repository", "domain": "context",
+                          "security_id": member.security_id, "exchange": member.exchange,
+                          "period_or_window": "2025", "context_kind": "security_state",
+                          "scope_key": "fixture-state", "as_of_utc": self.frozen.as_of_utc}
+            selector_hash = digest(descriptor)
+            extra_descriptors[selector_hash] = descriptor
+            extra.append(CoverageRequirement(self.frozen.frozen_input_hash,
+                                             member.security_id, "context",
+                                             selector_hash, "2025", member.exchange))
         requirements = self.requirements + extra
         records = self.records + [good(req) for req in extra]
         contract = dict(self.contract_wire,
                         requirements=[req.to_dict() for req in requirements],
+                        selector_descriptors=dict(self.selector_descriptors, **extra_descriptors),
                         domain_owners={"financial": "formal_snapshot_repository",
                                        "context": "formal_context_repository"})
         calls = []
@@ -483,6 +516,26 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "schema"):
                 coverage_module._read_environment(
                     Path(__file__).resolve().parents[1], self.db_path, self.status_path, 7)
+        finally:
+            writer.close()
+
+    def test_valid_writer_open_wal_read_does_not_reject_transient_shm_marks(self):
+        writer = sqlite3.connect(self.db_path)
+        try:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("UPDATE schema_migration SET version=version WHERE version=7")
+            writer.commit()
+            self.assertTrue(self.db_path.with_name(self.db_path.name + "-wal").is_file())
+            status = json.loads(self.status_path.read_text(encoding="utf-8"))
+            status["db_sha256"] = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+            status["db_generation_hash"] = digest(db_generation(self.db_path))
+            self.status_path.write_text(json.dumps(status), encoding="utf-8")
+            first = coverage_module._read_environment(
+                Path(__file__).resolve().parents[1], self.db_path, self.status_path, 7)
+            second = coverage_module._read_environment(
+                Path(__file__).resolve().parents[1], self.db_path, self.status_path, 7)
+            self.assertEqual(first, second)
         finally:
             writer.close()
 

@@ -90,7 +90,8 @@ def _aware(value: Any) -> datetime | None:
 _CONTRACT_FIELDS = frozenset({
     "schema_version", "purpose", "approval_id", "signing_identity",
     "registry_manifest_hash", "frozen_input_hash", "requirements",
-    "domain_owners", "expected_schema_version", "report_period", "query_version",
+    "domain_owners", "selector_descriptors", "expected_schema_version",
+    "report_period", "query_version",
 })
 
 
@@ -165,6 +166,33 @@ def _official_inputs(contract: Any, verifier: Any, bundle: Any, loader: Any, fro
     if (type(owners) is not dict or set(owners) != {row["domain"] for row in catalog}
             or any(type(owner) is not str or not owner for owner in owners.values())):
         raise ValueError("coverage contract repository owners are incomplete")
+    descriptors = wire["selector_descriptors"]
+    owner_fields = {
+        "formal_snapshot_repository": {"source", "dataset"},
+        "formal_context_repository": {"context_kind", "scope_key", "as_of_utc"},
+        "formal_feature_repository": {"input_hash", "slot_id"},
+        "formal_policy_repository": {"batch_hash", "rule_id"},
+    }
+    common_fields = {"owner", "domain", "security_id", "exchange", "period_or_window"}
+    if type(descriptors) is not dict or set(descriptors) != {row["selector_hash"] for row in catalog}:
+        raise ValueError("coverage contract selector catalog is incomplete")
+    for row in catalog:
+        selector = descriptors[row["selector_hash"]]
+        owner = owners[row["domain"]]
+        if (owner not in owner_fields or type(selector) is not dict
+                or set(selector) != common_fields | owner_fields[owner]
+                or _digest(selector) != row["selector_hash"]
+                or selector["owner"] != owner
+                or any(selector[field] != row[field] for field in
+                       ("domain", "security_id", "exchange", "period_or_window"))
+                or any(type(value) is not str or not value for value in selector.values())):
+            raise ValueError("coverage contract selector descriptor or owner mismatch")
+        if ((owner == "formal_context_repository" and _aware(selector["as_of_utc"]) is None)
+                or (owner == "formal_feature_repository" and
+                    _SHA256.fullmatch(selector["input_hash"]) is None)
+                or (owner == "formal_policy_repository" and
+                    _SHA256.fullmatch(selector["batch_hash"]) is None)):
+            raise ValueError("coverage contract selector descriptor is invalid")
     if (type(wire["expected_schema_version"]) is not int
             or wire["expected_schema_version"] <= 0
             or any(type(wire[field]) is not str or not wire[field]
@@ -240,19 +268,22 @@ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
         status_wire = json.loads(status.read_text(encoding="utf-8"))
     except (sqlite3.Error, OSError, RuntimeError) as exc:
         raise ValueError("official coverage database schema or status could not be read") from exc
-    if db_hashes() != before:
+    # SHM read marks are transient SQLite coordination bytes. Only main DB
+    # and committed WAL bytes identify the durable generation.
+    material = lambda hashes: {suffix: hashes[suffix] for suffix in ("", "-wal")}
+    if material(db_hashes()) != material(before):
         raise ValueError("official coverage database changed during identity read")
     status_schema_version = status_wire.get("schema_version") if type(status_wire) is dict else None
     if status_schema_version != expected_schema_version:
         raise ValueError("official coverage database schema version mismatch")
     if (type(status_wire) is not dict or status_wire.get("db_sha256") != db_sha256
-            or status_wire.get("db_generation_hash") != _digest(before)
+            or status_wire.get("db_generation_hash") != _digest(material(before))
             or status_wire.get("schema_versions") != list(versions)
             or _aware(status_wire.get("generated_at_utc")) is None):
         raise ValueError("official coverage database status identity mismatch")
     return {"workspace_revision": revision.stdout.strip(), "db_path": str(db),
             "db_sha256": db_sha256,
-            "db_sidecar_sha256": {suffix: before[suffix] for suffix in ("-wal", "-shm")},
+            "db_sidecar_sha256": {"-wal": before["-wal"]},
             "db_schema_versions": {"user_version": version,
                                    "migrations": list(versions),
                                    "status_schema_version": status_schema_version},
@@ -263,7 +294,8 @@ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
 
 def _repository_provenance(req: Mapping[str, Any], source: Any,
                            owner: str, validator: Callable[..., Any],
-                           snapshots: FormalSnapshotRepository) -> dict[str, Any]:
+                           snapshots: FormalSnapshotRepository,
+                           selector: Mapping[str, Any]) -> dict[str, Any]:
     if owner != "formal_snapshot_repository":
         raise ValueError("official coverage repository owner has no authenticated adapter")
     if not isinstance(source, Mapping) or source.get("coverage_class") not in {
@@ -289,7 +321,8 @@ def _repository_provenance(req: Mapping[str, Any], source: Any,
             else getattr(ref, attribute) != req[field]
             for attribute, field in bindings.items())
             or ref.verification_status != "verified"
-            or hashlib.sha256(raw).hexdigest() != ref.content_sha256):
+            or hashlib.sha256(raw).hexdigest() != ref.content_sha256
+            or ref.source != selector["source"] or ref.dataset != selector["dataset"]):
         raise ValueError("official coverage source repository lineage mismatch")
     facts = tuple(fact for fact in snapshots._state_store.list_formal_financial_facts(
         security_id=req["security_id"])
@@ -564,6 +597,7 @@ class FormalCoverageAuditor:
                 row["repository_provenance"] = _repository_provenance(
                     req, source, official_wire["domain_owners"][req["domain"]],
                     callback_map[str(req["domain"])], snapshot_repository,
+                    official_wire["selector_descriptors"][req["selector_hash"]],
                 )
             row["coverage_class"] = cls
             row["reason_codes"] = tuple(sorted(set(str(x) for x in reasons)))
@@ -683,6 +717,7 @@ def _install_coverage_authority() -> None:
             provenance = _repository_provenance(
                 req, source, wire["domain_owners"][req["domain"]],
                 context["validators"][req["domain"]], context["snapshot_repository"],
+                wire["selector_descriptors"][req["selector_hash"]],
             )
             if row.get("repository_provenance") != provenance:
                 raise ValueError("official coverage repository provenance changed")
