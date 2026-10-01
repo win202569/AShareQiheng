@@ -27,6 +27,20 @@ COVERAGE_CLASSES = (
 )
 _COVERAGE_SET = frozenset(COVERAGE_CLASSES)
 _SEALS: dict[int, tuple[weakref.ReferenceType[Any], bytes, type]] = {}
+_AUDIT_ROW_FIELDS = (
+    "required", "applicability_rule_hash", "source", "dataset",
+    "request_fingerprint", "refresh_generation", "task_id", "collection_state",
+    "selected_snapshot_id", "content_sha256", "manifest_sha256", "parser_id",
+    "parser_version", "mapping_version", "published_at_utc", "effective_at_utc",
+    "captured_at_utc", "source_updated_at_utc", "expected_units",
+    "observed_units", "missing_units", "verification_state", "temporal_state",
+    "coverage_class", "reason_codes", "evidence_hashes", "rechecked_at_utc",
+)
+_VERIFIED_LINEAGE_FIELDS = (
+    "source", "dataset", "request_fingerprint", "selected_snapshot_id",
+    "content_sha256", "manifest_sha256", "parser_id", "parser_version",
+    "mapping_version", "published_at_utc", "effective_at_utc",
+)
 
 
 def _canonical(value: Any) -> bytes:
@@ -52,6 +66,19 @@ def _aware(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+
+
+def _official_contract_identity(contract: Any) -> dict[str, str] | None:
+    """An unapproved or unidentified bundle is never an official authority."""
+    if not isinstance(contract, Mapping) or contract.get("approved") is not True:
+        return None
+    if contract.get("purpose") != "official":
+        return None
+    fields = ("signing_identity", "root_manifest_hash")
+    if any(type(contract.get(field)) is not str or not contract[field].strip()
+           for field in fields):
+        return None
+    return {field: contract[field] for field in fields}
 
 
 def _seal(obj: Any, payload: Mapping[str, Any]) -> None:
@@ -86,7 +113,15 @@ class CoverageRequirement:
                 "expected_units": list(self.expected_units)}
 
 
-class _Proof:
+class _SealedProofType(type):
+    def __setattr__(cls, name: str, value: Any) -> None:
+        raise TypeError("coverage proof methods cannot be replaced")
+
+    def __delattr__(cls, name: str) -> None:
+        raise TypeError("coverage proof methods cannot be removed")
+
+
+class _Proof(metaclass=_SealedProofType):
     __slots__ = ("__weakref__",)
 
     def __init__(self, *_: Any, **__: Any) -> None:
@@ -119,7 +154,11 @@ class _Proof:
 
     def canonical_bytes(self) -> bytes:
         data = self._data()
-        return _canonical({k: v for k, v in data.items() if k != "diagnostics"})
+        canonical = {k: v for k, v in data.items()
+                     if k not in {"diagnostics", "manifest_hash"}}
+        canonical["rows"] = [{k: v for k, v in row.items()
+                              if k != "rechecked_at_utc"} for row in data["rows"]]
+        return _canonical(canonical)
 
     def __copy__(self) -> Any:
         raise TypeError("coverage proofs cannot be copied")
@@ -161,6 +200,13 @@ class FormalCoverageAuditor:
         self.production_contract = production_contract
         self.repository_validators = dict(repository_validators or validators or {})
 
+    @staticmethod
+    def revoke(manifest: VerifiedCoverageManifest) -> None:
+        if type(manifest) is not VerifiedCoverageManifest:
+            raise ValueError("coverage proof is not a genuine verified manifest")
+        _require(manifest)
+        _SEALS.pop(id(manifest), None)
+
     def audit(self, requirements: Sequence[CoverageRequirement | Mapping[str, Any]],
               records: Sequence[Mapping[str, Any]] | Mapping[Any, Mapping[str, Any]] = (),
               *, repository_validators: Mapping[str, Callable[..., Any]] | None = None,
@@ -171,6 +217,8 @@ class FormalCoverageAuditor:
               timing_diagnostics: Mapping[str, Any] | None = None) -> VerifiedCoverageManifest:
         reqs = [r.to_dict() if isinstance(r, CoverageRequirement) else dict(r)
                 for r in requirements]
+        if not reqs:
+            raise ValueError("coverage requirements must be nonempty")
         keys = [_key(r) for r in reqs]
         if any(None in k for k in keys) or len(keys) != len(set(keys)):
             raise ValueError("coverage requirements must be unique and fully enumerated")
@@ -189,12 +237,15 @@ class FormalCoverageAuditor:
                 by_key[key] = row
         callback_map = dict(self.repository_validators)
         callback_map.update(repository_validators or validators or {})
+        registry_disapproved = registry is not None and registry.get("approved") is False
         rows: list[dict[str, Any]] = []
         blockers: set[str] = set()
         for req in reqs:
             key = _key(req)
             source = by_key.get(key)
-            row = dict(req)
+            row = {field: None for field in _AUDIT_ROW_FIELDS}
+            row.update(req)
+            row["required"] = True
             reasons: list[str] = []
             identity_mismatch = any(
                 tuple(k for i, k in enumerate(candidate_key) if i != 5) ==
@@ -206,6 +257,7 @@ class FormalCoverageAuditor:
                 reasons.append("exchange_identity_mismatch" if identity_mismatch else "absent_record")
             else:
                 row.update({k: v for k, v in source.items() if k not in req})
+                row["required"] = True
                 cls = source.get("coverage_class")
                 if cls not in _COVERAGE_SET:
                     cls = "blocked_integrity"; reasons.append("invalid_coverage_class")
@@ -214,6 +266,8 @@ class FormalCoverageAuditor:
                     cls = "blocked_schema"; reasons.append("missing_table")
                 if source.get("registry_purpose") not in (None, req.get("domain")):
                     cls = "blocked_registry"; reasons.append("registry_purpose_mismatch")
+                if registry_disapproved:
+                    cls = "blocked_registry"; reasons.append("registry_not_approved")
                 if source.get("signature_ok") is False or source.get("hash_ok") is False:
                     cls = "blocked_integrity"; reasons.append("signature_or_hash_mismatch")
                 if source.get("source_correction") or source.get("ambiguous_duplicate"):
@@ -221,6 +275,16 @@ class FormalCoverageAuditor:
                 if cls == "verified_no_coverage" and not (
                     source.get("authenticated") and source.get("explicit_source_statement")):
                     cls = "blocked_integrity"; reasons.append("no_coverage_not_authenticated")
+                if cls in {"verified_complete", "verified_partial", "verified_no_coverage"}:
+                    if any(type(source.get(field)) is not str or not source[field].strip()
+                           for field in _VERIFIED_LINEAGE_FIELDS):
+                        cls = "blocked_integrity"; reasons.append("incomplete_verified_lineage")
+                    elif source.get("verification_state") != "verified" or source.get("temporal_state") != "visible":
+                        cls = "blocked_integrity"; reasons.append("unverified_source_state")
+                    elif not isinstance(source.get("observed_units"), (list, tuple)):
+                        cls = "blocked_integrity"; reasons.append("missing_observed_units")
+                    elif cls == "verified_complete" and set(source["observed_units"]) != set(req.get("expected_units", ())):
+                        cls = "blocked_integrity"; reasons.append("units_mismatch")
                 if source.get("effective_at_utc") and (_aware(source["effective_at_utc"]) is None or
                         _aware(source["effective_at_utc"]) > _aware(self.freeze_at_utc)):
                     cls = "blocked_temporal"; reasons.append("after_temporal_cutoff")
@@ -238,24 +302,26 @@ class FormalCoverageAuditor:
                         result = validator(req, source)
                     except Exception:
                         result = False
-                    if result is False:
+                    if result is not True:
                         cls = "blocked_integrity"; reasons.append("repository_validation_failed")
             row["coverage_class"] = cls
             row["reason_codes"] = tuple(sorted(set(str(x) for x in reasons)))
             row["evidence_hashes"] = dict(source.get("evidence_hashes", {})) if source else {}
+            row["missing_units"] = sorted(set(req.get("expected_units", ())) -
+                                          set(row.get("observed_units") or ()))
             rows.append(row)
             if cls.startswith("blocked") or cls in {"missing", "pending", "retryable_failed", "terminal_failed"}:
                 blockers.add(f"{req['security_id']}:{req['domain']}:{cls}")
         contract = self.production_contract if production_contract is None else production_contract
-        if registry is not None and registry.get("approved") is False:
+        official_contract = _official_contract_identity(contract)
+        if registry_disapproved:
             blockers.add("registry_not_approved")
-        if contract is None:
-            # Preview remains useful; official gate reports this independently.
-            pass
+        canonical_rows = [{k: v for k, v in row.items() if k != "rechecked_at_utc"}
+                          for row in rows]
         canonical = {"schema_version": "formal-coverage-v1", "freeze_at_utc": self.freeze_at_utc,
-                     "production_contract": bool(contract), "rows": rows,
+                     "production_contract": official_contract, "rows": canonical_rows,
                      "blockers": sorted(blockers)}
-        payload = dict(canonical, manifest_hash=_digest(canonical),
+        payload = dict(canonical, rows=rows, manifest_hash=_digest(canonical),
                        diagnostics={"audit_at_utc": audit_at_utc,
                                     "sql": dict(db_diagnostics or {}),
                                     "timing": dict(timing_diagnostics or {})})
