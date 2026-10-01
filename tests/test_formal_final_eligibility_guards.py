@@ -1,7 +1,10 @@
 """D3b accepts only matching, complete genuine Stage D proof chains."""
 
 import copy
+import inspect
 import unittest
+from unittest.mock import patch
+from ashare_pipeline import formal_final_eligibility as eligibility_module
 
 from ashare_pipeline.formal_final_eligibility import (
     FormalEligibility, FormalEligibilityBatch, _validate_scorecard_coverage,
@@ -12,6 +15,36 @@ from tests.test_formal_final_scoring import d1_batch, shared_ready_batch, NO_CAP
 
 
 class PureEligibilityGuardTests(unittest.TestCase):
+    def test_module_record_swap_cannot_authorize_nonproof_source(self):
+        forged_source = object()
+        forged_record = (None, None, None, forged_source)
+        with patch.object(eligibility_module, "_D2_RECORD", lambda *_: forged_record,
+                create=True):
+            with self.assertRaises(ValueError):
+                eligibility_module._d2_source(object())
+
+    def test_module_source_helper_swap_cannot_rebind_builder_authority(self):
+        captured = inspect.getclosurevars(build_formal_eligibility_batch).nonlocals.get(
+            "d2_source")
+        self.assertIsNotNone(captured, "builder must retain its authenticated D2 source checker")
+        with patch.object(eligibility_module, "_d2_source", lambda _: object(),
+                create=True):
+            with self.assertRaises(ValueError):
+                captured(object())
+
+    def test_ready_batch_card_row_uses_bound_source_without_proof_only_score_hash(self):
+        row = {"entry_hash": "d1-entry", "secondary_industry": "bank"}
+        card = {"security_id": "SH600000", "source_entry_hash": "d1-entry",
+            "source_batch_hash": "d1-batch", "secondary_industry": "bank",
+            "card_hash": "d2-card"}
+        validate = getattr(eligibility_module, "_validate_ready_card_provenance", None)
+        self.assertIsNotNone(validate, "D2 batch rows need a provenance check without proof-only fields")
+        validate(card, row, "SH600000", "d1-batch")
+        with self.assertRaises(ValueError):
+            validate(
+                dict(card, source_entry_hash="other-entry"), row,
+                "SH600000", "d1-batch")
+
     def test_plain_values_cannot_enter_public_builder(self):
         for inputs, scores in (({}, {}), ([], []), (None, None)):
             with self.subTest(types=(type(inputs), type(scores))):

@@ -14,7 +14,6 @@ from .formal_final_scoring import FinalScoreCardBatch
 from .formal_scoring import _canonical, _digest, _freeze
 
 
-_D2_RECORD = inspect.getclosurevars(FinalScoreCardBatch.require_verified).nonlocals["record"]
 _HARD_VETO_SEMANTICS = frozenset({
     "st", "star_st", "delisting_arrangement", "forced_delist_risk",
     "governance_red", "nonpositive_equity", "audit_adverse",
@@ -60,14 +59,24 @@ def _validate_scorecard_coverage(security_ids, wire):
         raise ValueError("final scorecards are missing, duplicated or outside the universe")
 
 
-def _d2_source(scores):
-    # D2 seals this source in its private proof record; checking identity closes
-    # an otherwise ambiguous same-hash, different-publication handoff.
-    return _D2_RECORD(scores, FinalScoreCardBatch)[3]
+def _validate_ready_card_provenance(card_wire, row_wire, security_id, input_batch_hash):
+    # D2 batch cards are raw rows. Their proof-only score_batch_hash is
+    # authenticated separately by the selector canonical-byte check.
+    if (card_wire["security_id"] != security_id
+            or card_wire["source_entry_hash"] != row_wire["entry_hash"]
+            or card_wire["source_batch_hash"] != input_batch_hash
+            or card_wire["secondary_industry"] != row_wire["secondary_industry"]):
+        raise ValueError("eligibility card and input provenance mismatch")
 
 
 def _install_eligibility():
     proofs = {}
+    d2_record = inspect.getclosurevars(FinalScoreCardBatch.require_verified).nonlocals["record"]
+
+    def d2_source(scores):
+        # D2 seals its genuine D1 source in a private proof record. Capture that
+        # authority rather than resolving a replaceable module global at use time.
+        return d2_record(scores, FinalScoreCardBatch)[3]
 
     def record(item, cls):
         saved = proofs.get(id(item))
@@ -77,7 +86,7 @@ def _install_eligibility():
         inputs.require_verified()
         scores.require_verified()
         if (inputs.canonical_bytes() != input_bytes or scores.canonical_bytes() != score_bytes
-                or _d2_source(scores) is not inputs):
+                or d2_source(scores) is not inputs):
             raise ValueError("formal eligibility source publication changed")
         return saved
 
@@ -147,7 +156,7 @@ def _install_eligibility():
             raise ValueError("eligibility requires genuine D1 and D2 batches")
         inputs.require_verified()
         scores.require_verified()
-        if _d2_source(scores) is not inputs:
+        if d2_source(scores) is not inputs:
             raise ValueError("eligibility D1/D2 publications do not match")
         input_bytes, score_bytes = inputs.canonical_bytes(), scores.canonical_bytes()
         input_wire = inputs.to_dict()
@@ -205,12 +214,7 @@ def _install_eligibility():
             if pending != (card_wire is None):
                 raise ValueError("D1 status and D2 scorecard partition disagree")
             if card_wire is not None:
-                if (card_wire["security_id"] != sid
-                        or card_wire["source_entry_hash"] != row_wire["entry_hash"]
-                        or card_wire["source_batch_hash"] != input_batch_hash
-                        or card_wire["secondary_industry"] != row_wire["secondary_industry"]
-                        or card_wire["score_batch_hash"] != score_batch_hash):
-                    raise ValueError("eligibility card and input provenance mismatch")
+                _validate_ready_card_provenance(card_wire, row_wire, sid, input_batch_hash)
                 fields = {"Sc": Decimal(card_wire["Sc"]),
                     "C": Decimal(card_wire["confidence"]["C"]),
                     "R_safety": Decimal(card_wire["R_safety"]),
@@ -262,10 +266,10 @@ def _install_eligibility():
         result.require_verified()
         return result
 
-    return FormalEligibility, FormalEligibilityBatch, build
+    return FormalEligibility, FormalEligibilityBatch, build, d2_source
 
 
-FormalEligibility, FormalEligibilityBatch, build_formal_eligibility_batch = _install_eligibility()
+FormalEligibility, FormalEligibilityBatch, build_formal_eligibility_batch, _d2_source = _install_eligibility()
 del _install_eligibility
 
 __all__ = ["FormalEligibility", "FormalEligibilityBatch", "build_formal_eligibility_batch"]

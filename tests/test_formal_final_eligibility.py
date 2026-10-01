@@ -200,5 +200,20 @@ class SmallGenuineEligibilityTests(unittest.TestCase):
             build_formal_eligibility_batch(self.inputs, self.cards.to_dict())
 
 
+class ReadyCardProvenanceRegressionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture, cls.inputs, cls.cards = shared_ready_batch()
+
+    def test_genuine_ready_card_builds_eligibility_from_batch_score_hash(self):
+        card = self.cards.card_for(NO_CAP_PEER)
+        self.assertIsNotNone(card)
+        item = build_formal_eligibility_batch(self.inputs, self.cards).eligibility_for(NO_CAP_PEER)
+        self.assertIn(item.state, {"formal_scored", "pool_vetoed"})
+        self.assertEqual(item.card_hash, card.card_hash)
+        self.assertEqual(item.score_batch_hash, self.cards.batch_hash)
+        self.assertIsNotNone(item.sort_fields)
+
+
 if __name__ == "__main__":
     unittest.main()
