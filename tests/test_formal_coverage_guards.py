@@ -173,13 +173,24 @@ class CoverageGuardTests(unittest.TestCase):
     def test_signed_applicability_and_partial_required_units_fail_closed(self):
         not_applicable = dict(self.row, coverage_class="not_applicable_signed")
         manifest = self.a.audit([self.r], [not_applicable])
-        self.assertEqual(manifest.rows[0]["coverage_class"], "blocked_integrity")
+        self.assertEqual(manifest.rows[0]["coverage_class"], "blocked_dependency")
         partial = dict(self.row, coverage_class="verified_partial",
                        expected_units=["CNY"], observed_units=[])
         required = CoverageRequirement("f", "SH600000", "financial", "s", "2025", "SH", ("CNY",))
         manifest = self.a.audit([required], [partial])
         with self.assertRaises(ValueError):
             manifest.require_preview_ready()
+
+    def test_caller_applicability_flags_and_permissive_callback_do_not_authorize_preview(self):
+        claimed = dict(self.row, coverage_class="not_applicable_signed",
+                       explicit_source_statement=True,
+                       applicability_rule_hash="a" * 64)
+        for callbacks in ({}, {"financial": lambda *_: True}):
+            with self.subTest(callbacks=bool(callbacks)):
+                manifest = FormalCoverageAuditor(repository_validators=callbacks).audit(
+                    [self.r], [claimed])
+                with self.assertRaisesRegex(ValueError, "coverage preview blocked"):
+                    manifest.require_preview_ready()
 
     def test_verified_lineage_hashes_and_publication_cutoff_are_required(self):
         for field in ("refresh_generation", "task_id", "collection_state",
@@ -456,6 +467,24 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
         self.status_path.write_text(json.dumps(status), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "schema"):
             self.audit()
+
+    def test_committed_wal_migration_removal_is_seen_by_read_only_schema_gate(self):
+        writer = sqlite3.connect(self.db_path)
+        try:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("DELETE FROM schema_migration WHERE version=7")
+            writer.commit()
+            self.assertTrue(self.db_path.with_name(self.db_path.name + "-wal").is_file())
+            status = json.loads(self.status_path.read_text(encoding="utf-8"))
+            status["db_sha256"] = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+            status["db_generation_hash"] = digest(db_generation(self.db_path))
+            self.status_path.write_text(json.dumps(status), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "schema"):
+                coverage_module._read_environment(
+                    Path(__file__).resolve().parents[1], self.db_path, self.status_path, 7)
+        finally:
+            writer.close()
 
     def test_recheck_timestamp_is_noncanonical_even_in_repository_receipt(self):
         early = [dict(row, rechecked_at_utc="2026-10-01T00:00:00+00:00") for row in self.records]

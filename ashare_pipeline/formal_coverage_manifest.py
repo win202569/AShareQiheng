@@ -205,7 +205,11 @@ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
     before = db_hashes()
     db_sha256 = before[""]
     try:
-        connection = sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)
+        # Immutable mode is safe only for a checkpointed DB. With a WAL,
+        # normal read-only mode must see the committed frames; a sidecar race
+        # then fails the before/after generation comparison below.
+        read_mode = "?mode=ro" if before["-wal"] is not None else "?mode=ro&immutable=1"
+        connection = sqlite3.connect(db.as_uri() + read_mode, uri=True)
         try:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             # StateStore owns schema_migration, not SQLite user_version. A
@@ -507,14 +511,11 @@ class FormalCoverageAuditor:
                 if cls == "verified_no_coverage" and not (
                     source.get("authenticated") and source.get("explicit_source_statement")):
                     cls = "blocked_integrity"; reasons.append("no_coverage_not_authenticated")
-                if cls == "not_applicable_signed" and not (
-                    source.get("authenticated") is True
-                    and source.get("explicit_source_statement") is True
-                    and source.get("signature_ok") is True
-                    and source.get("hash_ok") is True
-                    and type(source.get("applicability_rule_hash")) is str
-                    and _SHA256.fullmatch(source["applicability_rule_hash"])):
-                    cls = "blocked_integrity"; reasons.append("applicability_not_authenticated")
+                if cls == "not_applicable_signed":
+                    # A caller's flags, hash and generic callback are not an
+                    # owning-repository applicability proof. No existing
+                    # coverage adapter can authenticate this class yet.
+                    cls = "blocked_dependency"; reasons.append("applicability_owner_proof_missing")
                 if cls in {"verified_complete", "verified_partial", "verified_no_coverage"}:
                     if any(type(source.get(field)) is not str or not source[field].strip()
                            for field in _VERIFIED_LINEAGE_FIELDS):
