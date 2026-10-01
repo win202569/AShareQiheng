@@ -1937,15 +1937,18 @@ class StateStore:
 
     @classmethod
     def _assert_v8_objects(cls, connection: sqlite3.Connection, *, applied: bool) -> None:
-        approved = set(_V8_TABLE_DDL) | set(_V8_INDEX_DDL)
+        approved = {("table", name) for name in _V8_TABLE_DDL} | {
+            ("index", name) for name in _V8_INDEX_DDL
+        }
         for row in connection.execute("SELECT type,name,tbl_name,sql FROM sqlite_master"):
             kind, name, table, sql = row
             if name.lower().startswith("formal_final_") or table.lower() in _V8_TABLE_DDL:
                 # SQLite creates only primary-key autoindexes for the V8 tables.
                 if (applied and kind == "index" and sql is None
+                        and table in _V8_TABLE_DDL
                         and name == f"sqlite_autoindex_{table}_1"):
                     continue
-                if not applied or name not in approved:
+                if not applied or (kind, name) not in approved:
                     raise RuntimeError(f"unexpected v8 schema object {name}")
 
     @classmethod

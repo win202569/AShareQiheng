@@ -249,6 +249,41 @@ class FormalFinalMigrationTests(unittest.TestCase):
                     StateStore(path).initialize()
                 self.assertEqual(self.snapshot(path), before)
 
+    def assert_named_trigger_collisions_rejected(self, names):
+        for scenario, migrated, target in (
+            ("premature-legacy", False, "score_run"),
+            ("reopen-legacy", True, "score_run"),
+            ("reopen-v8", True, "formal_final_run"),
+        ):
+            path = self.root / f"trigger-{scenario}.sqlite"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.executescript(Path(__file__).with_name("fixtures").joinpath("schema_v7.sql").read_text(encoding="utf-8"))
+            if migrated:
+                StateStore(path).initialize()
+            for name in names:
+                with self.subTest(scenario=scenario, trigger_name=name):
+                    with closing(sqlite3.connect(path)) as connection:
+                        connection.execute(f"CREATE TRIGGER {name} AFTER INSERT ON {target} BEGIN SELECT 1; END")
+                        connection.commit()
+                    before = self.snapshot(path)
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, "unexpected v8 schema object"):
+                            StateStore(path).initialize()
+                        self.assertEqual(self.snapshot(path), before)
+                    finally:
+                        with closing(sqlite3.connect(path)) as connection:
+                            connection.execute(f"DROP TRIGGER {name}")
+                            connection.commit()
+
+    def test_v8_table_named_trigger_rejects_without_advancing_ledger(self):
+        self.assert_named_trigger_collisions_rejected(TABLES)
+
+    def test_v8_index_named_trigger_rejects_without_advancing_ledger(self):
+        self.assert_named_trigger_collisions_rejected((
+            "formal_final_run_input", "formal_final_selected_ordinal",
+            "formal_final_dependency_source", "formal_final_dependency_effect",
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()
