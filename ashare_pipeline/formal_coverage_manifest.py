@@ -1,13 +1,13 @@
 """Fail-closed production coverage audit for the formal scoring run.
 
 This module deliberately treats database row counts as observations only.  A
-coverage row is verified only after its source/repository callback has accepted
-the complete, hash-bound evidence record.
+coverage row is verified only after its owner has revalidated the complete,
+hash-bound evidence record.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import copy
 import hashlib
@@ -23,6 +23,11 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
 from .formal_snapshot_repository import FormalSnapshotRepository
+from .formal_context_repository import FormalContextRepository, _require_authentic_context_repository
+from .formal_feature_repository import FormalFeatureRepository
+from .formal_policy_financial import _feature_dependencies
+from .formal_metric_batch_guard import _metric_batch_guard
+from .formal_policy_repository import FormalPolicyRepository, VerifiedPolicyResultBatch
 from .formal_repository_identity import _require_repository_initialization
 from .formal_universe import FormalFrozenUniverseInput, _validate_frozen_universe_input
 from . import state_store as _state_schema
@@ -293,11 +298,13 @@ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
 
 
 def _repository_provenance(req: Mapping[str, Any], source: Any,
-                           owner: str, validator: Callable[..., Any],
+                           owner: str, validator: Callable[..., Any] | None,
                            snapshots: FormalSnapshotRepository,
-                           selector: Mapping[str, Any]) -> dict[str, Any]:
+                           selector: Mapping[str, Any], *, typed_context=None,
+                           cache=None) -> dict[str, Any]:
     if owner != "formal_snapshot_repository":
-        raise ValueError("official coverage repository owner has no authenticated adapter")
+        return _typed_repository_provenance(req, source, owner, snapshots, selector,
+                                            typed_context, cache)
     if not isinstance(source, Mapping) or source.get("coverage_class") not in {
             "verified_complete", "verified_partial", "verified_no_coverage"}:
         raise ValueError("official coverage requires verified source repository evidence")
@@ -351,6 +358,162 @@ def _repository_provenance(req: Mapping[str, Any], source: Any,
             or any(char not in "0123456789abcdef" for char in result["evidence_hash"])):
         raise ValueError("official coverage repository provenance mismatch")
     return dict(result)
+
+
+def _typed_repository_provenance(req, source, owner, snapshots, selector, context, cache):
+    """Fixed owner adapters. Only repository reads and sealed batches authorize rows.
+
+    Aggregate lineage columns contain sorted distinct values; the full selected
+    item and dependency evidence remain in the canonical provenance receipt.
+    The signed period/window for these as-of selections is the frozen cutoff.
+    """
+    if context is None or owner not in {
+            "formal_context_repository", "formal_feature_repository", "formal_policy_repository"}:
+        raise ValueError("coverage repository owner has no authenticated adapter")
+    frozen, graph = context["frozen"], context["bundle"]
+    root, freeze = frozen.registry_manifest_hash, _aware(frozen.as_of_utc).isoformat()
+    store = snapshots._state_store
+    if (req["frozen_input_hash"] != frozen.frozen_input_hash
+            or _aware(req["period_or_window"]) != _aware(freeze)
+            or req["exchange"] != req["security_id"][:2]):
+        raise ValueError("coverage repository owner requirement root, window or exchange mismatch")
+    evidence, units = {}, []
+    coverage_class = "verified_complete"
+    if owner == "formal_context_repository":
+        repository = context["context_repository"]
+        if type(repository) is not FormalContextRepository:
+            raise ValueError("coverage repository owner requires genuine Context repository")
+        _require_authentic_context_repository(repository)
+        if (repository._state_store is not store or repository._snapshots is not snapshots
+                or repository._verifier is not store._require_registry_verifier()
+                or _aware(selector["as_of_utc"]) != _aware(freeze)):
+            raise ValueError("coverage Context owner or cutoff mismatch")
+        fact = repository.get_verified(selector["context_kind"], selector["scope_key"],
+            req["security_id"], freeze, root)
+        selected = fact.to_dict()
+        if (fact.security_id != req["security_id"] or fact.as_of_utc != freeze
+                or fact.registry_manifest_hash != root
+                or fact.context_kind != selector["context_kind"]
+                or fact.scope_key != selector["scope_key"]):
+            raise ValueError("coverage Context selected fact key mismatch")
+        evidence = {"fact": selected}
+        if fact.no_coverage:
+            coverage_class = "verified_no_coverage"
+        _require_authentic_context_repository(repository)
+    elif owner == "formal_feature_repository":
+        repository = context["feature_repository"]
+        if type(repository) is not FormalFeatureRepository:
+            raise ValueError("coverage repository owner requires genuine Feature repository")
+        provider = _feature_dependencies(repository)
+        if (repository._store is not store
+                or repository._verifier is not store._require_registry_verifier()):
+            raise ValueError("coverage Feature owner store or verifier mismatch")
+        with _metric_batch_guard(provider, store) as guard:
+            historical = repository._read_authenticated_bundle(
+                input_hash=selector["input_hash"], require_complete=False)
+            if (historical is None or historical.security_id != req["security_id"]
+                    or historical.registry_manifest_hash != root or historical.as_of_utc != freeze):
+                raise ValueError("coverage Feature input key or root mismatch")
+            _, registry = repository._registry(root)
+            slots = {slot.slot_id: slot for slot in registry.slots_for_template(historical.template_id)}
+            slot = slots.get(selector["slot_id"])
+            if slot is None:
+                raise ValueError("coverage Feature selected slot is absent")
+            if slot.required:
+                current = repository.select_current_verified_metric_features(req["security_id"],
+                    freeze, template_id=historical.template_id, registry_manifest_hash=root,
+                    required_feature_keys=(selector["slot_id"],))
+                same_bundle = current is not None and current.bundle_hash == historical.bundle_hash()
+            else:
+                current = repository.select_current_verified_formal_feature_bundle(req["security_id"],
+                    freeze, template_id=historical.template_id, registry_manifest_hash=root)
+                same_bundle = current is not None and current.canonical_bytes() == historical.canonical_bytes()
+            if (current is None or current.input_hash != selector["input_hash"]
+                    or not same_bundle or current.blockers):
+                raise ValueError("coverage Feature signed input is stale")
+            matches = [value for value in current.values if value.slot_id == selector["slot_id"]]
+            if len(matches) != 1 or matches[0].status != "derived" or not matches[0].evidence:
+                raise ValueError("coverage Feature selected slot is absent or incomplete")
+            selected = matches[0].to_dict()
+            units = [matches[0].unit]
+            evidence = {"bundle": historical.to_dict(), "selection": current.to_dict(),
+                "bundle_hash": historical.bundle_hash(),
+                "facts": [fact.to_dict() for fact in store.list_formal_financial_facts(
+                    security_id=req["security_id"])]}
+            guard.finalize(lambda: _feature_dependencies(repository))
+    else:
+        repository, batch = context["policy_repository"], context["policy_batch"]
+        if type(repository) is not FormalPolicyRepository or type(batch) is not VerifiedPolicyResultBatch:
+            raise ValueError("coverage repository owner requires genuine Policy repository and batch")
+        if repository._batch_journal_identity()[0] is not store:
+            raise ValueError("coverage Policy owner store mismatch")
+        if "policy" not in cache:
+            repository.recheck_current(batch)
+            cache["policy"] = batch.to_dict()
+        wire = cache["policy"]
+        if (wire["batch_hash"] != selector["batch_hash"]
+                or wire["frozen_input_hash"] != frozen.frozen_input_hash
+                or wire["registry_manifest_hash"] != root or wire["as_of_utc"] != freeze
+                or wire["universe_hash"] != frozen.universe_hash
+                or wire["security_ids"] != [member.security_id for member in frozen.members]):
+            raise ValueError("coverage Policy batch key or root mismatch")
+        matches = [decision for result in wire["results"] if result["security_id"] == req["security_id"]
+                   for decision in result["decisions"] if decision["rule_id"] == selector["rule_id"]]
+        if (len(matches) != 1 or matches[0]["security_id"] != req["security_id"]
+                or matches[0]["evaluation_state"] not in {"matched", "clear", "not_applicable"}
+                or matches[0]["pending_requirements"]):
+            raise ValueError("coverage Policy selected security/rule is absent or incomplete")
+        selected = matches[0]
+        evidence = {"batch": wire}
+        if selected["evaluation_state"] == "not_applicable":
+            coverage_class = "not_applicable_signed"
+    if set(req.get("expected_units", ())) != set(units):
+        raise ValueError("coverage owner selected item units mismatch")
+
+    # Preserve every underlying source ref, including the facts used to derive
+    # an aggregate feature or policy decision. The owner validates its complete
+    # evidence graph above; these reads also bind raw source bytes to this row.
+    ids = set()
+    def collect(value):
+        if isinstance(value, dict):
+            if type(value.get("source_snapshot_id")) is str:
+                ids.add(value["source_snapshot_id"])
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+    collect(evidence)
+    lineage = []
+    for snapshot_id in sorted(ids):
+        ref = store.get_formal_snapshot(snapshot_id)
+        if ref is None or ref.verification_status != "verified":
+            raise ValueError("coverage owner source snapshot is missing")
+        raw = snapshots.read_verified_raw(ref)
+        if hashlib.sha256(raw).hexdigest() != ref.content_sha256:
+            raise ValueError("coverage owner raw source hash mismatch")
+        task = store.get_formal_task(ref.producing_task_id)
+        if task is None or task["status"] != "verified":
+            raise ValueError("coverage owner source task is not verified")
+        lineage.append(dict(asdict(ref), collection_state=task["status"]))
+    evidence["source_snapshots"] = lineage
+    evidence["registry_manifest_hash"] = root
+    evidence["registry_hashes"] = {role: graph.blob(role).registry_hash for role in graph.roles}
+    bindings = {"selected_snapshot_id": "snapshot_id", "task_id": "producing_task_id"}
+    record = dict(req)
+    for field in _VERIFIED_LINEAGE_FIELDS:
+        values = { _canonical(item.get(bindings.get(field, field))) for item in lineage }
+        detached = [json.loads(value) for value in sorted(values)]
+        record[field] = detached[0] if len(detached) == 1 else detached
+    record.update(required=True, coverage_class=coverage_class, observed_units=units,
+        verification_state="verified", temporal_state="visible", reason_codes=[],
+        evidence_hashes={"selection": _digest(selected), "evidence": _digest(evidence),
+                         "registry": root, "frozen_input": frozen.frozen_input_hash})
+    if source is not None and _record_digest(source) != _record_digest(record):
+        raise ValueError("coverage owner record differs from authenticated selection")
+    return dict(domain=req["domain"], owner=owner, requirement_hash=_digest(req),
+        record_hash=_record_digest(record), evidence_hash=_digest(evidence),
+        selected_item=selected, evidence=evidence, record=record)
 
 
 @dataclass(frozen=True)
@@ -467,6 +630,8 @@ class FormalCoverageAuditor:
               contract_verifier: Any = None, registry_bundle: Any = None,
               registry_loader: Any = None,
               snapshot_repository: Any = None,
+              context_repository: Any = None, feature_repository: Any = None,
+              policy_repository: Any = None, policy_batch: Any = None,
               frozen_universe: Any = None, workspace_root: Any = None,
               db_path: Any = None, status_path: Any = None,
               db_diagnostics: Mapping[str, Any] | None = None,
@@ -504,14 +669,26 @@ class FormalCoverageAuditor:
                 by_key[key] = row
         callback_map = dict(self.repository_validators)
         callback_map.update(repository_validators or validators or {})
-        if official_wire is not None and not set(official_wire["domain_owners"]) <= set(callback_map):
+        if official_wire is not None and any(domain not in callback_map
+                for domain, owner in official_wire["domain_owners"].items()
+                if owner == "formal_snapshot_repository"):
             raise ValueError("official coverage repository validation callback is missing")
+        typed_context = dict(context_repository=context_repository, feature_repository=feature_repository,
+            policy_repository=policy_repository, policy_batch=policy_batch,
+            frozen=frozen_universe, bundle=registry_bundle)
+        owner_cache = {}
         registry_disapproved = registry is not None and registry.get("approved") is False
         rows: list[dict[str, Any]] = []
         blockers: set[str] = set()
         for req in reqs:
             key = _key(req)
             source = by_key.get(key)
+            provenance = None
+            if official_wire is not None and official_wire["domain_owners"][req["domain"]] != "formal_snapshot_repository":
+                provenance = _repository_provenance(req, source,
+                    official_wire["domain_owners"][req["domain"]], None, snapshot_repository,
+                    official_wire["selector_descriptors"][req["selector_hash"]],
+                    typed_context=typed_context, cache=owner_cache)
             row = {field: None for field in _AUDIT_ROW_FIELDS}
             row.update(req)
             row["required"] = True
@@ -521,7 +698,11 @@ class FormalCoverageAuditor:
                 tuple(k for i, k in enumerate(key) if i != 5)
                 for candidate_key in by_key if candidate_key != key
             )
-            if source is None:
+            if provenance is not None:
+                source = provenance["record"]
+                row.update(source)
+                cls = source["coverage_class"]
+            elif source is None:
                 cls = "blocked_identity" if identity_mismatch else "missing"
                 reasons.append("exchange_identity_mismatch" if identity_mismatch else "absent_record")
             else:
@@ -594,9 +775,9 @@ class FormalCoverageAuditor:
                         if result is not True:
                             cls = "blocked_integrity"; reasons.append("repository_validation_failed")
             if official_wire is not None:
-                row["repository_provenance"] = _repository_provenance(
+                row["repository_provenance"] = provenance or _repository_provenance(
                     req, source, official_wire["domain_owners"][req["domain"]],
-                    callback_map[str(req["domain"])], snapshot_repository,
+                    callback_map.get(str(req["domain"])), snapshot_repository,
                     official_wire["selector_descriptors"][req["selector_hash"]],
                 )
             row["coverage_class"] = cls
@@ -646,13 +827,17 @@ class FormalCoverageAuditor:
                                                        if environment is not None else None)})
         context = None
         if official_wire is not None:
+            if _read_environment(workspace_root, db_path, status_path,
+                                 official_wire["expected_schema_version"]) != environment:
+                raise ValueError("coverage environment changed during owner validation")
             context = {"contract": dict(contract), "verifier": contract_verifier,
                  "bundle": registry_bundle, "registry_loader": registry_loader,
                  "snapshot_repository": snapshot_repository, "db_path": db_path,
                  "frozen": frozen_universe,
+                 "typed_context": typed_context,
                  "requirements": copy.deepcopy(reqs),
                  "sources": copy.deepcopy([by_key.get(key) for key in keys]),
-                 "validators": {domain: callback_map[domain]
+                 "validators": {domain: callback_map.get(domain)
                                 for domain in official_wire["domain_owners"]}}
         return payload, context
 
@@ -712,18 +897,32 @@ def _install_coverage_authority() -> None:
                                 context["db_path"], context["snapshot_repository"])
         if wire is None:
             raise ValueError("official coverage authenticated contract was revoked")
+        owner_cache = {}
         for row, req, source in zip(data["rows"], context["requirements"],
                                     context["sources"], strict=True):
             provenance = _repository_provenance(
                 req, source, wire["domain_owners"][req["domain"]],
                 context["validators"][req["domain"]], context["snapshot_repository"],
                 wire["selector_descriptors"][req["selector_hash"]],
+                typed_context=context["typed_context"], cache=owner_cache,
             )
             if row.get("repository_provenance") != provenance:
                 raise ValueError("official coverage repository provenance changed")
+        after = _read_environment(paths["workspace_root"], paths["db_path"],
+                                  paths["status_path"], data["expected_schema_version"])
+        if after != current:
+            raise ValueError("coverage environment changed during gate recheck")
+
+    def preview_gate(self: VerifiedCoverageManifest) -> None:
+        data = read(self)
+        if data["blockers"]:
+            raise ValueError("coverage preview blocked: " + ",".join(data["blockers"]))
+        if data.get("authenticated_context"):
+            official_gate(self)
 
     type.__setattr__(_Proof, "_data", read)
     type.__setattr__(VerifiedCoverageManifest, "require_official_ready", official_gate)
+    type.__setattr__(VerifiedCoverageManifest, "require_preview_ready", preview_gate)
     FormalCoverageAuditor.audit = audit
     FormalCoverageAuditor.revoke = staticmethod(revoke)
 

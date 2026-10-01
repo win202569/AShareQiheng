@@ -208,6 +208,211 @@ class CoverageGuardTests(unittest.TestCase):
                          "blocked_temporal")
 
 
+class OwnerCoverageAdapterTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
+        def shared_metric_fact(documents):
+            # Required fixture slots share one signed input; Policy keeps its
+            # separate equity input. Both still use real persisted producers.
+            for slot in documents["feature"]["slots"]:
+                if ".policy." not in slot["slot_id"]:
+                    slot["formula"]["fact_key"] = "coverage.shared"
+        cls.fixture = PolicyRuntimeFixture(range_enabled=True, cyclic=False, mutate=shared_metric_fact)
+        cls.addClassCleanup(cls.fixture.close)
+        f = cls.fixture
+        cls.features = {}
+        for member in f.industry["memberships"]:
+            sid, template = member["security_id"], member["template_id"]
+            f.put_industry(sid)
+            f.put_policy_context(sid, "security_state", dict(is_st=False, is_star_st=False,
+                listing_status="listed", forced_delist_risk=False, suspended=False))
+            f.put_policy_financial(sid, {"fixture.policy.current.equity": 1.0},
+                fy_end="2025-12-31", units={"fixture.policy.current.equity": "CNY"})
+            f.put_financial(sid, {"coverage.shared": 3.0}, generation="coverage-complete")
+            cls.features[sid] = f.persist_features(sid)
+        cls.batch, cls.revoke_batch, _ = f.policy_repository._build_batch(
+            f.frozen.frozen_input_hash, scoring_registry=f.scoring,
+            policy_registry=f.policy_registry, owner_scope=None)
+        cls.status_path = f.root / "coverage-status.json"
+        cls.status_path.write_text(json.dumps({
+            "generated_at_utc": "2026-09-01T00:00:00+00:00", "schema_version": 7,
+            "db_sha256": hashlib.sha256(f.db_path.read_bytes()).hexdigest(),
+            "db_generation_hash": digest(db_generation(f.db_path)),
+            "schema_versions": [2, 3, 4, 5, 6, 7],
+        }), encoding="utf-8")
+
+    def catalog(self, domain, *, change=None):
+        f = self.fixture
+        owner = "formal_" + domain + "_repository"
+        descriptors, requirements = {}, []
+        for member in f.frozen.members:
+            sid = member.security_id
+            selector = dict(owner=owner, domain=domain, security_id=sid,
+                            exchange=member.exchange, period_or_window=f.frozen.as_of_utc)
+            units = []
+            if domain == "context":
+                selector.update(context_kind="industry_snapshot", scope_key="fixture-industry",
+                                as_of_utc=f.frozen.as_of_utc)
+            elif domain == "feature":
+                bundle = self.features[sid]
+                selector.update(input_hash=bundle.input_hash,
+                                slot_id=bundle.template_id + ".G.operating_revenue_yoy")
+                units = ["CNY"]
+            else:
+                result = next(item for item in self.batch.results if item.security_id == sid)
+                rule = next(item for item in result.decisions if item.semantic_id == "nonpositive_equity")
+                selector.update(batch_hash=self.batch.batch_hash, rule_id=rule.rule_id)
+            if change:
+                selector.update(change(selector))
+            selector_hash = digest(selector)
+            descriptors[selector_hash] = selector
+            requirements.append(dict(frozen_input_hash=f.frozen.frozen_input_hash,
+                security_id=sid, domain=domain, selector_hash=selector_hash,
+                exchange=member.exchange, period_or_window=f.frozen.as_of_utc, expected_units=units))
+        manifest = f.bundle.manifest
+        return dict(schema_version="formal-coverage-contract-v1", purpose="official",
+            approval_id=manifest.approval_id, signing_identity=manifest.key_id,
+            registry_manifest_hash=manifest.manifest_hash, frozen_input_hash=f.frozen.frozen_input_hash,
+            requirements=requirements, domain_owners={domain: owner}, selector_descriptors=descriptors,
+            expected_schema_version=7, report_period="2025", query_version="coverage-v1")
+
+    def audit(self, domain, *, wire=None, **changes):
+        f = self.fixture
+        wire = self.catalog(domain) if wire is None else wire
+        raw = canonical(wire)
+        args = dict(production_contract=dict(canonical_json=raw, signature=f.verifier.sign(raw),
+                    key_id=f.bundle.manifest.key_id), contract_verifier=f.verifier,
+            registry_bundle=f.bundle, registry_loader=FormalRegistryBundleLoader(f.store, f.verifier),
+            snapshot_repository=f.snapshots, frozen_universe=f.frozen,
+            workspace_root=Path(__file__).resolve().parents[1], db_path=f.db_path,
+            status_path=self.status_path, context_repository=f.context,
+            feature_repository=f.feature_repository, policy_repository=f.policy_repository,
+            policy_batch=self.batch)
+        args.update(changes)
+        return FormalCoverageAuditor().audit(wire["requirements"], **args)
+
+    def assert_owner_ready(self, domain):
+        result = self.audit(domain)
+        result.require_preview_ready()
+        result.require_official_ready()
+        self.assertEqual(len(result.rows), 3)
+        for row in result.rows:
+            provenance = row["repository_provenance"]
+            self.assertEqual(provenance["owner"], "formal_" + domain + "_repository")
+            self.assertEqual(provenance["requirement_hash"], digest(next(
+                req for req in self.catalog(domain)["requirements"]
+                if req["security_id"] == row["security_id"])))
+            self.assertTrue(provenance["evidence"])
+            self.assertTrue(row["evidence_hashes"])
+
+    def test_genuine_context_owner_rows_reach_both_gates(self):
+        self.assert_owner_ready("context")
+
+    def test_genuine_feature_owner_rows_reach_both_gates(self):
+        self.assert_owner_ready("feature")
+
+    def test_genuine_policy_owner_rows_reach_both_gates(self):
+        self.assert_owner_ready("policy")
+
+    def test_wrong_typed_owner_cannot_be_replaced_with_callback_or_dictionary(self):
+        for domain in ("context", "feature", "policy"):
+            genuine = {"context": self.fixture.context, "feature": self.fixture.feature_repository,
+                       "policy": self.fixture.policy_repository}[domain]
+            for forged in (True, {}, lambda *_: True, object(), object.__new__(type(genuine))):
+                with self.subTest(domain=domain, forged=type(forged)), self.assertRaises(ValueError):
+                    self.audit(domain, **{domain + "_repository": forged})
+        f = self.fixture
+        other_policy_owner = type(f.policy_repository)(f.feature_repository, f.context,
+            f.range_store, registry_signature_verifier=f.verifier)
+        with self.assertRaises(ValueError):
+            self.audit("policy", policy_repository=other_policy_owner)
+
+    def test_signed_wrong_slot_scope_rule_and_member_selection_are_rejected(self):
+        changes = {"context": lambda s: dict(scope_key="wrong-scope"),
+                   "feature": lambda s: dict(slot_id="bank.nonexistent"),
+                   "policy": lambda s: dict(rule_id="wrong-rule")}
+        for domain, change in changes.items():
+            with self.subTest(domain=domain), self.assertRaises(ValueError):
+                self.audit(domain, wire=self.catalog(domain, change=change))
+        with self.assertRaises(ValueError):
+            self.audit("feature", wire=self.catalog("feature", change=lambda s:
+                dict(input_hash=self.features["SH600000"].input_hash)))
+        with self.assertRaises(ValueError):
+            self.audit("context", wire=self.catalog("context", change=lambda s:
+                dict(security_id="SH600000")))
+
+    def assert_raw_change_blocks_gates(self, domain):
+        f = self.fixture
+        result = self.audit(domain)
+        if domain == "context":
+            row = next(row for row in result.rows if row["security_id"] == "SH600000")
+            snapshot_id = row["repository_provenance"]["selected_item"]["source_snapshot_id"]
+        elif domain == "feature":
+            row = next(row for row in result.rows if row["security_id"] == "SH600000")
+            snapshot_id = row["repository_provenance"]["selected_item"]["evidence"][0]["source_snapshot_id"]
+        else:
+            fact = next(fact for fact in f.store.list_formal_financial_facts(security_id="SH600000")
+                        if fact.metric_key == "fixture.policy.current.equity")
+            snapshot_id = fact.source_snapshot_id
+        ref = f.store.get_formal_snapshot(snapshot_id)
+        path, original = Path(ref.content_path), Path(ref.content_path).read_bytes()
+        try:
+            path.write_bytes(b"stale source bytes")
+            for gate in (result.require_preview_ready, result.require_official_ready):
+                with self.subTest(gate=gate.__name__), self.assertRaises(ValueError):
+                    gate()
+        finally:
+            path.write_bytes(original)
+
+    def test_context_gates_recheck_raw_evidence_without_database_change(self):
+        self.assert_raw_change_blocks_gates("context")
+
+    def test_feature_gates_recheck_raw_evidence_without_database_change(self):
+        self.assert_raw_change_blocks_gates("feature")
+
+    def test_feature_gates_reject_stale_current_inputs_with_intact_historical_receipt(self):
+        from ashare_pipeline.formal_financial_schema import FormalFactIssue
+        f = self.fixture
+        result = self.audit("feature")
+        original_generation = db_generation(f.db_path)
+        f.set_issues("SH600000", (FormalFactIssue("unknown_source_field", None, "UNKNOWN", {}),))
+        try:
+            # The historical receipt and all raw files remain authentic. Only
+            # the genuine provider's complete current input has changed.
+            historical = f.feature_repository._read_authenticated_bundle(
+                input_hash=self.features["SH600000"].input_hash, require_complete=False)
+            self.assertEqual(historical.input_hash, self.features["SH600000"].input_hash)
+            self.assertEqual(db_generation(f.db_path), original_generation)
+            for gate in (result.require_preview_ready, result.require_official_ready):
+                with self.subTest(gate=gate.__name__), self.assertRaises(ValueError):
+                    gate()
+        finally:
+            f.set_issues("SH600000", ())
+
+    def test_policy_gates_recheck_raw_evidence_without_database_change(self):
+        self.assert_raw_change_blocks_gates("policy")
+
+    def test_cross_root_contract_and_plain_policy_batch_are_rejected(self):
+        for domain in ("context", "feature", "policy"):
+            wire = self.catalog(domain)
+            wire["registry_manifest_hash"] = "f" * 64
+            with self.subTest(domain=domain), self.assertRaises(ValueError):
+                self.audit(domain, wire=wire)
+        with self.assertRaises(ValueError):
+            self.audit("policy", policy_batch=self.batch.to_dict())
+
+    def test_revoked_policy_publication_invalidates_both_coverage_gates(self):
+        f = self.fixture
+        batch, revoke, _ = f.policy_repository._build_batch(f.frozen.frozen_input_hash,
+            scoring_registry=f.scoring, policy_registry=f.policy_registry, owner_scope=None)
+        result = self.audit("policy", policy_batch=batch)
+        revoke(batch)
+        for gate in (result.require_preview_ready, result.require_official_ready):
+            with self.subTest(gate=gate.__name__), self.assertRaises(ValueError):
+                gate()
+
+
 class OfficialCoverageBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
