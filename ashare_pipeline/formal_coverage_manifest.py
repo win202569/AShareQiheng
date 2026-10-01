@@ -3,6 +3,21 @@
 This module deliberately treats database row counts as observations only.  A
 coverage row is verified only after its owner has revalidated the complete,
 hash-bound evidence record.
+
+The signed catalog has a closed source-evidence vocabulary for design section 9:
+financial -> Snapshot/financial facts; trading_calendar -> Context's exchange
+calendar selector; the six other Context kinds (or the legacy context umbrella)
+-> Context facts; feature -> the current signed Feature slot; policy -> a Policy
+decision; market/range -> a Policy market-liquidity decision with its complete
+calendar/market range evidence. These last two domains mean the policy's signed
+trading window, not arbitrary market queries. Their owner is Policy, whose
+recheck authenticates the underlying Market and Range repositories.
+
+Metric percentiles, Stage C valuation, and D1 final-input batches are downstream
+calculation proofs, not source domains of this independent data audit (design
+sections 3-5, 7.3, 9 and 13). Their own repositories/gates remain necessary for a
+Stage D run. No catalog may relabel them as financial/features/policy coverage;
+unmapped domain/owner pairs are rejected before evidence reads.
 """
 
 from __future__ import annotations
@@ -24,6 +39,7 @@ from typing import Any, Callable, Mapping, Sequence
 from .formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
 from .formal_snapshot_repository import FormalSnapshotRepository
 from .formal_context_repository import FormalContextRepository, _require_authentic_context_repository
+from .formal_sources import CalendarSelector
 from .formal_feature_repository import FormalFeatureRepository
 from .formal_policy_financial import _feature_dependencies
 from .formal_metric_batch_guard import _metric_batch_guard
@@ -58,6 +74,18 @@ _VERIFIED_LINEAGE_FIELDS = (
     "source_updated_at_utc",
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CONTEXT_FACT_DOMAINS = frozenset({"market_close", "security_state", "industry_snapshot",
+    "regulatory_state", "event_calendar", "consensus_snapshot"})
+_DOMAIN_ADAPTERS = MappingProxyType({
+    "financial": ("formal_snapshot_repository", "financial"),
+    "trading_calendar": ("formal_context_repository", "calendar"),
+    "context": ("formal_context_repository", "context"),
+    **{kind: ("formal_context_repository", "context") for kind in _CONTEXT_FACT_DOMAINS},
+    "feature": ("formal_feature_repository", "feature"),
+    "policy": ("formal_policy_repository", "policy"),
+    "market": ("formal_policy_repository", "policy_market"),
+    "range": ("formal_policy_repository", "policy_market"),
+})
 
 
 def _canonical(value: Any) -> bytes:
@@ -171,12 +199,17 @@ def _official_inputs(contract: Any, verifier: Any, bundle: Any, loader: Any, fro
     if (type(owners) is not dict or set(owners) != {row["domain"] for row in catalog}
             or any(type(owner) is not str or not owner for owner in owners.values())):
         raise ValueError("coverage contract repository owners are incomplete")
+    if any(domain not in _DOMAIN_ADAPTERS or owner != _DOMAIN_ADAPTERS[domain][0]
+           for domain, owner in owners.items()):
+        raise ValueError("coverage contract domain/owner pair has no authenticated adapter")
     descriptors = wire["selector_descriptors"]
-    owner_fields = {
-        "formal_snapshot_repository": {"source", "dataset"},
-        "formal_context_repository": {"context_kind", "scope_key", "as_of_utc"},
-        "formal_feature_repository": {"input_hash", "slot_id"},
-        "formal_policy_repository": {"batch_hash", "rule_id"},
+    adapter_fields = {
+        "financial": {"source", "dataset"},
+        "context": {"context_kind", "scope_key", "as_of_utc"},
+        "calendar": {"context_kind", "scope_key", "as_of_utc", "as_of_rule"},
+        "feature": {"input_hash", "slot_id"},
+        "policy": {"batch_hash", "rule_id"},
+        "policy_market": {"batch_hash", "rule_id"},
     }
     common_fields = {"owner", "domain", "security_id", "exchange", "period_or_window"}
     if type(descriptors) is not dict or set(descriptors) != {row["selector_hash"] for row in catalog}:
@@ -184,8 +217,9 @@ def _official_inputs(contract: Any, verifier: Any, bundle: Any, loader: Any, fro
     for row in catalog:
         selector = descriptors[row["selector_hash"]]
         owner = owners[row["domain"]]
-        if (owner not in owner_fields or type(selector) is not dict
-                or set(selector) != common_fields | owner_fields[owner]
+        adapter = _DOMAIN_ADAPTERS[row["domain"]][1]
+        if (type(selector) is not dict
+                or set(selector) != common_fields | adapter_fields[adapter]
                 or _digest(selector) != row["selector_hash"]
                 or selector["owner"] != owner
                 or any(selector[field] != row[field] for field in
@@ -198,6 +232,12 @@ def _official_inputs(contract: Any, verifier: Any, bundle: Any, loader: Any, fro
                 or (owner == "formal_policy_repository" and
                     _SHA256.fullmatch(selector["batch_hash"]) is None)):
             raise ValueError("coverage contract selector descriptor is invalid")
+        if adapter == "context" and (selector["context_kind"] not in _CONTEXT_FACT_DOMAINS
+                or row["domain"] != "context" and selector["context_kind"] != row["domain"]):
+            raise ValueError("coverage contract Context domain and selected kind mismatch")
+        if adapter == "calendar":
+            CalendarSelector(**{field: selector[field] for field in
+                ("context_kind", "scope_key", "exchange", "as_of_rule")})
     if (type(wire["expected_schema_version"]) is not int
             or wire["expected_schema_version"] <= 0
             or any(type(wire[field]) is not str or not wire[field]
@@ -378,6 +418,7 @@ def _typed_repository_provenance(req, source, owner, snapshots, selector, contex
             or req["exchange"] != req["security_id"][:2]):
         raise ValueError("coverage repository owner requirement root, window or exchange mismatch")
     evidence, units = {}, []
+    calendar_selector = calendar_binding = None
     coverage_class = "verified_complete"
     if owner == "formal_context_repository":
         repository = context["context_repository"]
@@ -388,15 +429,41 @@ def _typed_repository_provenance(req, source, owner, snapshots, selector, contex
                 or repository._verifier is not store._require_registry_verifier()
                 or _aware(selector["as_of_utc"]) != _aware(freeze)):
             raise ValueError("coverage Context owner or cutoff mismatch")
-        fact = repository.get_verified(selector["context_kind"], selector["scope_key"],
-            req["security_id"], freeze, root)
+        if _DOMAIN_ADAPTERS[req["domain"]][1] == "calendar":
+            calendar_selector = CalendarSelector(**{field: selector[field] for field in
+                ("context_kind", "scope_key", "exchange", "as_of_rule")})
+            calendar_binding = repository.resolve_verified_calendar_binding(
+                calendar_selector, req["exchange"], freeze, root)
+            binding = asdict(calendar_binding)
+            if any(binding[field] != expected for field, expected in (
+                    ("exchange", req["exchange"]), ("freeze_at_utc", freeze),
+                    ("registry_manifest_hash", root), ("selector_hash", calendar_selector.selector_hash))):
+                raise ValueError("coverage calendar selector binding mismatch")
+            candidates = store.list_formal_context_facts(registry_manifest_hash=root,
+                context_kind="trading_calendar", scope_key=selector["scope_key"], as_of_utc=freeze,
+                source_snapshot_id=binding["snapshot_id"])
+            matches = [fact for fact in candidates if fact.security_id is None
+                       and fact.value["exchange"] == req["exchange"]]
+            if len(matches) != 1:
+                raise ValueError("coverage calendar selected fact is absent or ambiguous")
+            fact = matches[0]
+            ref = snapshots.get_verified_by_manifest(binding["manifest_sha256"])
+            if (ref.snapshot_id != fact.source_snapshot_id or ref.snapshot_id != binding["snapshot_id"]
+                    or ref.security_id is not None or ref.exchange != req["exchange"]
+                    or ref.producing_task_id != binding["prerequisite_task_id"]):
+                raise ValueError("coverage calendar source identity mismatch")
+            evidence.update(calendar_selector=asdict(calendar_selector), calendar_binding=binding)
+        else:
+            fact = repository.get_verified(selector["context_kind"], selector["scope_key"],
+                req["security_id"], freeze, root)
         selected = fact.to_dict()
-        if (fact.security_id != req["security_id"] or fact.as_of_utc != freeze
+        if (fact.security_id != (None if calendar_selector is not None else req["security_id"])
+                or fact.as_of_utc != freeze
                 or fact.registry_manifest_hash != root
                 or fact.context_kind != selector["context_kind"]
                 or fact.scope_key != selector["scope_key"]):
             raise ValueError("coverage Context selected fact key mismatch")
-        evidence = {"fact": selected}
+        evidence["fact"] = selected
         if fact.no_coverage:
             coverage_class = "verified_no_coverage"
         _require_authentic_context_repository(repository)
@@ -447,10 +514,7 @@ def _typed_repository_provenance(req, source, owner, snapshots, selector, contex
             raise ValueError("coverage repository owner requires genuine Policy repository and batch")
         if repository._batch_journal_identity()[0] is not store:
             raise ValueError("coverage Policy owner store mismatch")
-        if "policy" not in cache:
-            repository.recheck_current(batch)
-            cache["policy"] = batch.to_dict()
-        wire = cache["policy"]
+        wire = cache["policy"] if "policy" in cache else batch.to_dict()
         if (wire["batch_hash"] != selector["batch_hash"]
                 or wire["frozen_input_hash"] != frozen.frozen_input_hash
                 or wire["registry_manifest_hash"] != root or wire["as_of_utc"] != freeze
@@ -465,6 +529,28 @@ def _typed_repository_provenance(req, source, owner, snapshots, selector, contex
             raise ValueError("coverage Policy selected security/rule is absent or incomplete")
         selected = matches[0]
         evidence = {"batch": wire}
+        if _DOMAIN_ADAPTERS[req["domain"]][1] == "policy_market":
+            rule_input = wire["evidence_batch"]["rule_inputs"][req["security_id"]].get(selector["rule_id"])
+            market = wire["evidence_batch"]["selections"][req["security_id"]].get(selector["rule_id"])
+            window = None if market is None else market.get("window")
+            if (rule_input is None or rule_input["rule"]["kind"] != "market_liquidity"
+                    or market is None or market["pending"] or window is None or window["pending"]
+                    or window != rule_input["market"]
+                    or any(window[field] != expected for field, expected in (
+                        ("security_id", req["security_id"]), ("exchange", req["exchange"]),
+                        ("as_of_utc", freeze), ("registry_manifest_hash", root), ("rule_id", selector["rule_id"])))
+                    or not window["observations"] or not window["lineage"]
+                    or not window["calendar_coverage_hash"] or not window["required_trading_days"]
+                    or any(day["coverage"] != "covered" for day in window["daily_records"])
+                    or [day["date"] for day in window["daily_records"]] != window["required_trading_days"]):
+                raise ValueError("coverage market/range requires the complete signed market-liquidity selection")
+            evidence.update(market_selection=market, market_rule=rule_input["rule"])
+        if "policy" not in cache:
+            # Reject a mismatched signed selection before expensive source
+            # reads; every accepted row still requires the original owner to
+            # recheck the complete published batch before evidence is returned.
+            repository.recheck_current(batch)
+            cache["policy"] = wire
         if selected["evaluation_state"] == "not_applicable":
             coverage_class = "not_applicable_signed"
     if set(req.get("expected_units", ())) != set(units):
@@ -496,9 +582,28 @@ def _typed_repository_provenance(req, source, owner, snapshots, selector, contex
         if task is None or task["status"] != "verified":
             raise ValueError("coverage owner source task is not verified")
         lineage.append(dict(asdict(ref), collection_state=task["status"]))
+    # Policy owns the Range observations: its original current-state recheck
+    # above reauthenticates their signed parser/config, tasks, receipts and raw
+    # bytes (including the bound calendar coverage). Project those authenticated
+    # source identities too, so market/range rows retain real source lineage.
+    if "market_selection" in evidence:
+        for observation in evidence["market_selection"]["window"]["observations"]:
+            document, snapshot, task = observation["document"], observation["snapshot"], observation["task"]
+            lineage.append(dict(document, snapshot_id=snapshot["id"],
+                manifest_sha256=snapshot["manifest_sha256"], content_sha256=snapshot["content_sha256"],
+                content_path=snapshot["content_path"], manifest_path=snapshot["manifest_path"],
+                producing_task_id=task["id"], collection_state=task["status"],
+                refresh_generation=observation["generation"]["refresh_generation"],
+                observation_hash=observation["observation_hash"]))
     evidence["source_snapshots"] = lineage
+    evidence["selector_descriptor"] = dict(selector)
     evidence["registry_manifest_hash"] = root
     evidence["registry_hashes"] = {role: graph.blob(role).registry_hash for role in graph.roles}
+    if calendar_selector is not None:
+        current = repository.resolve_verified_calendar_binding(calendar_selector, req["exchange"], freeze, root)
+        if asdict(current) != asdict(calendar_binding):
+            raise ValueError("coverage calendar selection changed during evidence read")
+        _require_authentic_context_repository(repository)
     bindings = {"selected_snapshot_id": "snapshot_id", "task_id": "producing_task_id"}
     record = dict(req)
     for field in _VERIFIED_LINEAGE_FIELDS:
