@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
+import inspect
 import json
 from pathlib import Path
 from types import MappingProxyType
@@ -536,6 +537,89 @@ class FormalFinalRunRepository:
                 (input_manifest_hash,)))
             return tuple(self._read_run(connection, run_id) for run_id in ids)
 
+
+def _install_rebuild_planner(repository_type):
+    """Capture existing D1 authorities; expose neither mint nor publication controls."""
+    from .formal_final_score_inputs import _prepare_final_inputs
+    from .formal_final_invalidation import _derive_plan
+
+    authorities = inspect.getclosurevars(_prepare_final_inputs).nonlocals
+    record = authorities["record"]
+    dependencies = authorities["dependencies"]
+    verify_sources = authorities["verify_sources"]
+    input_type, coverage_type = PolicyAdjustedScoreInputBatch, VerifiedCoverageManifest
+    coverage_methods = tuple((name, getattr(coverage_type, name)) for name in
+        ("require_verified", "require_preview_ready", "require_official_ready", "canonical_bytes", "to_dict", "_data"))
+    read_run = repository_type._read_run
+    serialize, identity, coverage_identity = _serialize_payload, _input_identity, _coverage_identity
+    derive = _derive_plan
+
+    def plan_rebuild(self, *, prior_run_id, prior_input_manifest_hash,
+                     input_batch, coverage_manifest, mode="test_preview"):
+        """Compare one exact historical run with freshly authenticated manifests.
+
+        This read-only plan never authenticates recovered DTOs or caches a
+        validity decision. Every call checks the retained source checkpoint;
+        the eventual append-only writer must revalidate again before reuse.
+        """
+        if (type(self) is not repository_type or type(self._store) is not StateStore
+                or Path(self._store.db_path).resolve() != self._path):
+            raise ValueError("rebuild repository identity changed")
+        if mode not in ("test_preview", "official_candidate"):
+            raise ValueError("Stage D run mode is invalid")
+        if (type(prior_run_id) is not str or not prior_run_id
+                or type(prior_input_manifest_hash) is not str or not prior_input_manifest_hash):
+            raise ValueError("rebuild requires an exact prior run and manifest hash")
+        if type(input_batch) is not input_type or type(coverage_manifest) is not coverage_type:
+            raise ValueError("rebuild requires genuine final input and coverage proofs")
+        if any(getattr(coverage_type, name) is not method for name, method in coverage_methods):
+            raise ValueError("rebuild coverage authority changed")
+        saved = record(input_batch, input_type)
+        retention = saved[5]
+        feature = dependencies(retention[0])[0]
+        if feature._store is not self._store:
+            raise ValueError("rebuild input belongs to another source store")
+        checkpoint = retention[3][0]
+        with checkpoint.hold():
+            source_bytes = verify_sources(retention[1])
+            for proof in retention[2]:
+                proof.require_verified()
+            raw = saved[2]
+            inputs = json.loads(raw)
+            if serialize(inputs)[0].encode() != raw:
+                raise ValueError("rebuild input bytes are not canonical")
+            coverage_identity(coverage_manifest, inputs, tuple(inputs["security_ids"]), mode)
+            coverage_raw = coverage_manifest.canonical_bytes()
+            coverage = json.loads(coverage_raw)
+            with self._store._transaction() as connection:
+                prior = read_run(self, connection, prior_run_id)
+            if prior is None or prior.input_manifest_hash != prior_input_manifest_hash:
+                raise ValueError("exact prior run manifest was not found")
+            artifacts = {"score_input_batch": {"artifact_hash": hashlib.sha256(raw).hexdigest()},
+                "coverage_manifest": {"artifact_hash": hashlib.sha256(coverage_raw).hexdigest()}}
+            header = dict(mode=mode, code_version=self._code_version, contract_version=self._contract_version,
+                **{key: inputs[key] for key in ("registry_manifest_hash", "frozen_input_hash", "universe_hash", "as_of_utc")})
+            old_artifacts = {kind: {"artifact_hash": digest} for kind, digest in prior.artifact_hashes.items()}
+            plan = derive(prior_inputs=json.loads(prior.artifacts["score_input_batch"]),
+                current_inputs=inputs, prior_coverage=json.loads(prior.artifacts["coverage_manifest"]),
+                current_coverage=coverage, prior_dependencies=prior.dependencies,
+                prior_identity=identity(prior.header, old_artifacts), current_identity=identity(header, artifacts))
+            # Validity is checked after the diff as well. A byte-identical old
+            # proof cannot survive a revoked capability or changed live source.
+            if record(input_batch, input_type)[2] != raw or verify_sources(retention[1]) != source_bytes:
+                raise ValueError("rebuild sources changed while deriving the plan")
+            dependencies(retention[0])
+            coverage_identity(coverage_manifest, inputs, tuple(inputs["security_ids"]), mode)
+            if coverage_manifest.canonical_bytes() != coverage_raw:
+                raise ValueError("rebuild coverage changed while deriving the plan")
+            checkpoint.recheck()
+            return plan
+
+    return plan_rebuild
+
+
+FormalFinalRunRepository.plan_rebuild = _install_rebuild_planner(FormalFinalRunRepository)
+del _install_rebuild_planner
 
 _prepare_publication, _publication_controls, _register_publication_owner = _bind_repository_writer(FormalFinalRunRepository)
 
