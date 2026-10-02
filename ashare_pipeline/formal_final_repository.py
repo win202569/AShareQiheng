@@ -223,8 +223,16 @@ def _project_rows(run_id, wires):
     ordinals = {}
     for pool in ("strong", "wait"):
         selected = pools[pool + "_security_ids"]
-        if len(selected) != len(set(selected)) or pools["counts"][pool] != len(selected):
+        if (type(selected) is not list or any(type(sid) is not str for sid in selected)
+                or len(selected) != len(set(selected)) or pools["counts"][pool] != len(selected)
+                or not set(selected) <= set(ids)):
             raise ValueError("pool selected membership or count is invalid")
+        selected_decisions = {item["security_id"] for item in pools["decisions"]
+            if item["pool"] == pool and item["decision"] == "selected"}
+        if set(selected) != selected_decisions:
+            raise ValueError("pool selected membership differs from its decisions")
+        # The canonical list is the order authority; every projected ordinal
+        # must match its 1-based position during both writing and recovery.
         ordinals.update({(sid, pool): index for index, sid in enumerate(selected, 1)})
     for item in pools["decisions"]:
         ordinal = ordinals.get((item["security_id"], item["pool"]))

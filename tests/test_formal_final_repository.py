@@ -125,6 +125,36 @@ class FormalFinalRecoveryBoundaryTests(unittest.TestCase):
                     self.read()
                 self.connection.execute("ROLLBACK TO damage")
 
+    def test_recovery_rejects_rehashed_selected_list_decision_mismatches(self):
+        for damage in ("outside_frozen_member", "missing_selected_decision", "extra_selected_decision"):
+            with self.subTest(damage=damage):
+                pools = copy.deepcopy(self.wires[3])
+                if damage == "outside_frozen_member":
+                    pools["strong_security_ids"].append("SH600999")
+                    pools["counts"]["strong"] = 2
+                else:
+                    decision = pools["decisions"][0 if damage == "missing_selected_decision" else 1]
+                    decision["decision"] = "not_qualified" if damage == "missing_selected_decision" else "selected"
+                    decision["decision_hash"] = self.module._serialize_payload({
+                        key: value for key, value in decision.items() if key != "decision_hash"})[1]
+                pools["batch_hash"] = self.module._serialize_payload({
+                    key: value for key, value in pools.items() if key != "batch_hash"})[1]
+                raw, digest = self.module._serialize_payload(pools)
+                self.connection.execute("SAVEPOINT pool_damage")
+                try:
+                    self.connection.execute("UPDATE formal_final_artifact SET payload_json=?,artifact_hash=? "
+                        "WHERE artifact_kind='pool_selection_batch'", (raw, digest))
+                    artifacts = {row["artifact_kind"]: dict(row) for row in self.connection.execute(
+                        "SELECT * FROM formal_final_artifact")}
+                    header = dict(self.connection.execute("SELECT * FROM formal_final_run").fetchone())
+                    self.connection.execute("UPDATE formal_final_run SET result_hash=?",
+                        (self.module._result_hash(header, artifacts),))
+                    with self.assertRaises(ValueError):
+                        self.read()
+                finally:
+                    self.connection.execute("ROLLBACK TO pool_damage")
+                    self.connection.execute("RELEASE pool_damage")
+
     def test_qualified_canonical_decimal_boundary_preserves_exact_values(self):
         from ashare_pipeline.formal_pool import _detach_eligibility_rows, _select_detached_rows
         rows = _detach_eligibility_rows(self.wires[2]["eligibilities"])

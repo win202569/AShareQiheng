@@ -14,6 +14,35 @@ from tests.test_formal_final_migration import TABLES
 
 
 class FormalFinalAuthorityBoundaryTests(unittest.TestCase):
+    def test_replaced_frame_provider_cannot_authenticate_prepare_or_controls(self):
+        import ashare_pipeline.formal_final_publication as publication
+        import ashare_pipeline.formal_final_repository as module
+        from ashare_pipeline.state_store import StateStore
+        from pathlib import Path
+        from types import SimpleNamespace
+        import tempfile
+
+        class ProducerTripwire:
+            def require_verified(self):
+                raise AssertionError("forged frame reached producer authority")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "frame.sqlite")
+            store.initialize()
+            repository = module.FormalFinalRunRepository(store, code_version="frame-attack-test")
+            forged_frame = SimpleNamespace(f_code=type(repository).commit_complete_run.__code__,
+                f_locals={"self": repository}, f_back=None)
+            batches = {name: ProducerTripwire() for name in (
+                "input_batch", "score_batch", "eligibility_batch", "pool_batch")}
+            with patch.object(publication, "_getframe", lambda depth=0: forged_frame):
+                for path, call in (
+                    ("prepare", lambda: module._prepare_publication(**batches)),
+                    ("take_controls", lambda: module._publication_controls(object())),
+                ):
+                    with self.subTest(path=path), self.assertRaisesRegex(ValueError,
+                            "frame authority|authenticated repository writer"):
+                        call()
+
     def test_exported_coordinator_has_no_publication_authority(self):
         from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
         class Tripwire:
@@ -169,6 +198,27 @@ class FormalFinalAtomicityContractTests(unittest.TestCase):
         original = self.fixture.store._connect
         with patch.object(module, "_prepare_publication", capture), patch.object(module,
                 "_writer_connection", lambda store: FaultConnection(original(), before_commit=observe)):
+            receipt = self.repository.commit_complete_run(**self.batches)
+        for proof in receipt.batches:
+            proof.require_verified()
+
+    def test_replaced_frame_provider_cannot_take_a_real_pending_publication(self):
+        import ashare_pipeline.formal_final_publication as publication
+        import ashare_pipeline.formal_final_repository as module
+        from types import SimpleNamespace
+        prepare = module._prepare_publication
+        forged_frame = SimpleNamespace(f_code=type(self.repository).commit_complete_run.__code__,
+            f_locals={"self": self.repository}, f_back=None)
+        def capture(**kwargs):
+            prepared = prepare(**kwargs)
+            with patch.object(publication, "_getframe", lambda depth=0: forged_frame):
+                with self.assertRaisesRegex(ValueError, "frame authority|authenticated repository writer"):
+                    module._publication_controls(prepared)
+            for proof in prepared.batches + prepared.children:
+                with self.assertRaises(ValueError):
+                    proof.require_verified()
+            return prepared
+        with patch.object(module, "_prepare_publication", capture):
             receipt = self.repository.commit_complete_run(**self.batches)
         for proof in receipt.batches:
             proof.require_verified()

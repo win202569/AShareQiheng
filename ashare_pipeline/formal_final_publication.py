@@ -12,12 +12,19 @@ from sys import _getframe
 def _install_authority():
     preparing, controls, repositories = {}, {}, {}
     writer_binding = []
+    owner, frame_authority, reference_authority = globals(), _getframe, _reference
+
+    def require_runtime_authority():
+        if (owner.get("_getframe") is not frame_authority
+                or owner.get("_reference") is not reference_authority):
+            raise ValueError("publication frame authority dependency changed")
 
     def writer_owner(*, direct=False):
+        require_runtime_authority()
         if not writer_binding:
             raise ValueError("publication requires the authenticated repository writer")
         repository_type, writer, initializer = writer_binding[0]
-        frame = _getframe(2)
+        frame = frame_authority(2)
         while frame is not None:
             if frame.f_code is writer.__code__:
                 repository = frame.f_locals.get("self")
@@ -128,7 +135,7 @@ def _install_authority():
 
             interfaces = ((PreparedPublication, tuple(vars(PreparedPublication).items())),)
             result = object.__new__(PreparedPublication)
-            owner[0] = _reference(result)
+            owner[0] = reference_authority(result)
 
             def recheck(connection=None):
                 authentic(result)
@@ -171,18 +178,20 @@ def _install_authority():
         return saved[2]
 
     def bind(repository_type):
-        frame = _getframe(1)
+        require_runtime_authority()
+        frame = frame_authority(1)
         if (writer_binding or frame.f_globals.get("__name__") != "ashare_pipeline.formal_final_repository"
                 or frame.f_globals.get("FormalFinalRunRepository") is not repository_type):
             raise ValueError("publication authority binds only the repository module")
         writer_binding.append((repository_type, repository_type.commit_complete_run, repository_type.__init__))
 
         def register(repository):
+            require_runtime_authority()
             if (type(repository) is not repository_type
-                    or _getframe(1).f_code is not writer_binding[0][2].__code__):
+                    or frame_authority(1).f_code is not writer_binding[0][2].__code__):
                 raise ValueError("publication requires an initialized repository")
             key = id(repository)
-            repositories[key] = _reference(repository, lambda _: repositories.pop(key, None))
+            repositories[key] = reference_authority(repository, lambda _: repositories.pop(key, None))
         return prepare, take_controls, register
 
     return claim, FormalFinalPublicationCoordinator, bind
