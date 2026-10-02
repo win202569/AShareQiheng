@@ -258,14 +258,28 @@ def _derive_plan(*, prior_inputs, current_inputs, prior_coverage, current_covera
     current_aggregates = {row["source_id"]: row["source_hash"] for row in current_dependencies
         if row["security_id"] is None and _aggregate_key(row["source_kind"])
         and row["source_kind"] != "batch_hash"}
-    # Stage C seals include both base and policy batches, even when their
-    # changes do not affect numeric V inputs (for example a policy cap).
-    if localized_sources & {"base", "policy"}:
-        localized_sources.add("valuation")
+    # A visible difference proves only that *some* source evidence changed.
+    # D1's authenticated ready contract retains all 22 base and three Stage C
+    # slots. Pending rows can omit original metrics and adjusted inputs, so
+    # neither their own nor a downstream aggregate can be fully attributed
+    # to the visible differences. Require completeness on BOTH sides before
+    # using any family-local diff as an explanation of a whole-batch seal.
+    complete_population = bool(old) and set(old) == set(new) and all(
+        row.get("status") == "ready" and bool(row.get("slots"))
+        for members in (old, new) for row in members.values())
+    localized_aggregates = localized_sources.copy() if complete_population else set()
+    # Stage C seals include both base and policy batches, even when complete
+    # retained V inputs show no numeric change (for example a policy cap).
+    if localized_aggregates & {"base", "policy"}:
+        localized_aggregates.add("valuation")
+    aggregate_sources = {"batch." + source + suffix: source
+        for source in ("base", "policy", "valuation")
+        for suffix in ("_batch_hash", "_batch_canonical_sha256")}
     for path in previous_aggregates.keys() | current_aggregates.keys():
         if previous_aggregates.get(path) != current_aggregates.get(path):
-            source = path.removeprefix("batch.").split("_", 1)[0]
-            if source not in localized_sources:
+            # Prefix similarity is not provenance: an unknown/nested batch
+            # source is not covered by a known source's retained evidence.
+            if aggregate_sources.get(path) not in localized_aggregates:
                 global_change("unlocalizable_upstream_change")
     if full:
         d1.update(new)

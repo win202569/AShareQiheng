@@ -189,6 +189,66 @@ class FormalInvalidationScopeTests(unittest.TestCase):
         self.assertTrue(plan.full_rebuild)
         self.assertIn("unlocalizable_upstream_change", plan.reason_codes)
 
+    def test_local_base_change_cannot_hide_omitted_pending_base_evidence(self):
+        self.old["inputs"][2].update(status="pending_evidence", slots={})
+        self.new = copy.deepcopy(self.old)
+        self.new["inputs"][0]["consensus_context"]["content_sha256"] = "visible-correction"
+        self.new["base_batch_hash"] = "visible-and-hidden-corrections"
+        plan = self.plan()
+        self.assertTrue(plan.full_rebuild)
+        self.assertEqual(plan.direct_security_ids, IDS[:1])
+        self.assertEqual(plan.d1_rebuild_ids, IDS)
+        self.assertEqual(plan.d2_rebuild_ids, IDS)
+        self.assertEqual(plan.eligibility_rebuild_ids, IDS)
+        self.assertIn("unlocalizable_upstream_change", plan.reason_codes)
+
+    def test_local_cap_cannot_hide_omitted_pending_valuation_evidence(self):
+        self.old["inputs"][2].update(status="pending_evidence", slots={})
+        self.new = copy.deepcopy(self.old)
+        self.new["inputs"][0]["policy_result"]["dimension_caps"] = {"T": "55"}
+        self.new["policy_batch_hash"] = "visible-cap"
+        self.new["valuation_batch_hash"] = "cap-and-hidden-valuation-correction"
+        plan = self.plan()
+        self.assertTrue(plan.full_rebuild)
+        self.assertEqual(plan.direct_security_ids, IDS[:1])
+        self.assertEqual(plan.d1_rebuild_ids, IDS)
+        self.assertEqual(plan.d2_rebuild_ids, IDS)
+        self.assertEqual(plan.eligibility_rebuild_ids, IDS)
+        self.assertIn("unlocalizable_upstream_change", plan.reason_codes)
+
+    def test_aggregate_localization_requires_exact_known_source_path(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                self.old, self.coverage, self.identity = manifests()
+                target = self.old.setdefault("base_extra", {}) if nested else self.old
+                key = "base_batch_hash" if nested else "base_extra_batch_hash"
+                target[key] = "old-opaque-source"
+                self.new = copy.deepcopy(self.old)
+                target = self.new["base_extra"] if nested else self.new
+                target[key] = "new-opaque-source"
+                self.new["inputs"][0]["consensus_context"]["content_sha256"] = "visible-correction"
+                plan = self.plan()
+                self.assertTrue(plan.full_rebuild)
+                self.assertIn("unlocalizable_upstream_change", plan.reason_codes)
+
+    def test_complete_retained_evidence_localizes_cap_and_downstream_valuation_seals(self):
+        self.new["inputs"][0]["policy_result"]["dimension_caps"] = {"T": "55"}
+        for family in ("policy", "valuation"):
+            for suffix in ("_batch_hash", "_batch_canonical_sha256"):
+                key = family + suffix
+                self.old[key] = "old-" + key
+                self.new[key] = "corrected-" + key
+                for row in self.old["inputs"]:
+                    row[key] = self.old[key]
+                for row in self.new["inputs"]:
+                    row[key] = self.new[key]
+        plan = self.plan()
+        self.assertFalse(plan.full_rebuild)
+        self.assertEqual(plan.d1_rebuild_ids, IDS[:1])
+        self.assertEqual(plan.d2_rebuild_ids, IDS[:1])
+        self.assertEqual(plan.eligibility_rebuild_ids, IDS[:1])
+        self.assertEqual(plan.cohort_keys, ())
+
     def test_nested_industry_manifest_change_forces_full_rebuild(self):
         self.old["inputs"][0]["slots"][VMID]["valuation_input"]["industry_batch_hash"] = "old-industry"
         self.new = copy.deepcopy(self.old)
