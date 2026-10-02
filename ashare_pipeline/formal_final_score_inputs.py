@@ -5,14 +5,17 @@ entries; identity mismatches abort the whole publication.
 """
 
 import hashlib
+import inspect
 import json
 import weakref
+from contextlib import closing, contextmanager
 from types import MappingProxyType
 
 from .formal_final_publication import _claim_preparation
 
 from . import formal_metric_engine as metric_engine
-from .formal_metric_batch_guard import _metric_batch_guard
+from .formal_metric_batch_guard import _metric_batch_guard, FormalMetricCurrentInputProvider
+from .state_store import StateStore
 from .formal_metric_engine import _canonical, _digest, _freeze
 from .formal_policy_registry import FormalPolicyRegistry
 from .formal_policy_repository import FormalPolicyRepository, VerifiedPolicyResultBatch, PolicyResult
@@ -25,6 +28,70 @@ from .formal_valuation_engine import (
     PolicyAdjustedValuationScore, PolicyAdjustedValuationPeerContext,
     build_valuation_peer_context, score_valuation_percentile,
 )
+
+
+def _install_source_checkpoint():
+    # Capture the existing provider's authentication authority, not a caller's
+    # replaceable accessor. Like D3's D2 ownership check, no new mint is exposed.
+    require = inspect.getclosurevars(FormalMetricCurrentInputProvider.resolve_current_inputs).nonlocals["require"]
+    connect = StateStore._connect
+
+    def source_digest(connection):
+        digest = hashlib.sha256()
+        for name, ddl in connection.execute("SELECT name,sql FROM sqlite_master WHERE type='table' ORDER BY name"):
+            if name.startswith(("formal_final_", "sqlite_")):
+                continue
+            quoted = '"' + name.replace('"', '""') + '"'
+            # Content, not data_version: our own append-only Stage D history is
+            # deliberately excluded. Conservative unrelated-source changes fail
+            # closed; no expensive metric/policy/valuation calculations repeat.
+            rows = sorted(repr(tuple(row)) for row in connection.execute("SELECT * FROM " + quoted))
+            digest.update(repr((name, ddl, rows)).encode())
+        return digest.digest()
+
+    def capture(store, provider):
+        owned = require(provider, store)
+        with owned["lock"], closing(connect(store)) as connection:
+            epoch = owned["epoch"]
+            connection.execute("BEGIN")
+            baseline = source_digest(connection)
+        class Checkpoint:
+            __slots__ = ()
+
+            def recheck(self, connection=None):
+                with owned["lock"]:
+                    if require(provider, store) is not owned or owned["epoch"] != epoch:
+                        raise ValueError("final current-source provider changed")
+                    if connection is None:
+                        with closing(connect(store)) as current:
+                            current.execute("BEGIN")
+                            actual = source_digest(current)
+                    else:
+                        database = connection.execute("PRAGMA database_list").fetchone()[2]
+                        from pathlib import Path
+                        if Path(database).resolve() != Path(store.db_path).resolve():
+                            raise ValueError("final current-source transaction owner differs")
+                        actual = source_digest(connection)
+                    if actual != baseline:
+                        raise ValueError("final current-source database evidence changed")
+
+            @contextmanager
+            def hold(self):
+                with owned["lock"]:
+                    self.recheck()
+                    if owned["finalizing"]:
+                        raise ValueError("final current-source provider is already finalizing")
+                    owned["finalizing"] = True
+                    try:
+                        yield
+                    finally:
+                        owned["finalizing"] = False
+        return Checkpoint()
+    return capture
+
+
+_current_source_checkpoint = _install_source_checkpoint()
+del _install_source_checkpoint
 
 
 def _install_final_inputs():
@@ -368,7 +435,8 @@ def _install_final_inputs():
                         security_ids=ids, inputs=rows)
                     payload["batch_hash"] = digest(payload)
                     # Keep genuine source chains alive, including Stage C's repository owner.
-                    retention = (self, sources, tuple(derived))
+                    checkpoint = [None]
+                    retention = (self, sources, tuple(derived), checkpoint)
                     children = tuple(mint(PolicyAdjustedScoreInput,
                         dict(row, batch_hash=payload["batch_hash"]), publication, retention) for row in rows)
                     index = MappingProxyType(dict(zip(ids, children, strict=True)))
@@ -392,6 +460,7 @@ def _install_final_inputs():
                                     batch_hash=payload["batch_hash"]))
                                     for child, row in zip(children, rows, strict=True))):
                             raise ValueError("final score prepared canonical bytes changed")
+                        checkpoint[0] = _current_source_checkpoint(feature._store, feature._current_input_provider)
                         publication[0] = True
                         return prepared
 
@@ -425,16 +494,19 @@ def _install_final_inputs():
         prepared_gates[id(result)] = gate
         prepared_origins[id(result)] = source
         source_bytes = verify_sources(retention[1])
+        checkpoint = retention[3][0]
+        checkpoint.recheck()
 
-        def recheck():
+        def recheck(connection=None):
             record(source, PolicyAdjustedScoreInputBatch)
             dependencies(retention[0])
             if verify_sources(retention[1]) != source_bytes:
                 raise ValueError("final input dependencies changed before commit")
             for proof in retention[2]:
                 proof.require_verified()
+            checkpoint.recheck(connection)
 
-        return result, MappingProxyType(index), recheck
+        return result, MappingProxyType(index), recheck, checkpoint.hold
 
     own_members = tuple((cls, tuple(vars(cls).items())) for cls in
         (Proof, PolicyAdjustedScoreInput, PolicyAdjustedScoreInputBatch, FormalFinalScoreInputRepository))

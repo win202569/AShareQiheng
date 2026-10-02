@@ -13,6 +13,53 @@ from tests.test_formal_final_repository import minimal_batches
 from tests.test_formal_final_migration import TABLES
 
 
+class FormalFinalAuthorityBoundaryTests(unittest.TestCase):
+    def test_exported_coordinator_has_no_publication_authority(self):
+        from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
+        class Tripwire:
+            def require_verified(self):
+                raise AssertionError("caller reached producer authority")
+        with self.assertRaisesRegex((ValueError, TypeError), "repository"):
+            FormalFinalPublicationCoordinator.prepare(input_batch=Tripwire(), score_batch=Tripwire(),
+                eligibility_batch=Tripwire(), pool_batch=Tripwire())
+
+    def test_source_checkpoint_detects_real_database_and_provider_changes(self):
+        from ashare_pipeline.formal_final_score_inputs import _current_source_checkpoint
+        from ashare_pipeline.formal_metric_batch_guard import FormalMetricCurrentInputProvider
+        from ashare_pipeline.formal_feature_repository import FormalFeatureCurrentInput
+        from ashare_pipeline.state_store import StateStore
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "source.sqlite")
+            store.initialize()
+            provider = FormalMetricCurrentInputProvider(store)
+            with closing(store._connect()) as connection:
+                connection.execute("CREATE TABLE source_evidence(id TEXT PRIMARY KEY,value TEXT)")
+                connection.execute("INSERT INTO source_evidence VALUES('fact','original')")
+                connection.commit()
+            checkpoint = _current_source_checkpoint(store, provider)
+            with closing(store._connect()) as connection:
+                connection.execute("UPDATE source_evidence SET value='corrected'")
+                connection.commit()
+                connection.execute("BEGIN IMMEDIATE")
+                with self.assertRaisesRegex(ValueError, "source"):
+                    checkpoint.recheck(connection)
+                connection.rollback()
+            checkpoint = _current_source_checkpoint(store, provider)
+            snapshot = FormalFeatureCurrentInput("SH600000", "2026-08-31T07:00:00+00:00",
+                "general_nonfinancial", "a" * 64, "corrected-provider", (), (), True)
+            provider.publish(snapshot)
+            with self.assertRaisesRegex(ValueError, "provider"):
+                checkpoint.recheck()
+            checkpoint = _current_source_checkpoint(store, provider)
+            with checkpoint.hold():
+                with self.assertRaisesRegex(ValueError, "finalization"):
+                    provider.publish(snapshot)
+                with self.assertRaisesRegex(ValueError, "provider"):
+                    checkpoint.recheck()
+
+
 class FaultConnection:
     def __init__(self, connection, fail_table=None, before_commit=None):
         self.connection = connection
@@ -56,18 +103,17 @@ class FormalFinalAtomicityContractTests(unittest.TestCase):
 
     def test_every_commit_failure_leaves_zero_stage_d_rows_and_revokes_children(self):
         import ashare_pipeline.formal_final_repository as module
-        from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
         original = self.fixture.store._connect
         for table in TABLES:
             before = self.counts()
             captured = []
-            prepare = FormalFinalPublicationCoordinator.prepare
+            prepare = module._prepare_publication
             def capture(*args, **kwargs):
                 result = prepare(*args, **kwargs)
                 captured.append(result)
                 return result
             with self.subTest(table=table), patch.object(module, "_prepare_publication", capture), patch.object(
-                    self.fixture.store, "_connect", lambda: FaultConnection(original(), fail_table=table)):
+                    module, "_writer_connection", lambda store: FaultConnection(original(), fail_table=table)):
                 with self.assertRaisesRegex(RuntimeError, "injected table failure"):
                     self.repository.commit_complete_run(**self.batches)
             self.assertEqual(self.counts(), before)
@@ -98,7 +144,7 @@ class FormalFinalAtomicityContractTests(unittest.TestCase):
         original = self.fixture.store._connect
         def fail():
             raise sqlite3.OperationalError("injected commit")
-        with patch.object(self.fixture.store, "_connect", lambda: FaultConnection(original(), before_commit=fail)):
+        with patch.object(module, "_writer_connection", lambda store: FaultConnection(original(), before_commit=fail)):
             with self.assertRaisesRegex(sqlite3.OperationalError, "injected commit"):
                 self.repository.commit_complete_run(**self.batches)
         self.assertEqual(self.counts(), before)
@@ -112,40 +158,60 @@ class FormalFinalAtomicityContractTests(unittest.TestCase):
             captured.append(result)
             return result
         def observe():
+            for name in ("prevalidate_commit", "arm", "mark_committed", "revoke"):
+                self.assertFalse(hasattr(captured[0], name))
+            # Even a callback inside the writer stack cannot take its capability.
+            with self.assertRaisesRegex(ValueError, "repository"):
+                module._publication_controls(captured[0])
             for proof in captured[0].batches + captured[0].children:
                 with self.assertRaises(ValueError):
                     proof.require_verified()
         original = self.fixture.store._connect
-        with patch.object(module, "_prepare_publication", capture), patch.object(self.fixture.store,
-                "_connect", lambda: FaultConnection(original(), before_commit=observe)):
+        with patch.object(module, "_prepare_publication", capture), patch.object(module,
+                "_writer_connection", lambda store: FaultConnection(original(), before_commit=observe)):
             receipt = self.repository.commit_complete_run(**self.batches)
         for proof in receipt.batches:
             proof.require_verified()
 
     def test_post_commit_mark_committed_is_prevalidated_and_cannot_fail(self):
-        from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
-        coordinator = FormalFinalPublicationCoordinator.prepare(**{
-            key: self.batches[key] for key in ("input_batch", "score_batch", "eligibility_batch", "pool_batch")})
-        coordinator.prevalidate_commit()
-        coordinator.arm()
+        import ashare_pipeline.formal_final_repository as module
+        prepared = self.capture_aborted_preparation()
+        for name in ("prevalidate_commit", "arm", "mark_committed", "revoke", "recheck"):
+            self.assertFalse(hasattr(prepared, name))
+        with self.assertRaisesRegex(ValueError, "repository"):
+            module._publication_controls(prepared)
+        with self.assertRaisesRegex(ValueError, "repository"):
+            module._prepare_publication(**{key: self.batches[key] for key in (
+                "input_batch", "score_batch", "eligibility_batch", "pool_batch")})
         # No source recheck, JSON, hashing, SQL or minting belongs to the flip.
+        # Inspect code, never obtain a usable flip capability.
         import dis
-        instructions = list(dis.get_instructions(type(coordinator).mark_committed))
+        from types import CodeType
+        flip = next(code for code in module._prepare_publication.__code__.co_consts
+            if isinstance(code, CodeType) and code.co_name == "mark_committed")
+        instructions = list(dis.get_instructions(flip))
         self.assertFalse(any("CALL" in item.opname or "BUILD" in item.opname or "RAISE" in item.opname
             for item in instructions))
-        coordinator.mark_committed()
-        for proof in coordinator.batches:
-            proof.require_verified()
-        coordinator.revoke()
-        coordinator.mark_committed()  # A retained flip cannot resurrect revoked children.
-        for proof in coordinator.batches:
+        for proof in prepared.batches:
             with self.assertRaises(ValueError):
                 proof.require_verified()
 
+    def capture_aborted_preparation(self):
+        import ashare_pipeline.formal_final_repository as module
+        captured, prepare = [], module._prepare_publication
+        def capture(**kwargs):
+            result = prepare(**kwargs)
+            captured.append(result)
+            return result
+        with patch.object(module, "_prepare_publication", capture), patch.object(
+                module, "_writer_connection", side_effect=RuntimeError("abort prepared")):
+            with self.assertRaisesRegex(RuntimeError, "abort prepared"):
+                self.repository.commit_complete_run(**self.batches)
+        return captured[0]
+
     def test_prepared_adapters_reject_constructor_copy_pickle_and_method_replacement(self):
         from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
-        prepared = FormalFinalPublicationCoordinator.prepare(**{
-            key: self.batches[key] for key in ("input_batch", "score_batch", "eligibility_batch", "pool_batch")})
+        prepared = self.capture_aborted_preparation()
         for proof in prepared.batches:
             cls = type(proof)
             with self.assertRaises(TypeError):
@@ -161,18 +227,14 @@ class FormalFinalAtomicityContractTests(unittest.TestCase):
             FormalFinalPublicationCoordinator()
         with self.assertRaises(TypeError):
             setattr(type(prepared), "mark_committed", lambda self: None)
-        prepared.revoke()
 
     def test_weak_reference_redirect_does_not_authenticate_forgery(self):
-        from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
         source = self.batches["input_batch"]
         with patch.object(weakref, "ref", lambda item, *args: lambda: source):
             # Stage C captures weakref's original authority and deliberately
             # rejects this environment change during final source revalidation.
             with self.assertRaises(ValueError):
-                FormalFinalPublicationCoordinator.prepare(**{
-                    key: self.batches[key] for key in (
-                        "input_batch", "score_batch", "eligibility_batch", "pool_batch")})
+                self.repository.commit_complete_run(**self.batches)
         for proof in tuple(self.batches[key] for key in (
                 "input_batch", "score_batch", "eligibility_batch", "pool_batch")):
             proof.require_verified()
@@ -249,22 +311,21 @@ class FormalFinalAtomicityContractTests(unittest.TestCase):
         self.assertEqual(self.counts(), before)
 
     def test_connection_cleanup_cannot_revoke_a_durable_commit(self):
+        import ashare_pipeline.formal_final_repository as module
         original = self.fixture.store._connect
         class CleanupFailure(FaultConnection):
             def close(self):
                 self.connection.close()
                 if self.writing:
                     raise RuntimeError("injected cleanup")
-        with patch.object(self.fixture.store, "_connect", lambda: CleanupFailure(original())):
+        with patch.object(module, "_writer_connection", lambda store: CleanupFailure(original())):
             receipt = self.repository.commit_complete_run(**self.batches)
         self.assertIsNotNone(self.repository.get_run(receipt.run_id))
         for proof in receipt.batches:
             proof.require_verified()
 
     def test_replaced_verification_method_cannot_open_an_unpublished_proof(self):
-        from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
-        prepared = FormalFinalPublicationCoordinator.prepare(**{
-            key: self.batches[key] for key in ("input_batch", "score_batch", "eligibility_batch", "pool_batch")})
+        prepared = self.capture_aborted_preparation()
         for proof in prepared.batches:
             base = type(proof).__mro__[1]
             original = vars(base)["require_verified"]
@@ -274,7 +335,6 @@ class FormalFinalAtomicityContractTests(unittest.TestCase):
                     proof.require_verified()
             finally:
                 type.__setattr__(base, "require_verified", original)
-        prepared.revoke()
 
     def test_adapter_method_replacement_fails_closed_before_write(self):
         from ashare_pipeline import formal_final_score_inputs, formal_final_scoring
@@ -288,3 +348,53 @@ class FormalFinalAtomicityContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.repository.commit_complete_run(**self.batches)
             self.assertEqual(self.counts(), before)
+
+    def test_zz_real_source_correction_and_provider_change_after_preparation_abort(self):
+        import ashare_pipeline.formal_final_repository as module
+        from dataclasses import replace
+        before = self.counts()
+        prepare = module._prepare_publication
+        captured = []
+        with closing(self.fixture.store._connect()) as connection:
+            row = connection.execute("SELECT id,content_sha256 FROM formal_source_snapshot LIMIT 1").fetchone()
+        self.assertIsNotNone(row)
+
+        def corrected_source(**kwargs):
+            publication = prepare(**kwargs)
+            captured.append(publication)
+            with closing(self.fixture.store._connect()) as connection:
+                connection.execute("UPDATE formal_source_snapshot SET content_sha256=? WHERE id=?",
+                    ("e" * 64, row["id"]))
+                connection.commit()
+            return publication
+        try:
+            with patch.object(module, "_prepare_publication", corrected_source):
+                with self.assertRaisesRegex(ValueError, "current-source"):
+                    self.repository.commit_complete_run(**self.batches)
+        finally:
+            with closing(self.fixture.store._connect()) as connection:
+                connection.execute("UPDATE formal_source_snapshot SET content_sha256=? WHERE id=?",
+                    (row["content_sha256"], row["id"]))
+                connection.commit()
+        self.assertEqual(self.counts(), before)
+        for proof in captured.pop().batches:
+            with self.assertRaises(ValueError):
+                proof.require_verified()
+
+        def changed_provider(**kwargs):
+            publication = prepare(**kwargs)
+            captured.append(publication)
+            sid = next(iter(self.fixture.templates))
+            snapshot = self.fixture.provider.resolve_current_inputs(security_id=sid,
+                as_of_utc=self.batches["input_batch"].as_of_utc,
+                template_id=self.fixture.templates[sid],
+                registry_manifest_hash=self.batches["input_batch"].registry_manifest_hash)
+            self.fixture.provider.publish(replace(snapshot, batch_id="post-preparation-correction"))
+            return publication
+        with patch.object(module, "_prepare_publication", changed_provider):
+            with self.assertRaisesRegex(ValueError, "current-source provider"):
+                self.repository.commit_complete_run(**self.batches)
+        self.assertEqual(self.counts(), before)
+        for proof in captured.pop().batches:
+            with self.assertRaises(ValueError):
+                proof.require_verified()

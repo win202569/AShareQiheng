@@ -6,10 +6,31 @@ The post-commit method contains only the prevalidated shared-state assignment.
 """
 
 from weakref import ref as _reference
+from sys import _getframe
 
 
 def _install_authority():
-    preparing = {}
+    preparing, controls, repositories = {}, {}, {}
+    writer_binding = []
+
+    def writer_owner(*, direct=False):
+        if not writer_binding:
+            raise ValueError("publication requires the authenticated repository writer")
+        repository_type, writer, initializer = writer_binding[0]
+        frame = _getframe(2)
+        while frame is not None:
+            if frame.f_code is writer.__code__:
+                repository = frame.f_locals.get("self")
+                saved = repositories.get(id(repository))
+                if (type(repository) is repository_type and saved is not None and saved() is repository
+                        and repository_type.commit_complete_run is writer
+                        and repository_type.__init__ is initializer):
+                    return repository
+                break
+            if direct:
+                break
+            frame = frame.f_back
+        raise ValueError("publication requires the authenticated repository writer")
 
     def claim(capability, source, stage):
         saved = preparing.get(id(capability))
@@ -32,6 +53,10 @@ def _install_authority():
 
         @staticmethod
         def prepare(*, input_batch, score_batch, eligibility_batch, pool_batch):
+            raise ValueError("publication is private to the authenticated repository writer")
+
+    def prepare(*, input_batch, score_batch, eligibility_batch, pool_batch):
+            repository = writer_owner()
             # Imports are intentionally deferred: each producer captures claim
             # at installation without importing the other Stage D producers.
             from .formal_final_score_inputs import _prepare_final_inputs
@@ -51,7 +76,7 @@ def _install_authority():
             preparing[id(capability)] = (capability, dict(zip(
                 ("inputs", "scores", "eligibility", "pools"), sources)), gate, set())
             try:
-                inputs, input_rows, source_recheck = _prepare_final_inputs(input_batch, capability)
+                inputs, input_rows, source_recheck, source_hold = _prepare_final_inputs(input_batch, capability)
                 scores, cards = _prepare_final_scores(score_batch, inputs, input_rows, capability,
                     source_input=input_batch)
                 eligibility, eligibility_rows = _prepare_final_eligibility(eligibility_batch,
@@ -92,34 +117,6 @@ def _install_authority():
                 def children(self):
                     return children
 
-                def recheck(self):
-                    if state[0] == 3:
-                        raise ValueError("publication was revoked")
-                    source_recheck()
-                    for source, raw in zip(sources, source_bytes, strict=True):
-                        source.require_verified()
-                        if source.canonical_bytes() != raw:
-                            raise ValueError("publication source changed")
-
-                def prevalidate_commit(self):
-                    if state[0] != 0:
-                        raise ValueError("publication commit is not preparable")
-                    self.recheck()
-                    prevalidated[0] = True
-
-                def arm(self):
-                    if state[0] != 0 or not prevalidated[0]:
-                        raise ValueError("publication cannot be armed")
-                    state[0] = 1
-                    armed[0] = True
-
-                def mark_committed(self):
-                    state[0] = 2
-
-                def revoke(self):
-                    revoked[0] = True
-                    state[0] = 3
-
                 def __copy__(self):
                     raise TypeError("publication cannot be copied")
 
@@ -132,12 +129,66 @@ def _install_authority():
             interfaces = ((PreparedPublication, tuple(vars(PreparedPublication).items())),)
             result = object.__new__(PreparedPublication)
             owner[0] = _reference(result)
+
+            def recheck(connection=None):
+                authentic(result)
+                if state[0] == 3:
+                    raise ValueError("publication was revoked")
+                source_recheck(connection)
+                for source, raw in zip(sources, source_bytes, strict=True):
+                    source.require_verified()
+                    if source.canonical_bytes() != raw:
+                        raise ValueError("publication source changed")
+
+            def prevalidate_commit():
+                if state[0] != 0:
+                    raise ValueError("publication commit is not preparable")
+                recheck()
+                prevalidated[0] = True
+
+            def arm():
+                if state[0] != 0 or not prevalidated[0]:
+                    raise ValueError("publication cannot be armed")
+                state[0] = 1
+                armed[0] = True
+
+            def mark_committed():
+                state[0] = 2
+
+            def revoke():
+                revoked[0] = True
+                state[0] = 3
+
+            controls[id(result)] = (result, repository,
+                (recheck, prevalidate_commit, arm, mark_committed, revoke, source_hold))
             return result
 
-    return claim, FormalFinalPublicationCoordinator
+    def take_controls(publication):
+        repository = writer_owner(direct=True)
+        saved = controls.pop(id(publication), None)
+        if saved is None or saved[0] is not publication or saved[1] is not repository:
+            raise ValueError("publication has no repository-owned capability")
+        return saved[2]
+
+    def bind(repository_type):
+        frame = _getframe(1)
+        if (writer_binding or frame.f_globals.get("__name__") != "ashare_pipeline.formal_final_repository"
+                or frame.f_globals.get("FormalFinalRunRepository") is not repository_type):
+            raise ValueError("publication authority binds only the repository module")
+        writer_binding.append((repository_type, repository_type.commit_complete_run, repository_type.__init__))
+
+        def register(repository):
+            if (type(repository) is not repository_type
+                    or _getframe(1).f_code is not writer_binding[0][2].__code__):
+                raise ValueError("publication requires an initialized repository")
+            key = id(repository)
+            repositories[key] = _reference(repository, lambda _: repositories.pop(key, None))
+        return prepare, take_controls, register
+
+    return claim, FormalFinalPublicationCoordinator, bind
 
 
-_claim_preparation, FormalFinalPublicationCoordinator = _install_authority()
+_claim_preparation, FormalFinalPublicationCoordinator, _bind_repository_writer = _install_authority()
 del _install_authority
 
 __all__ = ["FormalFinalPublicationCoordinator"]

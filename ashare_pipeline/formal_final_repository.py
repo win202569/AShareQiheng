@@ -11,7 +11,7 @@ from types import MappingProxyType
 from uuid import uuid4
 
 from .formal_coverage_manifest import VerifiedCoverageManifest
-from .formal_final_publication import FormalFinalPublicationCoordinator
+from .formal_final_publication import _bind_repository_writer
 from .formal_final_score_inputs import PolicyAdjustedScoreInputBatch
 from .formal_final_scoring import FinalScoreCardBatch
 from .formal_final_eligibility import FormalEligibilityBatch, _validate_scorecard_coverage
@@ -28,7 +28,6 @@ _TABLES = ("formal_final_run", "formal_final_artifact", "formal_final_input",
     "formal_final_pool_decision", "formal_final_dependency")
 _BATCH_TYPES = (PolicyAdjustedScoreInputBatch, FinalScoreCardBatch,
     FormalEligibilityBatch, PoolSelectionBatch)
-_prepare_publication = FormalFinalPublicationCoordinator.prepare
 
 
 def _json_value(value):
@@ -138,7 +137,7 @@ def _coverage_identity(coverage, wire, ids, mode):
 
 
 def _recheck_sources(store, coverage, batches, mode, publication, connection):
-    publication.recheck()
+    publication(connection)
     inputs = batches[0].to_dict()
     ids = tuple(inputs["security_ids"])
     _coverage_identity(coverage, inputs, ids, mode)
@@ -160,7 +159,11 @@ def _recheck_sources(store, coverage, batches, mode, publication, connection):
 
 
 def _arm_publication(publication):
-    publication.arm()
+    publication()
+
+
+def _writer_connection(store):
+    return store._connect()
 
 
 def _payload_columns(payload):
@@ -306,6 +309,76 @@ def _result_hash(header, artifacts):
             for name, row in artifacts.items()}))[1]
 
 
+def _recover_expected(header, artifacts):
+    """Rebuild every stored projection from the five canonical authorities."""
+    by_kind = {item["artifact_kind"]: dict(item) for item in artifacts}
+    if len(artifacts) != 5 or set(by_kind) != set(ARTIFACT_KINDS):
+        raise ValueError("historical run artifact set is incomplete")
+    decoded = {}
+    for kind, item in by_kind.items():
+        payload = json.loads(item["payload_json"])
+        raw, digest = _serialize_payload(payload)
+        if raw != item["payload_json"] or digest != item["artifact_hash"]:
+            raise ValueError("historical artifact is not canonical or its hash differs")
+        decoded[kind] = payload
+
+    def sealed(payload, schema, key, prior=None):
+        unsigned = {k: v for k, v in payload.items() if k != key}
+        if prior is not None:
+            unsigned[key] = prior
+        if (type(payload) is not dict or payload.get("schema_version") != schema
+                or payload.get(key) != _serialize_payload(unsigned)[1]):
+            raise ValueError("historical artifact internal identity differs")
+
+    inputs, scores, eligibility, pools = tuple(decoded[name] for name in ARTIFACT_KINDS[1:])
+    for payload, schema, row_key, row_schema, hash_key in (
+        (inputs, "policy-adjusted-score-input-batch-v1", "inputs", "policy-adjusted-score-input-v1", "entry_hash"),
+        (scores, "formal-final-score-card-batch-v1", "cards", "formal-final-score-card-v1", "card_hash"),
+        (eligibility, "formal-eligibility-batch-v1", "eligibilities", "formal-eligibility-v1", "eligibility_hash"),
+        (pools, "formal-pool-batch-v1", "decisions", "formal-pool-decision-v1", "decision_hash"),
+    ):
+        # D2's released hash preimage carries D1's batch_hash in common
+        # provenance before assigning its own batch_hash. Preserve that contract.
+        sealed(payload, schema, "batch_hash", inputs["batch_hash"] if payload is scores else None)
+        for child in payload[row_key]:
+            sealed(child, row_schema, hash_key)
+    rows = _project_rows(header["run_id"], (inputs, scores, eligibility, pools))
+    input_map = {row["security_id"]: row for row in inputs["inputs"]}
+    card_map = {row["security_id"]: row for row in scores["cards"]}
+    eligible_map = {row["security_id"]: row for row in eligibility["eligibilities"]}
+    for sid, card in card_map.items():
+        if (card["source_entry_hash"] != input_map[sid]["entry_hash"]
+                or card["source_batch_hash"] != inputs["batch_hash"]):
+            raise ValueError("historical scorecard source identity differs")
+    for sid, item in eligible_map.items():
+        if (item["source_entry_hash"] != input_map[sid]["entry_hash"]
+                or item["source_batch_hash"] != inputs["batch_hash"]
+                or item["score_batch_hash"] != scores["batch_hash"]
+                or item["card_hash"] != card_map.get(sid, {}).get("card_hash")):
+            raise ValueError("historical eligibility source identity differs")
+    for item in pools["decisions"]:
+        if (item["eligibility_hash"] != eligible_map[item["security_id"]]["eligibility_hash"]
+                or item["source_batch_hash"] != eligibility["batch_hash"]):
+            raise ValueError("historical pool source identity differs")
+    coverage = decoded["coverage_manifest"]
+    if (coverage["schema_version"] != "formal-coverage-v1"
+            or {row["security_id"] for row in coverage["rows"]} != set(input_map)
+            or coverage["freeze_at_utc"] != inputs["as_of_utc"]
+            or any(row["frozen_input_hash"] != inputs["frozen_input_hash"]
+                or row["exchange"] != row["security_id"][:2] for row in coverage["rows"])):
+        raise ValueError("historical coverage differs from the frozen universe")
+    if coverage.get("authenticated_context") and (
+            any(coverage[a] != inputs[b] for a, b in (("registry_manifest_hash", "registry_manifest_hash"),
+                ("frozen_input_hash", "frozen_input_hash"), ("universe_records_hash", "universe_hash")))
+            or coverage["member_count"] != len(input_map)):
+        raise ValueError("historical authenticated coverage identity differs")
+    blocked = bool(coverage["blockers"]) or any(row["state"] == "pending_evidence"
+        for row in eligibility["eligibilities"])
+    if header["status"] != ("blocked" if blocked else "preview_ready"):
+        raise ValueError("historical status differs from canonical artifacts")
+    return {"formal_final_run": [dict(header)], "formal_final_artifact": list(by_kind.values()), **rows}
+
+
 class FormalFinalRunRepository:
     """The sole Stage D mutation is commit_complete_run; history has no writer."""
 
@@ -318,6 +391,7 @@ class FormalFinalRunRepository:
         self._store = state_store
         self._path = Path(state_store.db_path).resolve()
         self._code_version, self._contract_version = code_version, contract_version
+        _register_publication_owner(self)
 
     def commit_complete_run(self, *, mode, coverage_manifest, input_batch,
                             score_batch, eligibility_batch, pool_batch):
@@ -334,6 +408,7 @@ class FormalFinalRunRepository:
         _coverage_identity(coverage_manifest, wires[0], tuple(wires[0]["security_ids"]), mode)
         publication = _prepare_publication(input_batch=input_batch, score_batch=score_batch,
             eligibility_batch=eligibility_batch, pool_batch=pool_batch)
+        recheck, prevalidate, arm, mark_committed, revoke, source_hold = _publication_controls(publication)
         try:
             run_id = _new_run_id()
             rows = _project_rows(run_id, wires)
@@ -361,21 +436,22 @@ class FormalFinalRunRepository:
             header["input_manifest_hash"] = _serialize_payload(_input_identity(header, artifacts))[1]
             header["result_hash"] = _result_hash(header, artifacts)
             expected = {"formal_final_run": [header], "formal_final_artifact": list(artifacts.values()), **rows}
-            publication.prevalidate_commit()
+            prevalidate()
             # Resolve and validate everything which can fail before entering the
             # commit boundary. The captured flip itself performs only STORE_SUBSCR.
-            mark_committed = publication.mark_committed
             receipt = FormalFinalRunReceipt(run_id, header["status"], header["input_manifest_hash"],
                 header["result_hash"], *publication.batches)
             empty_columns = {
                 "formal_final_scorecard": ("run_id", "security_id", "card_hash", "S0", "Sc", "Sbase",
                     "B", "R_safety", "C", "grade", "payload_json", "payload_hash"),
             }
-            connection = self._store._connect()
+            connection = _writer_connection(self._store)
             committed = False
+            source_guard = source_hold()
             try:
+                source_guard.__enter__()
                 connection.execute("BEGIN IMMEDIATE")
-                _recheck_sources(self._store, coverage_manifest, batches, mode, publication, connection)
+                _recheck_sources(self._store, coverage_manifest, batches, mode, recheck, connection)
                 for table in _TABLES:
                     items = expected[table]
                     columns = tuple(items[0]) if items else empty_columns.get(table)
@@ -383,16 +459,18 @@ class FormalFinalRunRepository:
                         raise ValueError("Stage D required table has no complete records: " + table)
                     _insert_rows(connection, table, items, columns)
                 _verify_persisted(connection, run_id, expected)
-                _recheck_sources(self._store, coverage_manifest, batches, mode, publication, connection)
-                _arm_publication(publication)
+                _recheck_sources(self._store, coverage_manifest, batches, mode, recheck, connection)
+                _arm_publication(arm)
+                recheck(connection)
                 connection.commit()
                 mark_committed()
                 committed = True
             except BaseException:
-                publication.revoke()
+                revoke()
                 connection.rollback()
                 raise
             finally:
+                source_guard.__exit__(None, None, None)
                 # Closing is cleanup after publication. It cannot turn a
                 # successful durable commit into a reported failed run.
                 try:
@@ -402,7 +480,7 @@ class FormalFinalRunRepository:
                         raise
             return receipt
         except BaseException:
-            publication.revoke()
+            revoke()
             raise
 
     def get_run(self, run_id):
@@ -417,6 +495,11 @@ class FormalFinalRunRepository:
             "SELECT * FROM formal_final_artifact WHERE run_id = ? ORDER BY artifact_kind", (run_id,)))
         if {item["artifact_kind"] for item in artifacts} != set(ARTIFACT_KINDS):
             raise ValueError("historical run artifact set is incomplete")
+        try:
+            expected = _recover_expected(dict(row), artifacts)
+            _verify_persisted(connection, run_id, expected)
+        except (KeyError, TypeError, IndexError) as exc:
+            raise ValueError("historical run canonical artifacts are malformed") from exc
         payloads, hashes = {}, {}
         for item in artifacts:
             raw = item["payload_json"].encode()
@@ -445,5 +528,7 @@ class FormalFinalRunRepository:
                 (input_manifest_hash,)))
             return tuple(self._read_run(connection, run_id) for run_id in ids)
 
+
+_prepare_publication, _publication_controls, _register_publication_owner = _bind_repository_writer(FormalFinalRunRepository)
 
 __all__ = ["FormalFinalRunRepository", "FormalFinalRunReceipt", "FormalFinalRunSnapshot"]

@@ -23,6 +23,120 @@ from tests.test_formal_final_migration import TABLES
 _SHARED = None
 
 
+class FormalFinalRecoveryBoundaryTests(unittest.TestCase):
+    """Short storage tests use canonical DTOs, never counterfeit live proofs."""
+
+    def setUp(self):
+        import ashare_pipeline.formal_final_repository as repository
+        from ashare_pipeline.state_store import _V8_TABLE_DDL
+        self.module = repository
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.addCleanup(self.connection.close)
+        # Recovery does not mint proofs or depend on the frozen-root FK target.
+        for ddl in _V8_TABLE_DDL.values():
+            self.connection.execute(ddl)
+        seal = lambda row, key: dict(row, **{key: repository._serialize_payload(row)[1]})
+        sid = "SH600000"
+        common = dict(registry_manifest_hash="root", frozen_input_hash="frozen",
+            universe_hash="universe", as_of_utc="2026-08-31T07:00:00+00:00")
+        entry = seal(dict(schema_version="policy-adjusted-score-input-v1", security_id=sid,
+            secondary_industry="industry", status="ready", **common), "entry_hash")
+        inputs = seal(dict(schema_version="policy-adjusted-score-input-batch-v1",
+            security_ids=[sid], inputs=[entry], **common), "batch_hash")
+        card = seal(dict(schema_version="formal-final-score-card-v1", security_id=sid,
+            source_entry_hash=entry["entry_hash"], source_batch_hash=inputs["batch_hash"],
+            secondary_industry="industry", S0="80", Sc="80.12345678901234567890123456789",
+            Sbase="80", B="80", R_safety="80", confidence={"C": "0.9"}, Sc_grade="A"), "card_hash")
+        scores = seal(dict(schema_version="formal-final-score-card-batch-v1", security_ids=[sid],
+            cards=[card], pending={}, source_batch_hash=inputs["batch_hash"],
+            batch_hash=inputs["batch_hash"], **common), "batch_hash")
+        eligibility = seal(dict(schema_version="formal-eligibility-v1", security_id=sid,
+            secondary_industry="industry", state="formal_scored", reason_codes=[],
+            strong_qualified=True, wait_qualified=False, hard_veto=False,
+            strong_prohibited=False, wait_prohibited=False, source_entry_hash=entry["entry_hash"],
+            source_batch_hash=inputs["batch_hash"], score_batch_hash=scores["batch_hash"],
+            card_hash=card["card_hash"], sort_fields=dict(Sc=card["Sc"], B="80", C="0.9",
+                R_safety="80", V="75")), "eligibility_hash")
+        eligible = seal(dict(schema_version="formal-eligibility-batch-v1", security_ids=[sid],
+            eligibilities=[eligibility], source_batch_hash=inputs["batch_hash"],
+            score_batch_hash=scores["batch_hash"]), "batch_hash")
+        decisions = [seal(dict(schema_version="formal-pool-decision-v1", security_id=sid,
+            pool=pool, decision="selected" if pool == "strong" else "not_qualified",
+            eligibility_hash=eligibility["eligibility_hash"], source_batch_hash=eligible["batch_hash"]),
+            "decision_hash") for pool in ("strong", "wait")]
+        pools = seal(dict(schema_version="formal-pool-batch-v1", security_ids=[sid],
+            source_batch_hash=eligible["batch_hash"], strong_security_ids=[sid], wait_security_ids=[],
+            counts=dict(strong=1, wait=0), decisions=decisions), "batch_hash")
+        coverage = dict(schema_version="formal-coverage-v1", blockers=[],
+            authenticated_context=False, freeze_at_utc=common["as_of_utc"],
+            rows=[dict(security_id=sid, exchange="SH", frozen_input_hash="frozen")])
+        self.wires = inputs, scores, eligible, pools
+        artifacts = {}
+        for name, payload in zip(repository.ARTIFACT_KINDS, (coverage, *self.wires)):
+            raw, digest = repository._serialize_payload(payload)
+            artifacts[name] = dict(run_id="test", artifact_kind=name, payload_json=raw, artifact_hash=digest)
+        header = dict(run_id="test", mode="test_preview", status="preview_ready", **common,
+            coverage_manifest_hash=artifacts["coverage_manifest"]["artifact_hash"],
+            code_version="test", contract_version="formal-final-v1", created_at="2026-10-02T00:00:00+00:00")
+        header["input_manifest_hash"] = repository._serialize_payload(repository._input_identity(header, artifacts))[1]
+        header["result_hash"] = repository._result_hash(header, artifacts)
+        self.expected = {"formal_final_run": [header], "formal_final_artifact": list(artifacts.values()),
+            **repository._project_rows("test", self.wires)}
+        for name, rows in self.expected.items():
+            repository._insert_rows(self.connection, name, rows, tuple(rows[0]))
+
+    def read(self):
+        return self.module.FormalFinalRunRepository._read_run(None, self.connection, "test")
+
+    def test_populated_scorecard_and_selected_ordinals_round_trip_exactly(self):
+        snapshot = self.read()
+        self.assertEqual(snapshot.scorecards[0]["Sc"], self.wires[1]["cards"][0]["Sc"])
+        row = self.connection.execute("SELECT Sc,typeof(Sc) FROM formal_final_scorecard").fetchone()
+        self.assertEqual(tuple(row), (snapshot.scorecards[0]["Sc"], "text"))
+        self.assertEqual(self.connection.execute("SELECT selected_ordinal FROM formal_final_pool_decision "
+            "WHERE pool_name='strong'").fetchone()[0], 1)
+
+    def test_recovery_rejects_deletion_from_every_child_table(self):
+        for table in TABLES[2:]:
+            with self.subTest(table=table):
+                self.connection.execute("SAVEPOINT damage")
+                self.connection.execute("DELETE FROM " + table)
+                with self.assertRaises(ValueError):
+                    self.read()
+                self.connection.execute("ROLLBACK TO damage")
+
+    def test_recovery_rejects_projection_payload_and_header_tampering(self):
+        altered = dict(self.wires[1]["cards"][0], Sc="1")
+        raw, digest = self.module._serialize_payload(altered)
+        attacks = [
+            ("UPDATE formal_final_scorecard SET Sc='1'", ()),
+            ("UPDATE formal_final_pool_decision SET selected_ordinal=2 WHERE pool_name='strong'", ()),
+            ("UPDATE formal_final_scorecard SET Sc='1',payload_json=?,payload_hash=?", (raw, digest)),
+            ("UPDATE formal_final_run SET result_hash='wrong'", ()),
+            ("UPDATE formal_final_run SET input_manifest_hash='wrong'", ()),
+            ("UPDATE formal_final_run SET universe_hash='wrong'", ()),
+        ]
+        for sql, args in attacks:
+            with self.subTest(sql=sql):
+                self.connection.execute("SAVEPOINT damage")
+                self.connection.execute(sql, args)
+                with self.assertRaises(ValueError):
+                    self.read()
+                self.connection.execute("ROLLBACK TO damage")
+
+    def test_qualified_canonical_decimal_boundary_preserves_exact_values(self):
+        from ashare_pipeline.formal_pool import _detach_eligibility_rows, _select_detached_rows
+        rows = _detach_eligibility_rows(self.wires[2]["eligibilities"])
+        self.assertEqual(rows[0]["sort_fields"]["Sc"], Decimal(self.wires[1]["cards"][0]["Sc"]))
+        self.assertEqual(_select_detached_rows(rows).strong_ids, ("SH600000",))
+        for bad in ("NaN", "Infinity", " 80", "+80", 80.0):
+            damaged = copy.deepcopy(self.wires[2]["eligibilities"])
+            damaged[0]["sort_fields"]["Sc"] = bad
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                _detach_eligibility_rows(damaged)
+
+
 def minimal_batches():
     global _SHARED
     if _SHARED is None:

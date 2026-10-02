@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import weakref
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from weakref import ref as _reference
 
@@ -19,6 +19,33 @@ from .formal_universe import canonical_security_id
 _SORT_KEYS = {"Sc", "B", "C", "R_safety", "V"}
 _POOL_NAMES = ("strong", "wait")
 _DECISIONS = frozenset({"selected", "not_qualified", "industry_cap_reached", "overall_capacity_reached"})
+
+
+def _detach_eligibility_rows(rows):
+    """Decode only canonical decimal text after the batch is authenticated.
+
+    The pure selector still requires exact Decimal and does not accept strings.
+    """
+    detached = [{key: row.get(key) for key in (
+        "security_id", "secondary_industry", "state", "strong_qualified",
+        "wait_qualified", "sort_fields", "eligibility_hash", "source_entry_hash",
+        "source_batch_hash", "score_batch_hash")} for row in rows]
+    for row in detached:
+        if row["sort_fields"] is None:
+            continue
+        converted = {}
+        for key, text in row["sort_fields"].items():
+            try:
+                if type(text) is not str:
+                    raise ValueError("pool canonical sort value is not text")
+                value = Decimal(text)
+                if not value.is_finite() or str(value) != text:
+                    raise ValueError("pool canonical sort value is invalid")
+            except InvalidOperation as exc:
+                raise ValueError("pool canonical sort value is invalid") from exc
+            converted[key] = value
+        row["sort_fields"] = converted
+    return detached
 
 
 @dataclass(frozen=True)
@@ -224,10 +251,7 @@ def _install_pool_proofs():
         rows = wire.get("eligibilities")
         if type(ids) is not tuple or type(rows) is not list or tuple(r.get("security_id") for r in rows) != ids:
             raise ValueError("eligibility universe is malformed")
-        detached = [{key: row.get(key) for key in (
-            "security_id", "secondary_industry", "state", "strong_qualified",
-            "wait_qualified", "sort_fields", "eligibility_hash", "source_entry_hash",
-            "source_batch_hash", "score_batch_hash")} for row in rows]
+        detached = _detach_eligibility_rows(rows)
         if any(row["source_batch_hash"] != wire.get("source_batch_hash") for row in detached):
             raise ValueError("eligibility rows are not bound to the published batch")
         selected = _select_detached_rows(detached)
