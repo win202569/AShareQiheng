@@ -14,7 +14,7 @@ import weakref
 from typing import Literal
 
 from .formal_financial_schema import FormalFinancialFact
-from .formal_registry_manifest import FormalRegistryManifest
+from .formal_registry_manifest import FormalRegistryManifest, VerifiedRegistryBundle
 from .formal_sources import RegistrySignatureVerifier
 from .formal_universe import canonical_security_id
 
@@ -489,6 +489,9 @@ def _release_eligible(
 
 
 def _make_signed_registry_type() -> tuple[type[object], object]:
+    bundle_type = VerifiedRegistryBundle
+    require_bundle_authenticated = bundle_type.require_authenticated
+    blob_for = bundle_type.blob
     sensitive_fields = frozenset(
         {
             "canonical_json",
@@ -515,7 +518,7 @@ def _make_signed_registry_type() -> tuple[type[object], object]:
         mapping_registry_hash: str
         template_ids: tuple[str, ...]
         slots: tuple[FormalFeatureSlot, ...]
-        slot_bytes: tuple[bytes, ...]
+        slot_fingerprints: tuple[tuple[object, ...], ...]
         release_eligible: bool
 
     records: dict[
@@ -529,6 +532,62 @@ def _make_signed_registry_type() -> tuple[type[object], object]:
 
     def forget(identity: int) -> None:
         records.pop(identity, None)
+
+    def formula_fingerprint(node: object, ancestors: set[int]) -> tuple[object, ...]:
+        if type(node) is not FormulaNode:
+            raise ValueError("feature formula fingerprint requires exact FormulaNode")
+        identity = id(node)
+        if identity in ancestors:
+            raise ValueError("feature formula fingerprint must not be cyclic")
+        ancestors.add(identity)
+        try:
+            read = object.__getattribute__
+            op = read(node, "op")
+            fact_key = read(node, "fact_key")
+            period_key = read(node, "period_key")
+            left = read(node, "left")
+            right = read(node, "right")
+            items = read(node, "items")
+            intervals = read(node, "intervals")
+            if (type(op) is not str
+                    or (fact_key is not None and type(fact_key) is not str)
+                    or (period_key is not None and type(period_key) is not str)
+                    or (left is not None and type(left) is not FormulaNode)
+                    or (right is not None and type(right) is not FormulaNode)
+                    or type(items) is not tuple
+                    or any(type(item) is not FormulaNode for item in items)
+                    or (intervals is not None and type(intervals) is not int)):
+                raise ValueError("feature formula fingerprint field type changed")
+            return (
+                op,
+                fact_key,
+                period_key,
+                None if left is None else formula_fingerprint(left, ancestors),
+                None if right is None else formula_fingerprint(right, ancestors),
+                tuple(formula_fingerprint(item, ancestors) for item in items),
+                intervals,
+            )
+        finally:
+            ancestors.remove(identity)
+
+    def slot_fingerprint(slot: object) -> tuple[object, ...]:
+        if type(slot) is not FormalFeatureSlot:
+            raise ValueError("feature slot fingerprint requires exact FormalFeatureSlot")
+        read = object.__getattribute__
+        values = (
+            read(slot, "slot_id"),
+            read(slot, "template_id"),
+            read(slot, "dimension"),
+            read(slot, "required"),
+            read(slot, "unit"),
+            read(slot, "formula"),
+            read(slot, "formula_version"),
+        )
+        if (any(type(value) is not str for value in (*values[:3], values[4], values[6]))
+                or type(values[3]) is not bool
+                or type(values[5]) is not FormulaNode):
+            raise ValueError("feature slot fingerprint field type changed")
+        return (*values[:5], formula_fingerprint(values[5], set()), values[6])
 
     def fingerprint(registry: object) -> _Seal | None:
         if type(registry) is not SignedFormalFeatureRegistry:
@@ -560,12 +619,12 @@ def _make_signed_registry_type() -> tuple[type[object], object]:
         ):
             return None
         try:
-            slot_bytes = tuple(_canonical_json_bytes(item.to_dict()) for item in values[8])
-        except (TypeError, ValueError):
+            slot_fingerprints = tuple(slot_fingerprint(item) for item in values[8])
+        except (AttributeError, RecursionError, TypeError, ValueError):
             return None
-        return _Seal(*values[:9], slot_bytes, values[9])
+        return _Seal(*values[:9], slot_fingerprints, values[9])
 
-    def require_verified(registry: object) -> _Seal:
+    def _require_verified(registry: object) -> _Seal:
         record = records.get(id(registry))
         current = fingerprint(registry)
         if record is None or current is None or record[0]() is not registry:
@@ -581,7 +640,7 @@ def _make_signed_registry_type() -> tuple[type[object], object]:
             or current.mapping_registry_hash != sealed.mapping_registry_hash
             or current.template_ids is not sealed.template_ids
             or current.slots is not sealed.slots
-            or current.slot_bytes != sealed.slot_bytes
+            or current.slot_fingerprints != sealed.slot_fingerprints
             or current.release_eligible is not sealed.release_eligible
         ):
             raise ValueError("signed formal feature registry was not verified or was mutated")
@@ -618,11 +677,11 @@ def _make_signed_registry_type() -> tuple[type[object], object]:
 
         def __getattribute__(self, name: str) -> object:
             if name in sensitive_fields:
-                return getattr(require_verified(self), name)
+                return getattr(_require_verified(self), name)
             return object.__getattribute__(self, name)
 
         def slots_for_template(self, template_id: str) -> tuple[FormalFeatureSlot, ...]:
-            sealed = require_verified(self)
+            sealed = _require_verified(self)
             if type(template_id) is not str or template_id not in sealed.template_ids:
                 raise ValueError("feature template is not declared")
             return tuple(
@@ -632,8 +691,29 @@ def _make_signed_registry_type() -> tuple[type[object], object]:
                 for slot_bytes in slot_bytes_for_template(self, sealed, template_id)
             )
 
+        def require_verified(self) -> None:
+            _require_verified(self)
+
+        def require_authenticated(
+            self, registry_bundle: VerifiedRegistryBundle, *, expected_purpose: str
+        ) -> None:
+            sealed = _require_verified(self)
+            if type(registry_bundle) is not bundle_type:
+                raise ValueError("formal feature registry requires an exact verified bundle")
+            require_bundle_authenticated(
+                registry_bundle, expected_purpose=expected_purpose
+            )
+            feature = blob_for(registry_bundle, "feature")
+            source = blob_for(registry_bundle, "source")
+            mapping = blob_for(registry_bundle, "mapping")
+            if (sealed.canonical_json != feature.canonical_json
+                    or sealed.registry_hash != feature.registry_hash
+                    or sealed.source_registry_hash != source.registry_hash
+                    or sealed.mapping_registry_hash != mapping.registry_hash):
+                raise ValueError("formal feature registry differs from authenticated bundle")
+
         def require_release_eligible(self) -> None:
-            sealed = require_verified(self)
+            sealed = _require_verified(self)
             if sealed.release_eligible is not True:
                 raise ValueError("formal feature registry is not release eligible")
 
@@ -657,13 +737,20 @@ def _make_signed_registry_type() -> tuple[type[object], object]:
             object.__setattr__(registry, name, value)
         sealed = fingerprint(registry)
         assert sealed is not None
+        canonical_slot_bytes = tuple(
+            _canonical_json_bytes(item.to_dict()) for item in sealed.slots
+        )
+        confirmed = fingerprint(registry)
+        if confirmed is None or confirmed != sealed:
+            raise ValueError("signed formal feature registry changed during construction")
+        sealed = confirmed
         identity = id(registry)
         template_slot_bytes = tuple(
             (
                 template_id,
                 tuple(
                     slot_bytes
-                    for slot, slot_bytes in zip(sealed.slots, sealed.slot_bytes)
+                    for slot, slot_bytes in zip(sealed.slots, canonical_slot_bytes)
                     if slot.template_id == template_id
                 ),
             )

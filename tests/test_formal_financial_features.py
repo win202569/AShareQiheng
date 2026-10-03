@@ -16,6 +16,7 @@ from tests.test_formal_feature_contract import (
     formal_fact, canonical_bytes, feature_registry_bytes, registry_manifest,
     load_registry, slot_wire, TEMPLATES,
 )
+from tests.test_formal_test_root_contract import signed_stage_d_graph
 
 CUTOFF = "2026-08-31T07:00:00+00:00"
 WINDOW = ("2024Q3", "2024Q4", "2025Q1", "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2")
@@ -410,6 +411,135 @@ class FormulaTests(unittest.TestCase):
 
 
 class BundleTests(unittest.TestCase):
+    def test_authenticated_official_bundle_does_not_release_unbound_feature_registry(self):
+        def bind_real_financial_fact(documents):
+            for slot in documents["feature"]["slots"]:
+                if slot["template_id"] == "general_nonfinancial":
+                    slot["formula"] = {
+                        "op": "fact",
+                        "fact_key": "revenue",
+                        "period_key": "FY2025",
+                    }
+                    slot["unit"] = "CNY"
+
+        root_bundle, bound_registry, _, _ = signed_stage_d_graph(
+            purpose="official", mutate=bind_real_financial_fact
+        )
+        target_slot = bound_registry.slots_for_template(
+            "general_nonfinancial"
+        )[0]
+        values = dict(
+            security_id="SH600001",
+            as_of_utc=CUTOFF,
+            template_id="general_nonfinancial",
+            facts=history_ready_facts(metric_key=target_slot.formula.fact_key),
+            issues=(),
+            registry_manifest=root_bundle.manifest,
+            registry_bundle=root_bundle,
+            expected_purpose="official",
+        )
+
+        bound_result = build_formal_feature_bundle(
+            **values, registry=bound_registry
+        )
+        unbound_registry = load_registry(bound_registry.canonical_json)
+        unbound_result = build_formal_feature_bundle(
+            **values, registry=unbound_registry
+        )
+
+        bound_value = next(
+            value
+            for value in bound_result.values
+            if value.slot_id == target_slot.slot_id
+        )
+        unbound_value = next(
+            value
+            for value in unbound_result.values
+            if value.slot_id == target_slot.slot_id
+        )
+        self.assertEqual(bound_value.status, "derived")
+        self.assertFalse(unbound_registry.release_eligible)
+        self.assertEqual(unbound_value.status, "blocked")
+        self.assertIn(
+            "feature_registry_not_release_eligible", unbound_result.blockers
+        )
+
+    def test_genuine_test_root_computes_without_acquiring_release_authority(self):
+        def bind_real_financial_fact(documents):
+            for slot in documents["feature"]["slots"]:
+                if slot["template_id"] == "general_nonfinancial":
+                    slot["formula"] = {
+                        "op": "fact",
+                        "fact_key": "revenue",
+                        "period_key": "FY2025",
+                    }
+                    slot["unit"] = "CNY"
+
+        root_bundle, feature_registry, _, _ = signed_stage_d_graph(
+            purpose="test", mutate=bind_real_financial_fact
+        )
+        target_slot = feature_registry.slots_for_template(
+            "general_nonfinancial"
+        )[0]
+        values = dict(
+            security_id="SH600001",
+            as_of_utc=CUTOFF,
+            template_id="general_nonfinancial",
+            facts=history_ready_facts(metric_key=target_slot.formula.fact_key),
+            issues=(),
+            registry=feature_registry,
+            registry_manifest=root_bundle.manifest,
+            registry_bundle=root_bundle,
+            expected_purpose="test",
+        )
+
+        result = build_formal_feature_bundle(**values)
+
+        target_value = next(
+            value for value in result.values if value.slot_id == target_slot.slot_id
+        )
+        self.assertEqual(target_value.status, "derived")
+        self.assertNotIn("feature_registry_not_release_eligible", result.blockers)
+        with self.assertRaisesRegex(ValueError, "release eligible"):
+            feature_registry.require_release_eligible()
+
+        for invalid_purpose in ("official", None, True):
+            with self.subTest(expected_purpose=invalid_purpose), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                build_formal_feature_bundle(
+                    **{**values, "expected_purpose": invalid_purpose}
+                )
+        with self.assertRaises(ValueError):
+            build_formal_feature_bundle(
+                **{
+                    key: value
+                    for key, value in values.items()
+                    if key != "registry_bundle"
+                }
+            )
+
+        def change_mapping(documents):
+            documents["mapping"]["fixture_nonce"] = "different-financial-root"
+
+        other_bundle, _, _, _ = signed_stage_d_graph(
+            purpose="test", mutate=change_mapping
+        )
+        with self.assertRaises(ValueError):
+            build_formal_feature_bundle(
+                **{
+                    **values,
+                    "registry_manifest": other_bundle.manifest,
+                    "registry_bundle": other_bundle,
+                }
+            )
+
+        standalone = bundle(history_ready_facts(), purpose="test")
+        self.assertEqual(standalone.values[0].status, "blocked")
+        self.assertIn(
+            "feature_registry_not_release_eligible", standalone.blockers
+        )
+
     def test_input_hash_binds_effective_registry_release_eligibility(self):
         slots = sorted(
             [slot_wire(template, unit="CNY", formula=leaf().to_dict()) for template in TEMPLATES],

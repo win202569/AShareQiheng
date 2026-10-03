@@ -80,9 +80,11 @@ def _build_range_bindings_contract():
     from . import formal_range_format as format_module
     from . import formal_context_schema as context_module
 
-    require_bundle = bundle_type.require_official
+    require_bundle_official = bundle_type.require_official
+    require_bundle_authenticated = bundle_type.require_authenticated
     blob_for = bundle_type.blob
-    require_scoring = scoring_type.require_official
+    require_scoring_official = scoring_type.require_official
+    require_scoring_authenticated = scoring_type.require_authenticated
     read_policy_sources = policy_module._read_authenticated_policy_sources
     validate_lease_scope = _range_binding_lease_scope_authority()
     get_frame = sys._getframe
@@ -119,9 +121,11 @@ def _build_range_bindings_contract():
           (vars(format_module.re), "fullmatch", format_module.re.fullmatch))
     config_members = tuple(vars(RangeConfig).items())
     interfaces = (
-        (bundle_type, "require_official", require_bundle),
+        (bundle_type, "require_official", require_bundle_official),
+        (bundle_type, "require_authenticated", require_bundle_authenticated),
         (bundle_type, "blob", blob_for),
-        (scoring_type, "require_official", require_scoring),
+        (scoring_type, "require_official", require_scoring_official),
+        (scoring_type, "require_authenticated", require_scoring_authenticated),
         (policy_module, "_read_authenticated_policy_sources", read_policy_sources),
     )
 
@@ -145,16 +149,31 @@ def _build_range_bindings_contract():
         policy_hash: str
 
 
-    def _capture_graph_snapshot(bundle, scoring_registry, policy_registry) -> _GraphSnapshot:
+    def _capture_graph_snapshot(bundle, scoring_registry, policy_registry, *,
+                                expected_purpose) -> _GraphSnapshot:
         _check_dependencies()
         if (type(bundle) is not bundle_type or type(scoring_registry) is not scoring_type
                 or type(policy_registry) is not policy_type):
             raise ValueError("range bindings require exact genuine registry types")
-        original_bundle, original_scoring, _, policy_bytes = read_policy_sources(policy_registry)
+        if type(expected_purpose) is not str or expected_purpose not in ("test", "official"):
+            raise ValueError("range binding expected_purpose must be exact test or official")
+        original_bundle, original_scoring, _, policy_bytes = read_policy_sources(
+            policy_registry, expected_purpose=expected_purpose
+        )
+        if bundle.manifest.purpose != expected_purpose:
+            raise ValueError("range binding registry purpose differs from expected purpose")
         if bundle is not original_bundle:
-            require_bundle(bundle)
+            if expected_purpose == "official":
+                require_bundle_official(bundle)
+            else:
+                require_bundle_authenticated(bundle, expected_purpose="test")
         if bundle is not original_bundle or scoring_registry is not original_scoring:
-            require_scoring(scoring_registry, bundle)
+            if expected_purpose == "official":
+                require_scoring_official(scoring_registry, bundle)
+            else:
+                require_scoring_authenticated(
+                    scoring_registry, bundle, expected_purpose="test"
+                )
         manifest = bundle.manifest
         manifest_bytes = manifest.canonical_json
         root_hash = hashlib.sha256(manifest_bytes).hexdigest()
@@ -235,8 +254,12 @@ def _build_range_bindings_contract():
             raise ValueError("policy calendar bridge mismatch")
 
 
-    def _derive_graph(bundle, scoring_registry, policy_registry):
-        snapshot = _capture_graph_snapshot(bundle, scoring_registry, policy_registry)
+    def _derive_graph(bundle, scoring_registry, policy_registry, *,
+                      expected_purpose):
+        snapshot = _capture_graph_snapshot(
+            bundle, scoring_registry, policy_registry,
+            expected_purpose=expected_purpose,
+        )
         policy = json.loads(snapshot.policy_bytes)
         root_hash = snapshot.root_hash
         if policy["registry_manifest_hash"] != root_hash:
@@ -384,6 +407,7 @@ def _build_range_bindings_contract():
         bundle: object
         scoring_registry: object
         policy_registry: object
+        expected_purpose: str
         snapshot: _GraphSnapshot
         bindings: dict[tuple[str, str], object]
         manifest: object
@@ -483,7 +507,8 @@ def _build_range_bindings_contract():
             raise ValueError("range binding set children changed")
         if current:
             snapshot = _capture_graph_snapshot(
-                record.bundle, record.scoring_registry, record.policy_registry
+                record.bundle, record.scoring_registry, record.policy_registry,
+                expected_purpose=record.expected_purpose,
             )
             if snapshot != record.snapshot:
                 raise ValueError("range binding sources changed")
@@ -925,7 +950,8 @@ def _build_range_bindings_contract():
             parent_record = _bindings_record(parent)
             entry = _capture_graph_snapshot(
                 parent_record.bundle, parent_record.scoring_registry,
-                parent_record.policy_registry
+                parent_record.policy_registry,
+                expected_purpose=parent_record.expected_purpose,
             )
             if entry != parent_record.snapshot:
                 raise ValueError("range binding sources changed before owner operation")
@@ -985,7 +1011,8 @@ def _build_range_bindings_contract():
         try:
             exit_snapshot = _capture_graph_snapshot(
                 parent_record.bundle, parent_record.scoring_registry,
-                parent_record.policy_registry
+                parent_record.policy_registry,
+                expected_purpose=parent_record.expected_purpose,
             )
             if exit_snapshot != entry or exit_snapshot != parent_record.snapshot:
                 raise ValueError("range binding sources changed during owner operation")
@@ -1070,11 +1097,13 @@ def _build_range_bindings_contract():
 
 
     def load_policy_range_bindings(
-        bundle, *, scoring_registry, policy_registry
+        bundle, *, scoring_registry, policy_registry,
+        expected_purpose="official"
     ) -> RangeBindings:
         """Bind signed range configs to every active market rule and exchange."""
         snapshot, definitions = _derive_graph(
-            bundle, scoring_registry, policy_registry
+            bundle, scoring_registry, policy_registry,
+            expected_purpose=expected_purpose,
         )
         root_hash = snapshot.root_hash
         result = object.__new__(RangeBindings)
@@ -1111,7 +1140,9 @@ def _build_range_bindings_contract():
             if record is not None and record.reference is reference:
                 _bindings_records.pop(identity, None)
 
-        if _capture_graph_snapshot(bundle, scoring_registry, policy_registry) != snapshot:
+        if _capture_graph_snapshot(
+                bundle, scoring_registry, policy_registry,
+                expected_purpose=expected_purpose) != snapshot:
             raise ValueError("range binding sources changed during loading")
         reference = weakref.ref(result, forget_bindings)
         _bindings_records[identity] = _BindingsRecord(
@@ -1119,6 +1150,7 @@ def _build_range_bindings_contract():
             bundle,
             scoring_registry,
             policy_registry,
+            expected_purpose,
             snapshot,
             {key: weakref.ref(binding) for key, binding in binding_objects.items()},
             object.__getattribute__(bundle, "manifest"),

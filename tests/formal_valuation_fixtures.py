@@ -8,9 +8,10 @@ from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
 
 class ValuationRuntimeFixture(PolicyRuntimeFixture):
     def __init__(self, *, peer_count=20, extra_members=(), cyclic_ids=("BJ430001",),
-                 signature_documents_configurator=None):
+                 signature_documents_configurator=None, purpose="official"):
         if type(peer_count) is not int or peer_count < 3:
             raise ValueError("valuation fixture requires all three exchanges")
+        self.purpose = purpose
         securities = {"BJ430001": "general_nonfinancial"}
         securities.update({f"SH{600000 + index}": "general_nonfinancial"
                            for index in range(peer_count - 2)})
@@ -29,7 +30,7 @@ class ValuationRuntimeFixture(PolicyRuntimeFixture):
                 else:
                     dependency.update(policy_dependency="unaffected", profit_semantic_id=None,
                         adapter_id=None, adapter_version=None)
-            add_valuation_adapter_document(documents)
+            add_valuation_adapter_document(documents, purpose=purpose)
             # Keep market requests small while the genuine range producer
             # materializes every requested slice. The resulting full window
             # clears the independent no-effective-trade rule.
@@ -40,10 +41,11 @@ class ValuationRuntimeFixture(PolicyRuntimeFixture):
 
         super().__init__(range_enabled=True, templates=securities, extra_members=extra_members, cyclic=True,
             noncyclic_ids=tuple(sorted(set(securities) - set(cyclic_ids))),
-            valuation_adapter=True, mutate=choose_earnings_adapter)
+            valuation_adapter=True, mutate=choose_earnings_adapter, purpose=purpose)
         self.templates = securities
         self.valuation_registry = load_formal_valuation_adapter_registry(self.bundle,
-            scoring_registry=self.scoring, policy_registry=self.policy_registry)
+            scoring_registry=self.scoring, policy_registry=self.policy_registry,
+            expected_purpose=self.purpose)
         self.repository = FormalValuationRepository(self.feature_repository, self.context,
             self.range_store, registry_signature_verifier=self.verifier)
         self.valuation_feature_bundles = {}
@@ -69,4 +71,5 @@ class ValuationRuntimeFixture(PolicyRuntimeFixture):
     def build_adjusted_batch(self):
         return self.repository.build_batch(self.frozen.frozen_input_hash,
             scoring_registry=self.scoring, policy_registry=self.policy_registry,
-            valuation_adapter_registry=self.valuation_registry)
+            valuation_adapter_registry=self.valuation_registry,
+            expected_purpose=self.purpose)

@@ -22,6 +22,10 @@ from .state_store import StateStore, _formal_frozen_universe_payload, _plain_for
 
 
 _FREEZE = "2026-08-31T07:00:00+00:00"
+_REQUIRE_BUNDLE_OFFICIAL = VerifiedRegistryBundle.require_official
+_REQUIRE_BUNDLE_AUTHENTICATED = VerifiedRegistryBundle.require_authenticated
+_REQUIRE_SCORING_OFFICIAL = FormalScoringRegistry.require_official
+_REQUIRE_SCORING_AUTHENTICATED = FormalScoringRegistry.require_authenticated
 
 
 def _text(value):
@@ -30,16 +34,33 @@ def _text(value):
     return value
 
 
-def _industry(bundle, scoring):
+def _industry(bundle, scoring, *, expected_purpose):
     if type(bundle) is not VerifiedRegistryBundle or type(scoring) is not FormalScoringRegistry:
         raise ValueError("industry requires exact verified registry types")
-    bundle.require_official()
-    scoring.require_official(bundle)
+    if (type(expected_purpose) is not str
+            or expected_purpose not in {"test", "official"}):
+        raise ValueError("industry expected_purpose must be exact test or official")
+    if (VerifiedRegistryBundle.require_official is not _REQUIRE_BUNDLE_OFFICIAL
+            or VerifiedRegistryBundle.require_authenticated is not _REQUIRE_BUNDLE_AUTHENTICATED
+            or FormalScoringRegistry.require_official is not _REQUIRE_SCORING_OFFICIAL
+            or FormalScoringRegistry.require_authenticated is not _REQUIRE_SCORING_AUTHENTICATED):
+        raise ValueError("industry registry verifier changed")
+    actual_purpose = getattr(bundle.manifest, "purpose")
+    if actual_purpose != expected_purpose:
+        raise ValueError("industry registry purpose differs from expected_purpose")
+    if expected_purpose == "official":
+        _REQUIRE_BUNDLE_OFFICIAL(bundle)
+        _REQUIRE_SCORING_OFFICIAL(scoring, bundle)
+    else:
+        _REQUIRE_BUNDLE_AUTHENTICATED(bundle, expected_purpose="test")
+        _REQUIRE_SCORING_AUTHENTICATED(
+            scoring, bundle, expected_purpose="test"
+        )
     wire = _load(bundle.blob("industry").canonical_json)
     if set(wire) != set("registry_role schema_version purpose classification_system source_version effective_date context_scope_key memberships mapping_sha256".split()):
         raise ValueError("industry registry has missing or extra fields")
     if (wire["registry_role"] != "industry" or wire["schema_version"] != "formal-industry-registry-v1"
-            or wire["purpose"] != "official" or wire["classification_system"] != "SW2021"):
+            or wire["purpose"] != expected_purpose or wire["classification_system"] != "SW2021"):
         raise ValueError("industry registry role/version/purpose/classification mismatch")
     _text(wire["source_version"])
     _text(wire["context_scope_key"])
@@ -50,11 +71,15 @@ def _industry(bundle, scoring):
     if type(memberships) is not list or not memberships:
         raise ValueError("industry memberships must be a nonempty array")
     ids = []
+    validated_templates = set()
     for member in memberships:
         if type(member) is not dict or set(member) != {"security_id", "template_id", "primary_industry", "secondary_industry"}:
             raise ValueError("industry member has missing or extra fields")
         ids.append(canonical_security_id(member["security_id"]))
-        scoring.template_for(_text(member["template_id"]))
+        template_id = _text(member["template_id"])
+        if template_id not in validated_templates:
+            scoring.template_for(template_id)
+            validated_templates.add(template_id)
         _text(member["primary_industry"])
         _text(member["secondary_industry"])
     if ids != sorted(set(ids)):
@@ -90,9 +115,9 @@ def _metric_context_types():
         FormalSnapshotRepository: "__init__ get_verified_by_manifest read_verified_raw".split(),
         FormalSnapshotStore: "__init__ read_verified_raw validate_stored_snapshot _validate_inspection_inputs _validate_formal_fetch_values _validate_request_values _require_version_identifier _require_recomputed_verification _read_calendar_binding _resolve_calendar_binding _require_calendar_binding_identity _official_request_from_manifest _require_exact_manifest_payload _validate_content_file _read_manifest _require_sha256 _safe_path_component _path_inside_root _require_target_within_root".split(),
         FormalRegistryBundleLoader: ["__init__", "load"],
-        VerifiedRegistryBundle: ["require_official", "blob"],
+        VerifiedRegistryBundle: ["require_official", "require_authenticated", "blob"],
         FormalRegistryManifest: ["from_signed_bytes", "require_official", "assert_member_hashes"],
-        FormalScoringRegistry: ["require_official", "template_for"],
+        FormalScoringRegistry: ["require_official", "require_authenticated", "template_for"],
         FormalContextRegistry: ["load", "descriptor_for"],
         SignedContextRequestResolver: ["__init__", "resolve", "_resolve", "_resolve_historical"],
         FormalContextFact: ["from_dict", "to_dict", "canonical_bytes"],
@@ -184,14 +209,14 @@ def _metric_context_types():
     class VerifiedMetricIndustryBatch(Proof):
         __slots__ = ()
 
-    def mint(repository, cls, payload, scoring=None):
+    def mint(repository, cls, payload, scoring=None, expected_purpose=None):
         proof = object.__new__(cls)
         identity = id(proof)
         proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)), weakref.ref(repository),
-            _canonical(payload), scoring)
+            _canonical(payload), scoring, expected_purpose)
         return proof
 
-    def read_universe(repository, frozen_input_hash, scoring):
+    def read_universe(repository, frozen_input_hash, scoring, *, expected_purpose):
         store, _, verifier = dependencies(repository)
         frozen = reader(store, frozen_input_hash)
         if frozen is None:
@@ -200,7 +225,9 @@ def _metric_context_types():
         if datetime.fromisoformat(frozen.as_of_utc) != datetime.fromisoformat(_FREEZE):
             raise ValueError("metric universe requires the fixed freeze instant")
         graph = loader(FormalRegistryBundleLoader(store, verifier), frozen.registry_manifest_hash)
-        industry = parse_industry(graph, scoring)
+        industry = parse_industry(
+            graph, scoring, expected_purpose=expected_purpose
+        )
         payload = dict(schema_version="formal-metric-universe-v1", as_of_utc=_FREEZE,
             frozen_as_of_utc=frozen.as_of_utc, registry_manifest_hash=frozen.registry_manifest_hash,
             frozen_input_hash=frozen.frozen_input_hash, universe_hash=frozen.universe_hash,
@@ -214,12 +241,13 @@ def _metric_context_types():
         dependencies(repository)
         return payload
 
-    def resolve_payload(repository, universe):
+    def resolve_payload(repository, universe, *, expected_purpose):
         _, context, _ = dependencies(repository)
         signed = universe["industry"]
         ids = tuple(universe["security_ids"])
         facts = batch_reader(context, "industry_snapshot", signed["context_scope_key"], ids,
-            _FREEZE, universe["registry_manifest_hash"])
+            _FREEZE, universe["registry_manifest_hash"],
+            expected_purpose=expected_purpose)
         members = {member["security_id"]: member for member in signed["memberships"]}
         entries, selected = {}, {}
         for sid in ids:
@@ -264,15 +292,35 @@ def _metric_context_types():
             repositories[identity] = (weakref.ref(self, lambda _: repositories.pop(identity, None)),
                 state_store, context_repository, registry_signature_verifier, snapshot)
 
-        def load_universe(self, frozen_input_hash, *, scoring_registry):
-            payload = read_universe(self, frozen_input_hash, scoring_registry)
-            return None if payload is None else mint(self, VerifiedMetricUniverse, payload, scoring_registry)
+        def load_universe(self, frozen_input_hash, *, scoring_registry,
+                          expected_purpose="official"):
+            if (type(expected_purpose) is not str
+                    or expected_purpose not in {"test", "official"}):
+                raise ValueError("expected_purpose must be exact test or official")
+            payload = read_universe(
+                self,
+                frozen_input_hash,
+                scoring_registry,
+                expected_purpose=expected_purpose,
+            )
+            return None if payload is None else mint(
+                self,
+                VerifiedMetricUniverse,
+                payload,
+                scoring_registry,
+                expected_purpose,
+            )
 
         def resolve_industries(self, universe_proof):
             dependencies(self)
             record = proof_record(universe_proof, VerifiedMetricUniverse, self)
-            payload = resolve_payload(self, _load(record[2]))
-            return mint(self, VerifiedMetricIndustryBatch, payload)
+            payload = resolve_payload(
+                self, _load(record[2]), expected_purpose=record[4]
+            )
+            return mint(
+                self, VerifiedMetricIndustryBatch, payload,
+                expected_purpose=record[4],
+            )
 
         def recheck_batch(self, universe_proof, industry_batch):
             """Final full-population closure check, once after all feature reads."""
@@ -280,10 +328,17 @@ def _metric_context_types():
             universe_record = proof_record(universe_proof, VerifiedMetricUniverse, self)
             batch_record = proof_record(industry_batch, VerifiedMetricIndustryBatch, self)
             universe = _load(universe_record[2])
-            current = read_universe(self, universe["frozen_input_hash"], universe_record[3])
+            current = read_universe(
+                self,
+                universe["frozen_input_hash"],
+                universe_record[3],
+                expected_purpose=universe_record[4],
+            )
             if current is None or _canonical(current) != universe_record[2]:
                 raise ValueError("metric universe or signed mapping changed during batch")
-            if _canonical(resolve_payload(self, current)) != batch_record[2]:
+            if _canonical(resolve_payload(
+                    self, current,
+                    expected_purpose=universe_record[4])) != batch_record[2]:
                 raise ValueError("metric industry Context correction or absence changed during batch")
             dependencies(self)
 

@@ -4,11 +4,13 @@ import copy
 import hashlib
 import hmac
 import importlib
+import inspect
 import json
 import sys
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 import unittest
 from unittest.mock import patch
 
@@ -46,14 +48,16 @@ class HmacVerifier:
 
 
 def signed_graph(*, mutate=None, context=False,
-                 manifest_version="formal-registry-manifest-v1"):
-    """Author one complete synthetic official-wire graph, never promote the test registry by approval."""
+                 manifest_version="formal-registry-manifest-v1", purpose="official"):
+    """Author one complete synthetic signed graph without granting production authority."""
+    if purpose not in ("test", "official"):
+        raise ValueError("fixture purpose must be test or official")
     verifier = HmacVerifier()
     wrapper = fixture_wire()
     scoring = wrapper["scoring"]
     slots = scoring.pop("fixture_feature_slots")
     policies = scoring.pop("fixture_policies")
-    scoring["purpose"] = "official"
+    scoring["purpose"] = purpose
     configs = []
     if context:
         from tests.test_formal_context_repository import descriptor
@@ -67,7 +71,7 @@ def signed_graph(*, mutate=None, context=False,
         mapping_registry_hash=hashlib.sha256(canonical(documents["mapping"])).hexdigest(),
         template_ids=sorted(TEMPLATES), slots=sorted(slots, key=lambda s: s["slot_id"]))
     for role, policy in policies.items():
-        policy["purpose"] = "official"
+        policy["purpose"] = purpose
         documents[role] = policy
         scoring["policy_contracts"][role]["registry_hash"] = hashlib.sha256(canonical(policy)).hexdigest()
     documents["scoring"] = wrapper
@@ -80,14 +84,16 @@ def signed_graph(*, mutate=None, context=False,
         raise ValueError("fixture documents differ from manifest roles")
     raws = {role: canonical(documents[role]) for role in active_roles}
     hashes = {role + "_registry_hash": hashlib.sha256(raw).hexdigest() for role, raw in raws.items()}
-    root = canonical(dict(schema_version=manifest_version, purpose="official", approval_id="test-graph-approval", **hashes))
+    approval_id = "test-graph-approval" if purpose == "official" else None
+    root = canonical(dict(schema_version=manifest_version, purpose=purpose,
+        approval_id=approval_id, **hashes))
     manifest = FormalRegistryManifest.from_signed_bytes(root, verifier.sign(root), "scoring-test-key", verifier)
     blobs = {}
     for role, raw in raws.items():
         digest = hashlib.sha256(raw).hexdigest()
         binding = canonical(dict(child_sha256=digest, registry_manifest_hash=manifest.manifest_hash, registry_role=role))
         blobs[digest] = VerifiedRegistryBlob(role, digest, raw, verifier.sign(raw), "scoring-test-key",
-            manifest.approval_id, manifest.manifest_hash, verifier.sign(binding), "scoring-test-key")
+            approval_id, manifest.manifest_hash, verifier.sign(binding), "scoring-test-key")
     repository = InMemoryRepository(manifest, blobs)
     bundle = FormalRegistryBundleLoader(repository, verifier).load(manifest.manifest_hash)
     feature = bundle.blob("feature")
@@ -175,6 +181,51 @@ class FormalScoringRegistryTests(unittest.TestCase):
             sys.setprofile(previous)
         self.assertEqual(initial_calls.count("template_slots"), 5)
         self.assertEqual(calls, ["release", "feature_fingerprint"])
+
+    def test_warm_authenticated_registry_never_rebuilds_recursive_fingerprint(self):
+        from tests.test_formal_test_root_contract import signed_stage_d_graph
+
+        for purpose in ("official", "test"):
+            with self.subTest(purpose=purpose):
+                bundle, vocabulary, _, _ = signed_stage_d_graph(purpose=purpose)
+                approval = self.api.RegistryApproval(
+                    purpose,
+                    bundle.manifest.scoring_registry_hash,
+                    bundle.manifest.approval_id if purpose == "official" else None,
+                )
+                registry = self.api.load_formal_registry(
+                    bundle, approval, feature_registry=vocabulary
+                )
+                registry.require_authenticated(
+                    bundle, expected_purpose=purpose
+                )
+                registry.template_for("bank")
+
+                fingerprint_code = inspect.getclosurevars(
+                    self.api.load_formal_registry
+                ).nonlocals["fingerprint"].__code__
+                fingerprint_calls = 0
+
+                def trace(frame, event, _argument):
+                    nonlocal fingerprint_calls
+                    if (event == "call" and frame.f_code is fingerprint_code
+                            and frame.f_code.co_filename.endswith(
+                                "formal_scoring_registry.py"
+                            )):
+                        fingerprint_calls += 1
+
+                previous = sys.getprofile()
+                sys.setprofile(trace)
+                try:
+                    for _ in range(3):
+                        registry.template_for("bank")
+                        registry.require_authenticated(
+                            bundle, expected_purpose=purpose
+                        )
+                finally:
+                    sys.setprofile(previous)
+
+                self.assertEqual(fingerprint_calls, 0)
 
     def test_test_purpose_cannot_be_promoted_by_official_approval(self):
         bundle, vocabulary, _, _ = signed_graph()
@@ -408,6 +459,68 @@ class FormalScoringRegistryTests(unittest.TestCase):
         object.__setattr__(metric, "direction", "lower")
         with self.assertRaises(self.api.RegistryValidationError):
             registry.require_official(bundle)
+
+    def test_warm_snapshot_rejects_mapping_type_and_cycle_mutations(self):
+        bundle, vocabulary, _, _ = signed_graph()
+        registry = self.load_official(bundle, vocabulary)
+        registry.require_official(bundle)
+        metric = registry.template_for("bank").metrics["V"][0]
+        original_map = object.__getattribute__(metric, "field_map")
+        cyclic_data = {}
+        cyclic_map = MappingProxyType(cyclic_data)
+        cyclic_data["self"] = cyclic_map
+        for replacement in (
+            {"value": original_map["value"]},
+            MappingProxyType({"value": "changed"}),
+            cyclic_map,
+        ):
+            try:
+                object.__setattr__(metric, "field_map", replacement)
+                with self.subTest(replacement=type(replacement)), self.assertRaises(
+                    self.api.RegistryValidationError
+                ):
+                    registry.require_official(bundle)
+            finally:
+                object.__setattr__(metric, "field_map", original_map)
+            registry.require_official(bundle)
+
+        original_industries = object.__getattribute__(
+            registry, "cyclic_secondary_industries"
+        )
+        try:
+            object.__setattr__(
+                registry,
+                "cyclic_secondary_industries",
+                tuple(original_industries),
+            )
+            with self.assertRaises(self.api.RegistryValidationError):
+                registry.require_official(bundle)
+        finally:
+            object.__setattr__(
+                registry, "cyclic_secondary_industries", original_industries
+            )
+        registry.require_official(bundle)
+
+    def test_warm_snapshot_rejects_identical_mapping_in_reversed_order(self):
+        bundle, vocabulary, _, _ = signed_graph()
+        registry = self.load_official(bundle, vocabulary)
+        registry.require_official(bundle)
+        template = registry.template_for("bank")
+        original = object.__getattribute__(template, "metrics")
+        reversed_mapping = MappingProxyType(
+            dict(reversed(tuple(original.items())))
+        )
+        self.assertEqual(dict(reversed_mapping), dict(original))
+        self.assertNotEqual(
+            tuple(reversed_mapping.items()), tuple(original.items())
+        )
+        try:
+            object.__setattr__(template, "metrics", reversed_mapping)
+            with self.assertRaises(self.api.RegistryValidationError):
+                registry.require_official(bundle)
+        finally:
+            object.__setattr__(template, "metrics", original)
+        registry.require_official(bundle)
 
     def test_copied_forged_and_approval_mutated_registries_cannot_be_official(self):
         bundle, vocabulary, _, _ = signed_graph()

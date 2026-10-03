@@ -108,14 +108,18 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
         value = records.get(id(store))
         if type(store) is not FormalRangeStore or value is None or value[0]() is not store:
             raise ValueError("range store is forged or copied")
-        _, state, path, root, verifier, verify_anchor, factory, cache = value
+        (_, state, path, root, verifier, verify_anchor, factory, cache,
+         expected_purpose) = value
         _require_repository_initialization(state)
         if (type(state) is not StateStore or state.db_path.resolve() != path
                 or getattr(state._connect, "__func__", None) is not connect):
             raise ValueError("range StateStore identity changed")
         if getattr(verifier, "verify") != verify_anchor:
             raise ValueError("range signature verifier changed")
-        return state, root, verifier, factory, cache
+        if (type(expected_purpose) is not str
+                or expected_purpose not in ("test", "official")):
+            raise ValueError("range store sealed purpose is invalid")
+        return state, root, verifier, factory, cache, expected_purpose
 
     from .formal_range_contract import _range_binding_lookup_authority
     planning_binding_type, read_planning_binding = _range_binding_planning_authority()
@@ -125,19 +129,41 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
      enter_sibling_target, close_sibling_target,
      enter_sibling_exact, close_sibling_exact) = _range_binding_sibling_read_authority()
 
-    def load_binding_identity(store, *, registry_manifest_hash, binding_hash, exchange):
-        state, _, verifier, factory, cache = record(store)
+    def load_binding_identity(store, *, registry_manifest_hash, binding_hash,
+                              exchange, expected_purpose):
+        state, _, verifier, factory, cache, sealed_purpose = record(store)
+        if (type(expected_purpose) is not str
+                or expected_purpose not in ("test", "official")
+                or expected_purpose != sealed_purpose):
+            raise ValueError("range binding expected purpose differs from store")
         root_hash = registry_manifest_hash
         bundle = FormalRegistryBundleLoader(state, verifier).load(root_hash)
-        key = root_hash, binding_hash, exchange
+        if bundle.manifest.purpose != expected_purpose:
+            raise ValueError("range binding registry purpose differs from expected purpose")
+        key = expected_purpose, root_hash, binding_hash, exchange
         if key not in cache:
             blob = bundle.blob("feature")
             vocabulary = load_signed_feature_registry(blob.canonical_json, blob.signature, blob.key_id,
                 verifier, registry_manifest=bundle.manifest)
-            scoring = load_formal_registry(bundle, RegistryApproval("official", bundle.manifest.scoring_registry_hash,
-                bundle.manifest.approval_id), feature_registry=vocabulary)
-            policy = load_formal_policy_registry(bundle, scoring_registry=scoring, feature_registry=vocabulary)
-            bindings = load_policy_range_bindings(bundle, scoring_registry=scoring, policy_registry=policy)
+            approval_id = bundle.manifest.approval_id
+            if (expected_purpose == "test" and approval_id is not None) or (
+                    expected_purpose == "official" and (
+                        type(approval_id) is not str
+                        or not approval_id
+                        or approval_id != approval_id.strip()
+                    )):
+                raise ValueError("range binding registry approval identity is invalid")
+            scoring = load_formal_registry(bundle, RegistryApproval(
+                expected_purpose, bundle.manifest.scoring_registry_hash, approval_id
+            ), feature_registry=vocabulary)
+            policy = load_formal_policy_registry(
+                bundle, scoring_registry=scoring, feature_registry=vocabulary,
+                expected_purpose=expected_purpose,
+            )
+            bindings = load_policy_range_bindings(
+                bundle, scoring_registry=scoring, policy_registry=policy,
+                expected_purpose=expected_purpose,
+            )
             binding = lookup_planning_binding(bindings, binding_hash, exchange)
             source = factory(binding)
             if type(source) is not source_type or source_binding(source) is not binding:
@@ -150,13 +176,14 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
         bind_source_store(source, store)
         return binding, source
 
-    def load_binding(store, payload):
+    def load_binding(store, payload, *, expected_purpose):
         request = payload["request"]
         return load_binding_identity(
             store,
             registry_manifest_hash=request["registry_manifest_hash"],
             binding_hash=payload.get("binding_hash"),
             exchange=request["exchange"],
+            expected_purpose=expected_purpose,
         )
 
     def planning_identity(value):
@@ -189,7 +216,10 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
 
     def request_for(store, row, seen, *, execution=False, evidence=None):
         payload = task_payload(row)
-        binding, source = load_binding(store, payload)
+        _, _, _, _, _, expected_purpose = record(store)
+        binding, source = load_binding(
+            store, payload, expected_purpose=expected_purpose
+        )
         parent = payload["parent"]
         previous = None
         if parent is not None:
@@ -244,7 +274,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
             raise ValueError("range raw files changed during verification")
 
     def read(store, task_id, *, historical=False, seen=(), evidence=None):
-        state, root, _, _, _ = record(store)
+        state, root, _, _, _, _ = record(store)
         _text(task_id)
         if task_id in seen:
             raise ValueError("range parent cycle")
@@ -334,12 +364,12 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                 raise ValueError("range current candidates changed during verification")
 
     def finish_current_check(store, snapshots):
-        state, _, _, _, _ = record(store)
+        state, _, _, _, _, _ = record(store)
         with transaction(state) as connection:
             check_candidate_snapshots(connection, snapshots)
 
     def current_candidates(store, fingerprint):
-        state, _, _, _, _ = record(store)
+        state, _, _, _, _, _ = record(store)
         with transaction(state) as connection:
             snapshot = candidate_snapshot(connection, fingerprint)
         token = (fingerprint, snapshot)
@@ -404,7 +434,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
             if capture is None:
                 finish_current_check(store, snapshots)
             else:
-                state, root, _, _, _ = record(store)
+                state, root, _, _, _, _ = record(store)
                 with transaction(state) as connection:
                     check_candidate_snapshots(connection, snapshots)
                     for item in authenticated:
@@ -430,12 +460,16 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
         return snapshots
 
     class FormalRangeStore:
-        def __init__(self, state_store, *, root, signature_verifier, source_factory):
+        def __init__(self, state_store, *, root, signature_verifier,
+                     source_factory, expected_purpose="official"):
             if type(self) is not FormalRangeStore or type(state_store) is not StateStore:
                 raise ValueError("range store requires exact StateStore")
             _require_repository_initialization(state_store)
             if not callable(source_factory) or not callable(getattr(signature_verifier, "verify", None)):
                 raise ValueError("range store dependencies invalid")
+            if (type(expected_purpose) is not str
+                    or expected_purpose not in ("test", "official")):
+                raise ValueError("range store expected_purpose must be exact test or official")
             with transaction(state_store) as connection:
                 schema_check(connection, _V7_TABLE_DDL, _V7_INDEX_DDL, "v7 schema")
                 if connection.execute("SELECT count(*) FROM schema_migration WHERE version=7").fetchone()[0] != 1:
@@ -443,10 +477,10 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
             identity = id(self)
             records[identity] = (weakref.ref(self, lambda _: records.pop(identity, None)), state_store,
                 state_store.db_path.resolve(), Path(root).resolve(), signature_verifier,
-                signature_verifier.verify, source_factory, {})
+                signature_verifier.verify, source_factory, {}, expected_purpose)
 
         def enqueue(self, request, *, refresh_generation):
-            state, _, _, _, _ = record(self)
+            state, _, _, _, _, expected_purpose = record(self)
             _text(refresh_generation)
             require_execution(request, self)
             payload = dict(schema_version="formal-range-task-v1", **describe_request(request), refresh_generation=refresh_generation)
@@ -457,7 +491,9 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                 range_config_id=wire["range_config_id"], refresh_generation=refresh_generation, **_payload(payload),
                 status="pending", worker_id=None, lease_expires_at=None, attempt_no=0, next_retry_at=None,
                 result_json=None, error_json=None, created_at=now, updated_at=now)
-            load_binding(self, payload)
+            load_binding(
+                self, payload, expected_purpose=expected_purpose
+            )
             with transaction(state, immediate=True) as connection:
                 existing = connection.execute("SELECT * FROM formal_range_task WHERE request_fingerprint=? AND registry_manifest_hash=? AND range_config_id=? AND refresh_generation=?",
                     tuple(row[key] for key in ("request_fingerprint", "registry_manifest_hash", "range_config_id", "refresh_generation"))).fetchone()
@@ -472,7 +508,8 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                 read(self, result["id"])
             return result
 
-        def resolve_planning_binding(self, binding):
+        def resolve_planning_binding(self, binding, *,
+                                     expected_purpose="official"):
             if type(binding) is not planning_binding_type:
                 raise ValueError("planning requires an exact genuine range binding")
             caller = read_planning_binding(binding)
@@ -481,6 +518,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                 registry_manifest_hash=caller["registry_manifest_hash"],
                 binding_hash=caller["binding_hash"],
                 exchange=caller["exchange"],
+                expected_purpose=expected_purpose,
             )
             if planning_identity(binding) != planning_identity(reconstructed):
                 raise ValueError("planning binding identity differs from owning Store graph")
@@ -489,7 +527,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
             return reconstructed, source
 
         def lease_next(self, worker_id, *, lease_seconds):
-            state, _, _, _, _ = record(self)
+            state, _, _, _, _, _ = record(self)
             _text(worker_id)
             if type(lease_seconds) is not int or lease_seconds <= 0:
                 raise ValueError("lease duration must be positive exact integer")
@@ -526,7 +564,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                 return dict(result, request=request, binding=source_binding(source))
 
         def renew(self, task_id, worker_id, attempt_id, *, lease_seconds):
-            state, _, _, _, _ = record(self)
+            state, _, _, _, _, _ = record(self)
             if type(lease_seconds) is not int or lease_seconds <= 0:
                 raise ValueError("lease duration must be positive exact integer")
             with transaction(state, immediate=True) as connection:
@@ -538,7 +576,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                 return public(connection.execute("SELECT * FROM formal_range_task WHERE id=?", (task_id,)).fetchone(), attempt)
 
         def fail(self, task_id, worker_id, attempt_id, *, code, retryable, next_retry_at):
-            state, _, _, _, _ = record(self)
+            state, _, _, _, _, _ = record(self)
             _text(code)
             if type(retryable) is not bool or (retryable and next_retry_at is None) or (not retryable and next_retry_at is not None):
                 raise ValueError("range failure retry shape invalid")
@@ -554,7 +592,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                 return public(connection.execute("SELECT * FROM formal_range_task WHERE id=?", (task_id,)).fetchone(), attempt)
 
         def persist(self, task_id, worker_id, attempt_id, *, fetch):
-            state, root, _, _, _ = record(self)
+            state, root, _, _, _, _ = record(self)
             if type(fetch) is not fetch_type:
                 raise ValueError("range persistence requires genuine fetch")
             fetch_manifest_bytes, raw_bytes = fetch_snapshot(fetch)
@@ -674,7 +712,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                     snapshots = (*snapshots, *parent_snapshots)
                 elif parent_tokens:
                     raise ValueError("range absence has an unexpected parent token")
-                state, root, _, _, _ = record(self)
+                state, root, _, _, _, _ = record(self)
                 with transaction(state) as connection:
                     check_candidate_snapshots(connection, snapshots)
                     for item in authenticated:
@@ -707,7 +745,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
                     close_sibling_exact(exact_only)
             if observation_wire(reread)[1] != digest:
                 raise ValueError("range selected observation changed during ticket issuance")
-            state, root, _, _, _ = record(self)
+            state, root, _, _, _, _ = record(self)
             with transaction(state) as connection:
                 if not {item[0]["request_fingerprint"] for item in authenticated} <= {
                         key for key, _ in snapshots}:
@@ -734,7 +772,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
             target = (None if request is None else
                       enter_sibling_target(fingerprint, "ticket:" + fingerprint))
             try:
-                state, root, _, _, _ = record(self)
+                state, root, _, _, _, _ = record(self)
                 if fingerprint not in dict(snapshots):
                     raise ValueError("range ticket evidence is incomplete")
                 if digest is None:
@@ -768,7 +806,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
         if callable(value) or isinstance(value, (staticmethod, classmethod)))
 
     def require_batch_journal_owner(store):
-        state, root, verifier, factory, _ = record(store)
+        state, root, verifier, factory, _, _ = record(store)
         for cls, name, method in batch_methods:
             if vars(cls).get(name) is not method:
                 raise ValueError("range journal reader or owner method changed")
@@ -782,7 +820,7 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
 
     def require_identity(store, expected_state_store, expected_signature_verifier):
         """Check ownership without exposing any captured dependency or authority."""
-        state, _, verifier, _, _ = record(store)
+        state, _, verifier, _, _, _ = record(store)
         if state is not expected_state_store or verifier is not expected_signature_verifier:
             raise ValueError("range store requires the same StateStore and signature verifier")
 

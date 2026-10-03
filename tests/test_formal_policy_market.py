@@ -125,6 +125,58 @@ class EvaluateWindowTests(unittest.TestCase):
 
 
 class MarketRepositoryTests(unittest.TestCase):
+    def test_test_store_requires_explicit_matching_selection_purpose(self):
+        import inspect
+        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+
+        fixture = RangeStoreFixture(purpose="test")
+        self.addCleanup(fixture.close)
+        repository = FormalPolicyMarketRepository(fixture.range_store)
+        for method_name in (
+                "select_calendar", "select", "select_calendar_batch_ticket",
+                "select_current_batch_ticket"):
+            parameter = inspect.signature(
+                getattr(FormalPolicyMarketRepository, method_name)
+            ).parameters["expected_purpose"]
+            self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+            self.assertEqual(parameter.default, "official")
+        with self.assertRaisesRegex(ValueError, "purpose"):
+            repository.select_calendar(fixture.binding, FREEZE)
+        selected = repository.select_calendar(
+            fixture.binding, FREEZE, expected_purpose="test"
+        )
+        self.assertIsNone(selected.coverage)
+        self.assertEqual(selected.pending, ("calendar_coverage_missing",))
+        selected.recheck()
+        market = repository.select(
+            "SH600000", FREEZE, binding=fixture.binding,
+            expected_purpose="test",
+        )
+        self.assertIsNone(market.window)
+        market.recheck()
+        journal = FormalBatchReadJournal.open(
+            repository,
+            registry_manifest_hash=fixture.graph.manifest.manifest_hash,
+            as_of_utc=FREEZE,
+            population=("SH600000",),
+            required_keys=(("SH600000",),),
+        )
+        ticket = repository.select_current_batch_ticket(
+            journal, "SH600000", FREEZE, binding=fixture.binding,
+            expected_purpose="test",
+        )
+        self.assertIsNone(ticket.selected().window)
+        journal.checkpoint()
+        journal.close()
+        class Purpose(str):
+            pass
+        for invalid in (None, True, Purpose("test"), "fixture"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    ValueError, "expected_purpose"):
+                repository.select_calendar(
+                    fixture.binding, FREEZE, expected_purpose=invalid)
+
     def fixture(self, **kwargs):
         fixture = RangeStoreFixture(**kwargs)
         self.addCleanup(fixture.close)

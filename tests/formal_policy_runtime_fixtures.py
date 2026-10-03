@@ -126,7 +126,8 @@ class PolicyRuntimeFixture(FinancialFixture):
     """Small producer-backed graph; it does not confer production meaning."""
 
     def __init__(self, *, range_enabled=False, templates=None, cyclic=True, mutate=None,
-                 extra_members=(), noncyclic_ids=(), valuation_adapter=False):
+                 extra_members=(), noncyclic_ids=(), valuation_adapter=False,
+                 purpose="official"):
         if type(range_enabled) is not bool or type(cyclic) is not bool:
             raise ValueError("range_enabled and cyclic must be exact bool")
         selected_templates = _templates(templates)
@@ -146,9 +147,9 @@ class PolicyRuntimeFixture(FinancialFixture):
                 config(dataset="fixture-state", exchange_scope=exchange)
                 for exchange in ("BJ", "SH", "SZ")
             )
-            add_policy_documents(documents)
+            add_policy_documents(documents, purpose=purpose)
             if valuation_adapter:
-                add_valuation_adapter_document(documents)
+                add_valuation_adapter_document(documents, purpose=purpose)
             _patch_current_policy_periods(documents)
             policy_financial_mapping_documents(documents)
             if range_enabled:
@@ -168,11 +169,13 @@ class PolicyRuntimeFixture(FinancialFixture):
                 exchange_rows=_exchange_rows(selected_templates, extra_members),
                 manifest_version=("formal-registry-manifest-v2" if valuation_adapter
                                   else "formal-registry-manifest-v1"),
+                purpose=purpose,
             )
             self.policy_registry = load_formal_policy_registry(
                 self.bundle,
                 scoring_registry=self.scoring,
                 feature_registry=self.vocabulary,
+                expected_purpose=self.purpose,
             )
             if range_enabled:
                 from ashare_pipeline.formal_range_contract import load_policy_range_bindings
@@ -182,7 +185,9 @@ class PolicyRuntimeFixture(FinancialFixture):
                     _CapturingRangeTransport, _IdentityRangeNormalizer, _JsonRangeParser,
                 )
                 bindings = load_policy_range_bindings(self.bundle,
-                    scoring_registry=self.scoring, policy_registry=self.policy_registry)
+                    scoring_registry=self.scoring,
+                    policy_registry=self.policy_registry,
+                    expected_purpose=self.purpose)
                 self.binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
                 self.transport = _CapturingRangeTransport()
                 self.parser = _JsonRangeParser()
@@ -196,7 +201,9 @@ class PolicyRuntimeFixture(FinancialFixture):
                 self.source = FormalRangeSource(self.binding, transport=self.transport,
                                                 implementations=self.implementations)
                 self.range_store = FormalRangeStore(self.store, root=self.root / "range_raw",
-                    signature_verifier=self.verifier, source_factory=self.source_factory)
+                    signature_verifier=self.verifier,
+                    source_factory=self.source_factory,
+                    expected_purpose=self.purpose)
         except Exception:
             if hasattr(self, "tempdir"):
                 self.tempdir.cleanup()
@@ -215,7 +222,8 @@ class PolicyRuntimeFixture(FinancialFixture):
 
     def build_policy_batch(self):
         return self.policy_repository.build_batch(self.frozen.frozen_input_hash,
-            scoring_registry=self.scoring, policy_registry=self.policy_registry)
+            scoring_registry=self.scoring, policy_registry=self.policy_registry,
+            expected_purpose=self.purpose)
 
     def populate_policy_evidence(self, *, skip_financial=(), security_state_overrides=None,
                                  financial_overrides=None):
@@ -225,7 +233,8 @@ class PolicyRuntimeFixture(FinancialFixture):
         from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
         from tests.test_formal_range_source import document_wire
         bindings = load_policy_range_bindings(self.bundle, scoring_registry=self.scoring,
-                                              policy_registry=self.policy_registry)
+            policy_registry=self.policy_registry,
+            expected_purpose=self.purpose)
         rules = self.policy_registry.to_dict()["rules"]
         templates = {member["security_id"]: member["template_id"] for member in self.industry["memberships"]}
         shared_calendars = {}
@@ -277,13 +286,16 @@ class PolicyRuntimeFixture(FinancialFixture):
                             or {row["date"]: row["is_open"] for row in document["rows"]} != days
                             or len(document["rows"]) != len(days)):
                         raise ValueError("fixture calendar request or current receipt differs")
-                calendar = FormalPolicyMarketRepository(self.range_store).select_calendar(self.binding, FREEZE)
+                calendar = FormalPolicyMarketRepository(self.range_store).select_calendar(
+                    self.binding, FREEZE, expected_purpose=self.purpose)
                 if calendar.coverage is None:
                     raise ValueError("fixture calendar must have genuine current coverage")
                 calendar.coverage.require_current()
                 if self._valuation_adapter_runtime:
                     shared_calendars[calendar_key] = (self.binding, calendar)
-            _, source = self.range_store.resolve_planning_binding(self.binding)
+            _, source = self.range_store.resolve_planning_binding(
+                self.binding, expected_purpose=self.purpose
+            )
             for request in source.market_requests(sid, calendar_coverage=calendar.coverage):
                 rows = []
                 sample = document_wire(request)["rows"][0]
@@ -338,7 +350,7 @@ class PolicyRuntimeFixture(FinancialFixture):
         scope = "fixture-state" if kind == "security_state" else "fixture-policy-" + kind
         request = self.resolver.resolve(context_kind=kind, scope_key=scope, security_id=security_id,
             as_of_utc=FREEZE, registry_manifest_hash=self.bundle.manifest.manifest_hash,
-            upstream_generation=generation)
+            upstream_generation=generation, expected_purpose=self.purpose)
         # New generations represent later corrections, with deterministic fixture times.
         generations = self._policy_context_generations.setdefault((security_id, kind), {})
         if generation not in generations:
@@ -361,9 +373,12 @@ class PolicyRuntimeFixture(FinancialFixture):
         self.assertEqual(verification.status, "verified")
         ref = self.snapshots.persist_verified(fetch, verification, producing_task_id=task, worker_id=worker)
         receipt = FormalContextRegistry.load(self.store, self.verifier,
-            self.bundle.manifest.manifest_hash).normalize_verified(request, ref, raw,
+            self.bundle.manifest.manifest_hash,
+            expected_purpose=self.purpose).normalize_verified(request, ref, raw,
             FixtureNormalizer(), task_id=task, worker_id=worker)
-        self.store.put_formal_context_facts(receipt)
+        self.store.put_formal_context_facts(
+            receipt, expected_purpose=self.purpose
+        )
         self.store.complete_formal_task(task, worker, {"snapshot": ref.snapshot_id})
         return receipt.facts[0], ref
 
@@ -371,18 +386,22 @@ class PolicyRuntimeFixture(FinancialFixture):
         from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
         member = next(m for m in self.industry["memberships"] if m["security_id"] == security_id)
         return FormalPolicyStateRepository(self.context).select(security_id, FREEZE,
-            template_id=member["template_id"], policy_registry=self.policy_registry)
+            template_id=member["template_id"],
+            policy_registry=self.policy_registry,
+            expected_purpose=self.purpose)
 
     def financial_selection(self, security_id):
         if security_id not in self._policy_industry_ids:
             self.put_industry(security_id)
             self._policy_industry_ids.add(security_id)
         universe = self.policy_context_repository.load_universe(self.frozen.frozen_input_hash,
-            scoring_registry=self.scoring)
+            scoring_registry=self.scoring, expected_purpose=self.purpose)
         industry = self.policy_context_repository.resolve_industries(universe)
         member = next(m for m in self.industry["memberships"] if m["security_id"] == security_id)
         selected = self.policy_financial_repository.select(security_id, FREEZE,
-            template_id=member["template_id"], policy_registry=self.policy_registry, industry_batch=industry)
+            template_id=member["template_id"],
+            policy_registry=self.policy_registry, industry_batch=industry,
+            expected_purpose=self.purpose)
         self.policy_context_repository.recheck_batch(universe, industry)
         return selected
 

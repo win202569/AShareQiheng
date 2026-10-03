@@ -24,7 +24,7 @@ from .formal_policy_market import (
 )
 from .formal_policy_values import PolicyValue, canonical_bytes, digest, _policy_value_operations
 from .formal_range_contract import load_policy_range_bindings
-from .formal_registry_manifest import FormalRegistryBundleLoader
+from .formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
 from .formal_scoring_registry import FormalScoringRegistry
 from .formal_batch_read_journal import (
     FormalBatchReadJournal, _issue_current_ticket, _require_current_scope,
@@ -44,6 +44,10 @@ def _install_repository():
     load_root = FormalRegistryBundleLoader.load
     load_bindings = load_policy_range_bindings
     evaluate, aggregate = evaluator_module.evaluate_rule, evaluator_module.aggregate_decisions
+    bundle_type = VerifiedRegistryBundle
+    scoring_type = FormalScoringRegistry
+    require_scoring_official = scoring_type.require_official
+    require_scoring_authenticated = scoring_type.require_authenticated
     roles = ("source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event")
     captured = tuple((owner, name, value) for name, value in owner.items()
                      if callable(value) and name != "_install_repository")
@@ -65,7 +69,8 @@ def _install_repository():
         FormalPolicyFinancialRepository, PolicyFinancialSelection,
         FormalPolicyStateRepository, PolicyStateSelection, FormalPolicyMarketRepository,
         MarketSelection, CalendarSelection, VerifiedMarketWindowV1, VerifiedCalendarCoverageV1,
-        range_module.FormalRangeStore, FormalRegistryBundleLoader, FormalScoringRegistry)
+        range_module.FormalRangeStore, FormalRegistryBundleLoader, FormalScoringRegistry,
+        VerifiedRegistryBundle)
     checked = tuple((cls, name, value) for cls in dependencies_classes
                     for name, value in vars(cls).items()
                     if callable(value) or isinstance(value, (staticmethod, classmethod)))
@@ -78,6 +83,23 @@ def _install_repository():
             raise ValueError("policy publication reader interface changed")
         if any(owner.get(name) is not original for name, original in entries):
             raise ValueError("policy publication entry point changed")
+
+    def authenticate_scoring(scoring, bundle, *, expected_purpose):
+        if type(scoring) is not scoring_type or type(bundle) is not bundle_type:
+            raise ValueError("policy publication requires exact scoring and registry bundle types")
+        if (type(expected_purpose) is not str
+                or expected_purpose not in {"test", "official"}):
+            raise ValueError("policy expected_purpose must be exact test or official")
+        if (scoring_type.require_official is not require_scoring_official
+                or scoring_type.require_authenticated is not require_scoring_authenticated):
+            raise ValueError("policy publication scoring verifier changed")
+        if getattr(bundle.manifest, "purpose") != expected_purpose:
+            raise ValueError("policy registry purpose differs from expected_purpose")
+        if expected_purpose == "official":
+            require_scoring_official(scoring, bundle)
+        else:
+            require_scoring_authenticated(scoring, bundle, expected_purpose="test")
+        return expected_purpose
 
     def state(feature, context, ranges, verifier, companion):
         interfaces()
@@ -127,7 +149,8 @@ def _install_repository():
         if (type(proof) not in proof_types or saved is None or saved[0]() is not proof
                 or saved[6] is not type(proof)
                 or not saved[3]["published"] or saved[4] is not saved[3]["parent_link"]
-                or saved[5] != saved[3]["batch_hash"]):
+                or saved[5] != saved[3]["batch_hash"]
+                or saved[7] != saved[3]["purpose"]):
             raise ValueError("policy proof is forged, copied, unpublished or revoked")
         return saved
 
@@ -157,7 +180,16 @@ def _install_repository():
         def require_verified(self):
             record(self)
 
-        require_official = require_verified
+        def require_authenticated(self, *, expected_purpose):
+            if (type(expected_purpose) is not str
+                    or expected_purpose not in {"test", "official"}):
+                raise ValueError("expected_purpose must be the exact string test or official")
+            if record(self)[7] != expected_purpose:
+                raise ValueError("policy proof purpose differs from expected_purpose")
+
+        def require_official(self):
+            if record(self)[7] != "official":
+                raise ValueError("policy proof does not have official authority")
 
         def to_dict(self):
             return json.loads(record(self)[2])
@@ -192,7 +224,8 @@ def _install_repository():
         data = dict(wire)
         data.update(attributes or {})
         proofs[key] = (weakref.ref(proof, lambda _: proofs.pop(key, None)), freeze(data), encode(wire),
-                       publication, publication["parent_link"], publication["batch_hash"], cls)
+                       publication, publication["parent_link"], publication["batch_hash"], cls,
+                       publication["purpose"])
         return proof
 
     class FormalPolicyRepository(metaclass=SealedMeta):
@@ -233,18 +266,20 @@ def _install_repository():
                 raise ValueError("policy result batch has no original current-state recheck")
             saved[2](batch)
 
-        def build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry):
+        def build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry,
+                        expected_purpose="official"):
             return self._build_batch(frozen_input_hash, scoring_registry=scoring_registry,
-                                     policy_registry=policy_registry, owner_scope=None)[0]
+                                     policy_registry=policy_registry, owner_scope=None,
+                                     expected_purpose=expected_purpose)[0]
 
         def _build_batch_in_owner_scope(self, frozen_input_hash, *, scoring_registry,
-                                        policy_registry, owner_scope):
+                                        policy_registry, owner_scope, expected_purpose):
             """Return a batch, coverage ticket, and revoker to an enclosing owner."""
             batch = revoke = None
             try:
                 batch, revoke, check_dependencies = self._build_batch(frozen_input_hash,
                     scoring_registry=scoring_registry, policy_registry=policy_registry,
-                    owner_scope=owner_scope)
+                    owner_scope=owner_scope, expected_purpose=expected_purpose)
                 wire = record(batch)[2]
                 ticket = _issue_current_ticket(owner_scope, self, "policy",
                     (frozen_input_hash, batch.batch_hash), wire,
@@ -273,23 +308,36 @@ def _install_repository():
             return saved[1]._store, (saved[7], saved[8], saved[9])
 
         def _build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry,
-                         owner_scope):
+                         owner_scope, expected_purpose):
             saved = dependencies(self)
             feature, _, ranges, verifier, context = saved[1:6]
             financial, states, market = saved[7:]
-            if type(frozen_input_hash) is not str or type(scoring_registry) is not FormalScoringRegistry:
+            if (type(frozen_input_hash) is not str
+                    or type(scoring_registry) is not FormalScoringRegistry
+                    or type(expected_purpose) is not str
+                    or expected_purpose not in {"test", "official"}):
                 raise ValueError("policy publication requires exact frozen and registry identities")
             prepared = None
             scope = None
             selections = []
             market_markers = []
-            publication = dict(published=False, parent_link=object(), batch_hash=None)
+            publication = dict(published=False, parent_link=object(), batch_hash=None, purpose=None)
 
             def registry_snapshot(root_hash):
                 dependencies(self)
                 bundle = load_root(FormalRegistryBundleLoader(feature._store, verifier), root_hash)
-                scoring_registry.require_official(bundle)
-                policy = read_policy(policy_registry)
+                purpose = authenticate_scoring(
+                    scoring_registry,
+                    bundle,
+                    expected_purpose=expected_purpose,
+                )
+                if publication["purpose"] is None:
+                    publication["purpose"] = purpose
+                elif publication["purpose"] != purpose:
+                    raise ValueError("policy publication registry purpose changed")
+                policy = read_policy(
+                    policy_registry, expected_purpose=expected_purpose
+                )
                 role_bytes = {role: bundle.blob(role).canonical_json for role in roles}
                 if (policy["registry_manifest_hash"] != root_hash
                         or any(policy["role_hashes"][role] != hash_payload(json.loads(raw))
@@ -299,12 +347,20 @@ def _install_repository():
 
             def prepare():
                 nonlocal universe, industry, policy_wire, source_bytes, root_hash, scope
-                universe = context.load_universe(frozen_input_hash, scoring_registry=scoring_registry)
+                universe = context.load_universe(
+                    frozen_input_hash,
+                    scoring_registry=scoring_registry,
+                    expected_purpose=expected_purpose,
+                )
                 if universe is None:
                     raise ValueError("policy frozen universe is absent")
                 root_hash = universe.registry_manifest_hash
                 bundle, policy_wire, source_bytes = registry_snapshot(root_hash)
-                bindings = load_bindings(bundle, scoring_registry=scoring_registry, policy_registry=policy_registry)
+                bindings = load_bindings(
+                    bundle, scoring_registry=scoring_registry,
+                    policy_registry=policy_registry,
+                    expected_purpose=expected_purpose,
+                )
                 industry = context.resolve_industries(universe)
                 required = tuple((sid,) for sid in universe.security_ids
                                  if industry.entries[sid]["status"] == "assigned")
@@ -330,9 +386,11 @@ def _install_repository():
                         template = entry["template_id"]
                         args = dict(template_id=template, policy_registry=policy_registry)
                         fin_ticket = financial.select_current_batch_ticket(scope, sid,
-                            universe.as_of_utc, industry_batch=industry, **args)
+                            universe.as_of_utc, industry_batch=industry,
+                            expected_purpose=expected_purpose, **args)
                         state_ticket = states.select_current_batch_ticket(scope, sid,
-                            universe.as_of_utc, **args)
+                            universe.as_of_utc,
+                            expected_purpose=expected_purpose, **args)
                         fin, state_selection = fin_ticket.selected(), state_ticket.selected()
                         selections.extend((fin, state_selection))
                         values = dict(fin.values)
@@ -352,7 +410,8 @@ def _install_repository():
                             if rule["kind"] == "market_liquidity":
                                 binding = bindings.for_rule(rule["rule_id"], sid[:2])
                                 selected = market.select_current_batch_ticket(scope, sid,
-                                    universe.as_of_utc, binding=binding).selected()
+                                    universe.as_of_utc, binding=binding,
+                                    expected_purpose=expected_purpose).selected()
                                 if type(selected) is not MarketSelection:
                                     raise ValueError("market repository returned an unknown selection")
                                 market_markers.append((selected, selected.window, selected.pending,

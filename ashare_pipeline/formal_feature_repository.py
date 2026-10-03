@@ -43,6 +43,10 @@ _IDENTITY = ("security_id", "as_of_utc", "template_id", "registry_manifest_hash"
 _METADATA_ONLY = frozenset({
     "id", "bundle_hash", "bundle_manifest_hash", "bundle_path", "manifest_path", "created_at_utc",
 })
+_REQUIRE_BUNDLE_OFFICIAL = VerifiedRegistryBundle.require_official
+_REQUIRE_BUNDLE_AUTHENTICATED = VerifiedRegistryBundle.require_authenticated
+_REQUIRE_FEATURE_RELEASE_ELIGIBLE = SignedFormalFeatureRegistry.require_release_eligible
+_REQUIRE_FEATURE_AUTHENTICATED = SignedFormalFeatureRegistry.require_authenticated
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,15 +129,32 @@ class FormalFeatureRepository:
         self._verifier = registry_signature_verifier
         self._current_input_provider = current_input_provider
 
-    def _registry(self, root_hash: str) -> tuple[VerifiedRegistryBundle, SignedFormalFeatureRegistry]:
+    def _registry(self, root_hash: str, *, expected_purpose="official") -> tuple[VerifiedRegistryBundle, SignedFormalFeatureRegistry]:
+        if (type(expected_purpose) is not str
+                or expected_purpose not in {"test", "official"}):
+            raise ValueError("formal feature expected_purpose must be exact test or official")
+        if (VerifiedRegistryBundle.require_official is not _REQUIRE_BUNDLE_OFFICIAL
+                or VerifiedRegistryBundle.require_authenticated is not _REQUIRE_BUNDLE_AUTHENTICATED
+                or SignedFormalFeatureRegistry.require_release_eligible is not _REQUIRE_FEATURE_RELEASE_ELIGIBLE
+                or SignedFormalFeatureRegistry.require_authenticated is not _REQUIRE_FEATURE_AUTHENTICATED):
+            raise ValueError("formal feature registry verifier changed")
         graph = FormalRegistryBundleLoader(self._store, self._verifier).load(root_hash)
-        graph.require_official()
+        actual_purpose = getattr(graph.manifest, "purpose")
+        if actual_purpose != expected_purpose:
+            raise ValueError("formal feature registry purpose differs from expected_purpose")
+        if expected_purpose == "official":
+            _REQUIRE_BUNDLE_OFFICIAL(graph)
+        else:
+            _REQUIRE_BUNDLE_AUTHENTICATED(graph, expected_purpose="test")
         child = graph.blob("feature")
         registry = load_signed_feature_registry(
             child.canonical_json, child.signature, child.key_id, self._verifier,
             registry_manifest=graph.manifest,
         )
-        registry.require_release_eligible()
+        if expected_purpose == "official":
+            _REQUIRE_FEATURE_RELEASE_ELIGIBLE(registry)
+        else:
+            _REQUIRE_FEATURE_AUTHENTICATED(registry, graph, expected_purpose="test")
         if (graph.manifest.manifest_hash != root_hash
                 or graph.manifest.feature_registry_hash != child.registry_hash
                 or registry.registry_hash != child.registry_hash
@@ -195,11 +216,17 @@ class FormalFeatureRepository:
                     if fact_wire[field] is not None and datetime.fromisoformat(fact_wire[field]) > cutoff:
                         raise ValueError("formal feature evidence is after cutoff")
 
-    def get_verified_formal_feature_bundle(self, *, input_hash: str) -> FormalFeatureBundle | None:
+    def get_verified_formal_feature_bundle(self, *, input_hash: str,
+                                           expected_purpose="official") -> FormalFeatureBundle | None:
         """Read an exact historical receipt; this does not rebuild historical inputs."""
-        return self._read_authenticated_bundle(input_hash=input_hash, require_complete=True)
+        return self._read_authenticated_bundle(
+            input_hash=input_hash,
+            require_complete=True,
+            expected_purpose=expected_purpose,
+        )
 
     def _read_authenticated_bundle(self, *, input_hash: str, require_complete: bool,
+                                   expected_purpose="official",
                                    _receipt_capture: list[bytes | None] | None = None) -> FormalFeatureBundle | None:
         """Authenticate every persisted byte; completeness is a separate read gate."""
         _require_hash(input_hash, "formal feature input hash")
@@ -229,7 +256,10 @@ class FormalFeatureRepository:
         if (wire["input_hash"] != input_hash or bundle.bundle_hash() != receipt.bundle_hash
                 or _canonical_json_bytes(expected) != before):
             raise ValueError("formal feature database/file projection mismatch")
-        _, registry = self._registry(wire["registry_manifest_hash"])
+        _, registry = self._registry(
+            wire["registry_manifest_hash"],
+            expected_purpose=expected_purpose,
+        )
         self._validate_signed_values(bundle, registry, require_complete=require_complete)
         self._validate_evidence(bundle)
         if _canonical_json_bytes(self._metadata(input_hash)) != before:
@@ -262,13 +292,16 @@ class FormalFeatureRepository:
 
     def select_current_verified_formal_feature_bundle(
         self, security_id: str, as_of_utc: str, *, template_id: str, registry_manifest_hash: str,
+        expected_purpose="official",
     ) -> FormalFeatureBundle | None:
         """Rebuild current semantics from a trusted complete finite provider snapshot."""
         request = _request(security_id, as_of_utc, template_id, registry_manifest_hash)
         provider = self._current_input_provider
         if provider is None:
             raise ValueError("formal feature current input provider is required")
-        graph, registry = self._registry(registry_manifest_hash)
+        graph, registry = self._registry(
+            registry_manifest_hash, expected_purpose=expected_purpose
+        )
         try:
             supplied = provider.resolve_current_inputs(**request)
         except Exception as error:
@@ -285,13 +318,17 @@ class FormalFeatureRepository:
         expected = build_formal_feature_bundle(
             security_id=security_id, as_of_utc=as_of_utc, template_id=template_id,
             facts=facts, issues=issues, registry=registry, registry_manifest=graph.manifest,
+            registry_bundle=graph, expected_purpose=expected_purpose,
         )
         if type(expected) is not FormalFeatureBundle:
             raise ValueError("formal feature builder returned an invalid bundle")
         expected_bytes = expected.canonical_bytes()
         if self._persisted_facts(security_id) != fact_records:
             raise ValueError("formal feature persisted inputs changed during construction")
-        result = self.get_verified_formal_feature_bundle(input_hash=expected.input_hash)
+        result = self.get_verified_formal_feature_bundle(
+            input_hash=expected.input_hash,
+            expected_purpose=expected_purpose,
+        )
         if result is not None and (type(result) is not FormalFeatureBundle or result.canonical_bytes() != expected_bytes):
             raise ValueError("formal feature current bundle differs from rebuilt inputs")
         if self._persisted_facts(security_id) != fact_records:
@@ -439,7 +476,8 @@ def _install_metric_projection():
     # Detect substituted public/private read paths as well as instance overrides.
     # Captured real methods make fake exact repository objects insufficient proof.
     checked_methods = tuple((cls, name, method)
-        for cls in (StateStore, FormalFeatureBundleStore, FormalSnapshotStore, repository_type)
+        for cls in (StateStore, FormalFeatureBundleStore, FormalSnapshotStore, repository_type,
+                    VerifiedRegistryBundle, SignedFormalFeatureRegistry)
         for name, method in vars(cls).items()
         if (callable(method) or isinstance(method, (staticmethod, classmethod))) and name != "__init__")
     checked_calculations = tuple((module, name, value)
@@ -470,7 +508,8 @@ def _install_metric_projection():
             raise ValueError("metric repository calculation dependency changed")
 
     def select_state(self, security_id: str, as_of_utc: str, *, template_id: str,
-               registry_manifest_hash: str, required_feature_keys: tuple[str, ...]):
+               registry_manifest_hash: str, required_feature_keys: tuple[str, ...],
+               expected_purpose="official"):
         """Authenticate a current stored bundle and project required signed V6 slots."""
         request = _request(security_id, as_of_utc, template_id, registry_manifest_hash)
         if as_of_utc != "2026-08-31T07:00:00+00:00":
@@ -483,7 +522,11 @@ def _install_metric_projection():
         provider = self._current_input_provider
         if provider is None:
             raise ValueError("formal feature current input provider is required")
-        graph, registry = read_registry(self, registry_manifest_hash)
+        graph, registry = read_registry(
+            self,
+            registry_manifest_hash,
+            expected_purpose=expected_purpose,
+        )
         slots_by_id = {slot.slot_id: slot for slot in registry.slots_for_template(template_id)}
         if any(key not in slots_by_id or not slots_by_id[key].required for key in required_feature_keys):
             raise ValueError("metric feature key is not an applicable required signed slot")
@@ -507,7 +550,8 @@ def _install_metric_projection():
 
         check_current()
         expected = builder(security_id=security_id, as_of_utc=as_of_utc, template_id=template_id,
-            facts=facts, issues=issues, registry=registry, registry_manifest=graph.manifest)
+            facts=facts, issues=issues, registry=registry, registry_manifest=graph.manifest,
+            registry_bundle=graph, expected_purpose=expected_purpose)
         if type(expected) is not FormalFeatureBundle:
             raise ValueError("metric feature builder returned an invalid bundle")
         expected_bytes = expected.canonical_bytes()
@@ -515,8 +559,14 @@ def _install_metric_projection():
         capture = ticket_capture.get()
         def read_selected(receipt):
             if receipt is None:
-                return read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+                return read_bundle(
+                    self,
+                    input_hash=expected.input_hash,
+                    require_complete=False,
+                    expected_purpose=expected_purpose,
+                )
             return read_bundle(self, input_hash=expected.input_hash, require_complete=False,
+                               expected_purpose=expected_purpose,
                                _receipt_capture=receipt)
         first_receipt = [] if capture is not None else None
         stored = read_selected(first_receipt)
@@ -527,7 +577,11 @@ def _install_metric_projection():
             # A bare None cannot distinguish two unpersisted generations. Recheck
             # the provider's logical generation, full source facts and signed root
             # before sealing an explicit marker for these exact current inputs.
-            graph_after, registry_after = read_registry(self, registry_manifest_hash)
+            graph_after, registry_after = read_registry(
+                self,
+                registry_manifest_hash,
+                expected_purpose=expected_purpose,
+            )
             if (graph_after.manifest.manifest_hash != graph.manifest.manifest_hash
                     or registry_after.registry_hash != registry.registry_hash):
                 raise ValueError("metric absence registry changed during selection")
@@ -603,7 +657,8 @@ def _install_metric_projection():
         return None if type(result) is VerifiedMetricFeatureAbsence else result
 
     def select_metric_ticket(self, journal, security_id, as_of_utc, *, template_id,
-                             registry_manifest_hash, required_feature_keys, metric_id=None):
+                             registry_manifest_hash, required_feature_keys, metric_id=None,
+                             expected_purpose="official"):
         from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
 
         _require_current_scope(journal, self, root=registry_manifest_hash,
@@ -615,7 +670,8 @@ def _install_metric_projection():
         try:
             result = select_state(self, security_id, as_of_utc, template_id=template_id,
                 registry_manifest_hash=registry_manifest_hash,
-                required_feature_keys=required_feature_keys)
+                required_feature_keys=required_feature_keys,
+                expected_purpose=expected_purpose)
         finally:
             ticket_capture.reset(capture_reset)
         selection_token = selected_receipt.get("token")
@@ -643,10 +699,19 @@ def _install_metric_projection():
         issue_hash = hashlib.sha256(_canonical_json_bytes([json.loads(r) for r in issues])).hexdigest()
         if result.fact_snapshot_hash != fact_hash or result.issue_snapshot_hash != issue_hash:
             raise ValueError("metric ticket input differs from selected evidence")
-        graph, registry = read_registry(self, registry_manifest_hash)
+        graph, registry = read_registry(
+            self,
+            registry_manifest_hash,
+            expected_purpose=expected_purpose,
+        )
         if result.feature_registry_hash != registry.registry_hash:
             raise ValueError("metric ticket signed registry changed")
-        bundle = read_bundle(self, input_hash=result.input_hash, require_complete=False)
+        bundle = read_bundle(
+            self,
+            input_hash=result.input_hash,
+            require_complete=False,
+            expected_purpose=expected_purpose,
+        )
         bundle_bytes = None if bundle is None else bundle.canonical_bytes()
         if selection_status == "present":
             if (bundle is None or bundle.bundle_hash() != selected_bundle_hash
@@ -661,7 +726,7 @@ def _install_metric_projection():
         evidence = (request, identity, facts, issues, result.input_hash, bundle_bytes,
                     metadata_bytes, registry.registry_hash,
                     graph.blob("feature").canonical_json, result, result.canonical_bytes(),
-                    selection_token)
+                    selection_token, expected_purpose)
         baseline = _canonical_json_bytes(dict(request=request, identity=list(identity),
             facts=[item.decode() for item in facts], issues=[item.decode() for item in issues],
             input_hash=result.input_hash, bundle=None if bundle_bytes is None else bundle_bytes.decode(),
@@ -684,7 +749,8 @@ def _install_metric_projection():
     def recheck_metric_ticket(self, evidence):
         dependencies(self)
         (request, identity, facts, issues, input_hash, bundle_bytes, metadata_bytes,
-         registry_hash, registry_bytes, selected, selected_bytes, selection_token) = evidence
+         registry_hash, registry_bytes, selected, selected_bytes, selection_token,
+         expected_purpose) = evidence
         (selection_status, selected_input_hash, selected_bundle_hash, selected_input_bytes,
          selected_metadata_bytes, selected_proof_bytes) = selection_token
         if (input_hash != selected_input_hash or selected.bundle_hash != selected_bundle_hash
@@ -702,13 +768,22 @@ def _install_metric_projection():
                 or _issue_snapshot(supplied.issues)[1] != issues
                 or persisted_facts(self, request["security_id"]) != facts):
             raise ValueError("metric ticket current input changed")
-        graph, registry = read_registry(self, request["registry_manifest_hash"])
+        graph, registry = read_registry(
+            self,
+            request["registry_manifest_hash"],
+            expected_purpose=expected_purpose,
+        )
         if registry.registry_hash != registry_hash or graph.blob("feature").canonical_json != registry_bytes:
             raise ValueError("metric ticket signed registry changed")
         metadata = self._metadata(input_hash)
         if (None if metadata is None else _canonical_json_bytes(metadata)) != metadata_bytes:
             raise ValueError("metric ticket metadata receipt changed")
-        bundle = read_bundle(self, input_hash=input_hash, require_complete=False)
+        bundle = read_bundle(
+            self,
+            input_hash=input_hash,
+            require_complete=False,
+            expected_purpose=expected_purpose,
+        )
         if (None if bundle is None else bundle.canonical_bytes()) != bundle_bytes:
             raise ValueError("metric ticket stored bundle changed")
         if selection_status == "present":
@@ -883,7 +958,7 @@ def _install_policy_projection(provider_module):
     methods = tuple(vars(PolicyFeatureState).items())
 
     def select(self, security_id, as_of_utc, *, template_id, registry_manifest_hash,
-               policy_registry, rule_ids):
+               policy_registry, rule_ids, expected_purpose="official"):
         provider = dependencies(self)
         request = _request(security_id, as_of_utc, template_id, registry_manifest_hash)
         if as_of_utc != "2026-08-31T07:00:00+00:00":
@@ -908,7 +983,11 @@ def _install_policy_projection(provider_module):
                     selectors.append(selector)
                 elif selector["kind"] == "annual_series":
                     selectors.extend(o["selector"] for o in selector["observations"])
-        graph, registry = read_registry(self, registry_manifest_hash)
+        graph, registry = read_registry(
+            self,
+            registry_manifest_hash,
+            expected_purpose=expected_purpose,
+        )
         index = {s.slot_id: s for s in registry.slots_for_template(template_id)}
         keys = sorted({s["feature_key"] for s in selectors})
         slots = tuple(index[key] for key in keys)
@@ -932,8 +1011,14 @@ def _install_policy_projection(provider_module):
             current()
             expected = builder(security_id=security_id, as_of_utc=as_of_utc,
                 template_id=template_id, facts=facts, issues=issues,
-                registry=registry, registry_manifest=graph.manifest)
-            stored = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+                registry=registry, registry_manifest=graph.manifest,
+                registry_bundle=graph, expected_purpose=expected_purpose)
+            stored = read_bundle(
+                self,
+                input_hash=expected.input_hash,
+                require_complete=False,
+                expected_purpose=expected_purpose,
+            )
             if stored is not None and stored.canonical_bytes() != expected.canonical_bytes():
                 raise PolicyIntegrityError("policy receipt differs from complete rebuilt inputs")
             local_issues = scoped_issues(graph, self._verifier, security_id, slots, issues)
@@ -947,7 +1032,12 @@ def _install_policy_projection(provider_module):
                     values.extend(local_values)
                     blockers.update(local_blockers)
             current()
-            reread = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+            reread = read_bundle(
+                self,
+                input_hash=expected.input_hash,
+                require_complete=False,
+                expected_purpose=expected_purpose,
+            )
             if ((reread is None) != (stored is None)
                     or (reread is not None and reread.canonical_bytes() != expected.canonical_bytes())):
                 raise PolicyIntegrityError("policy receipt changed during projection")
@@ -970,12 +1060,15 @@ def _install_policy_projection(provider_module):
                 result = object.__new__(PolicyFeatureState)
                 key = id(result)
                 records[key] = (weakref.ref(result, lambda _: records.pop(key, None)), encoded, self,
-                    dict(request, policy_registry=policy_registry, rule_ids=rule_ids))
+                    dict(request, policy_registry=policy_registry, rule_ids=rule_ids,
+                         expected_purpose=expected_purpose))
                 capture = batch_capture.get()
                 if capture is not None:
                     receipt = []
                     checked = read_bundle(self, input_hash=expected.input_hash,
-                                          require_complete=False, _receipt_capture=receipt)
+                                          require_complete=False,
+                                          expected_purpose=expected_purpose,
+                                          _receipt_capture=receipt)
                     if ((checked is None) != (stored is None)
                             or (checked is not None
                                 and checked.canonical_bytes() != stored.canonical_bytes())):
@@ -984,13 +1077,15 @@ def _install_policy_projection(provider_module):
                         identity, fact_bytes, issue_bytes, expected.input_hash,
                         None if stored is None else stored.canonical_bytes(), receipt[0],
                         registry.registry_hash, graph.blob("feature").canonical_json,
-                        _canonical_json_bytes(policy), policy_registry)
+                        _canonical_json_bytes(policy), policy_registry,
+                        expected_purpose)
                 return result
 
             return barrier.finalize(mint)
 
     def select_policy_ticket(self, journal, security_id, as_of_utc, *, template_id,
-                             registry_manifest_hash, policy_registry, rule_ids):
+                             registry_manifest_hash, policy_registry, rule_ids,
+                             expected_purpose="official"):
         from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
         _require_current_scope(journal, self, root=registry_manifest_hash,
                                as_of_utc=as_of_utc, population=(security_id,))
@@ -999,7 +1094,8 @@ def _install_policy_projection(provider_module):
         try:
             selected = select(self, security_id, as_of_utc, template_id=template_id,
                 registry_manifest_hash=registry_manifest_hash,
-                policy_registry=policy_registry, rule_ids=rule_ids)
+                policy_registry=policy_registry, rule_ids=rule_ids,
+                expected_purpose=expected_purpose)
         finally:
             batch_capture.reset(reset)
         evidence = capture.get("evidence")
@@ -1022,13 +1118,17 @@ def _install_policy_projection(provider_module):
     def recheck_policy_ticket(self, evidence):
         (selected, selected_bytes, request, rule_ids, identity, facts, issues,
          input_hash, bundle_bytes, receipt_bytes, registry_hash, feature_bytes,
-         policy_bytes, policy_registry) = evidence
+         policy_bytes, policy_registry, expected_purpose) = evidence
         provider = dependencies(self)
         if (record(selected)[1] != selected_bytes
                 or _canonical_json_bytes(policy_wire(policy_registry)) != policy_bytes):
             raise PolicyIntegrityError("policy feature ticket selection or registry changed")
         require_policy(policy_registry)
-        graph, registry = read_registry(self, request["registry_manifest_hash"])
+        graph, registry = read_registry(
+            self,
+            request["registry_manifest_hash"],
+            expected_purpose=expected_purpose,
+        )
         if (registry.registry_hash != registry_hash
                 or graph.blob("feature").canonical_json != feature_bytes):
             raise PolicyIntegrityError("policy feature ticket signed registry changed")
@@ -1040,6 +1140,7 @@ def _install_policy_projection(provider_module):
             raise PolicyIntegrityError("policy feature ticket inputs changed")
         receipt = []
         current = read_bundle(self, input_hash=input_hash, require_complete=False,
+                              expected_purpose=expected_purpose,
                               _receipt_capture=receipt)
         if (receipt[0] != receipt_bytes
                 or (None if current is None else current.canonical_bytes()) != bundle_bytes):

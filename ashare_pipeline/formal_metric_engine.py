@@ -12,7 +12,7 @@ from .formal_feature_repository import FormalFeatureRepository, VerifiedMetricFe
 from .formal_feature_repository import _require_authentic_metric_feature_repository
 from .formal_metric_context import FormalMetricContextRepository
 from .formal_metric_batch_guard import _metric_batch_guard
-from .formal_registry_manifest import FormalRegistryBundleLoader
+from .formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
 from .formal_scoring_registry import FormalScoringRegistry
 from .formal_batch_read_journal import FormalBatchReadJournal, _issue_current_ticket, _require_current_scope
 
@@ -140,6 +140,10 @@ del _install_metric_definition_producer
 def _install_engine():
     repositories, proofs = {}, {}
     context_type = FormalMetricContextRepository
+    bundle_type = VerifiedRegistryBundle
+    scoring_type = FormalScoringRegistry
+    require_scoring_official = scoring_type.require_official
+    require_scoring_authenticated = scoring_type.require_authenticated
     feature_read = FormalFeatureRepository.select_current_verified_metric_feature_state
     feature_ticket = FormalFeatureRepository.select_current_metric_batch_ticket
     require_feature = _require_authentic_metric_feature_repository
@@ -151,6 +155,24 @@ def _install_engine():
     checked = tuple((cls, name, method) for cls in (context_type, FormalFeatureRepository,
         FormalContextRepository, FormalRegistryBundleLoader, FormalScoringRegistry)
         for name, method in vars(cls).items() if callable(method) or isinstance(method, (staticmethod, classmethod)))
+
+    def authenticate_scoring(scoring, root, *, expected_purpose):
+        if type(scoring) is not scoring_type or type(root) is not bundle_type:
+            raise ValueError("metric input requires exact scoring and registry bundle types")
+        if (type(expected_purpose) is not str
+                or expected_purpose not in {"test", "official"}):
+            raise ValueError("metric expected_purpose must be exact test or official")
+        if (scoring_type.require_official is not require_scoring_official
+                or scoring_type.require_authenticated is not require_scoring_authenticated):
+            raise ValueError("metric scoring verifier changed")
+        if getattr(root.manifest, "purpose") != expected_purpose:
+            raise ValueError("metric registry purpose differs from expected_purpose")
+        if expected_purpose == "official":
+            require_scoring_official(scoring, root)
+        else:
+            require_scoring_authenticated(
+                scoring, root, expected_purpose="test"
+            )
 
     def state(feature, context, verifier):
         require_feature(feature)
@@ -238,14 +260,21 @@ def _install_engine():
             private, [True] if publication is None else publication)
         return proof
 
-    def build(repo, frozen_input_hash, scoring, metric_ids, guard, owner_scope=None):
+    def build(repo, frozen_input_hash, scoring, metric_ids, guard, *,
+              expected_purpose, owner_scope=None):
         feature, _, verifier, context = dependencies(repo)
-        universe = context.load_universe(frozen_input_hash, scoring_registry=scoring)
+        universe = context.load_universe(
+            frozen_input_hash,
+            scoring_registry=scoring,
+            expected_purpose=expected_purpose,
+        )
         if universe is None:
             return None
         universe.require_verified()
         root = load_root(FormalRegistryBundleLoader(feature._store, verifier), universe.registry_manifest_hash)
-        scoring.require_official(root)
+        authenticate_scoring(
+            scoring, root, expected_purpose=expected_purpose
+        )
         defs = definitions(scoring)
         known = set().union(*(set(items) for items in defs.values()))
         selected = tuple(sorted(known)) if metric_ids is None else metric_ids
@@ -275,7 +304,9 @@ def _install_engine():
                 request = dict(security_id=sid, as_of_utc=universe.as_of_utc, template_id=tid,
                     registry_manifest_hash=universe.registry_manifest_hash, required_feature_keys=keys)
                 if owner_scope is None:
-                    marker = feature_read(feature, **request)
+                    marker = feature_read(
+                        feature, **request, expected_purpose=expected_purpose
+                    )
                     if type(marker) not in (VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence):
                         raise ValueError("metric feature current state requires a genuine present or absence proof")
                     marker.require_verified()
@@ -285,7 +316,8 @@ def _install_engine():
                     for mid in selected:
                         ticket = feature_ticket(feature, owner_scope, sid, universe.as_of_utc,
                             template_id=tid, registry_manifest_hash=universe.registry_manifest_hash,
-                            required_feature_keys=keys, metric_id=mid)
+                            required_feature_keys=keys, metric_id=mid,
+                            expected_purpose=expected_purpose)
                         chosen = ticket.selected()
                         if type(chosen) not in (VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence):
                             raise ValueError("metric feature ticket requires a genuine present or absence proof")
@@ -334,12 +366,16 @@ def _install_engine():
         # pass; both absence transitions and numeric corrections invalidate all.
         if owner_scope is None:
             for sid, request in requests.items():
-                current = feature_read(feature, **request)
+                current = feature_read(
+                    feature, **request, expected_purpose=expected_purpose
+                )
                 current.require_verified()
                 if current.canonical_bytes() != markers[sid]:
                     raise ValueError("metric feature correction or absence changed during complete batch")
         context.recheck_batch(universe, industry)
-        scoring.require_official(root)
+        authenticate_scoring(
+            scoring, root, expected_purpose=expected_purpose
+        )
         dependencies(repo)
         payload = dict(common, schema_version="formal-metric-input-batch-v1", metric_ids=selected,
             security_ids=tuple(universe.security_ids), definitions=defs, inputs=rows,
@@ -381,12 +417,20 @@ def _install_engine():
             repositories[identity] = (weakref.ref(self, lambda _: repositories.pop(identity, None)),
                 feature_repository, context_repository, registry_signature_verifier, context, snapshot)
 
-        def build_batch(self, frozen_input_hash, *, scoring_registry, metric_ids=None):
+        def build_batch(self, frozen_input_hash, *, scoring_registry, metric_ids=None,
+                        expected_purpose="official"):
             feature, _, _, _ = dependencies(self)
             result = None
             try:
                 with batch_guard(feature._current_input_provider, feature._store) as guard:
-                    result = build(self, frozen_input_hash, scoring_registry, metric_ids, guard)
+                    result = build(
+                        self,
+                        frozen_input_hash,
+                        scoring_registry,
+                        metric_ids,
+                        guard,
+                        expected_purpose=expected_purpose,
+                    )
             except BaseException:
                 # Also revoke if context-manager rollback/close fails after the
                 # inner finalizer returned its prepared capability.
@@ -466,15 +510,22 @@ def _install_engine():
                         raise ValueError("invalid-template metric token row changed")
 
         def _build_batch_in_owner_scope(self, frozen_input_hash, *, scoring_registry,
-                                        metric_ids, owner_scope):
+                                        metric_ids, owner_scope, expected_purpose):
             result = None
             try:
                 feature, _, _, _ = dependencies(self)
                 if type(owner_scope) is not FormalBatchReadJournal:
                     raise ValueError("metric batch requires an authentic owner scope")
                 with batch_guard(feature._current_input_provider, feature._store) as guard:
-                    prepared = build(self, frozen_input_hash, scoring_registry, metric_ids,
-                        guard, owner_scope=owner_scope)
+                    prepared = build(
+                        self,
+                        frozen_input_hash,
+                        scoring_registry,
+                        metric_ids,
+                        guard,
+                        expected_purpose=expected_purpose,
+                        owner_scope=owner_scope,
+                    )
                     if prepared is None:
                         raise ValueError("metric frozen universe is absent")
                     result, publish_complete, universe, industry, invalid_members = prepared

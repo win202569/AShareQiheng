@@ -120,7 +120,8 @@ class FinalScoringFixture(ValuationRuntimeFixture):
         self.publish_current(sid)
 
     def __init__(self, *, peer_count=3, pending_ids=None, cap_ids=(FOCAL,),
-                 prohibition_ids=(), veto_ids=(), consensus_no_coverage=False):
+                 prohibition_ids=(), veto_ids=(), consensus_no_coverage=False,
+                 purpose="official"):
         if peer_count not in (3, 20, 23):
             raise ValueError("Stage D fixture supports 3, 20, or 23 members")
         self.date_only = False
@@ -131,7 +132,8 @@ class FinalScoringFixture(ValuationRuntimeFixture):
         self.consensus_no_coverage = consensus_no_coverage
         super().__init__(peer_count=peer_count,
             cyclic_ids=tuple(sorted({FOCAL, *self.cap_ids})),
-            signature_documents_configurator=_stage_d_documents)
+            signature_documents_configurator=_stage_d_documents,
+            purpose=purpose)
         active_by_default = {FOCAL, *self.cap_ids, *self.prohibition_ids, *self.veto_ids}
         self.pending_ids = (tuple(sorted(set(self.templates) - active_by_default))
             if pending_ids is None else tuple(pending_ids))
@@ -202,7 +204,8 @@ class FinalScoringFixture(ValuationRuntimeFixture):
     def build_d1_sources(self):
         return D1Sources(
             self.base_repository.build_batch(self.frozen.frozen_input_hash,
-                scoring_registry=self.scoring),
+                scoring_registry=self.scoring,
+                expected_purpose=self.purpose),
             self.build_policy_batch(),
             self.build_adjusted_batch(),
         )

@@ -240,7 +240,13 @@ def _install_financial():
         def __deepcopy__(self, memo):
             raise TypeError("financial selections cannot be copied")
 
-    def select(self, security_id, as_of_utc, *, template_id, policy_registry, industry_batch):
+    def select(self, security_id, as_of_utc, *, template_id, policy_registry,
+               industry_batch, expected_purpose="official"):
+        if (type(expected_purpose) is not str
+                or expected_purpose not in {"test", "official"}):
+            raise PolicyPreconditionError(
+                "expected_purpose must be exact test or official"
+            )
         feature_repository, provider = dependencies(self)
         if type(policy_registry) is not FormalPolicyRegistry or type(industry_batch) is not VerifiedMetricIndustryBatch:
             raise PolicyPreconditionError("genuine policy registry and industry batch required")
@@ -270,12 +276,13 @@ def _install_financial():
         if capture is None:
             state = feature_select(feature_repository, security_id, as_of_utc, template_id=template_id,
                 registry_manifest_hash=policy["registry_manifest_hash"], policy_registry=policy_registry,
-                rule_ids=rule_ids)
+                rule_ids=rule_ids, expected_purpose=expected_purpose)
         else:
             ticket = feature_repository.select_current_policy_batch_ticket(capture["journal"],
                 security_id, as_of_utc, template_id=template_id,
                 registry_manifest_hash=policy["registry_manifest_hash"],
-                policy_registry=policy_registry, rule_ids=rule_ids)
+                policy_registry=policy_registry, rule_ids=rule_ids,
+                expected_purpose=expected_purpose)
             capture.update(feature_ticket=ticket, policy=policy, industry=industry)
             state = ticket.selected()
         wire = state_wire(state)
@@ -316,11 +323,13 @@ def _install_financial():
         key = id(result)
         selections[key] = (weakref.ref(result, lambda _: selections.pop(key, None)), canonical_bytes(payload), self,
             dict(security_id=security_id, as_of_utc=as_of_utc, template_id=template_id,
-                 policy_registry=policy_registry, industry_batch=industry_batch))
+                 policy_registry=policy_registry, industry_batch=industry_batch,
+                 expected_purpose=expected_purpose))
         return result
 
     def select_current_batch_ticket(self, journal, security_id, as_of_utc, *,
-                                    template_id, policy_registry, industry_batch):
+                                    template_id, policy_registry, industry_batch,
+                                    expected_purpose="official"):
         from .formal_batch_read_journal import (
             _issue_current_ticket, _require_current_scope, _require_current_ticket,
         )
@@ -333,7 +342,8 @@ def _install_financial():
         reset = batch_capture.set(capture)
         try:
             selected = select(self, security_id, as_of_utc, template_id=template_id,
-                policy_registry=policy_registry, industry_batch=industry_batch)
+                policy_registry=policy_registry, industry_batch=industry_batch,
+                expected_purpose=expected_purpose)
         finally:
             batch_capture.reset(reset)
         feature_ticket = capture["feature_ticket"]

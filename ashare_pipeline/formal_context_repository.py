@@ -8,7 +8,8 @@ from types import MappingProxyType
 from .formal_context_schema import (FormalContextFact, FormalContextNormalization, FormalContextRegistry,
     CONTEXT_KINDS,
     FormalContextVersionView, SignedContextRequestResolver, _canonical, _load, _verify_context_fact,
-    _timestamp, _selector, _security, _text, _exchange, _hash)
+    _timestamp, _selector, _security, _text, _exchange, _hash,
+    _context_normalization_purpose)
 from .formal_evidence import VerifiedCalendarBinding
 from .formal_snapshot_repository import FormalSnapshotRepository
 from .formal_snapshot_store import FormalStoredSnapshot
@@ -66,7 +67,8 @@ def _require_context_writer(store, connection, ref, *, task_id, worker_id, expec
     return writer
 
 
-def _prove_historical_calendar(store, verifier, fact, selector, exchange, freeze, root):
+def _prove_historical_calendar(store, verifier, fact, selector, exchange,
+                               freeze, root, *, expected_purpose):
     """Prove the exact timestamp bootstrap anchor, never its current successor."""
     if type(fact) is not FormalContextFact or fact.context_kind == "trading_calendar":
         raise ValueError("historical calendar requires a stored non-calendar Context Fact")
@@ -86,8 +88,13 @@ def _prove_historical_calendar(store, verifier, fact, selector, exchange, freeze
         anchors = [anchor for anchor in anchors if anchor.value["exchange"] == exchange]
         if len(anchors) != 1 or anchors[0].evidence["calendar_binding"] is not None:
             raise ValueError("historical calendar anchor is missing, ambiguous or non-bootstrap")
-        ref, request = _validate_stored_fact(store, connection, anchors[0], verifier)
-    descriptor = FormalContextRegistry.load(store, verifier, root).descriptor_for(request)
+        ref, request = _validate_stored_fact(
+            store, connection, anchors[0], verifier,
+            expected_purpose=expected_purpose,
+        )
+    descriptor = FormalContextRegistry.load(
+        store, verifier, root, expected_purpose=expected_purpose
+    ).descriptor_for(request)
     if descriptor["bootstrap_calendar"] is not True or request.calendar_binding is not None or ref.published_precision != "timestamp":
         raise ValueError("historical calendar anchor must be timestamp bootstrap evidence")
     snapshots = FormalSnapshotRepository(store._configured_formal_snapshot_store_for_repository().root, store)
@@ -117,7 +124,7 @@ def _context_validation_types():
         record = seals.get(id(capability))
         if type(capability) is not HistoricalRead or record is None or record[0]() is not capability:
             raise ValueError("historical read capability is forged")
-        store, _, configured, request, request_bytes, _, _, _ = record[1:]
+        store, _, _, configured, request, request_bytes, _, _, _ = record[1:]
         if configured is not raw_store or store._configured_formal_snapshot_store_for_repository() is not raw_store:
             raise ValueError("historical read raw-store identity mismatch")
         if request.canonical_bytes() != request_bytes:
@@ -126,14 +133,15 @@ def _context_validation_types():
 
     def require_target(capability, raw_store, snapshot_id, stored):
         record = record_for(capability, raw_store)
-        target = record[6]
+        target = record[7]
         if type(stored) is not FormalStoredSnapshot or (snapshot_id is not None and snapshot_id != target[0]) or (stored.manifest_sha256, stored.content_sha256) != target[1:]:
             raise ValueError("historical read target snapshot, manifest or content mismatch")
         return None
 
     def read_binding(raw_store, capability, stored, official_request, precision, effective_hash):
         require_target(capability, raw_store, None, stored)
-        store, verifier, _, request, request_bytes, fact_wires, target, binding_bytes = record_for(capability, raw_store)
+        (store, verifier, expected_purpose, _, request, request_bytes,
+         fact_wires, target, binding_bytes) = record_for(capability, raw_store)
         fact_record_bytes, fact_scientific_bytes = fact_wires
         if _canonical(asdict(official_request)) != _canonical(asdict(request.official_request)) or precision != "date_only" or effective_hash != request.calendar_binding.manifest_sha256:
             raise ValueError("historical read request or effective-time evidence mismatch")
@@ -148,12 +156,15 @@ def _context_validation_types():
                 raise ValueError("historical read persisted Fact changed")
             if source is None or (source["id"], source["manifest_sha256"], source["content_sha256"]) != target or source["effective_time_evidence_hash"] != effective_hash:
                 raise ValueError("historical read target source changed")
-        fresh = SignedContextRequestResolver(store, verifier)._resolve_historical(fact)
+        fresh = SignedContextRequestResolver(store, verifier)._resolve_historical(
+            fact, expected_purpose=expected_purpose
+        )
         if fresh.canonical_bytes() != request_bytes or _canonical(asdict(fresh.calendar_binding)) != binding_bytes:
             raise ValueError("historical read request or calendar changed")
         return fresh.calendar_binding
 
-    def validate(store, connection, fact, verifier, *, writer=None, snapshot_repository=None):
+    def validate(store, connection, fact, verifier, *, expected_purpose,
+                 writer=None, snapshot_repository=None):
         if type(fact) is not FormalContextFact:
             raise ValueError("exact Context fact required")
         fact_scientific_bytes = fact.canonical_bytes()
@@ -166,7 +177,9 @@ def _context_validation_types():
         if fact.evidence["calendar_binding"] is not None and persisted is not None:
             if _row_fact(persisted).canonical_bytes() != fact_scientific_bytes:
                 raise ValueError("historical Context stored Fact mismatch")
-            request = resolver._resolve_historical(fact)
+            request = resolver._resolve_historical(
+                fact, expected_purpose=expected_purpose
+            )
             raw_store = store._configured_formal_snapshot_store_for_repository()
             target = (row["id"], _hash(row["manifest_sha256"]), _hash(row["content_sha256"]))
             if row["effective_time_evidence_hash"] != request.calendar_binding.manifest_sha256:
@@ -175,12 +188,15 @@ def _context_validation_types():
             identity = id(historical_read)
             fact_record_bytes = _canonical(fact.to_dict())
             seals[identity] = (weakref.ref(historical_read, lambda _: seals.pop(identity, None)),
-                store, verifier, raw_store, request, request.canonical_bytes(),
+                store, verifier, expected_purpose, raw_store, request,
+                request.canonical_bytes(),
                 (fact_record_bytes, fact_scientific_bytes), target,
                 _canonical(asdict(request.calendar_binding)))
         else:
             request = resolver.resolve(fact.context_kind, fact.scope_key, fact.security_id,
-                fact.as_of_utc, fact.registry_manifest_hash, upstream_generation=fact.evidence["upstream_generation"])
+                fact.as_of_utc, fact.registry_manifest_hash,
+                upstream_generation=fact.evidence["upstream_generation"],
+                expected_purpose=expected_purpose)
         ref = store._formal_verified_snapshot_ref_from_connection(connection, row, historical_read=historical_read)
         if writer is None:
             _require_context_producer(store, connection, ref, historical_read=historical_read)
@@ -228,12 +244,17 @@ def _logical_key(fact):
         fact.registry_manifest_hash, fact.refresh_generation)
 
 
-def _put_context_facts(store, connection, normalization):
+def _put_context_facts(store, connection, normalization, *, expected_purpose):
     if type(normalization) is not FormalContextNormalization:
         raise ValueError("Context persistence requires sealed normalization receipt")
     wire = normalization.to_dict()
+    if _context_normalization_purpose(normalization) != expected_purpose:
+        raise ValueError("Context normalization purpose mismatch")
     verifier = store._require_registry_verifier()
-    FormalContextRegistry.load(store, verifier, wire["registry_manifest_hash"])
+    FormalContextRegistry.load(
+        store, verifier, wire["registry_manifest_hash"],
+        expected_purpose=expected_purpose,
+    )
     facts = normalization.facts
     writer = wire["writer"]
     source = connection.execute("SELECT * FROM formal_source_snapshot WHERE id=?", (writer["receipt"]["snapshot_id"],)).fetchone()
@@ -246,7 +267,10 @@ def _put_context_facts(store, connection, normalization):
     for fact in facts:
         if fact.registry_manifest_hash != wire["registry_manifest_hash"]:
             raise ValueError("Context normalization root mismatch")
-        _, request = _validate_stored_fact(store, connection, fact, verifier, writer=writer)
+        _, request = _validate_stored_fact(
+            store, connection, fact, verifier,
+            expected_purpose=expected_purpose, writer=writer,
+        )
         if _canonical(wire["request"]) != request.canonical_bytes():
             raise ValueError("Context normalization request is stale")
         key = _logical_key(fact)
@@ -261,6 +285,7 @@ def _put_context_facts(store, connection, normalization):
             if _logical_key(candidate) != key:
                 continue
             _validate_stored_fact(store, connection, candidate, verifier,
+                expected_purpose=expected_purpose,
                 writer=writer if candidate.source_snapshot_id == writer_ref.snapshot_id else None)
             if key in existing and existing[key].id != candidate.id:
                 raise ValueError("conflicting stored Context generation")
@@ -282,9 +307,14 @@ def _put_context_facts(store, connection, normalization):
         worker_id=writer["worker_id"], expected_writer=writer)
 
 
-def _list_context_facts(store, connection, *, registry_manifest_hash, context_kind=None, scope_key=None, security_id=None, as_of_utc=None, source_snapshot_id=None):
+def _list_context_facts(store, connection, *, registry_manifest_hash,
+        context_kind=None, scope_key=None, security_id=None, as_of_utc=None,
+        source_snapshot_id=None, expected_purpose):
     verifier = store._require_registry_verifier()
-    FormalContextRegistry.load(store, verifier, registry_manifest_hash)
+    FormalContextRegistry.load(
+        store, verifier, registry_manifest_hash,
+        expected_purpose=expected_purpose,
+    )
     result = []
     keys = set()
     # Parse canonical IDs before filtering; replay only matching source chains.
@@ -307,7 +337,10 @@ def _list_context_facts(store, connection, *, registry_manifest_hash, context_ki
             continue
         if source_snapshot_id is not None and fact.source_snapshot_id != source_snapshot_id:
             continue
-        _validate_stored_fact(store, connection, fact, verifier)
+        _validate_stored_fact(
+            store, connection, fact, verifier,
+            expected_purpose=expected_purpose,
+        )
         result.append(FormalContextFact.from_dict(fact.to_dict()))
     return tuple(result)
 
@@ -322,26 +355,36 @@ class FormalContextRepository:
         self._snapshots = snapshot_repository
         self._verifier = registry_signature_verifier
 
-    def _load(self, root):
-        return FormalContextRegistry.load(self._state_store, self._verifier, root)
+    def _load(self, root, *, expected_purpose):
+        return FormalContextRegistry.load(
+            self._state_store, self._verifier, root,
+            expected_purpose=expected_purpose,
+        )
 
-    def _candidates(self, kind, scope_key, security_id, as_of_utc, root, exchange=None):
+    def _candidates(self, kind, scope_key, security_id, as_of_utc, root,
+                    exchange=None, *, expected_purpose):
         facts = self._state_store.list_formal_context_facts(registry_manifest_hash=root,
-            context_kind=kind, scope_key=scope_key, as_of_utc=as_of_utc)
+            context_kind=kind, scope_key=scope_key, as_of_utc=as_of_utc,
+            expected_purpose=expected_purpose)
         return tuple(fact for fact in facts if fact.security_id == security_id
             and (exchange is None or fact.value["exchange"] == exchange))
 
-    def _select(self, kind, scope_key, security_id, as_of_utc, root, exchange=None):
-        self._load(root)
+    def _select(self, kind, scope_key, security_id, as_of_utc, root,
+                exchange=None, *, expected_purpose):
+        self._load(root, expected_purpose=expected_purpose)
         _timestamp(as_of_utc)
         _text(scope_key)
         _security(security_id)
-        before = self._candidates(kind, scope_key, security_id, as_of_utc, root, exchange)
+        before = self._candidates(
+            kind, scope_key, security_id, as_of_utc, root, exchange,
+            expected_purpose=expected_purpose,
+        )
         if not before:
             raise ValueError("verified Context is missing or pending")
         for fact in before:
             with self._state_store._transaction() as connection:
                 _validate_stored_fact(self._state_store, connection, fact, self._verifier,
+                    expected_purpose=expected_purpose,
                     snapshot_repository=self._snapshots)
             for field in ("published_at_utc", "effective_at_utc", "source_updated_at_utc"):
                 if getattr(fact, field) is not None and _timestamp(getattr(fact, field)) > _timestamp(as_of_utc):
@@ -350,19 +393,30 @@ class FormalContextRepository:
         key = formal_version_sort_key(FormalContextVersionView.from_fact(ordered[0]))
         if sum(formal_version_sort_key(FormalContextVersionView.from_fact(fact)) == key for fact in before) != 1:
             raise ValueError("multiple equal leading Context versions")
-        self._load(root)
-        after = self._candidates(kind, scope_key, security_id, as_of_utc, root, exchange)
+        self._load(root, expected_purpose=expected_purpose)
+        after = self._candidates(
+            kind, scope_key, security_id, as_of_utc, root, exchange,
+            expected_purpose=expected_purpose,
+        )
         if tuple(fact.canonical_bytes() for fact in before) != tuple(fact.canonical_bytes() for fact in after):
             raise ValueError("Context correction race during verification")
         return FormalContextFact.from_dict(ordered[0].to_dict())
 
-    def get_verified(self, kind, scope_key, security_id, as_of_utc, registry_manifest_hash):
+    def get_verified(self, kind, scope_key, security_id, as_of_utc,
+                     registry_manifest_hash, *, expected_purpose="official"):
         if kind == "trading_calendar":
-            self._load(registry_manifest_hash)
+            self._load(
+                registry_manifest_hash,
+                expected_purpose=expected_purpose,
+            )
             raise ValueError("trading calendars require an exchange selector")
-        return self._select(kind, scope_key, security_id, as_of_utc, registry_manifest_hash)
+        return self._select(
+            kind, scope_key, security_id, as_of_utc,
+            registry_manifest_hash, expected_purpose=expected_purpose,
+        )
 
-    def _select_many_with_token(self, kind, scope_key, security_ids, as_of_utc, registry_manifest_hash):
+    def _select_many_with_token(self, kind, scope_key, security_ids, as_of_utc,
+                                registry_manifest_hash, *, expected_purpose):
         """Verify a complete scope twice, selecting each requested security once.
 
         None denotes actual absence; malformed evidence and selection races raise.
@@ -381,10 +435,13 @@ class FormalContextRepository:
         _timestamp(as_of_utc)
         _text(scope_key)
         _hash(registry_manifest_hash)
-        self._load(registry_manifest_hash)
+        self._load(
+            registry_manifest_hash, expected_purpose=expected_purpose
+        )
         def snapshot():
             return self._state_store.list_formal_context_facts(registry_manifest_hash=registry_manifest_hash,
-                context_kind=kind, scope_key=scope_key, as_of_utc=as_of_utc)
+                context_kind=kind, scope_key=scope_key, as_of_utc=as_of_utc,
+                expected_purpose=expected_purpose)
         before = snapshot()
         grouped = {security_id: [] for security_id in security_ids}
         for fact in before:
@@ -398,6 +455,7 @@ class FormalContextRepository:
             for fact in candidates:
                 with self._state_store._transaction() as connection:
                     _validate_stored_fact(self._state_store, connection, fact, self._verifier,
+                        expected_purpose=expected_purpose,
                         snapshot_repository=self._snapshots)
                 for field in ("published_at_utc", "effective_at_utc", "source_updated_at_utc"):
                     if getattr(fact, field) is not None and _timestamp(getattr(fact, field)) > _timestamp(as_of_utc):
@@ -407,7 +465,9 @@ class FormalContextRepository:
             if sum(formal_version_sort_key(FormalContextVersionView.from_fact(fact)) == key for fact in candidates) != 1:
                 raise ValueError("multiple equal leading Context versions")
             selected[security_id] = FormalContextFact.from_dict(ordered[0].to_dict())
-        self._load(registry_manifest_hash)
+        self._load(
+            registry_manifest_hash, expected_purpose=expected_purpose
+        )
         after = snapshot()
         if tuple(fact.canonical_bytes() for fact in before) != tuple(fact.canonical_bytes() for fact in after):
             raise ValueError("Context correction race during verification")
@@ -417,14 +477,17 @@ class FormalContextRepository:
                        for security_id in security_ids))
         return MappingProxyType(selected), token
 
-    def get_verified_many(self, kind, scope_key, security_ids, as_of_utc, registry_manifest_hash):
+    def get_verified_many(self, kind, scope_key, security_ids, as_of_utc,
+                          registry_manifest_hash, *, expected_purpose="official"):
         """Return the current complete Context scope as a detached mapping."""
         selected, _ = self._select_many_with_token(
-            kind, scope_key, security_ids, as_of_utc, registry_manifest_hash)
+            kind, scope_key, security_ids, as_of_utc,
+            registry_manifest_hash, expected_purpose=expected_purpose)
         return selected
 
     def select_current_batch_ticket(self, journal, kind, scope_key, security_ids,
-                                    as_of_utc, registry_manifest_hash):
+                                    as_of_utc, registry_manifest_hash, *,
+                                    expected_purpose="official"):
         """Issue a build-local ticket after the complete public batch selection."""
         from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
 
@@ -432,13 +495,15 @@ class FormalContextRepository:
         _require_current_scope(journal, self, root=registry_manifest_hash,
                                as_of_utc=as_of_utc, population=security_ids)
         selected, (candidate_bytes, selected_bytes) = self._select_many_with_token(
-            kind, scope_key, security_ids, as_of_utc, registry_manifest_hash)
+            kind, scope_key, security_ids, as_of_utc,
+            registry_manifest_hash, expected_purpose=expected_purpose)
         if tuple(fact.canonical_bytes() for fact in self._state_store.list_formal_context_facts(
                 registry_manifest_hash=registry_manifest_hash, context_kind=kind,
-                scope_key=scope_key, as_of_utc=as_of_utc)) != candidate_bytes:
+                scope_key=scope_key, as_of_utc=as_of_utc,
+                expected_purpose=expected_purpose)) != candidate_bytes:
             raise ValueError("Context candidates changed during ticket issuance")
         evidence = (kind, scope_key, security_ids, as_of_utc, registry_manifest_hash,
-                    candidate_bytes, selected_bytes)
+                    candidate_bytes, selected_bytes, expected_purpose)
         baseline = _canonical({"request": [kind, scope_key, list(security_ids), as_of_utc,
                                            registry_manifest_hash],
                                "candidates": [item.decode() for item in candidate_bytes],
@@ -452,18 +517,20 @@ class FormalContextRepository:
     def _batch_recheck_ticket(self, evidence):
         """Reread the original candidate and source evidence without selecting."""
         _require_authentic_context_repository(self)
-        kind, scope_key, security_ids, as_of_utc, root, candidate_bytes, selected_bytes = evidence
-        self._load(root)
+        (kind, scope_key, security_ids, as_of_utc, root, candidate_bytes,
+         selected_bytes, expected_purpose) = evidence
+        self._load(root, expected_purpose=expected_purpose)
         candidates = self._state_store.list_formal_context_facts(
             registry_manifest_hash=root, context_kind=kind, scope_key=scope_key,
-            as_of_utc=as_of_utc)
+            as_of_utc=as_of_utc, expected_purpose=expected_purpose)
         if tuple(fact.canonical_bytes() for fact in candidates) != candidate_bytes:
             raise ValueError("Context current candidate set changed")
         for fact in candidates:
             if fact.security_id in security_ids:
                 with self._state_store._transaction() as connection:
                     _validate_stored_fact(self._state_store, connection, fact,
-                        self._verifier, snapshot_repository=self._snapshots)
+                        self._verifier, expected_purpose=expected_purpose,
+                        snapshot_repository=self._snapshots)
         for security_id, selected in selected_bytes:
             current = tuple(fact for fact in candidates if fact.security_id == security_id)
             if selected is None:
@@ -479,15 +546,22 @@ class FormalContextRepository:
                     for fact in current) != 1 or ordered[0].canonical_bytes() != selected):
                 raise ValueError("Context original winner is no longer uniquely current")
 
-    def resolve_verified_calendar_binding(self, selector, exchange, as_of_utc, registry_manifest_hash):
-        self._load(registry_manifest_hash)
+    def resolve_verified_calendar_binding(self, selector, exchange, as_of_utc,
+            registry_manifest_hash, *, expected_purpose="official"):
+        self._load(
+            registry_manifest_hash, expected_purpose=expected_purpose
+        )
         if type(selector) is not CalendarSelector:
             raise ValueError("exact signed calendar selector required")
         selector_wire = asdict(selector)
         copied = _selector(selector_wire)
         if copied.exchange != _exchange(exchange):
             raise ValueError("calendar selector exchange mismatch")
-        fact = self._select("trading_calendar", copied.scope_key, None, as_of_utc, registry_manifest_hash, exchange)
+        fact = self._select(
+            "trading_calendar", copied.scope_key, None, as_of_utc,
+            registry_manifest_hash, exchange,
+            expected_purpose=expected_purpose,
+        )
         ref = self._state_store.get_formal_snapshot(fact.source_snapshot_id)
         if ref is None:
             raise ValueError("calendar source missing")
@@ -495,7 +569,11 @@ class FormalContextRepository:
         self._snapshots.read_verified_raw(ref)
         if asdict(selector) != selector_wire:
             raise ValueError("calendar selector mutated during verification")
-        after = self._select("trading_calendar", copied.scope_key, None, as_of_utc, registry_manifest_hash, exchange)
+        after = self._select(
+            "trading_calendar", copied.scope_key, None, as_of_utc,
+            registry_manifest_hash, exchange,
+            expected_purpose=expected_purpose,
+        )
         if after.id != fact.id:
             raise ValueError("calendar correction race during source verification")
         return VerifiedCalendarBinding(snapshot_id=ref.snapshot_id, manifest_sha256=ref.manifest_sha256,

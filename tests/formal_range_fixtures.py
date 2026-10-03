@@ -160,14 +160,21 @@ def add_range_documents(documents):
     )
 
 
-def range_graph(*, mutate=None):
+def range_graph(*, mutate=None, purpose="official"):
     def prepare(documents):
         add_range_documents(documents)
         if mutate is not None:
             mutate(documents)
         rehash_documents(documents)
 
-    return policy_graph(mutate=prepare)
+    return policy_graph(
+        mutate=prepare,
+        purpose=purpose,
+        manifest_version=("formal-registry-manifest-v2"
+                          if purpose == "test"
+                          else "formal-registry-manifest-v1"),
+        with_valuation_adapter=purpose == "test",
+    )
 
 
 class _CapturingRangeTransport:
@@ -213,14 +220,20 @@ class _IdentityRangeNormalizer:
 class RangeSourceFixture:
     """A genuine signed binding with only in-memory range bytes and transport."""
 
-    def __init__(self, *, mutate=None, implementations=None):
-        bundle, vocabulary, scoring, graph, verifier = range_graph(mutate=mutate)
+    def __init__(self, *, mutate=None, implementations=None,
+                 purpose="official"):
+        self.purpose = purpose
+        bundle, vocabulary, scoring, graph, verifier = range_graph(
+            mutate=mutate, purpose=purpose
+        )
         self.bundle, self.graph, self.verifier = bundle, graph, verifier
         policy = load_formal_policy_registry(
-            bundle, scoring_registry=scoring, feature_registry=vocabulary
+            bundle, scoring_registry=scoring, feature_registry=vocabulary,
+            expected_purpose=purpose,
         )
         bindings = load_policy_range_bindings(
-            bundle, scoring_registry=scoring, policy_registry=policy
+            bundle, scoring_registry=scoring, policy_registry=policy,
+            expected_purpose=purpose,
         )
         self.binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
         source_blob = bundle.blob("source")
@@ -296,7 +309,9 @@ class RangeStoreFixture(RangeSourceFixture):
                 self.store.put_formal_registry_blob(blob)
             self.store.put_formal_registry_manifest(self.graph.manifest)
             self.range_store = FormalRangeStore(self.store, root=self.root,
-                signature_verifier=self.verifier, source_factory=self.source_factory)
+                signature_verifier=self.verifier,
+                source_factory=self.source_factory,
+                expected_purpose=self.purpose)
         except BaseException:
             self.temp.cleanup()
             raise

@@ -3,6 +3,7 @@
 import unittest
 
 from ashare_pipeline.formal_policy_repository import VerifiedPolicyResultBatch
+from ashare_pipeline.formal_final_score_inputs import FormalFinalScoreInputRepository
 from ashare_pipeline.formal_score_inputs import FormalScoreInputBatch
 from ashare_pipeline.formal_valuation_engine import PolicyAdjustedValuationBatch
 from tests.formal_final_scoring_fixtures import FinalScoringFixture
@@ -55,6 +56,51 @@ class FinalScoringFixtureTests(unittest.TestCase):
             if value.slot_id in required}
         self.assertEqual(len(required), 25)
         self.assertEqual(actual, {slot_id: "derived" for slot_id in required})
+
+
+class SignedTestRootFinalScoringFixtureTests(unittest.TestCase):
+    def test_genuine_signed_test_root_builds_stage_a_b_c_and_d1_without_official_authority(self):
+        fixture = FinalScoringFixture(peer_count=3, purpose="test")
+        self.addCleanup(fixture.close)
+        fixture.populate_final_inputs()
+        sources = fixture.build_d1_sources()
+        d1 = FormalFinalScoreInputRepository(
+            fixture.feature_repository,
+            fixture.context,
+            fixture.range_store,
+            registry_signature_verifier=fixture.verifier,
+        ).build_batch(
+            fixture.frozen.frozen_input_hash,
+            scoring_registry=fixture.scoring,
+            policy_registry=fixture.policy_registry,
+            valuation_adapter_registry=fixture.valuation_registry,
+            expected_purpose=fixture.purpose,
+        )
+
+        root_hash = fixture.bundle.manifest.manifest_hash
+        expected_ids = tuple(member.security_id for member in fixture.frozen.members)
+        self.assertEqual(fixture.bundle.manifest.purpose, "test")
+        self.assertEqual(fixture.bundle.manifest.schema_version,
+                         "formal-registry-manifest-v2")
+        self.assertEqual(len(fixture.bundle.roles), 10)
+        fixture.bundle.require_authenticated(expected_purpose="test")
+        for batch in (*sources, d1):
+            batch.require_verified()
+            self.assertEqual(batch.registry_manifest_hash, root_hash)
+            self.assertEqual(batch.frozen_input_hash, fixture.frozen.frozen_input_hash)
+            self.assertEqual(batch.universe_hash, fixture.frozen.universe_hash)
+            self.assertEqual(batch.security_ids, expected_ids)
+
+        sources.policy.require_authenticated(expected_purpose="test")
+        with self.assertRaises(ValueError):
+            sources.policy.require_official()
+
+        with self.assertRaises(ValueError):
+            fixture.bundle.require_official()
+        with self.assertRaises(ValueError):
+            fixture.scoring.require_official(fixture.bundle)
+        with self.assertRaises(ValueError):
+            fixture.valuation_registry.require_official(fixture.bundle)
 
 
 if __name__ == "__main__":

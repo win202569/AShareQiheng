@@ -236,7 +236,7 @@ def rehash_documents(documents):
         )
 
 
-def add_policy_documents(documents):
+def add_policy_documents(documents, *, purpose="official"):
     """Add static fixture contracts before signing, preserving original declarations."""
     from tests.test_formal_context_repository import descriptor
     from tests.test_formal_sources import config
@@ -318,6 +318,7 @@ def add_policy_documents(documents):
                 metric["policy_refs"] = [dict(policy_role="redline", rule_id=f"{template}_nonpositive_equity")]
     documents["feature"]["slots"].sort(key=lambda slot: slot["slot_id"])
     for role, ids in active.items():
+        documents[role]["purpose"] = purpose
         documents[role]["rules"]["execution_contract"] = dict(
             schema_version="formal-policy-execution-contract-v1", role=role, rule_ids=sorted(ids))
     scoring["redlines"] = [dict(policy_role="redline", rule_id=key) for key in sorted(active["redline"])]
@@ -326,8 +327,10 @@ def add_policy_documents(documents):
     scoring["market_liquidity_rule"] = dict(policy_role="status", rule_id="general_nonfinancial_no_effective_trade_20d")
 
 
-def add_valuation_adapter_document(documents):
+def add_valuation_adapter_document(documents, *, purpose="official"):
     """Author the signed Stage C child from scoring and keyed cyclic rules."""
+    if type(purpose) is not str or purpose not in ("test", "official"):
+        raise ValueError("valuation adapter fixture purpose must be test or official")
     scoring = documents["scoring"]["scoring"]
     cyclic_rules = documents["cyclic"]["rules"]
     coverage, adapters = [], []
@@ -354,14 +357,15 @@ def add_valuation_adapter_document(documents):
                         "nonzero_original_current_profit"],
                     definition_basis=dependency["definition_basis"]))
     documents["valuation_adapter"] = dict(registry_role="valuation_adapter",
-        schema_version="formal-valuation-adapter-registry-v1", purpose="official",
+        schema_version="formal-valuation-adapter-registry-v1", purpose=purpose,
         registry_version="fixture-adapter-v1",
         coverage=sorted(coverage, key=lambda x: (x["template_id"], x["metric_id"])),
         adapters=sorted(adapters, key=lambda x: (x["template_id"], x["metric_id"])))
 
 
 def policy_graph(*, version="v1", manifest_version="formal-registry-manifest-v1",
-                 with_valuation_adapter=False, mutate=None):
+                 with_valuation_adapter=False, mutate=None,
+                 purpose="official"):
     from ashare_pipeline.formal_scoring_registry import RegistryApproval, load_formal_registry
     from tests.test_formal_scoring_registry import signed_graph
     from tests.test_formal_scoring_consensus_registry import v2_graph
@@ -372,21 +376,25 @@ def policy_graph(*, version="v1", manifest_version="formal-registry-manifest-v1"
         raise ValueError("valuation_adapter fixture requires manifest v2")
 
     def prepare(documents):
-        add_policy_documents(documents)
+        add_policy_documents(documents, purpose=purpose)
+        documents["industry"]["purpose"] = purpose
         if with_valuation_adapter:
-            add_valuation_adapter_document(documents)
+            add_valuation_adapter_document(documents, purpose=purpose)
         if mutate is not None:
             mutate(documents)
         rehash_documents(documents)
 
     if version == "v1":
         values = signed_graph(context=True, mutate=prepare,
-            manifest_version=manifest_version)
+            manifest_version=manifest_version, purpose=purpose)
     else:
         if manifest_version != "formal-registry-manifest-v1" or with_valuation_adapter:
             raise ValueError("fixture scoring v2 does not author Stage C roots")
         values = v2_graph(mutate=prepare)
     bundle, vocabulary, repository, verifier = values[:4]
-    approval = RegistryApproval("official", bundle.manifest.scoring_registry_hash, bundle.manifest.approval_id)
+    approval = RegistryApproval(
+        purpose, bundle.manifest.scoring_registry_hash,
+        bundle.manifest.approval_id,
+    )
     scoring = load_formal_registry(bundle, approval, feature_registry=vocabulary)
     return bundle, vocabulary, scoring, repository, verifier

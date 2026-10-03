@@ -350,16 +350,28 @@ def _build_proof_types():
                 request = sealed.next_page(source, observation)
             return tuple(observations), None
 
-        def calendar_for_market(sealed, binding, as_of_utc):
+        def expected_purpose_value(value):
+            if type(value) is not str or value not in ("test", "official"):
+                raise ValueError("expected_purpose must be exact test or official")
+            return value
+
+        def calendar_for_market(sealed, binding, as_of_utc, *, expected_purpose):
+            expected_purpose = expected_purpose_value(expected_purpose)
             capture = batch_capture.get()
             if capture is None:
-                return assemble_calendar(sealed, binding, as_of_utc)
+                return assemble_calendar(
+                    sealed, binding, as_of_utc, expected_purpose=expected_purpose)
+            if capture.get("expected_purpose") != expected_purpose:
+                raise ValueError("market selection purpose changed")
             ticket = capture["owner"].select_calendar_batch_ticket(
-                capture["journal"], binding, as_of_utc)
+                capture["journal"], binding, as_of_utc,
+                expected_purpose=expected_purpose)
             capture["calendar_ticket"] = ticket
             return ticket.selected()
 
-        def seal_selection(kind, selected, sealed, binding, as_of_utc, security_id):
+        def seal_selection(kind, selected, sealed, binding, as_of_utc, security_id,
+                           expected_purpose):
+            expected_purpose = expected_purpose_value(expected_purpose)
             capture = batch_capture.get()
             if capture is None:
                 return selected
@@ -386,51 +398,64 @@ def _build_proof_types():
             selection_records[identity] = (reference, owner, kind, fields, proof,
                 proof_bytes, binding, canonical_bytes(binding_identity), sealed.range_store,
                 tuple(capture["tickets"]), capture.get("calendar_ticket"),
-                (security_id, as_of_utc, binding_identity["binding_hash"]))
+                (security_id, as_of_utc, binding_identity["binding_hash"]),
+                expected_purpose)
             capture["sealed_selection"] = selected
             return selected
 
-        def selection_record(owner, selected, kind, capture=None):
+        def selection_record(owner, selected, kind, capture=None, expected_purpose=None):
             saved = selection_records.get(id(selected))
             if (saved is None or saved[0]() is not selected or saved[1] is not owner
                     or saved[2] != kind or type(selected) is not
                     (calendar_selection_type if kind == "calendar" else market_selection_type)
                     or (selected.pending, selected.lineage, selected.selection_hash) != saved[3]
                     or (selected.coverage if kind == "calendar" else selected.window) is not saved[4]
-                    or (None if saved[4] is None else saved[4].canonical_bytes()) != saved[5]):
+                    or (None if saved[4] is None else saved[4].canonical_bytes()) != saved[5]
+                    or type(saved[12]) is not str
+                    or saved[12] not in ("test", "official")):
                 raise ValueError("market or calendar selection changed after owner seal")
+            if (expected_purpose is not None
+                    and saved[12] != expected_purpose_value(expected_purpose)):
+                raise ValueError("market selection purpose differs from request")
             if capture is not None and (capture.get("sealed_selection") is not selected
                     or tuple(capture["tickets"]) != saved[9]
-                    or capture.get("calendar_ticket") is not saved[10]):
+                    or capture.get("calendar_ticket") is not saved[10]
+                    or capture.get("expected_purpose") != saved[12]):
                 raise ValueError("market selection token changed")
             return saved
 
-        def assemble_calendar(sealed, binding, as_of_utc):
+        def assemble_calendar(sealed, binding, as_of_utc, *, expected_purpose):
+            expected_purpose = expected_purpose_value(expected_purpose)
             def owner_mint(wire, owned_binding, recheck):
                 return mint_calendar(wire, owned_binding, sealed.range_store, recheck)
             def owner_seal(selected):
                 return seal_selection("calendar", selected, sealed, binding, as_of_utc,
-                                      _binding_identity(binding)["exchange"])
+                                      _binding_identity(binding)["exchange"],
+                                      expected_purpose)
             constructor = (calendar_selection_type if batch_capture.get() is None else
                 lambda *values: construct_selection(calendar_selection_type, values))
             return implementation_select_calendar(
-                sealed, binding, as_of_utc, _mint_calendar=owner_mint,
+                sealed, binding, as_of_utc, expected_purpose=expected_purpose,
+                _mint_calendar=owner_mint,
                 _page_group=owner_page_group,
                 _select_calendar=assemble_calendar,
                 _calendar_selection_type=constructor,
                 _seal_selection=owner_seal,
             )
 
-        def assemble_market(sealed, security_id, as_of_utc, *, binding):
+        def assemble_market(sealed, security_id, as_of_utc, *, binding,
+                            expected_purpose):
+            expected_purpose = expected_purpose_value(expected_purpose)
             def owner_mint(wire, owned_binding, recheck):
                 return mint_window(wire, owned_binding, sealed.range_store, recheck)
             def owner_seal(selected):
                 return seal_selection("market", selected, sealed, binding, as_of_utc,
-                                      security_id)
+                                      security_id, expected_purpose)
             constructor = (market_selection_type if batch_capture.get() is None else
                 lambda *values: construct_selection(market_selection_type, values))
             return implementation_select_market(
                 sealed, security_id, as_of_utc, binding=binding,
+                expected_purpose=expected_purpose,
                 _mint_window=owner_mint, _page_group=owner_page_group,
                 _select_calendar=calendar_for_market, _select_market=assemble_market,
                 _market_selection_type=constructor,
@@ -438,14 +463,16 @@ def _build_proof_types():
             )
 
         def ticket_evidence(owner, journal, kind, selected, binding, as_of_utc,
-                            security_id, capture):
+                            security_id, capture, expected_purpose):
             from .formal_batch_read_journal import _issue_current_ticket, _require_current_ticket
+            expected_purpose = expected_purpose_value(expected_purpose)
             sealed = repository_record(owner)
-            saved = selection_record(owner, selected, kind, capture)
+            saved = selection_record(owner, selected, kind, capture, expected_purpose)
             (_, _, _, fields, proof, proof_bytes, sealed_binding, binding_bytes,
-             range_store, lower, sealed_calendar_ticket, request) = saved
+             range_store, lower, sealed_calendar_ticket, request, sealed_purpose) = saved
             if (sealed_binding is not binding or range_store is not sealed.range_store
-                    or request[0:2] != (security_id, as_of_utc)):
+                    or request[0:2] != (security_id, as_of_utc)
+                    or sealed_purpose != expected_purpose):
                 raise ValueError("market ticket request differs from sealed selection")
             baselines = tuple(_require_current_ticket(journal, ticket, sealed.range_store,
                                                        "range")[1] for ticket in lower)
@@ -472,7 +499,7 @@ def _build_proof_types():
                 calendar=None if calendar_baseline is None else calendar_baseline.decode()))
             evidence = (kind, selected, fields, proof_bytes, proof, binding,
                 binding_bytes, sealed.range_store, journal, lower,
-                calendar_ticket, calendar_selected, request)
+                calendar_ticket, calendar_selected, request, expected_purpose)
             coverage = () if kind == "calendar" else ((security_id,),)
             return _issue_current_ticket(journal, owner, kind, request, baseline,
                                          evidence, coverage, selected)
@@ -501,19 +528,23 @@ def _build_proof_types():
             def __delattr__(self, name):
                 raise AttributeError("market repositories are immutable")
 
-            def select_calendar(self, binding, as_of_utc):
-                return assemble_calendar(repository_record(self), binding, as_of_utc)
+            def select_calendar(self, binding, as_of_utc, *, expected_purpose="official"):
+                return assemble_calendar(repository_record(self), binding, as_of_utc,
+                                         expected_purpose=expected_purpose)
 
-            def select(self, security_id, as_of_utc, *, binding):
+            def select(self, security_id, as_of_utc, *, binding,
+                       expected_purpose="official"):
                 return assemble_market(repository_record(self), security_id, as_of_utc,
-                                       binding=binding)
+                                       binding=binding, expected_purpose=expected_purpose)
 
             def _batch_journal_identity(self):
                 sealed = repository_record(self)
                 return sealed.range_store._batch_journal_identity()[0], sealed.range_store
 
-            def select_calendar_batch_ticket(self, journal, binding, as_of_utc):
+            def select_calendar_batch_ticket(self, journal, binding, as_of_utc, *,
+                                             expected_purpose="official"):
                 from .formal_batch_read_journal import _require_current_scope
+                expected_purpose = expected_purpose_value(expected_purpose)
                 sealed = repository_record(self)
                 lease = None
                 try:
@@ -523,14 +554,18 @@ def _build_proof_types():
                     _require_current_scope(journal, self,
                         root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
                         population=(identity["exchange"],))
-                    capture = {"journal": journal, "owner": self, "tickets": []}
+                    capture = {"journal": journal, "owner": self, "tickets": [],
+                               "expected_purpose": expected_purpose}
                     reset = batch_capture.set(capture)
                     try:
-                        selected = assemble_calendar(sealed, binding, as_of_utc)
+                        selected = assemble_calendar(
+                            sealed, binding, as_of_utc,
+                            expected_purpose=expected_purpose)
                     finally:
                         batch_capture.reset(reset)
                     ticket = ticket_evidence(self, journal, "calendar", selected, binding,
-                                             as_of_utc, identity["exchange"], capture)
+                                             as_of_utc, identity["exchange"], capture,
+                                             expected_purpose)
                     _close_binding_read_lease(lease)
                     return ticket
                 except BaseException:
@@ -545,8 +580,10 @@ def _build_proof_types():
                         pass
                     raise
 
-            def select_current_batch_ticket(self, journal, security_id, as_of_utc, *, binding):
+            def select_current_batch_ticket(self, journal, security_id, as_of_utc, *, binding,
+                                            expected_purpose="official"):
                 from .formal_batch_read_journal import _require_current_scope
+                expected_purpose = expected_purpose_value(expected_purpose)
                 sealed = repository_record(self)
                 lease = None
                 try:
@@ -556,15 +593,18 @@ def _build_proof_types():
                     _require_current_scope(journal, self,
                         root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
                         population=(security_id,))
-                    capture = {"journal": journal, "owner": self, "tickets": []}
+                    capture = {"journal": journal, "owner": self, "tickets": [],
+                               "expected_purpose": expected_purpose}
                     reset = batch_capture.set(capture)
                     try:
                         selected = assemble_market(
-                            sealed, security_id, as_of_utc, binding=binding)
+                            sealed, security_id, as_of_utc, binding=binding,
+                            expected_purpose=expected_purpose)
                     finally:
                         batch_capture.reset(reset)
                     ticket = ticket_evidence(self, journal, "market", selected, binding,
-                                             as_of_utc, security_id, capture)
+                                             as_of_utc, security_id, capture,
+                                             expected_purpose)
                     _close_binding_read_lease(lease)
                     return ticket
                 except BaseException:
@@ -583,10 +623,12 @@ def _build_proof_types():
                 from .formal_batch_read_journal import _require_current_ticket
                 (kind, selected, fields, proof_bytes, proof, binding, binding_bytes,
                  range_store, journal, lower, calendar_ticket, calendar_selected,
-                 request) = evidence
+                 request, expected_purpose) = evidence
+                expected_purpose = expected_purpose_value(expected_purpose)
                 sealed = repository_record(self)
                 if (range_store is not sealed.range_store
-                        or selection_record(self, selected, kind)[3] != fields
+                        or selection_record(self, selected, kind,
+                                            expected_purpose=expected_purpose)[3] != fields
                         or canonical_bytes(_binding_identity(binding)) != binding_bytes
                         or type(selected) is not (calendar_selection_type if kind == "calendar"
                                                     else market_selection_type)
@@ -594,6 +636,8 @@ def _build_proof_types():
                         or (selected.coverage if kind == "calendar" else selected.window) is not proof
                         or (None if proof is None else proof.canonical_bytes()) != proof_bytes):
                     raise ValueError("market or calendar ticket selection changed")
+                sealed.resolve_binding(sealed.range_store, binding,
+                                       expected_purpose=expected_purpose)
                 if kind == "market":
                     if calendar_ticket is None or _require_current_ticket(
                             journal, calendar_ticket, self, "calendar")[0] is not calendar_selected:
@@ -770,7 +814,8 @@ class _MarketRepositoryImplementation:
             request = sealed.next_page(source, observation)
         return tuple(observations), None
 
-    def select_calendar(sealed, binding, as_of_utc, *, _mint_calendar, _page_group,
+    def select_calendar(sealed, binding, as_of_utc, *, expected_purpose,
+                        _mint_calendar, _page_group,
                         _select_calendar, _calendar_selection_type,
                         _seal_selection) -> CalendarSelection:
         if type(binding) is not _binding_type:
@@ -778,7 +823,10 @@ class _MarketRepositoryImplementation:
         as_of = _aware(as_of_utc, "calendar as_of_utc")
         if as_of_utc != _FREEZE_UTC:
             raise ValueError("calendar selection requires the formal freeze")
-        owned_binding, source = sealed.resolve_binding(sealed.range_store, binding)
+        if type(expected_purpose) is not str or expected_purpose not in ("test", "official"):
+            raise ValueError("expected_purpose must be exact test or official")
+        owned_binding, source = sealed.resolve_binding(
+            sealed.range_store, binding, expected_purpose=expected_purpose)
         request = sealed.first_calendar_request(source, as_of_utc)
         groups = []
         missing = None
@@ -804,7 +852,8 @@ class _MarketRepositoryImplementation:
             identity = hashlib.sha256(canonical_bytes({"pending": list(pending),
                 "request": request.to_dict()})).hexdigest()
             def check_missing():
-                sealed.resolve_binding(sealed.range_store, owned_binding)
+                sealed.resolve_binding(sealed.range_store, owned_binding,
+                                       expected_purpose=expected_purpose)
                 if (missing is not None and sealed.select_current(
                         sealed.range_store, missing.request_fingerprint) is not None):
                     raise ValueError("calendar selection changed")
@@ -923,7 +972,9 @@ class _MarketRepositoryImplementation:
         expected_proof_wire = dict(wire,
             coverage_hash=hashlib.sha256(canonical_bytes(wire)).hexdigest())
         def recheck():
-            current = _select_calendar(sealed, owned_binding, as_of_utc)
+            current = _select_calendar(
+                sealed, owned_binding, as_of_utc,
+                expected_purpose=expected_purpose)
             if (current.coverage is None
                     or current.coverage.canonical_bytes() != canonical_bytes(expected_proof_wire)):
                 raise ValueError("calendar coverage selection changed")
@@ -932,13 +983,19 @@ class _MarketRepositoryImplementation:
         return _seal_selection(_calendar_selection_type(
             proof, (), lineage, selection_hash, proof.require_current))
 
-    def select(sealed, security_id, as_of_utc, *, binding, _mint_window, _page_group,
+    def select(sealed, security_id, as_of_utc, *, binding, expected_purpose,
+               _mint_window, _page_group,
                _select_calendar, _select_market,
                _market_selection_type, _seal_selection) -> MarketSelection:
         if type(security_id) is not str or _SECURITY.fullmatch(security_id) is None:
             raise ValueError("market selection security_id is invalid")
-        owned_binding, source = sealed.resolve_binding(sealed.range_store, binding)
-        calendar = _select_calendar(sealed, owned_binding, as_of_utc)
+        if type(expected_purpose) is not str or expected_purpose not in ("test", "official"):
+            raise ValueError("expected_purpose must be exact test or official")
+        owned_binding, source = sealed.resolve_binding(
+            sealed.range_store, binding, expected_purpose=expected_purpose)
+        calendar = _select_calendar(
+            sealed, owned_binding, as_of_utc,
+            expected_purpose=expected_purpose)
         if calendar.coverage is None:
             return _seal_selection(_market_selection_type(None, calendar.pending,
                 calendar.lineage, calendar.selection_hash, calendar.recheck))
@@ -1062,7 +1119,8 @@ class _MarketRepositoryImplementation:
             window_hash=hashlib.sha256(canonical_bytes(wire)).hexdigest())
         def recheck():
             current = _select_market(
-                sealed, security_id, as_of_utc, binding=owned_binding)
+                sealed, security_id, as_of_utc, binding=owned_binding,
+                expected_purpose=expected_purpose)
             if (current.window is None
                     or current.window.canonical_bytes() != canonical_bytes(expected_window_wire)):
                 raise ValueError("market window selection changed")
@@ -1089,10 +1147,16 @@ FormalPolicyMarketRepository = _install_market_proof_owner((
 del _install_market_proof_owner, _MarketRepositoryImplementation
 
 
-def plan_next_window_request(security_id, as_of_utc, *, binding, range_store):
+def plan_next_window_request(security_id, as_of_utc, *, binding, range_store,
+                             expected_purpose="official"):
     """Return only the next authenticated acquisition request; never fetch."""
+    if (type(expected_purpose) is not str
+            or expected_purpose not in ("test", "official")):
+        raise ValueError("expected_purpose must be exact test or official")
     repository = FormalPolicyMarketRepository(range_store)
-    owned_binding, source = range_store.resolve_planning_binding(binding)
+    owned_binding, source = range_store.resolve_planning_binding(
+        binding, expected_purpose=expected_purpose
+    )
     first_calendar = source.first_calendar_request(as_of_utc)
     calendar_page = range_store.select_current(first_calendar.request_fingerprint)
     if calendar_page is None:
@@ -1103,7 +1167,8 @@ def plan_next_window_request(security_id, as_of_utc, *, binding, range_store):
         if page is None:
             return successor
         successor = source.next_page(page)
-    calendar = repository.select_calendar(owned_binding, as_of_utc)
+    calendar = repository.select_calendar(
+        owned_binding, as_of_utc, expected_purpose=expected_purpose)
     if calendar.coverage is None:
         # A verified first group whose content cannot form coverage needs a new
         # source generation or temporal evidence, not the identical request.
@@ -1119,7 +1184,9 @@ def plan_next_window_request(security_id, as_of_utc, *, binding, range_store):
             if page is None:
                 return successor
             successor = source.next_page(page)
-    selection = repository.select(security_id, as_of_utc, binding=owned_binding)
+    selection = repository.select(
+        security_id, as_of_utc, binding=owned_binding,
+        expected_purpose=expected_purpose)
     if selection.window is None:
         return None
     if selection.window.price_state != "incomplete":

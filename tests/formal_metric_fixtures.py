@@ -22,12 +22,14 @@ FREEZE = "2026-08-31T07:00:00+00:00"
 IDS = ("BJ430001", "SH600000", "SZ000001")
 
 
-def industry_document():
+def industry_document(*, purpose="official"):
+    if type(purpose) is not str or purpose not in ("test", "official"):
+        raise ValueError("industry fixture purpose must be test or official")
     memberships = [dict(security_id=s, template_id=t, primary_industry=p, secondary_industry=q)
         for s, t, p, q in (("BJ430001", "general_nonfinancial", "manufacturing", "machinery"),
             ("SH600000", "bank", "banks", "joint-stock-banks"), ("SZ000001", "bank", "banks", "joint-stock-banks"))]
     mapping = dict(classification_system="SW2021", source_version="2026.08", effective_date="2026-08-28", memberships=memberships)
-    return dict(registry_role="industry", schema_version="formal-industry-registry-v1", purpose="official",
+    return dict(registry_role="industry", schema_version="formal-industry-registry-v1", purpose=purpose,
         context_scope_key="fixture-industry", mapping_sha256=hashlib.sha256(canonical(mapping)).hexdigest(), **mapping)
 
 
@@ -40,14 +42,17 @@ class MetricFixture:
     """A plain helper; no imported/inherited TestCase can duplicate suite discovery."""
 
     def __init__(self, *, mutate=None, exchange_rows=None, tempdir=None, calendar_binding_resolver=None,
-                 manifest_version="formal-registry-manifest-v1"):
+                 manifest_version="formal-registry-manifest-v1", purpose="official"):
+        if type(purpose) is not str or purpose not in ("test", "official"):
+            raise ValueError("metric fixture purpose must be test or official")
+        self.purpose = purpose
         self.tempdir = tempdir or tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
         self.db_path = self.root / "metric.sqlite"
         StateStore(self.db_path).initialize()
         self.raw = FormalSnapshotStore(self.root / "raw", calendar_binding_resolver=calendar_binding_resolver)
         def configure(docs):
-            docs["industry"] = industry_document()
+            docs["industry"] = industry_document(purpose=purpose)
             docs["scoring"]["descriptors"] = [descriptor("industry_snapshot", scope_key="fixture-industry",
                 dataset="fixture-industry", referenced_roles=["industry", "scoring", "source"])]
             docs["source"]["configs"] = [config(dataset="fixture-industry", exchange_scope=e) for e in ("BJ", "SH", "SZ")]
@@ -55,7 +60,7 @@ class MetricFixture:
             if mutate:
                 mutate(docs)
         self.bundle, vocabulary, graph, self.verifier = signed_graph(
-            mutate=configure, manifest_version=manifest_version)
+            mutate=configure, manifest_version=manifest_version, purpose=purpose)
         self.industry = __import__("json").loads(self.bundle.blob("industry").canonical_json)
         self.store, self.frozen, self.task_ids = test_state_store.StateStoreTestCase.task_backed_frozen_universe(
             self, registry_manifest_hash=self.bundle.manifest.manifest_hash,
@@ -65,8 +70,9 @@ class MetricFixture:
             self.store.put_formal_registry_blob(blob)
         self.store.put_formal_registry_manifest(graph.manifest)
         self.snapshot_id = self.store.put_formal_universe_snapshot(self.frozen)
-        self.scoring = load_formal_registry(self.bundle, RegistryApproval("official",
-            self.bundle.manifest.scoring_registry_hash, self.bundle.manifest.approval_id), feature_registry=vocabulary)
+        self.scoring = load_formal_registry(self.bundle, RegistryApproval(purpose,
+            self.bundle.manifest.scoring_registry_hash, self.bundle.manifest.approval_id),
+            feature_registry=vocabulary)
         self.snapshots = FormalSnapshotRepository(self.raw.root, self.store)
         self.context = FormalContextRepository(self.store, self.snapshots, self.verifier)
         self.resolver = SignedContextRequestResolver(self.store, self.verifier)
@@ -92,7 +98,7 @@ class MetricFixture:
         value.update(changes or {})
         request = self.resolver.resolve(context_kind="industry_snapshot", scope_key="fixture-industry",
             security_id=security_id, as_of_utc=FREEZE, registry_manifest_hash=self.bundle.manifest.manifest_hash,
-            upstream_generation=generation)
+            upstream_generation=generation, expected_purpose=self.purpose)
         task = self.store.enqueue_formal_task("formal_context", security_id + generation, request.refresh_generation, {})
         self.store.lease_next_formal_task(("formal_context",), "metric-fixture", 300)
         raw = canonical(dict(value=value, no_coverage=False))
@@ -106,8 +112,13 @@ class MetricFixture:
         verified = verify_official_fetch(fetch, SourcePolicy.cninfo())
         self.assertEqual(verified.status, "verified")
         ref = self.snapshots.persist_verified(fetch, verified, producing_task_id=task, worker_id="metric-fixture")
-        receipt = FormalContextRegistry.load(self.store, self.verifier, self.bundle.manifest.manifest_hash).normalize_verified(
+        receipt = FormalContextRegistry.load(
+            self.store, self.verifier, self.bundle.manifest.manifest_hash,
+            expected_purpose=self.purpose,
+        ).normalize_verified(
             request, ref, raw, FixtureNormalizer(), task_id=task, worker_id="metric-fixture")
-        self.store.put_formal_context_facts(receipt)
+        self.store.put_formal_context_facts(
+            receipt, expected_purpose=self.purpose
+        )
         self.store.complete_formal_task(task, "metric-fixture", {"snapshot": ref.snapshot_id})
         return receipt.facts[0], ref

@@ -18,7 +18,10 @@ from .formal_feature_contract import (
     FormalEvidenceRef, FormalFeatureBundle, FormalFeatureValue, FormulaNode,
     SignedFormalFeatureRegistry,
 )
-from .formal_registry_manifest import FormalRegistryManifest
+from .formal_registry_manifest import (
+    FormalRegistryManifest,
+    VerifiedRegistryBundle,
+)
 from .formal_time import formal_version_sort_key, is_visible_at
 from .formal_universe import canonical_security_id
 
@@ -542,7 +545,7 @@ def evaluate_formula(node: FormulaNode, facts: dict) -> FormalFormulaResult:
         raise ValueError("formula is too deep") from error
 
 
-def build_formal_feature_bundle(*, security_id: str, as_of_utc: str, template_id: str, facts: Iterable[FormalFinancialFact], issues: Iterable[FormalFactIssue], registry: SignedFormalFeatureRegistry, registry_manifest: FormalRegistryManifest) -> FormalFeatureBundle:
+def build_formal_feature_bundle(*, security_id: str, as_of_utc: str, template_id: str, facts: Iterable[FormalFinancialFact], issues: Iterable[FormalFactIssue], registry: SignedFormalFeatureRegistry, registry_manifest: FormalRegistryManifest, registry_bundle: VerifiedRegistryBundle | None = None, expected_purpose: str | None = None) -> FormalFeatureBundle:
     _security(security_id)
     _utc(as_of_utc)
     if type(template_id) is not str or template_id not in {"bank", "broker", "general_nonfinancial", "insurance", "real_estate"}:
@@ -555,6 +558,22 @@ def build_formal_feature_bundle(*, security_id: str, as_of_utc: str, template_id
     slots = registry.slots_for_template(template_id)
     if type(registry_manifest) is not FormalRegistryManifest:
         raise ValueError("bundle requires exact sealed root")
+    computation_authenticated = False
+    if registry_bundle is None and expected_purpose is not None:
+        raise ValueError("registry_bundle and expected_purpose must be provided together")
+    if registry_bundle is not None:
+        if type(expected_purpose) is not str or expected_purpose not in {
+            "test", "official"
+        }:
+            raise ValueError("expected_purpose must be exact test or official")
+        if type(registry_bundle) is not VerifiedRegistryBundle:
+            raise ValueError("computation requires an exact verified registry bundle")
+        if registry_bundle.manifest is not registry_manifest:
+            raise ValueError("computation bundle manifest identity differs")
+        registry.require_authenticated(
+            registry_bundle, expected_purpose=expected_purpose
+        )
+        computation_authenticated = True
     try:
         active = _ROOT_HASHES + (("valuation_adapter_registry_hash",)
             if registry_manifest.schema_version == "formal-registry-manifest-v2" else ())
@@ -626,12 +645,15 @@ def build_formal_feature_bundle(*, security_id: str, as_of_utc: str, template_id
         if key not in values:
             values[key] = result
     output = []
-    if not eligible:
+    computation_eligible = eligible or (
+        computation_authenticated and expected_purpose == "test"
+    )
+    if not computation_eligible:
         blockers.add("feature_registry_not_release_eligible")
     for slot in slots:
         slot_wire = slot.to_dict()
-        if not eligible or untrustworthy:
-            reason = "feature_registry_not_release_eligible" if not eligible else "feature_input_not_trustworthy"
+        if not computation_eligible or untrustworthy:
+            reason = "feature_registry_not_release_eligible" if not computation_eligible else "feature_input_not_trustworthy"
             status, result = "blocked", _missing(reason)
         else:
             result = _evaluate(_formula_snapshot(slot.formula), values, ambiguous)

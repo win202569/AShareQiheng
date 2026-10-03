@@ -100,14 +100,14 @@ class ScoreFixture(FinancialFixture):
     def put_calendar(self):
         request = self.resolver.resolve(context_kind="trading_calendar", scope_key="fixture-calendar-BJ",
             security_id=None, as_of_utc=FREEZE, registry_manifest_hash=self.bundle.manifest.manifest_hash,
-            upstream_generation="calendar-1")
+            upstream_generation="calendar-1", expected_purpose=self.purpose)
         return self.put_context(request, dict(exchange="BJ", calendar_version="fixture-v1",
             trading_days=["2026-08-21", "2026-08-31", "2026-09-02"]), False, "calendar-1")
 
     def put_consensus(self, *, no_coverage=True, generation="consensus-1"):
         request = self.resolver.resolve(context_kind="consensus_snapshot", scope_key="fixture-consensus",
             security_id=FOCAL, as_of_utc=FREEZE, registry_manifest_hash=self.bundle.manifest.manifest_hash,
-            upstream_generation=generation)
+            upstream_generation=generation, expected_purpose=self.purpose)
         value = dict(coverage_status="no_valid_coverage" if no_coverage else "covered",
             estimates=[] if no_coverage else [dict(period="FY2026", metric="profit", value=1)])
         return self.put_context(request, value, no_coverage, generation)
@@ -131,8 +131,13 @@ class ScoreFixture(FinancialFixture):
             declared_security_id=request.official_request.security_id, declared_period=request.official_request.period_or_date)
         verified = verify_official_fetch(fetch, SourcePolicy.cninfo(), calendar_binding=binding)
         ref = self.snapshots.persist_verified(fetch, verified, producing_task_id=task, worker_id="score-fixture")
-        receipt = FormalContextRegistry.load(self.store, self.verifier, self.bundle.manifest.manifest_hash).normalize_verified(
+        receipt = FormalContextRegistry.load(
+            self.store, self.verifier, self.bundle.manifest.manifest_hash,
+            expected_purpose=self.purpose,
+        ).normalize_verified(
             request, ref, raw, FixtureNormalizer(), task_id=task, worker_id="score-fixture")
-        self.store.put_formal_context_facts(receipt)
+        self.store.put_formal_context_facts(
+            receipt, expected_purpose=self.purpose
+        )
         self.store.complete_formal_task(task, "score-fixture", {"snapshot": ref.snapshot_id})
         return receipt.facts[0]

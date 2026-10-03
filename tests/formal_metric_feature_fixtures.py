@@ -32,7 +32,7 @@ def configuration(docs):
 class FinancialFixture(MetricFixture):
     def __init__(self, *, population=False, missing_memberships=False, mutate=None,
                  calendar_binding_resolver=None, exchange_rows=None,
-                 manifest_version="formal-registry-manifest-v1"):
+                 manifest_version="formal-registry-manifest-v1", purpose="official"):
         rows = exchange_rows
         def configure(docs):
             configuration(docs)
@@ -54,7 +54,7 @@ class FinancialFixture(MetricFixture):
                 for exchange, ids in {"BJ": ["BJ430001"], "SH": [f"SH{600000+i}" for i in range(20)], "SZ": ["SZ000001"]}.items()}
         super().__init__(mutate=configure, exchange_rows=rows, tempdir=project_temporary_directory(),
             calendar_binding_resolver=calendar_binding_resolver,
-            manifest_version=manifest_version)
+            manifest_version=manifest_version, purpose=purpose)
         self.files = FormalFeatureBundleStore(self.root / "features")
         self.store._formal_feature_bundle_store = self.files
         self.issues = {}
@@ -121,7 +121,8 @@ class FinancialFixture(MetricFixture):
         member = next(m for m in self.industry["memberships"] if m["security_id"] == sid)
         bundle = build_formal_feature_bundle(security_id=sid, as_of_utc=FREEZE, template_id=member["template_id"],
             facts=self.store.list_formal_financial_facts(security_id=sid), issues=self.issues.get(sid, ()),
-            registry=self.vocabulary, registry_manifest=self.bundle.manifest)
+            registry=self.vocabulary, registry_manifest=self.bundle.manifest,
+            registry_bundle=self.bundle, expected_purpose=self.bundle.manifest.purpose)
         self.store.put_formal_feature_bundle(bundle, self.files.write(bundle))
         return bundle
 

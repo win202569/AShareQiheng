@@ -227,20 +227,38 @@ def _require_coverage(rules, scoring, children):
 def _install_binder():
     # Call the authentic class implementations, even if callers shadow methods.
     bundle_type, scoring_type, feature_type = VerifiedRegistryBundle, FormalScoringRegistry, SignedFormalFeatureRegistry
-    require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
-    require_scoring = scoring_type.require_official
-    require_feature = feature_type.require_release_eligible
+    require_bundle_official = bundle_type.require_official
+    require_bundle_authenticated = bundle_type.require_authenticated
+    blob_for = bundle_type.blob
+    require_scoring_official = scoring_type.require_official
+    require_scoring_authenticated = scoring_type.require_authenticated
+    require_feature_official = feature_type.require_release_eligible
+    require_feature_authenticated = feature_type.require_authenticated
     slots_for_template = feature_type.slots_for_template
 
     def bind(bundle: VerifiedRegistryBundle, *, scoring_registry: FormalScoringRegistry,
-            feature_registry: SignedFormalFeatureRegistry) -> bytes:
+            feature_registry: SignedFormalFeatureRegistry,
+            expected_purpose) -> bytes:
         """Reparse verified children and return auditable definitions, never runtime evidence."""
         if (type(bundle) is not bundle_type or type(scoring_registry) is not scoring_type
                 or type(feature_registry) is not feature_type):
             raise PolicyContractError("exact verified bundle, scoring and feature types required", path="graph")
-        require_bundle(bundle)
-        require_scoring(scoring_registry, bundle)
-        require_feature(feature_registry)
+        if type(expected_purpose) is not str or expected_purpose not in ("test", "official"):
+            raise PolicyContractError("expected purpose must be exact test or official", path="graph")
+        if bundle.manifest.purpose != expected_purpose:
+            raise PolicyContractError("registry purpose differs from expected purpose", path="graph")
+        if expected_purpose == "official":
+            require_bundle_official(bundle)
+            require_scoring_official(scoring_registry, bundle)
+            require_feature_official(feature_registry)
+        else:
+            require_bundle_authenticated(bundle, expected_purpose="test")
+            require_scoring_authenticated(
+                scoring_registry, bundle, expected_purpose="test"
+            )
+            require_feature_authenticated(
+                feature_registry, bundle, expected_purpose="test"
+            )
         blobs = {role: blob_for(bundle, role) for role in _ROLES}
         hashes = {role: hashlib.sha256(blob.canonical_json).hexdigest() for role, blob in blobs.items()}
         if (hashlib.sha256(bundle.manifest.canonical_json).hexdigest() != bundle.manifest.manifest_hash
@@ -256,7 +274,7 @@ def _install_binder():
         children = {role: json.loads(blobs[role].canonical_json) for role in _POLICY_ROLES}
         for role, child in children.items():
             declared = scoring_registry.policy_contracts[role]
-            if (child["purpose"] != "official" or declared["registry_hash"] != hashes[role]
+            if (child["purpose"] != expected_purpose or declared["registry_hash"] != hashes[role]
                     or child["registry_version"] != declared["registry_version"]
                     or tuple(child["source_evidence_categories"]) != declared["source_evidence_categories"]):
                 raise PolicyContractError("policy purpose, version or categories mismatch", path=role)
@@ -300,8 +318,13 @@ def _install_policy_registry():
     records = {}
     module_globals = globals()
     bundle_type, scoring_type, feature_type = VerifiedRegistryBundle, FormalScoringRegistry, SignedFormalFeatureRegistry
-    require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
-    require_scoring, require_feature = scoring_type.require_official, feature_type.require_release_eligible
+    require_bundle_official = bundle_type.require_official
+    require_bundle_authenticated = bundle_type.require_authenticated
+    blob_for = bundle_type.blob
+    require_scoring_official = scoring_type.require_official
+    require_scoring_authenticated = scoring_type.require_authenticated
+    require_feature_official = feature_type.require_release_eligible
+    require_feature_authenticated = feature_type.require_authenticated
     bind, encode, freeze = _bind_policy_contract, _canonical, _freeze
     loads, sha256, weak_ref = json.loads, hashlib.sha256, weakref.ref
     fields = frozenset(("schema_version", "contract_version", "registry_manifest_hash", "role_hashes",
@@ -341,8 +364,9 @@ def _install_policy_registry():
     )
     bindings = tuple((owner, name, owner[name]) for owner, names in binding_names for name in names.split())
     source_interfaces = (
-        (bundle_type, "require_official blob"), (scoring_type, "require_official"),
-        (feature_type, "require_release_eligible slots_for_template"),
+        (bundle_type, "require_official require_authenticated blob"),
+        (scoring_type, "require_official require_authenticated"),
+        (feature_type, "require_release_eligible require_verified require_authenticated slots_for_template"),
         (manifest_module.FormalRegistryManifest, ""), (manifest_module.VerifiedRegistryBlob, ""),
         (feature_module.FormalFeatureSlot, "__init__ __post_init__ from_dict to_dict"),
         (feature_module.FormulaNode, "__init__ __post_init__ from_dict"),
@@ -385,12 +409,28 @@ def _install_policy_registry():
                     or any(current[name] is not value for name, value in expected)):
                 raise ValueError("policy proof class member or inheritance changed")
 
-    def verify_sources(bundle, scoring, feature):
+    def verify_sources(bundle, scoring, feature, *, expected_purpose):
         if type(bundle) is not bundle_type or type(scoring) is not scoring_type or type(feature) is not feature_type:
             raise ValueError("policy proof requires exact genuine registry sources")
-        require_bundle(bundle)
-        require_scoring(scoring, bundle)
-        require_feature(feature)
+        if type(expected_purpose) is not str or expected_purpose not in ("test", "official"):
+            raise ValueError("policy proof expected_purpose must be exact test or official")
+        if bundle.manifest.purpose != expected_purpose:
+            raise ValueError("policy proof registry purpose differs from expected purpose")
+        if expected_purpose == "official":
+            require_bundle_official(bundle)
+            require_scoring_official(scoring, bundle)
+            require_feature_official(feature)
+        else:
+            authenticated_feature = require_scoring_authenticated(
+                scoring,
+                bundle,
+                expected_purpose="test",
+                feature_registry=feature,
+            )
+            if authenticated_feature is not feature:
+                raise ValueError(
+                    "policy proof feature differs from scoring authenticated feature"
+                )
         blobs = {role: blob_for(bundle, role) for role in _ROLES}
         hashes = {role: sha256(blob.canonical_json).hexdigest() for role, blob in blobs.items()}
         root_hash = sha256(bundle.manifest.canonical_json).hexdigest()
@@ -409,12 +449,22 @@ def _install_policy_registry():
             raise ValueError("policy proof feature/source/mapping differs from current root")
         return root_hash, hashes
 
-    def proof_record(proof):
+    def proof_record(proof, *, expected_purpose=None):
         dependencies()
         record = records.get(id(proof))
         if type(proof) is not proof_type or record is None or record[0]() is not proof:
             raise ValueError("policy proof is forged, copied or unregistered")
-        root_hash, hashes = verify_sources(record[3], record[4], record[5])
+        sealed_purpose = record[8]
+        if expected_purpose is None:
+            expected_purpose = sealed_purpose
+        if (type(expected_purpose) is not str
+                or expected_purpose not in ("test", "official")
+                or expected_purpose != sealed_purpose):
+            raise ValueError("policy proof expected purpose differs from sealed purpose")
+        root_hash, hashes = verify_sources(
+            record[3], record[4], record[5],
+            expected_purpose=expected_purpose,
+        )
         if root_hash != record[6] or hashes != record[7]:
             raise ValueError("policy proof source identity changed")
         return record
@@ -477,17 +527,27 @@ def _install_policy_registry():
     proof_type = FormalPolicyRegistry
 
     def load(bundle: VerifiedRegistryBundle, *, scoring_registry: FormalScoringRegistry,
-            feature_registry: SignedFormalFeatureRegistry) -> FormalPolicyRegistry:
+            feature_registry: SignedFormalFeatureRegistry,
+            expected_purpose="official") -> FormalPolicyRegistry:
         """Authenticate and bind one complete signed graph without executing it."""
         dependencies()
-        root_hash, hashes = verify_sources(bundle, scoring_registry, feature_registry)
-        canonical = bind(bundle, scoring_registry=scoring_registry, feature_registry=feature_registry)
+        root_hash, hashes = verify_sources(
+            bundle, scoring_registry, feature_registry,
+            expected_purpose=expected_purpose,
+        )
+        canonical = bind(
+            bundle, scoring_registry=scoring_registry,
+            feature_registry=feature_registry,
+            expected_purpose=expected_purpose,
+        )
         payload = loads(canonical)
         if type(canonical) is not bytes or type(payload) is not dict or set(payload) != fields or encode(payload) != canonical:
             raise ValueError("policy binder returned a noncanonical definition")
         frozen_payload = freeze(dict(payload, contract_hash=sha256(canonical).hexdigest()))
         dependencies()
-        if verify_sources(bundle, scoring_registry, feature_registry) != (root_hash, hashes):
+        if verify_sources(
+                bundle, scoring_registry, feature_registry,
+                expected_purpose=expected_purpose) != (root_hash, hashes):
             raise ValueError("policy proof sources changed during loading")
         result = object.__new__(proof_type)
         identity = id(result)
@@ -498,17 +558,18 @@ def _install_policy_registry():
                 records.pop(identity, None)
 
         records[identity] = (weak_ref(result, forget), frozen_payload, canonical,
-            bundle, scoring_registry, feature_registry, root_hash, hashes)
+            bundle, scoring_registry, feature_registry, root_hash, hashes,
+            expected_purpose)
         return result
 
-    def read(proof):
+    def read(proof, *, expected_purpose):
         """Internal consumer read anchored in this owner's original proof record."""
-        record = proof_record(proof)
+        record = proof_record(proof, expected_purpose=expected_purpose)
         return dict(loads(record[2]), contract_hash=record[1]["contract_hash"])
 
-    def read_sources(proof):
+    def read_sources(proof, *, expected_purpose):
         """Internal read of original sources and bytes after one complete proof check."""
-        record = proof_record(proof)
+        record = proof_record(proof, expected_purpose=expected_purpose)
         return record[3], record[4], record[5], record[2]
 
     own_members = class_snapshot((ProofMeta, Proof, proof_type))

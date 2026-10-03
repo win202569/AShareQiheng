@@ -48,7 +48,7 @@ def _install_valuation_engine():
     metric_verify = MetricInputBatch.require_verified
     policy_verify = VerifiedPolicyResultBatch.require_verified
     adapter_verify = FormalValuationAdapterRegistry.require_current_bundle
-    scoring_verify = FormalScoringRegistry.require_official
+    scoring_verify = FormalScoringRegistry.require_authenticated
     checked = tuple((cls, name, value) for cls in
         (FormalFeatureRepository, FormalContextRepository, FormalRangeStore,
          FormalMetricInputRepository, FormalPolicyRepository, MetricInputBatch,
@@ -582,12 +582,14 @@ def _install_valuation_engine():
                 metric_repo, policy_repo, original)
 
         def build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry,
-                        valuation_adapter_registry):
+                        valuation_adapter_registry, expected_purpose="official"):
             build_started = clock()
             feature, _, _, verifier, metric_repo, policy_repo = dependencies(self)
             if (type(frozen_input_hash) is not str or type(scoring_registry) is not FormalScoringRegistry
                     or type(policy_registry) is not FormalPolicyRegistry
-                    or type(valuation_adapter_registry) is not FormalValuationAdapterRegistry):
+                    or type(valuation_adapter_registry) is not FormalValuationAdapterRegistry
+                    or type(expected_purpose) is not str
+                    or expected_purpose not in {"test", "official"}):
                 raise ValueError("valuation publication requires exact authenticated inputs")
             publication = [False]
             prepared = None
@@ -608,10 +610,10 @@ def _install_valuation_engine():
                         frozen_input_hash=frozen_input_hash)
                     base, metric_ticket, metric_revoke = metric_build(metric_repo, frozen_input_hash,
                         scoring_registry=scoring_registry, metric_ids=_V_METRICS,
-                        owner_scope=scope)
+                        owner_scope=scope, expected_purpose=expected_purpose)
                     policy, policy_ticket, policy_revoke = policy_build(policy_repo, frozen_input_hash,
                         scoring_registry=scoring_registry, policy_registry=policy_registry,
-                        owner_scope=scope)
+                        owner_scope=scope, expected_purpose=expected_purpose)
                     metric_verify(base)
                     validation_counts["base_batch_full_validations"] += 1
                     policy_verify(policy)
@@ -621,8 +623,16 @@ def _install_valuation_engine():
                     root_hash = base.registry_manifest_hash
                     bundle = load_root(FormalRegistryBundleLoader(feature._store, verifier), root_hash)
                     validation_counts["registry_full_parses"] += 1
-                    scoring_verify(scoring_registry, bundle)
-                    adapter_verify(valuation_adapter_registry, bundle)
+                    scoring_verify(
+                        scoring_registry,
+                        bundle,
+                        expected_purpose=expected_purpose,
+                    )
+                    adapter_verify(
+                        valuation_adapter_registry,
+                        bundle,
+                        expected_purpose=expected_purpose,
+                    )
                     validation_done = clock()
                     base_bytes, policy_bytes = base.canonical_bytes(), policy.canonical_bytes()
                     identity_done = clock()
@@ -672,7 +682,7 @@ def _install_valuation_engine():
                     root_ticket = _issue_current_ticket(scope, self, "valuation",
                         (frozen_input_hash, root_hash), bundle.manifest.canonical_json,
                         (root_hash, root_wire, scoring_registry, valuation_adapter_registry,
-                         adapter_wire, verifier), (), bundle)
+                         adapter_wire, verifier, expected_purpose), (), bundle)
                     if root_ticket.selected() is not bundle:
                         raise ValueError("valuation root ticket changed")
 
@@ -708,13 +718,22 @@ def _install_valuation_engine():
             return feature._store, (metric_repo, policy_repo)
 
         def _batch_recheck_ticket(self, evidence):
-            root_hash, root_wire, scoring_registry, adapter_registry, adapter_wire, verifier = evidence
+            (root_hash, root_wire, scoring_registry, adapter_registry, adapter_wire,
+             verifier, expected_purpose) = evidence
             feature, _, _, original_verifier, _, _ = dependencies(self)
             if verifier is not original_verifier:
                 raise ValueError("valuation verifier changed")
             current = load_root(FormalRegistryBundleLoader(feature._store, verifier), root_hash)
-            scoring_verify(scoring_registry, current)
-            adapter_verify(adapter_registry, current)
+            scoring_verify(
+                scoring_registry,
+                current,
+                expected_purpose=expected_purpose,
+            )
+            adapter_verify(
+                adapter_registry,
+                current,
+                expected_purpose=expected_purpose,
+            )
             if (tuple((role, current.blob(role).canonical_json) for role in current.roles) != root_wire
                     or adapter_registry.to_dict() != adapter_wire):
                 raise ValueError("valuation signed root or adapter changed")

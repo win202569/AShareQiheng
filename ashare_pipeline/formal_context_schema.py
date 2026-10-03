@@ -14,7 +14,7 @@ from typing import Protocol
 
 from .formal_evidence import OfficialRequest, OfficialSnapshotRef, VerifiedCalendarBinding
 from .formal_sources import CalendarSelector, SignedSourceRegistry
-from .formal_registry_manifest import FormalRegistryBundleLoader
+from .formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
 from .formal_time import SHANGHAI
 
 
@@ -466,6 +466,10 @@ def _fact_matches(fact, request, snapshot, descriptor):
 
 def _trusted_context_types():
     """Keep every capability mint and seal table in a non-exported closure."""
+    bundle_type = VerifiedRegistryBundle
+    require_bundle_official = bundle_type.require_official
+    require_bundle_authenticated = bundle_type.require_authenticated
+
     def capability(name):
         seals = {}
 
@@ -521,6 +525,21 @@ def _trusted_context_types():
     registry_seals = {}
     resolver_seals = {}
     request_descriptors = {}
+    normalization_purposes = {}
+
+    def exact_purpose(value):
+        if type(value) is not str or value not in ("test", "official"):
+            raise ValueError("expected_purpose must be exact test or official")
+        return value
+
+    def normalization_purpose(normalization):
+        if type(normalization) is not Normalization:
+            raise ValueError("exact sealed Context normalization required")
+        normalization.canonical_bytes()
+        record = normalization_purposes.get(id(normalization))
+        if record is None or record[0]() is not normalization:
+            raise ValueError("Context normalization purpose seal is missing")
+        return record[1]
 
     def verify_context_fact(fact, request, snapshot):
         """Use only the private descriptor of a sealed, freshly resolved request."""
@@ -548,12 +567,23 @@ def _trusted_context_types():
             raise ValueError("Context registry requires load from StateStore")
 
         @classmethod
-        def load(cls, state_store, registry_signature_verifier, registry_manifest_hash):
+        def load(cls, state_store, registry_signature_verifier,
+                 registry_manifest_hash, *, expected_purpose="official"):
             from .state_store import StateStore
             if cls is not Registry or type(state_store) is not StateStore:
                 raise ValueError("Context registry requires exact StateStore")
+            expected_purpose = exact_purpose(expected_purpose)
             bundle = FormalRegistryBundleLoader(state_store, registry_signature_verifier).load(registry_manifest_hash)
-            bundle.require_official()
+            if (type(bundle) is not bundle_type
+                    or bundle_type.require_official is not require_bundle_official
+                    or bundle_type.require_authenticated is not require_bundle_authenticated):
+                raise ValueError("Context registry bundle verifier changed")
+            if expected_purpose == "official":
+                require_bundle_official(bundle)
+            else:
+                require_bundle_authenticated(bundle, expected_purpose="test")
+            if bundle.manifest.purpose != expected_purpose:
+                raise ValueError("Context registry purpose differs from expected purpose")
             scoring = bundle.blob("scoring")
             wire = _load(scoring.canonical_json)
             version = wire.get("schema_version")
@@ -587,21 +617,24 @@ def _trusted_context_types():
             identity = id(item)
             registry_seals[identity] = (weakref.ref(item, lambda _: registry_seals.pop(identity, None)),
                 state_store, registry_signature_verifier, registry_manifest_hash, scoring.canonical_json,
-                tuple((role, bundle.blob(role).registry_hash) for role in sorted(_ROLES)), sources)
+                tuple((role, bundle.blob(role).registry_hash) for role in sorted(_ROLES)), sources,
+                expected_purpose)
             return item
 
         def descriptor_for(self, request):
             if type(request) is not Request:
                 raise ValueError("exact resolved Context request required")
             request.to_dict()
-            state, verifier, root, _, _, _ = registry_state(self)
-            current = Registry.load(state, verifier, root)
+            state, verifier, root, _, _, _, expected_purpose = registry_state(self)
+            current = Registry.load(
+                state, verifier, root, expected_purpose=expected_purpose
+            )
             return select_descriptor(current, request.context_kind, request.scope_key, request.security_id)
 
         def normalize_verified(self, request, snapshot, raw_bytes, normalizer, *, task_id: str, worker_id: str):
             from .formal_snapshot_repository import FormalSnapshotRepository
             from .formal_context_repository import _require_context_writer
-            state, verifier, root, _, _, _ = registry_state(self)
+            state, verifier, root, _, _, _, expected_purpose = registry_state(self)
             if type(request) is not Request or type(snapshot) is not OfficialSnapshotRef or type(raw_bytes) is not bytes:
                 raise ValueError("normalization requires exact verified Context inputs")
             request_wire = request.to_dict()
@@ -609,7 +642,8 @@ def _trusted_context_types():
                 raise ValueError("normalization root mismatch")
             current_request = Resolver(state, verifier).resolve(context_kind=request.context_kind, scope_key=request.scope_key,
                 security_id=request.security_id, as_of_utc=request.as_of_utc, registry_manifest_hash=root,
-                upstream_generation=request.upstream_generation)
+                upstream_generation=request.upstream_generation,
+                expected_purpose=expected_purpose)
             if current_request.canonical_bytes() != request.canonical_bytes():
                 raise ValueError("normalization request is stale or mismatched")
             version = getattr(normalizer, "normalizer_version", None)
@@ -637,20 +671,33 @@ def _trusted_context_types():
                 raise ValueError("duplicate normalized Context facts")
             after_request = Resolver(state, verifier).resolve(context_kind=request.context_kind, scope_key=request.scope_key,
                 security_id=request.security_id, as_of_utc=request.as_of_utc, registry_manifest_hash=root,
-                upstream_generation=request.upstream_generation)
+                upstream_generation=request.upstream_generation,
+                expected_purpose=expected_purpose)
             if after_request.canonical_bytes() != current_request.canonical_bytes() or repository.read_verified_raw(ref) != raw_bytes:
                 raise ValueError("Context normalization changed during verification")
             with state._transaction() as connection:
                 _require_context_writer(state, connection, ref, task_id=task_id, worker_id=worker_id,
                     expected_writer=writer)
-            return mint_normalization(dict(registry_manifest_hash=root, request=request_wire, facts=facts, writer=writer))
+            normalization = mint_normalization(
+                dict(registry_manifest_hash=root, request=request_wire,
+                     facts=facts, writer=writer)
+            )
+            identity = id(normalization)
+            normalization_purposes[identity] = (
+                weakref.ref(
+                    normalization,
+                    lambda _: normalization_purposes.pop(identity, None),
+                ),
+                expected_purpose,
+            )
+            return normalization
 
     def select_descriptor(registry, kind, scope_key, security_id):
         if type(kind) is not str or kind not in CONTEXT_KINDS:
             raise ValueError("unsupported Context kind")
         _text(scope_key)
         _security(security_id)
-        _, _, _, raw, _, _ = registry_state(registry)
+        _, _, _, raw, _, _, _ = registry_state(registry)
         matches = [item for item in _load(raw)["descriptors"] if item["context_kind"] == kind and item["scope_key"] == scope_key
             and item["security_scope"] == ("none" if security_id is None else "security")]
         if len(matches) != 1:
@@ -669,29 +716,38 @@ def _trusted_context_types():
             identity = id(self)
             resolver_seals[identity] = (weakref.ref(self, lambda _: resolver_seals.pop(identity, None)), state_store, registry_signature_verifier)
 
-        def resolve(self, context_kind, scope_key, security_id, as_of_utc, registry_manifest_hash, *, upstream_generation: str):
+        def resolve(self, context_kind, scope_key, security_id, as_of_utc,
+                    registry_manifest_hash, *, upstream_generation: str,
+                    expected_purpose="official"):
             return self._resolve(context_kind, scope_key, security_id, as_of_utc, registry_manifest_hash,
-                upstream_generation=upstream_generation)
+                upstream_generation=upstream_generation,
+                expected_purpose=expected_purpose)
 
-        def _resolve_historical(self, fact):
+        def _resolve_historical(self, fact, *, expected_purpose):
             if type(fact) is not FormalContextFact:
                 raise ValueError("historical Context requires an exact stored Fact")
             fact.to_dict()
             return self._resolve(fact.context_kind, fact.scope_key, fact.security_id, fact.as_of_utc,
                 fact.registry_manifest_hash, upstream_generation=fact.evidence["upstream_generation"],
-                historical_fact=fact)
+                historical_fact=fact, expected_purpose=expected_purpose)
 
         def _resolve(self, context_kind, scope_key, security_id, as_of_utc, registry_manifest_hash, *,
-                upstream_generation, historical_fact=None):
+                upstream_generation, expected_purpose, historical_fact=None):
             record = resolver_seals.get(id(self))
             if type(self) is not Resolver or record is None or record[0]() is not self:
                 raise ValueError("Context resolver is forged")
             state, verifier = record[1:]
+            expected_purpose = exact_purpose(expected_purpose)
             _timestamp(as_of_utc)
             _text(upstream_generation)
-            registry = Registry.load(state, verifier, registry_manifest_hash)
+            registry = Registry.load(
+                state, verifier, registry_manifest_hash,
+                expected_purpose=expected_purpose,
+            )
             descriptor = select_descriptor(registry, context_kind, scope_key, security_id)
-            _, _, _, _, role_hashes, sources = registry_state(registry)
+            _, _, _, _, role_hashes, sources, sealed_purpose = registry_state(registry)
+            if sealed_purpose != expected_purpose:
+                raise ValueError("Context registry purpose changed during resolution")
             exchange = None
             if descriptor["exchange_rule"] == "security_exchange":
                 exchange = security_id[:2]
@@ -723,11 +779,15 @@ def _trusted_context_types():
                 from .formal_snapshot_repository import FormalSnapshotRepository
                 if historical_fact is not None:
                     binding = _prove_historical_calendar(state, verifier, historical_fact,
-                        config.calendar_selector, exchange, as_of_utc, registry_manifest_hash)
+                        config.calendar_selector, exchange, as_of_utc,
+                        registry_manifest_hash,
+                        expected_purpose=expected_purpose)
                 else:
                     snapshots = FormalSnapshotRepository(state._configured_formal_snapshot_store_for_repository().root, state)
                     binding = FormalContextRepository(state, snapshots, verifier).resolve_verified_calendar_binding(
-                        config.calendar_selector, exchange, as_of_utc, registry_manifest_hash)
+                        config.calendar_selector, exchange, as_of_utc,
+                        registry_manifest_hash,
+                        expected_purpose=expected_purpose)
             elif historical_fact is not None:
                 raise ValueError("historical Context requires a signed calendar selector")
             relevant = [[role, digest] for role, digest in role_hashes if role in descriptor["referenced_roles"]]
@@ -753,17 +813,26 @@ def _trusted_context_types():
                 relevant_registry_hashes=relevant, refresh_generation=generation, calendar_binding=binding_wire,
                 calendar_selector=selected_wire, evidence=evidence))
             identity = id(request)
-            request_descriptors[identity] = (weakref.ref(request, lambda _: request_descriptors.pop(identity, None)), _canonical(descriptor))
+            request_descriptors[identity] = (
+                weakref.ref(
+                    request, lambda _: request_descriptors.pop(identity, None)
+                ),
+                _canonical(descriptor),
+                expected_purpose,
+            )
             return request
 
     Registry.__name__ = "FormalContextRegistry"
     Registry.__qualname__ = "FormalContextRegistry"
     Resolver.__name__ = "SignedContextRequestResolver"
     Resolver.__qualname__ = "SignedContextRequestResolver"
-    return Request, Registry, Resolver, Normalization, verify_context_fact
+    return (Request, Registry, Resolver, Normalization, verify_context_fact,
+            normalization_purpose)
 
 
-FormalContextRequest, FormalContextRegistry, SignedContextRequestResolver, FormalContextNormalization, _verify_context_fact = _trusted_context_types()
+(FormalContextRequest, FormalContextRegistry, SignedContextRequestResolver,
+ FormalContextNormalization, _verify_context_fact,
+ _context_normalization_purpose) = _trusted_context_types()
 del _trusted_context_types
 
 

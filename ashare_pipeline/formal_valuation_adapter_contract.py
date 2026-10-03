@@ -70,8 +70,12 @@ def _entries(value, keys, path):
 def _install_registry():
     records = {}
     bundle_type, scoring_type, policy_type = VerifiedRegistryBundle, FormalScoringRegistry, FormalPolicyRegistry
-    require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
-    require_scoring, read_policy = scoring_type.require_official, _read_authenticated_policy_registry
+    require_bundle_official = bundle_type.require_official
+    require_bundle_authenticated = bundle_type.require_authenticated
+    blob_for = bundle_type.blob
+    require_scoring_official = scoring_type.require_official
+    require_scoring_authenticated = scoring_type.require_authenticated
+    read_policy = _read_authenticated_policy_registry
     definitions = _scoring_metric_definitions
     metric_owner = metric_module
     definition_guard = metric_owner._metric_definition_dependency_changes
@@ -83,7 +87,7 @@ def _install_registry():
         return dumps(value, sort_keys=True, ensure_ascii=False,
             separators=(",", ":"), allow_nan=False).encode("utf-8")
 
-    def sources(bundle, scoring, policy):
+    def sources(bundle, scoring, policy, *, expected_purpose):
         if type(bundle) is not bundle_type or type(scoring) is not scoring_type or type(policy) is not policy_type:
             _fail("graph", "requires exact verified source types")
         if (globals().get("metric_module") is not metric_owner
@@ -93,11 +97,24 @@ def _install_registry():
         if changes:
             _fail("graph.definition dependencies",
                 "metric definition encoder or producer changed: " + ", ".join(changes))
-        require_bundle(bundle)
+        if (type(expected_purpose) is not str
+                or expected_purpose not in ("test", "official")):
+            _fail("graph.purpose", "expected_purpose must be exact test or official")
+        if bundle.manifest.purpose != expected_purpose:
+            _fail("graph.purpose", "differs from expected_purpose")
+        if expected_purpose == "official":
+            require_bundle_official(bundle)
+        else:
+            require_bundle_authenticated(bundle, expected_purpose="test")
         if bundle.manifest.schema_version != "formal-registry-manifest-v2":
             raise ValueError("valuation_adapter role is unavailable for this manifest version")
-        require_scoring(scoring, bundle)
-        policy_wire = read_policy(policy)
+        if expected_purpose == "official":
+            require_scoring_official(scoring, bundle)
+        else:
+            require_scoring_authenticated(scoring, bundle, expected_purpose="test")
+        policy_wire = read_policy(
+            policy, expected_purpose=expected_purpose
+        )
         if (policy_wire["registry_manifest_hash"] != bundle.manifest.manifest_hash
                 or policy_wire["role_hashes"] != {
                     role: scoring.role_hashes[role] for role in policy_wire["role_hashes"]}):
@@ -108,8 +125,10 @@ def _install_registry():
             _fail("graph", "signed child hash differs from root")
         return blob.canonical_json
 
-    def contract(bundle, scoring, policy):
-        raw = sources(bundle, scoring, policy)
+    def contract(bundle, scoring, policy, *, expected_purpose):
+        raw = sources(
+            bundle, scoring, policy, expected_purpose=expected_purpose
+        )
         try:
             child = parse(raw, label="valuation adapter registry")
         except ValueError as error:
@@ -118,7 +137,7 @@ def _install_registry():
             _fail("child", "has wrong fields")
         for field, value in (("registry_role", "valuation_adapter"),
                 ("schema_version", "formal-valuation-adapter-registry-v1"),
-                ("purpose", "official")):
+                ("purpose", expected_purpose)):
             if child[field] != value:
                 _fail(field, f"must be {value}")
         _text(child["registry_version"], "registry_version")
@@ -208,15 +227,24 @@ def _install_registry():
                 current[name] is not value for name, value in own_members):
             _fail("proof", "class contract changed")
 
-    def record(proof, bundle=None):
+    def record(proof, bundle=None, *, expected_purpose=None):
         class_intact()
         found = records.get(id(proof))
         if type(proof) is not FormalValuationAdapterRegistry or found is None or found[0]() is not proof:
             _fail("proof", "is forged or copied")
-        reference, scoring, policy, raw, encoded, coverage, adapters, fingerprints = found[1:]
+        (reference, scoring, policy, raw, encoded, coverage, adapters,
+         fingerprints, sealed_purpose) = found[1:]
+        if expected_purpose is None:
+            expected_purpose = sealed_purpose
+        if (type(expected_purpose) is not str
+                or expected_purpose not in ("test", "official")
+                or expected_purpose != sealed_purpose):
+            _fail("proof", "expected purpose differs from sealed purpose")
         if bundle is not None and (type(bundle) is not bundle_type or bundle is not reference):
             _fail("proof", "requires its original verified bundle")
-        if sources(reference, scoring, policy) != raw:
+        if sources(
+                reference, scoring, policy,
+                expected_purpose=expected_purpose) != raw:
             _fail("proof", "signed sources changed")
         if any(type(adapter) is not definition_type
                 or canonical(serialize_definition(adapter)) != fingerprints[key]
@@ -246,19 +274,37 @@ def _install_registry():
             return object.__getattribute__(self, name)
 
         def require_official(self, bundle):
-            record(self, bundle)
+            require_bundle_official(bundle)
+            record(self, bundle, expected_purpose="official")
 
-        def require_current_bundle(self, bundle):
+        def require_authenticated(self, bundle, *, expected_purpose):
+            require_bundle_authenticated(
+                bundle, expected_purpose=expected_purpose
+            )
+            record(self, bundle, expected_purpose=expected_purpose)
+
+        def require_current_bundle(
+            self, bundle, *, expected_purpose="official"
+        ):
             """Authenticate a fresh store load against the registry's original root.
 
             This does not relax ``require_official``'s object-identity contract.
             Both bundles must independently retain their loader seals, and the
             currently loaded ten signed envelopes must match the original.
             """
-            original = record(self)[1]
+            original = record(
+                self, expected_purpose=expected_purpose
+            )[1]
+            if (type(expected_purpose) is not str
+                    or expected_purpose not in {"test", "official"}):
+                _fail("proof", "expected_purpose must be exact test or official")
             if type(bundle) is not bundle_type:
                 _fail("proof", "requires a loader-verified current bundle")
-            require_bundle(bundle)
+            if original.manifest.purpose != expected_purpose:
+                _fail("proof", "original registry purpose differs from expected_purpose")
+            require_bundle_authenticated(
+                bundle, expected_purpose=expected_purpose
+            )
             if (bundle.manifest.schema_version != "formal-registry-manifest-v2"
                     or serialize_envelope(bundle.manifest) != serialize_envelope(original.manifest)
                     or tuple(bundle.roles) != tuple(original.roles)
@@ -293,16 +339,23 @@ def _install_registry():
 
     own_members = tuple(vars(FormalValuationAdapterRegistry).items())
 
-    def load(bundle, *, scoring_registry, policy_registry):
-        raw, payload, coverage, adapters, verified_values = contract(bundle, scoring_registry, policy_registry)
+    def load(bundle, *, scoring_registry, policy_registry,
+             expected_purpose="official"):
+        raw, payload, coverage, adapters, verified_values = contract(
+            bundle, scoring_registry, policy_registry,
+            expected_purpose=expected_purpose,
+        )
         encoded = canonical(payload)
-        if sources(bundle, scoring_registry, policy_registry) != raw:
+        if sources(
+                bundle, scoring_registry, policy_registry,
+                expected_purpose=expected_purpose) != raw:
             _fail("graph", "signed sources changed during loading")
         result = object.__new__(FormalValuationAdapterRegistry)
         identity = id(result)
         records[identity] = (weakref.ref(result, lambda _: records.pop(identity, None)),
             bundle, scoring_registry, policy_registry, raw, encoded, coverage, adapters,
-            {key: canonical(value) for key, value in verified_values.items()})
+            {key: canonical(value) for key, value in verified_values.items()},
+            expected_purpose)
         return result
 
     return FormalValuationAdapterRegistry, load

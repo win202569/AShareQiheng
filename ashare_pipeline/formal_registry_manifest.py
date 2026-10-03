@@ -164,6 +164,13 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
     ``object.__setattr__`` after signature validation.
     """
 
+    canonical_object_parser = _load_canonical_object
+
+    def parse_canonical_object(value: object, *, label: str) -> dict[str, object]:
+        if _load_canonical_object is not canonical_object_parser:
+            raise ValueError("registry canonical parser changed")
+        return canonical_object_parser(value, label=label)
+
     manifest_fields = (
         "manifest_hash",
         "schema_version",
@@ -344,6 +351,7 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
         manifest_fingerprint: tuple[tuple[type[object], object], ...]
         blobs: object
         blobs_fingerprint: tuple[tuple[object, ...], ...]
+        role_purposes: tuple[tuple[str, object], ...]
 
     verified_manifests: dict[int, _VerifiedManifestRecord] = {}
     verified_bundles: dict[int, _VerifiedBundleRecord] = {}
@@ -446,7 +454,7 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
             signature_text, key_text = _verify_signature(
                 canonical_json, signature, key_id, verifier, label="registry manifest"
             )
-            wire = _load_canonical_object(canonical_json, label="registry manifest")
+            wire = parse_canonical_object(canonical_json, label="registry manifest")
             schema_version = wire.get("schema_version")
             role_fields = role_fields_for_schema(schema_version)
             root_keys = {"schema_version", "purpose", "approval_id", *role_fields.values()}
@@ -546,6 +554,23 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
             fields.append((role, fingerprint))
         return tuple(fields)
 
+    def extract_role_purposes(manifest: object, blobs: Mapping[str, object]) -> tuple[tuple[str, object], ...]:
+        """Snapshot parsed purpose evidence without granting authentication."""
+        purpose_roles = {"industry", "cyclic", "redline", "status", "event", "valuation_adapter"}
+        result = []
+        for role in sorted(blobs):
+            blob = blobs[role]
+            wire = parse_canonical_object(blob.canonical_json, label=f"registry blob {role}")
+            if role == "scoring":
+                scoring = wire.get("scoring")
+                declared_purpose = scoring.get("purpose") if type(scoring) is dict else None
+            elif role in purpose_roles:
+                declared_purpose = wire.get("purpose")
+            else:
+                declared_purpose = wire.get("purpose", manifest.purpose)
+            result.append((role, declared_purpose))
+        return tuple(result)
+
     def remember_verified_bundle(bundle: object) -> None:
         try:
             manifest = bundle.manifest
@@ -556,6 +581,7 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
         sealed_blobs = blobs_fingerprint(blobs)
         if sealed_manifest is None or sealed_blobs is None:
             raise RuntimeError("verified registry bundle fields are invalid")
+        role_purposes = extract_role_purposes(manifest, blobs)
         identity = id(bundle)
 
         def forget(reference: weakref.ReferenceType[object]) -> None:
@@ -570,6 +596,7 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
             sealed_manifest,
             blobs,
             sealed_blobs,
+            role_purposes,
         )
 
     def has_verified_bundle(bundle: object) -> bool:
@@ -593,6 +620,54 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
         if type(bundle) is not VerifiedRegistryBundle or not has_verified_bundle(bundle):
             raise ValueError("registry bundle was not verified by FormalRegistryBundleLoader")
 
+    def require_authenticated_bundle(
+        bundle: object, *, expected_purpose: object
+    ) -> None:
+        if type(expected_purpose) is not str or expected_purpose not in {"test", "official"}:
+            raise ValueError("expected_purpose must be the exact string test or official")
+        require_bundle_seal(bundle)
+        manifest = bundle.manifest
+        require_manifest_seal(manifest)
+        if manifest.schema_version != "formal-registry-manifest-v2":
+            raise ValueError("authenticated computation requires a v2 registry manifest")
+        if manifest.purpose != expected_purpose:
+            raise ValueError("registry manifest purpose differs from expected_purpose")
+        if hashlib.sha256(manifest.canonical_json).hexdigest() != manifest.manifest_hash:
+            raise ValueError("registry manifest hash no longer matches")
+        if expected_purpose == "official":
+            require_official_manifest(manifest)
+        elif manifest.approval_id is not None:
+            raise ValueError("test registry manifest approval_id must be null")
+
+        roles = tuple(role_fields_for_schema(manifest.schema_version))
+        if len(roles) != 10 or set(bundle.blobs) != set(roles):
+            raise ValueError("authenticated computation requires every v2 registry role")
+        record = verified_bundles.get(id(bundle))
+        if record is None or record.reference() is not bundle:
+            raise ValueError("registry bundle authentication record is unavailable")
+        role_purposes = dict(record.role_purposes)
+        if set(role_purposes) != set(roles):
+            raise ValueError("registry bundle purpose evidence is incomplete")
+        for role in roles:
+            blob = bundle.blobs.get(role)
+            if type(blob) is not VerifiedRegistryBlob or blob.registry_role != role:
+                raise ValueError(f"registry bundle role is invalid for {role}")
+            digest = hashlib.sha256(blob.canonical_json).hexdigest()
+            if (digest != blob.registry_hash
+                    or digest != getattr(manifest, role + "_registry_hash")):
+                raise ValueError(f"registry bundle hash mismatch for {role}")
+            if blob.declared_registry_manifest_hash != manifest.manifest_hash:
+                raise ValueError(f"registry bundle root binding mismatch for {role}")
+            if expected_purpose == "official":
+                if blob.approval_id != manifest.approval_id:
+                    raise ValueError(f"registry blob approval mismatch for {role}")
+            elif blob.approval_id is not None:
+                raise ValueError(f"test registry blob approval must be null for {role}")
+
+            declared_purpose = role_purposes[role]
+            if type(declared_purpose) is not str or declared_purpose != expected_purpose:
+                raise ValueError(f"registry blob {role} purpose differs from registry root")
+
     @dataclass(frozen=True, init=False, slots=True, weakref_slot=True)
     class VerifiedRegistryBundle:
         manifest: FormalRegistryManifest
@@ -605,6 +680,9 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
         def roles(self) -> tuple[str, ...]:
             require_bundle_seal(self)
             return tuple(role_fields_for_schema(self.manifest.schema_version))
+
+        def require_authenticated(self, *, expected_purpose: str) -> None:
+            require_authenticated_bundle(self, expected_purpose=expected_purpose)
 
         def require_official(self) -> None:
             require_bundle_seal(self)
@@ -698,7 +776,9 @@ def _make_trusted_registry_types() -> tuple[type[object], type[object], type[obj
                 raise ValueError(f"registry blob hash mismatch for role {expected_role}")
             if type(envelope.registry_role) is not str or envelope.registry_role != expected_role:
                 raise ValueError(f"registry blob role mismatch for role {expected_role}")
-            wire = _load_canonical_object(envelope.canonical_json, label=f"registry blob {expected_role}")
+            wire = parse_canonical_object(
+                envelope.canonical_json, label=f"registry blob {expected_role}"
+            )
             if wire.get("registry_role") != expected_role:
                 raise ValueError(f"registry blob declared role mismatch for role {expected_role}")
             if expected_role == "source":

@@ -117,13 +117,18 @@ def _install_state():
         def __deepcopy__(self, memo):
             raise TypeError("state selections cannot be copied")
 
-    def select(self, security_id, as_of_utc, *, template_id, policy_registry):
+    def select(self, security_id, as_of_utc, *, template_id, policy_registry,
+               expected_purpose="official"):
         context = dependencies(self)
         if (type(security_id) is not str or canonical_security_id(security_id) != security_id
                 or type(as_of_utc) is not str or as_of_utc != _FREEZE
-                or type(template_id) is not str):
+                or type(template_id) is not str
+                or type(expected_purpose) is not str
+                or expected_purpose not in ("test", "official")):
             raise PolicyPreconditionError("state selection requires canonical security, freeze and genuine registry")
-        policy = read_policy(policy_registry)
+        policy = read_policy(
+            policy_registry, expected_purpose=expected_purpose
+        )
         if template_id not in {rule["template_id"] for rule in policy["rules"]}:
             raise PolicyPreconditionError("state template is not signed")
         rules = [rule for rule in policy["rules"] if rule["template_id"] == template_id
@@ -147,12 +152,15 @@ def _install_state():
             for kind, scope in groups:
                 if capture is not None and not capture["complete"]:
                     ticket = context.select_current_batch_ticket(capture["journal"], kind,
-                        scope, security_ids, as_of_utc, policy["registry_manifest_hash"])
+                        scope, security_ids, as_of_utc,
+                        policy["registry_manifest_hash"],
+                        expected_purpose=expected_purpose)
                     capture["tickets"].append(ticket)
                     selected = ticket.selected()
                 else:
                     selected = read_many(context, kind, scope, security_ids, as_of_utc,
-                        policy["registry_manifest_hash"])
+                        policy["registry_manifest_hash"],
+                        expected_purpose=expected_purpose)
                 fact = selected[security_id]
                 result[(kind, scope)] = None if fact is None else fact.to_dict()
             if capture is not None:
@@ -188,7 +196,9 @@ def _install_state():
         if factors != read():
             raise PolicyIntegrityError("Context state changed during selection")
         dependencies(self)
-        if read_policy(policy_registry) != policy:
+        if read_policy(
+                policy_registry,
+                expected_purpose=expected_purpose) != policy:
             raise PolicyIntegrityError("policy registry changed during state selection")
         payload = dict(values=values, lineage=dict(security_id=security_id, exchange=security_id[:2],
             template_id=template_id, as_of_utc=as_of_utc,
@@ -199,16 +209,21 @@ def _install_state():
         result = object.__new__(PolicyStateSelection)
         key = id(result)
         selections[key] = (weakref.ref(result, lambda _: selections.pop(key, None)), canonical_bytes(payload), self,
-            dict(security_id=security_id, as_of_utc=as_of_utc, template_id=template_id, policy_registry=policy_registry))
+            dict(security_id=security_id, as_of_utc=as_of_utc,
+                template_id=template_id, policy_registry=policy_registry,
+                expected_purpose=expected_purpose))
         return result
 
     def select_current_batch_ticket(self, journal, security_id, as_of_utc, *,
-                                    template_id, policy_registry):
+                                    template_id, policy_registry,
+                                    expected_purpose="official"):
         from .formal_batch_read_journal import (
             _issue_current_ticket, _require_current_scope, _require_current_ticket,
         )
         context = dependencies(self)
-        policy = read_policy(policy_registry)
+        policy = read_policy(
+            policy_registry, expected_purpose=expected_purpose
+        )
         root = policy["registry_manifest_hash"]
         _require_current_scope(journal, self, root=root, as_of_utc=as_of_utc,
                                population=(security_id,))
@@ -216,7 +231,8 @@ def _install_state():
         reset = batch_capture.set(capture)
         try:
             result = select(self, security_id, as_of_utc,
-                template_id=template_id, policy_registry=policy_registry)
+                template_id=template_id, policy_registry=policy_registry,
+                expected_purpose=expected_purpose)
         finally:
             batch_capture.reset(reset)
         saved = record(result)
@@ -226,22 +242,27 @@ def _install_state():
         for item in lower:
             context._batch_recheck_ticket(_require_current_ticket(
                 journal, item, context, "context")[2])
-        if read_policy(policy_registry) != policy:
+        if read_policy(
+                policy_registry,
+                expected_purpose=expected_purpose) != policy:
             raise PolicyIntegrityError("policy registry changed during state ticket issuance")
         request = (security_id, as_of_utc, template_id, root)
         baseline = canonical_bytes(dict(request=request, selected=json.loads(saved[1]),
                                         policy=policy,
                                         context=[item.decode() for item in lower_baselines]))
         evidence = (result, saved[1], policy_registry, canonical_bytes(policy), lower,
-                    journal, context, request)
+                    journal, context, request, expected_purpose)
         return _issue_current_ticket(journal, self, "state", request, baseline,
                                      evidence, ((security_id,),), result)
 
     def _batch_recheck_ticket(self, evidence):
         from .formal_batch_read_journal import _require_current_ticket
-        selection, selected_bytes, policy_registry, policy_bytes, lower, journal, context, request = evidence
+        (selection, selected_bytes, policy_registry, policy_bytes, lower,
+         journal, context, request, expected_purpose) = evidence
         if (record(selection)[1] != selected_bytes
-                or canonical_bytes(read_policy(policy_registry)) != policy_bytes
+                or canonical_bytes(read_policy(
+                    policy_registry,
+                    expected_purpose=expected_purpose)) != policy_bytes
                 or dependencies(self) is not context):
             raise PolicyIntegrityError("state ticket selection or policy changed")
         for ticket in lower:

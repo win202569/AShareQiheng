@@ -44,6 +44,9 @@ _SLOTS = (
 )
 _POLICY_ROLES = ("cyclic", "redline", "status", "event")
 _ROLES = ("source", "mapping", "feature", "scoring", "industry", *_POLICY_ROLES)
+_AUTHENTICATED_BUNDLE_VERIFIER = VerifiedRegistryBundle.require_authenticated
+_AUTHENTICATED_FEATURE_VERIFIER = SignedFormalFeatureRegistry.require_authenticated
+_VERIFIED_FEATURE_VERIFIER = SignedFormalFeatureRegistry.require_verified
 
 
 def _keys(value, expected, label):
@@ -204,6 +207,27 @@ def _feature_slots(feature_registry, bundle, *, verifier, materialize=True):
     return {t: {slot.slot_id: slot for slot in feature_registry.slots_for_template(t)} for t in _TEMPLATES}
 
 
+def _authenticated_feature_slots(
+    feature_registry, bundle, *, expected_purpose, verifier, materialize=True
+):
+    if type(feature_registry) is not SignedFormalFeatureRegistry:
+        raise RegistryValidationError(
+            "authenticated feature vocabulary must be an exact sealed SignedFormalFeatureRegistry"
+        )
+    if SignedFormalFeatureRegistry.require_authenticated is not verifier:
+        raise RegistryValidationError("authenticated feature verifier binding changed")
+    verifier(feature_registry, bundle, expected_purpose=expected_purpose)
+    if not materialize:
+        return None
+    return {
+        template: {
+            slot.slot_id: slot
+            for slot in feature_registry.slots_for_template(template)
+        }
+        for template in _TEMPLATES
+    }
+
+
 def _graph(bundle):
     if type(bundle) is not VerifiedRegistryBundle:
         raise RegistryValidationError("official scoring requires an exact verified registry bundle")
@@ -218,10 +242,38 @@ def _graph(bundle):
     return result
 
 
+def _authenticated_graph_hashes(bundle):
+    if type(bundle) is not VerifiedRegistryBundle:
+        raise RegistryValidationError(
+            "authenticated scoring requires an exact verified registry bundle"
+        )
+    result = {}
+    for role in _ROLES:
+        blob = bundle.blob(role)
+        digest = hashlib.sha256(blob.canonical_json).hexdigest()
+        if digest != blob.registry_hash or digest != getattr(
+            bundle.manifest, role + "_registry_hash"
+        ):
+            raise RegistryValidationError(f"registry manifest {role} hash mismatch")
+        result[role] = digest
+    return result
+
+
+def _authenticated_graph(bundle, *, expected_purpose):
+    if type(bundle) is not VerifiedRegistryBundle:
+        raise RegistryValidationError(
+            "authenticated scoring requires an exact verified registry bundle"
+        )
+    if VerifiedRegistryBundle.require_authenticated is not _AUTHENTICATED_BUNDLE_VERIFIER:
+        raise RegistryValidationError("authenticated bundle verifier binding changed")
+    _AUTHENTICATED_BUNDLE_VERIFIER(bundle, expected_purpose=expected_purpose)
+    return _authenticated_graph_hashes(bundle)
+
+
 def _policies(scoring, bundle, purpose):
     contracts = scoring["policy_contracts"]
     _keys(contracts, _POLICY_ROLES, "policy_contracts")
-    if purpose == "test":
+    if purpose == "test" and bundle is None:
         _keys(scoring["fixture_policies"], _POLICY_ROLES, "fixture_policies")
     policies = {}
     for role in _POLICY_ROLES:
@@ -388,12 +440,13 @@ def _parse(raw, approval, bundle, feature_registry, feature_verifier):
     purpose = scoring["purpose"]
     expected = {"contract_version", "purpose", "dimension_weights", "internal_weights", "templates", "policy_contracts",
         "cyclic_rule", "redlines", "status_rules", "market_liquidity_rule"}
-    if purpose == "test":
+    if purpose == "test" and bundle is None:
         expected |= {"fixture_feature_slots", "fixture_policies"}
     _keys(scoring, expected, "scoring")
     if scoring["contract_version"] != "V3":
         raise RegistryValidationError("scoring contract_version must be V3")
-    if type(approval) is not RegistryApproval or approval.purpose != purpose:
+    if (type(approval) is not RegistryApproval or type(approval.purpose) is not str
+            or approval.purpose != purpose):
         raise RegistryValidationError("official or test approval purpose differs from content")
     digest = hashlib.sha256(raw).hexdigest()
     if purpose == "official":
@@ -404,8 +457,25 @@ def _parse(raw, approval, bundle, feature_registry, feature_verifier):
         if raw != bundle.blob("scoring").canonical_json:
             raise RegistryValidationError("scoring bytes differ from registry manifest")
         slots = _feature_slots(feature_registry, bundle, verifier=feature_verifier)
+    elif bundle is not None:
+        role_hashes = _authenticated_graph(bundle, expected_purpose="test")
+        if (type(approval.approved_content_sha256) is not str
+                or approval.approved_content_sha256 != digest
+                or approval.approval_id is not None):
+            raise RegistryValidationError(
+                "signed test approval must bind the exact scoring child without approval identity"
+            )
+        if raw != bundle.blob("scoring").canonical_json:
+            raise RegistryValidationError("scoring bytes differ from registry manifest")
+        slots = _authenticated_feature_slots(
+            feature_registry,
+            bundle,
+            expected_purpose="test",
+            verifier=_AUTHENTICATED_FEATURE_VERIFIER,
+        )
     else:
-        if bundle is not None or approval.approved_content_sha256 is not None or approval.approval_id is not None or feature_registry is not None:
+        if (approval.approved_content_sha256 is not None
+                or approval.approval_id is not None or feature_registry is not None):
             raise RegistryValidationError("test fixture cannot use an official bundle or approval")
         role_hashes = {}
         values = scoring["fixture_feature_slots"]
@@ -474,6 +544,10 @@ def _parse(raw, approval, bundle, feature_registry, feature_verifier):
 def _trusted_registry():
     seals = {}
     feature_verifier = SignedFormalFeatureRegistry.require_release_eligible
+    authenticated_feature_verifier = _AUTHENTICATED_FEATURE_VERIFIER
+    verified_feature_verifier = _VERIFIED_FEATURE_VERIFIER
+    authenticated_bundle_verifier = _AUTHENTICATED_BUNDLE_VERIFIER
+    authenticated_graph_hashes = _authenticated_graph_hashes
 
     def fingerprint(value):
         if type(value) in (str, bytes, int, bool, Decimal, type(None)):
@@ -483,13 +557,99 @@ def _trusted_registry():
         if type(value) is MappingProxyType:
             return (MappingProxyType, tuple((fingerprint(k), fingerprint(v)) for k, v in value.items()))
         if type(value) in (FormalScoringRegistry, RegistryApproval, TemplateDefinition, MetricDefinition, RedlineDefinition, StatusRule):
-            return (type(value), tuple(fingerprint(object.__getattribute__(value, f.name)) for f in fields(value)))
+            return (type(value), tuple(
+                (f.name, fingerprint(object.__getattribute__(value, f.name)))
+                for f in fields(value)
+            ))
         raise RegistryValidationError("registry contains forged or mutable records")
+
+    def matches_snapshot(value, snapshot, ancestors):
+        if type(snapshot) is not tuple or len(snapshot) != 2:
+            return False
+        expected_type, expected = snapshot
+        if type(value) is not expected_type:
+            return False
+        if expected_type in (str, bytes, int, bool, Decimal, type(None)):
+            return value == expected
+
+        identity = id(value)
+        if identity in ancestors:
+            return False
+        ancestors.add(identity)
+        try:
+            if expected_type is tuple:
+                if type(expected) is not tuple or len(value) != len(expected):
+                    return False
+                return all(
+                    matches_snapshot(item, item_snapshot, ancestors)
+                    for item, item_snapshot in zip(value, expected, strict=True)
+                )
+            if expected_type is frozenset:
+                if type(expected) is not tuple or len(value) != len(expected):
+                    return False
+                used = 0
+                for item in value:
+                    found = False
+                    for index, item_snapshot in enumerate(expected):
+                        marker = 1 << index
+                        if (used & marker) == 0 and matches_snapshot(
+                            item, item_snapshot, ancestors
+                        ):
+                            used |= marker
+                            found = True
+                            break
+                    if not found:
+                        return False
+                return used == (1 << len(expected)) - 1
+            if expected_type is MappingProxyType:
+                if type(expected) is not tuple or len(value) != len(expected):
+                    return False
+                for (key, item), item_pair in zip(
+                    value.items(), expected, strict=True
+                ):
+                    if type(item_pair) is not tuple or len(item_pair) != 2:
+                        return False
+                    key_snapshot, item_snapshot = item_pair
+                    if (not matches_snapshot(key, key_snapshot, ancestors)
+                            or not matches_snapshot(
+                                item, item_snapshot, ancestors
+                            )):
+                        return False
+                return True
+            if expected_type in (
+                FormalScoringRegistry,
+                RegistryApproval,
+                TemplateDefinition,
+                MetricDefinition,
+                RedlineDefinition,
+                StatusRule,
+            ):
+                if type(expected) is not tuple:
+                    return False
+                for field_snapshot in expected:
+                    if (type(field_snapshot) is not tuple
+                            or len(field_snapshot) != 2
+                            or type(field_snapshot[0]) is not str):
+                        return False
+                    name, value_snapshot = field_snapshot
+                    if not matches_snapshot(
+                        object.__getattribute__(value, name),
+                        value_snapshot,
+                        ancestors,
+                    ):
+                        return False
+                return True
+            return False
+        finally:
+            ancestors.remove(identity)
 
     def sealed(registry):
         record = seals.get(id(registry))
         try:
-            valid = type(registry) is FormalScoringRegistry and record is not None and record[0]() is registry and record[1] == fingerprint(registry)
+            valid = (type(registry) is FormalScoringRegistry
+                and record is not None
+                and record[0]() is registry
+                and matches_snapshot(registry, record[1], set()))
         except (AttributeError, TypeError, ValueError, RecursionError):
             valid = False
         if not valid:
@@ -537,6 +697,62 @@ def _trusted_registry():
             except (ValueError, TypeError, AttributeError) as error:
                 raise RegistryValidationError(f"official registry manifest proof failed: {error}") from error
 
+        def require_authenticated(
+            self, registry_bundle, *, expected_purpose, feature_registry=None
+        ):
+            record = sealed(self)
+            try:
+                if (SignedFormalFeatureRegistry.require_authenticated
+                        is not authenticated_feature_verifier
+                        or SignedFormalFeatureRegistry.require_verified
+                        is not verified_feature_verifier
+                        or VerifiedRegistryBundle.require_authenticated
+                        is not authenticated_bundle_verifier):
+                    raise RegistryValidationError(
+                        "authenticated registry verifier binding changed"
+                    )
+                authenticated_bundle_verifier(
+                    registry_bundle, expected_purpose=expected_purpose
+                )
+                if self.approval.purpose != expected_purpose:
+                    raise RegistryValidationError(
+                        "scoring registry purpose differs from expected_purpose"
+                    )
+                hashes = authenticated_graph_hashes(registry_bundle)
+                if (registry_bundle.manifest.manifest_hash != self.registry_manifest_hash
+                        or hashes != dict(self.role_hashes)):
+                    raise RegistryValidationError(
+                        "registry manifest graph differs from loaded scoring registry"
+                    )
+                if registry_bundle.blob("scoring").canonical_json != record[2]:
+                    raise RegistryValidationError(
+                        "scoring content differs from registry manifest"
+                    )
+                feature_registry = (
+                    record[3] if feature_registry is None else feature_registry
+                )
+                if type(feature_registry) is not SignedFormalFeatureRegistry:
+                    raise RegistryValidationError(
+                        "authenticated scoring requires an exact sealed feature registry"
+                    )
+                verified_feature_verifier(feature_registry)
+                feature = registry_bundle.blob("feature")
+                source = registry_bundle.blob("source")
+                mapping = registry_bundle.blob("mapping")
+                read = object.__getattribute__
+                if (read(feature_registry, "canonical_json") != feature.canonical_json
+                        or read(feature_registry, "registry_hash") != feature.registry_hash
+                        or read(feature_registry, "source_registry_hash") != source.registry_hash
+                        or read(feature_registry, "mapping_registry_hash") != mapping.registry_hash):
+                    raise RegistryValidationError(
+                        "feature vocabulary differs from authenticated registry graph"
+                    )
+                return feature_registry
+            except (ValueError, TypeError, AttributeError) as error:
+                raise RegistryValidationError(
+                    f"authenticated registry manifest proof failed: {error}"
+                ) from error
+
     def load_formal_registry(source, approval, *, feature_registry=None):
         try:
             bundle = source if type(source) is VerifiedRegistryBundle else None
@@ -552,7 +768,10 @@ def _trusted_registry():
             identity = id(registry)
             seals[identity] = (weakref.ref(registry, lambda _: seals.pop(identity, None)), fingerprint(registry), raw, feature_registry)
             if bundle is not None:
-                registry.require_official(bundle)
+                if approval.purpose == "official":
+                    registry.require_official(bundle)
+                else:
+                    registry.require_authenticated(bundle, expected_purpose="test")
             return registry
         except (OSError, ValueError, TypeError, AttributeError, KeyError, RecursionError) as error:
             raise RegistryValidationError(f"invalid scoring registry: {error}") from error

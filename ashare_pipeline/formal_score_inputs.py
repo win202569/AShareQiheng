@@ -24,6 +24,7 @@ from .formal_feature_repository import (FormalFeatureRepository, VerifiedMetricF
 from .formal_metric_context import (FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch)
 from .formal_metric_engine import (FormalMetricInputRepository, MetricInput, MetricInputBatch,
     MetricPeerContext, MetricScore)
+from .formal_registry_manifest import VerifiedRegistryBundle
 from .formal_scoring_registry import FormalScoringRegistry
 
 
@@ -99,6 +100,10 @@ def _install_score_inputs():
     encode, digest, freeze = metric_module._canonical, metric_module._digest, metric_module._freeze
     full_gate = _full_company_gate
     consensus_branch, temporal_quality = _consensus_branch, _temporal_quality
+    bundle_type = VerifiedRegistryBundle
+    scoring_type = FormalScoringRegistry
+    require_scoring_official = scoring_type.require_official
+    require_scoring_authenticated = scoring_type.require_authenticated
     checked_functions = tuple((module, name, getattr(module, name)) for module, names in (
         (metric_module, ("build_metric_peer_context", "score_metric_percentile", "_plain", "_canonical",
             "_digest", "_freeze", "_arithmetic_context", "FormalMetricInputRepository")),
@@ -110,7 +115,8 @@ def _install_score_inputs():
         MetricScore, FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch,
         VerifiedMetricFeatureAbsence, VerifiedMetricFeatureProjection, FormalFeatureRepository, FormalContextRepository,
         FormalContextFact, FormalFeatureBundle, FormalEvidenceRef, FormalFeatureValue, FormalFeatureSlot,
-        SignedFormalFeatureRegistry, FormalScoringRegistry) for base in cls.__mro__ if base is not object}
+        SignedFormalFeatureRegistry, FormalScoringRegistry, VerifiedRegistryBundle)
+        for base in cls.__mro__ if base is not object}
 
     def resolved_method(cls, name):
         return next((vars(base)[name] for base in cls.__mro__ if name in vars(base)), None)
@@ -122,6 +128,22 @@ def _install_score_inputs():
                 if callable(value) or isinstance(value, (staticmethod, classmethod))}))
 
     checked_methods = capture_methods(classes)
+
+    def authenticate_scoring(scoring, graph, *, expected_purpose):
+        if type(scoring) is not scoring_type or type(graph) is not bundle_type:
+            raise ValueError("complete score requires exact scoring and registry bundle types")
+        if (type(expected_purpose) is not str
+                or expected_purpose not in {"test", "official"}):
+            raise ValueError("complete score expected_purpose must be exact test or official")
+        if (scoring_type.require_official is not require_scoring_official
+                or scoring_type.require_authenticated is not require_scoring_authenticated):
+            raise ValueError("complete score registry verifier changed")
+        if getattr(graph.manifest, "purpose") != expected_purpose:
+            raise ValueError("complete score registry purpose differs from expected_purpose")
+        if expected_purpose == "official":
+            require_scoring_official(scoring, graph)
+        else:
+            require_scoring_authenticated(scoring, graph, expected_purpose="test")
 
     def methods_unchanged(checks):
         if any(resolved_method(cls, name) is not value for cls, name, value in checks):
@@ -200,10 +222,15 @@ def _install_score_inputs():
             freeze(data), encode(payload), index, publication)
         return result
 
-    def read_full(repository, batch, sid):
+    def read_full(repository, batch, sid, *, expected_purpose):
         feature, _, _, _, _ = dependencies(repository)
         marker = batch.feature_states[sid]
-        result = full_read(feature, input_hash=marker["input_hash"], require_complete=False)
+        result = full_read(
+            feature,
+            input_hash=marker["input_hash"],
+            require_complete=False,
+            expected_purpose=expected_purpose,
+        )
         dependencies(repository)
         if type(result) is not FormalFeatureBundle or result.bundle_hash() != marker["bundle_hash"]:
             raise ValueError("complete score current full bundle disappeared or changed")
@@ -214,13 +241,14 @@ def _install_score_inputs():
             raise ValueError("complete score full bundle cutoff mismatch")
         return result
 
-    def read_consensus(repository, batch, groups, links):
+    def read_consensus(repository, batch, groups, links, *, expected_purpose):
         _, context, _, _, _ = dependencies(repository)
         result = {}
         for scope, ids in sorted(groups.items()):
             dependencies(repository)
             facts = consensus_read(context, "consensus_snapshot", scope, tuple(sorted(ids)),
-                _FREEZE, batch.registry_manifest_hash)
+                _FREEZE, batch.registry_manifest_hash,
+                expected_purpose=expected_purpose)
             dependencies(repository)
             for sid in ids:
                 fact = facts[sid]
@@ -238,22 +266,40 @@ def _install_score_inputs():
                 result[sid] = wire
         return result
 
-    def build(repository, frozen_input_hash, scoring, guard, publication):
+    def build(repository, frozen_input_hash, scoring, guard, publication, *,
+              expected_purpose):
         feature, _, _, metrics, _ = dependencies(repository)
-        batch = metric_build(metrics, frozen_input_hash, scoring_registry=scoring, metric_ids=None)
+        batch = metric_build(
+            metrics,
+            frozen_input_hash,
+            scoring_registry=scoring,
+            metric_ids=None,
+            expected_purpose=expected_purpose,
+        )
         dependencies(repository)
         if batch is None:
             return guard.finalize(lambda: dependencies(repository) and None)
         if type(batch) is not MetricInputBatch:
             raise ValueError("complete score requires the owned genuine metric batch")
         batch.require_verified()
-        graph, vocabulary = registry_read(feature, batch.registry_manifest_hash)
-        scoring.require_official(graph)
+        graph, vocabulary = registry_read(
+            feature,
+            batch.registry_manifest_hash,
+            expected_purpose=expected_purpose,
+        )
+        authenticate_scoring(
+            scoring, graph, expected_purpose=expected_purpose
+        )
         full, links, groups = {}, {}, {}
         for sid in batch.security_ids:
             marker = batch.feature_states.get(sid)
             if marker is not None and marker.get("status") != "current_receipt_absent":
-                full[sid] = read_full(repository, batch, sid)
+                full[sid] = read_full(
+                    repository,
+                    batch,
+                    sid,
+                    expected_purpose=expected_purpose,
+                )
             # Link follows genuine signed template classification, including
             # pending members: selected Context absence participates in closure.
             tid = batch.input_for(sid, batch.metric_ids[0]).template_id
@@ -261,7 +307,10 @@ def _install_score_inputs():
             if link is not None:
                 links[sid] = link
                 groups.setdefault(link["scope_key"], []).append(sid)
-        consensus = read_consensus(repository, batch, groups, links)
+        consensus = read_consensus(
+            repository, batch, groups, links,
+            expected_purpose=expected_purpose,
+        )
         common = dict(registry_manifest_hash=batch.registry_manifest_hash, registry_hashes=dict(scoring.role_hashes),
             frozen_input_hash=batch.frozen_input_hash, universe_hash=batch.universe_hash,
             population_hash=batch.population_hash, metric_batch_hash=batch.batch_hash, as_of_utc=_FREEZE)
@@ -330,11 +379,20 @@ def _install_score_inputs():
         # reads, outside the short writer fence. DB/provider changes are caught
         # by the enclosing guard, including missing-to-present transitions.
         for sid, earlier in full.items():
-            if read_full(repository, batch, sid).canonical_bytes() != earlier.canonical_bytes():
+            if read_full(
+                    repository,
+                    batch,
+                    sid,
+                    expected_purpose=expected_purpose,
+            ).canonical_bytes() != earlier.canonical_bytes():
                 raise ValueError("complete score full bundle changed during final sweep")
-        if encode(read_consensus(repository, batch, groups, links)) != encode(consensus):
+        if encode(read_consensus(
+                repository, batch, groups, links,
+                expected_purpose=expected_purpose)) != encode(consensus):
             raise ValueError("complete score consensus correction or absence changed during batch")
-        scoring.require_official(graph)
+        authenticate_scoring(
+            scoring, graph, expected_purpose=expected_purpose
+        )
         dependencies(repository)
         payload = dict(common, schema_version="formal-score-input-batch-v1", security_ids=batch.security_ids,
             inputs=ready, pending_reasons=pending, metric_batch=batch.to_dict(),
@@ -370,12 +428,20 @@ def _install_score_inputs():
                 feature_repository, context_repository, registry_signature_verifier, metrics, contexts)
             dependencies(self)
 
-        def build_batch(self, frozen_input_hash, *, scoring_registry):
+        def build_batch(self, frozen_input_hash, *, scoring_registry,
+                        expected_purpose="official"):
             feature, _, _, _, _ = dependencies(self)
             publication = [False]
             try:
                 with batch_guard(feature._current_input_provider, feature._store) as guard:
-                    result = build(self, frozen_input_hash, scoring_registry, guard, publication)
+                    result = build(
+                        self,
+                        frozen_input_hash,
+                        scoring_registry,
+                        guard,
+                        publication,
+                        expected_purpose=expected_purpose,
+                    )
                 dependencies(self)
                 return result
             except BaseException:
