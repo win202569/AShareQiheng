@@ -840,6 +840,42 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
                       "member_count", "member_count_by_exchange", "report_period", "query_version"):
             with self.subTest(field=field): self.assertIn(field, result.to_dict())
 
+    def test_postwrite_gate_ignores_own_wal_but_rechecks_live_owner_provenance(self):
+        import ashare_pipeline.formal_final_repository as runs
+        from ashare_pipeline.formal_final_score_inputs import _current_source_checkpoint
+        from ashare_pipeline.formal_metric_batch_guard import FormalMetricCurrentInputProvider
+
+        accepted = [True]
+        def validator(requirement, record):
+            return self.validate(requirement, record) if accepted[0] else {}
+
+        coverage = self.audit(validators={"financial": validator})
+        coverage.require_official_ready()
+        wire = dict(security_ids=[member.security_id for member in self.frozen.members],
+            frozen_input_hash=self.frozen.frozen_input_hash,
+            as_of_utc=self.frozen.as_of_utc,
+            registry_manifest_hash=self.frozen.registry_manifest_hash,
+            universe_hash=self.frozen.universe_hash)
+        checkpoint = _current_source_checkpoint(
+            self.registry_repository, FormalMetricCurrentInputProvider(self.registry_repository))
+        with checkpoint.hold(), self.registry_repository._transaction(immediate=True) as connection:
+            connection.execute("CREATE TABLE formal_final_local_marker(value TEXT)")
+            runs._coverage_identity(coverage, wire, tuple(wire["security_ids"]))
+            checkpoint.recheck(connection)
+            runs._coverage_postwrite_gate(coverage, "official_candidate")
+            accepted[0] = False
+            runs._coverage_identity(coverage, wire, tuple(wire["security_ids"]))
+            checkpoint.recheck(connection)
+            with self.assertRaisesRegex(ValueError, "provenance"):
+                runs._coverage_postwrite_gate(coverage, "official_candidate")
+            original = type(coverage)._recheck_official_provenance
+            type.__setattr__(type(coverage), "_recheck_official_provenance", lambda _: None)
+            try:
+                with self.assertRaisesRegex(ValueError, "authority changed"):
+                    runs._coverage_postwrite_gate(coverage, "official_candidate")
+            finally:
+                type.__setattr__(type(coverage), "_recheck_official_provenance", original)
+
     def test_requirement_omission_and_cross_root_identity_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "requirements"):
             self.audit(requirements=self.requirements[:-1])

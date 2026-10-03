@@ -140,6 +140,27 @@ def _coverage_live_gate(coverage, mode):
         coverage.require_preview_ready()
 
 
+def _bind_coverage_postwrite_gate():
+    provenance_gate = VerifiedCoverageManifest._recheck_official_provenance
+
+    def postwrite_gate(coverage, mode):
+        if (type(coverage) is not VerifiedCoverageManifest
+                or VerifiedCoverageManifest._recheck_official_provenance is not provenance_gate):
+            raise ValueError("run coverage provenance authority changed")
+        if mode == "official_candidate" or (
+                mode == "test_preview" and not coverage.blockers
+                and coverage.to_dict().get("authenticated_context")):
+            provenance_gate(coverage)
+        elif mode != "test_preview":
+            raise ValueError("Stage D run mode is invalid")
+
+    return postwrite_gate
+
+
+_coverage_postwrite_gate = _bind_coverage_postwrite_gate()
+del _bind_coverage_postwrite_gate
+
+
 def _recheck_sources(store, coverage, batches, mode, publication, connection):
     publication(connection)
     inputs = batches[0].to_dict()
@@ -474,6 +495,7 @@ class FormalFinalRunRepository:
                     _insert_rows(connection, table, items, columns)
                 _verify_persisted(connection, run_id, expected)
                 _recheck_sources(self._store, coverage_manifest, batches, mode, recheck, connection)
+                _coverage_postwrite_gate(coverage_manifest, mode)
                 _arm_publication(arm)
                 recheck(connection)
                 connection.commit()
@@ -557,6 +579,7 @@ def _install_rebuild_planner(repository_type):
         ("require_verified", "require_preview_ready", "require_official_ready", "canonical_bytes", "to_dict", "_data"))
     read_run = repository_type._read_run
     serialize, identity, coverage_identity = _serialize_payload, _input_identity, _coverage_identity
+    coverage_live_gate = _coverage_live_gate
     derive = _derive_plan
 
     def plan_rebuild(self, *, prior_run_id, prior_input_manifest_hash,
@@ -593,7 +616,8 @@ def _install_rebuild_planner(repository_type):
             inputs = json.loads(raw)
             if serialize(inputs)[0].encode() != raw:
                 raise ValueError("rebuild input bytes are not canonical")
-            coverage_identity(coverage_manifest, inputs, tuple(inputs["security_ids"]), mode)
+            coverage_identity(coverage_manifest, inputs, tuple(inputs["security_ids"]))
+            coverage_live_gate(coverage_manifest, mode)
             coverage_raw = coverage_manifest.canonical_bytes()
             coverage = json.loads(coverage_raw)
             with self._store._transaction() as connection:
@@ -614,7 +638,8 @@ def _install_rebuild_planner(repository_type):
             if record(input_batch, input_type)[2] != raw or verify_sources(retention[1]) != source_bytes:
                 raise ValueError("rebuild sources changed while deriving the plan")
             dependencies(retention[0])
-            coverage_identity(coverage_manifest, inputs, tuple(inputs["security_ids"]), mode)
+            coverage_identity(coverage_manifest, inputs, tuple(inputs["security_ids"]))
+            coverage_live_gate(coverage_manifest, mode)
             if coverage_manifest.canonical_bytes() != coverage_raw:
                 raise ValueError("rebuild coverage changed while deriving the plan")
             checkpoint.recheck()

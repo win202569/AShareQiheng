@@ -703,6 +703,9 @@ class _Proof(metaclass=_SealedProofType):
 class VerifiedCoverageManifest(_Proof):
     __slots__ = ()
 
+    def _recheck_official_provenance(self) -> None:
+        raise ValueError("coverage proof authority is unavailable")
+
     def require_preview_ready(self) -> None:
         data = self._data()
         if data["blockers"]:
@@ -981,7 +984,7 @@ def _install_coverage_authority() -> None:
         seals.pop(id(manifest), None)
         live_contexts.pop(id(manifest), None)
 
-    def official_gate(self: VerifiedCoverageManifest) -> None:
+    def official_provenance_gate(self: VerifiedCoverageManifest) -> None:
         data = read(self)
         if not data.get("authenticated_context"):
             raise ValueError("official coverage requires authenticated production contract")
@@ -991,11 +994,6 @@ def _install_coverage_authority() -> None:
         if live is None or live[0]() is not self:
             raise ValueError("official coverage live proof context was revoked")
         context = live[1]
-        paths = data["diagnostics"]["identity_paths"]
-        current = _read_environment(paths["workspace_root"], paths["db_path"],
-                                    paths["status_path"], data["expected_schema_version"])
-        if any(data[field] != value for field, value in current.items()):
-            raise ValueError("official coverage database or workspace identity changed")
         wire = _official_inputs(context["contract"], context["verifier"],
                                 context["bundle"], context["registry_loader"],
                                 context["frozen"], context["requirements"],
@@ -1013,6 +1011,19 @@ def _install_coverage_authority() -> None:
             )
             if row.get("repository_provenance") != provenance:
                 raise ValueError("official coverage repository provenance changed")
+
+    def official_gate(self: VerifiedCoverageManifest) -> None:
+        data = read(self)
+        if not data.get("authenticated_context"):
+            raise ValueError("official coverage requires authenticated production contract")
+        if data["blockers"]:
+            raise ValueError("official coverage blocked: " + ",".join(data["blockers"]))
+        paths = data["diagnostics"]["identity_paths"]
+        current = _read_environment(paths["workspace_root"], paths["db_path"],
+                                    paths["status_path"], data["expected_schema_version"])
+        if any(data[field] != value for field, value in current.items()):
+            raise ValueError("official coverage database or workspace identity changed")
+        official_provenance_gate(self)
         after = _read_environment(paths["workspace_root"], paths["db_path"],
                                   paths["status_path"], data["expected_schema_version"])
         if after != current:
@@ -1026,6 +1037,7 @@ def _install_coverage_authority() -> None:
             official_gate(self)
 
     type.__setattr__(_Proof, "_data", read)
+    type.__setattr__(VerifiedCoverageManifest, "_recheck_official_provenance", official_provenance_gate)
     type.__setattr__(VerifiedCoverageManifest, "require_official_ready", official_gate)
     type.__setattr__(VerifiedCoverageManifest, "require_preview_ready", preview_gate)
     FormalCoverageAuditor.audit = audit

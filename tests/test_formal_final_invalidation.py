@@ -2,11 +2,17 @@
 
 import copy
 import inspect
+import json
+from contextlib import nullcontext
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import FunctionType, SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ashare_pipeline.formal_final_invalidation import FormalRebuildPlan, _derive_plan
 from ashare_pipeline.formal_final_repository import FormalFinalRunRepository
+from ashare_pipeline.state_store import StateStore
 
 
 IDS = ("BJ430001", "SH600000", "SZ000001")
@@ -283,6 +289,64 @@ class FormalInvalidationScopeTests(unittest.TestCase):
         self.new["inputs"][0]["slots"][MID]["metric_score"]["raw_value"] = "11"
         self.new["inputs"][1]["slots"][MID]["metric_score"]["peer_context"]["peer_security_ids"] = list(IDS[:2])
         self.assertEqual(self.plan().expanded_security_ids, IDS[:2])
+
+    def test_captured_rebuild_planner_rechecks_mode_gate_at_both_read_boundaries(self):
+        """Exercise the real planner without constructing a D1 score batch."""
+        import ashare_pipeline.formal_final_repository as module
+        from ashare_pipeline.formal_coverage_manifest import CoverageRequirement, FormalCoverageAuditor
+
+        inputs, _, identity = manifests()
+        coverage = FormalCoverageAuditor().audit([
+            CoverageRequirement("frozen", sid, "financial", "selector", "2025", sid[:2])
+            for sid in IDS
+        ])
+        raw = module._serialize_payload(inputs)[0].encode()
+        coverage_raw = coverage.canonical_bytes()
+        prior = SimpleNamespace(input_manifest_hash="prior", header=identity,
+            artifacts={"score_input_batch": raw, "coverage_manifest": coverage_raw},
+            artifact_hashes={"score_input_batch": module._serialize_payload(inputs)[1],
+                "coverage_manifest": module._serialize_payload(json.loads(coverage_raw))[1]},
+            dependencies=dependencies(inputs))
+
+        class Batch:
+            pass
+
+        class Checkpoint:
+            def hold(self):
+                return nullcontext()
+
+            def recheck(self):
+                pass
+
+        with TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "planner.db")
+            feature = SimpleNamespace(_store=store)
+            retention = ((feature,), (), (), (Checkpoint(),))
+            saved = (None, None, raw, None, None, retention)
+
+            repository = object.__new__(FormalFinalRunRepository)
+            repository._store = store
+            repository._path = Path(store.db_path).resolve()
+            repository._code_version = "code"
+            repository._contract_version = "formal-final-v1"
+            gate = Mock(wraps=module._coverage_live_gate)
+            overrides = {"record": lambda proof, cls: saved,
+                "dependencies": lambda source: (feature,), "verify_sources": lambda sources: (),
+                "input_type": Batch, "read_run": lambda self, connection, run_id: prior,
+                "coverage_live_gate": gate}
+            original = FormalFinalRunRepository.plan_rebuild
+            values = dict(zip(original.__code__.co_freevars, original.__closure__, strict=True))
+            def cell(value):
+                return (lambda: value).__closure__[0]
+            planner = FunctionType(original.__code__, original.__globals__, closure=tuple(
+                cell(overrides[name]) if name in overrides else values[name]
+                for name in original.__code__.co_freevars))
+            plan = planner(repository, prior_run_id="run", prior_input_manifest_hash="prior",
+                input_batch=Batch(), coverage_manifest=coverage, mode="test_preview")
+            self.assertIsInstance(plan, FormalRebuildPlan)
+            self.assertEqual(gate.call_count, 2)
+            self.assertEqual(gate.call_args_list[0].args, (coverage, "test_preview"))
+            self.assertEqual(gate.call_args_list[1].args, (coverage, "test_preview"))
 
 
 class FormalInvalidationRepositoryTests(unittest.TestCase):

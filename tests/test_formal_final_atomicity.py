@@ -104,6 +104,9 @@ class FormalFinalAuthorityBoundaryTests(unittest.TestCase):
                 _connection.execute("UPDATE schema_migration SET version=version WHERE version=?",
                                     (SCHEMA_VERSION,))
 
+        def postwrite_gate(_coverage, _mode):
+            events.append(("provenance_gate", writer.in_transaction, inserted[0]))
+
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "ordering.sqlite",
                 registry_signature_verifier=AcceptingVerifier())
@@ -122,13 +125,15 @@ class FormalFinalAuthorityBoundaryTests(unittest.TestCase):
                         for table in module._TABLES[2:]}), patch.object(
                     module, "_writer_connection", return_value=writer), patch.object(
                     module, "_insert_rows", insert), patch.object(
-                    module, "_verify_persisted", return_value=None):
+                    module, "_verify_persisted", return_value=None), patch.object(
+                    module, "_coverage_postwrite_gate", postwrite_gate):
                 repository.commit_complete_run(mode="official_candidate",
                     coverage_manifest=Coverage(), input_batch=batches[0],
                     score_batch=batches[1], eligibility_batch=batches[2],
                     pool_batch=batches[3])
         self.assertEqual([event for event in events if isinstance(event, tuple)],
-                         [("live_gate", False, False), ("live_gate", True, False)])
+                         [("live_gate", False, False), ("live_gate", True, False),
+                          ("provenance_gate", True, True)])
         self.assertLess(events.index("begin"), events.index(("live_gate", True, False)))
         self.assertLess(events.index(("live_gate", True, False)), events.index("first_insert"))
         self.assertEqual(events.count("source_checkpoint"), 3)
