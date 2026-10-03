@@ -259,7 +259,7 @@ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
         raise ValueError("official coverage workspace revision is unavailable")
     def db_hashes() -> dict[str, str | None]:
         hashes: dict[str, str | None] = {}
-        for suffix in ("", "-wal", "-shm"):
+        for suffix in ("", "-wal"):
             path = db.with_name(db.name + suffix)
             if not path.exists():
                 if not suffix:

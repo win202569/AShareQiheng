@@ -6,14 +6,243 @@ import pickle
 import sqlite3
 import unittest
 import weakref
-from contextlib import closing
+from contextlib import closing, nullcontext
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from tests.test_formal_final_repository import minimal_batches
 from tests.test_formal_final_migration import TABLES
 
 
 class FormalFinalAuthorityBoundaryTests(unittest.TestCase):
+    def test_official_writer_gates_live_environment_inside_reservation_before_first_insert(self):
+        import ashare_pipeline.formal_final_repository as module
+        from ashare_pipeline.state_store import StateStore, SCHEMA_VERSION
+        from tests.test_formal_registry_manifest import AcceptingVerifier
+        from pathlib import Path
+        import tempfile
+
+        events = []
+        inserted = [False]
+        sid = "SH600000"
+        identity = dict(registry_manifest_hash="r" * 64, frozen_input_hash="f" * 64,
+            universe_hash="u" * 64, as_of_utc="2026-08-31T07:00:00+00:00",
+            security_ids=[sid])
+
+        class Batch:
+            def __init__(self, wire):
+                self.wire = wire
+
+            def require_verified(self):
+                return None
+
+            def to_dict(self):
+                return self.wire
+
+            def canonical_bytes(self):
+                return module._serialize_payload(self.wire)[0].encode()
+
+        class Coverage:
+            blockers = ()
+            manifest_hash = "c" * 64
+
+            def require_verified(self):
+                events.append("coverage_proof")
+
+            def to_dict(self):
+                return dict(authenticated_context=True, blockers=[],
+                    rows=[dict(security_id=sid, exchange="SH",
+                               frozen_input_hash=identity["frozen_input_hash"])],
+                    freeze_at_utc=identity["as_of_utc"],
+                    registry_manifest_hash=identity["registry_manifest_hash"],
+                    frozen_input_hash=identity["frozen_input_hash"],
+                    universe_records_hash=identity["universe_hash"], member_count=1)
+
+            def require_official_ready(self):
+                events.append(("live_gate", writer.in_transaction, inserted[0]))
+                if inserted[0]:
+                    raise AssertionError("official gate ran after Stage D insert")
+
+            def canonical_bytes(self):
+                return module._serialize_payload(self.to_dict())[0].encode()
+
+        class Writer(FaultConnection):
+            def execute(self, sql, *args):
+                if sql == "BEGIN IMMEDIATE":
+                    events.append("begin")
+                if sql.startswith("SELECT * FROM formal_universe_snapshot"):
+                    events.append("frozen")
+                    return SimpleNamespace(fetchone=lambda: object())
+                return super().execute(sql, *args)
+
+        class Loader:
+            def __init__(self, *_args):
+                pass
+
+            def load(self, root):
+                case.assertEqual(root, identity["registry_manifest_hash"])
+                events.append("registry")
+                return SimpleNamespace(manifest=SimpleNamespace(
+                    schema_version="formal-registry-manifest-v2"),
+                    require_official=lambda: events.append("official_root"))
+
+        case = self
+        frozen = SimpleNamespace(members=(SimpleNamespace(security_id=sid),),
+            universe_hash=identity["universe_hash"],
+            registry_manifest_hash=identity["registry_manifest_hash"])
+        batches = tuple(Batch(identity if index == 0 else
+                              dict(eligibilities=[]) if index == 2 else dict(kind=index))
+                        for index in range(4))
+
+        def source_checkpoint(_connection):
+            events.append("source_checkpoint")
+
+        def insert(_connection, table, _rows, _columns):
+            if not inserted[0]:
+                inserted[0] = True
+                events.append("first_insert")
+                _connection.execute("UPDATE schema_migration SET version=version WHERE version=?",
+                                    (SCHEMA_VERSION,))
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "ordering.sqlite",
+                registry_signature_verifier=AcceptingVerifier())
+            store.initialize()
+            repository = module.FormalFinalRunRepository(store, code_version="ordering-test")
+            with closing(Writer(store._connect())) as writer, patch.object(
+                    module, "_BATCH_TYPES", (Batch,) * 4), patch.object(
+                    module, "VerifiedCoverageManifest", Coverage), patch.object(
+                    module, "FormalRegistryBundleLoader", Loader), patch.object(
+                    store, "_formal_universe_from_connection", return_value=(frozen, None)), patch.object(
+                    module, "_prepare_publication", return_value=SimpleNamespace(batches=batches)), patch.object(
+                    module, "_publication_controls", return_value=(source_checkpoint,
+                        lambda: None, lambda: None, lambda: None, lambda: None,
+                        lambda: nullcontext())), patch.object(
+                    module, "_project_rows", return_value={table: [dict(run_id="witness")]
+                        for table in module._TABLES[2:]}), patch.object(
+                    module, "_writer_connection", return_value=writer), patch.object(
+                    module, "_insert_rows", insert), patch.object(
+                    module, "_verify_persisted", return_value=None):
+                repository.commit_complete_run(mode="official_candidate",
+                    coverage_manifest=Coverage(), input_batch=batches[0],
+                    score_batch=batches[1], eligibility_batch=batches[2],
+                    pool_batch=batches[3])
+        self.assertEqual([event for event in events if isinstance(event, tuple)],
+                         [("live_gate", False, False), ("live_gate", True, False)])
+        self.assertLess(events.index("begin"), events.index(("live_gate", True, False)))
+        self.assertLess(events.index(("live_gate", True, False)), events.index("first_insert"))
+        self.assertEqual(events.count("source_checkpoint"), 3)
+        self.assertEqual(events.count("frozen"), 2)
+        self.assertEqual(events.count("registry"), 2)
+        self.assertEqual(events.count("official_root"), 2)
+
+    def test_post_write_source_recheck_keeps_identity_liveness_root_and_checkpoint_without_live_hash(self):
+        import ashare_pipeline.formal_final_repository as module
+
+        events = []
+        sid = "SH600000"
+        identity = dict(registry_manifest_hash="r" * 64, frozen_input_hash="f" * 64,
+            universe_hash="u" * 64, as_of_utc="2026-08-31T07:00:00+00:00",
+            security_ids=[sid])
+        connection = SimpleNamespace(wrote=False,
+            execute=lambda *args: SimpleNamespace(fetchone=lambda: object()))
+
+        class Coverage:
+            revoked = False
+            wrong_root = False
+
+            def require_verified(self):
+                events.append("coverage_live")
+                if self.revoked:
+                    raise ValueError("coverage proof revoked")
+
+            def to_dict(self):
+                return dict(authenticated_context=True, blockers=[],
+                    rows=[dict(security_id=sid, exchange="SH",
+                               frozen_input_hash=identity["frozen_input_hash"])],
+                    freeze_at_utc=identity["as_of_utc"],
+                    registry_manifest_hash=("x" * 64 if self.wrong_root else
+                                            identity["registry_manifest_hash"]),
+                    frozen_input_hash=identity["frozen_input_hash"],
+                    universe_records_hash=identity["universe_hash"], member_count=1)
+
+            def require_official_ready(self):
+                events.append("live_environment")
+                if connection.wrote:
+                    raise AssertionError("post-write official gate hashed its own WAL")
+
+        class Loader:
+            revoked = False
+
+            def __init__(self, *_args):
+                pass
+
+            def load(self, root):
+                events.append("registry")
+                self_test.assertEqual(root, identity["registry_manifest_hash"])
+                return SimpleNamespace(manifest=SimpleNamespace(
+                    schema_version="formal-registry-manifest-v2"),
+                    require_official=self.require_official)
+
+            def require_official(self):
+                events.append("official_root")
+                if Loader.revoked:
+                    raise ValueError("official registry root revoked")
+
+        self_test = self
+        frozen = SimpleNamespace(members=(SimpleNamespace(security_id=sid),),
+            universe_hash=identity["universe_hash"],
+            registry_manifest_hash=identity["registry_manifest_hash"])
+        store = SimpleNamespace(
+            _formal_universe_from_connection=lambda *_args: (frozen, None),
+            _require_registry_verifier=lambda: object())
+        batch = SimpleNamespace(to_dict=lambda: identity)
+        coverage = Coverage()
+
+        source_changed = [False]
+
+        def checkpoint(_connection):
+            events.append("source_checkpoint")
+            if source_changed[0]:
+                raise ValueError("source checkpoint changed")
+
+        with patch.object(module, "VerifiedCoverageManifest", Coverage), patch.object(
+                module, "FormalRegistryBundleLoader", Loader):
+            module._recheck_sources(store, coverage, (batch,), "official_candidate",
+                checkpoint, connection)
+            connection.wrote = True
+            module._recheck_sources(store, coverage, (batch,), "official_candidate",
+                checkpoint, connection)
+            self.assertEqual(events.count("source_checkpoint"), 2)
+            self.assertEqual(events.count("coverage_live"), 2)
+            self.assertEqual(events.count("registry"), 2)
+            self.assertEqual(events.count("official_root"), 2)
+            self.assertEqual(events.count("live_environment"), 0)
+            coverage.wrong_root = True
+            with self.assertRaisesRegex(ValueError, "coverage root"):
+                module._recheck_sources(store, coverage, (batch,), "official_candidate",
+                    checkpoint, connection)
+            coverage.wrong_root = False
+            source_changed[0] = True
+            with self.assertRaisesRegex(ValueError, "source checkpoint"):
+                module._recheck_sources(store, coverage, (batch,), "official_candidate",
+                    checkpoint, connection)
+            source_changed[0] = False
+            frozen.universe_hash = "x" * 64
+            with self.assertRaisesRegex(ValueError, "frozen membership"):
+                module._recheck_sources(store, coverage, (batch,), "official_candidate",
+                    checkpoint, connection)
+            frozen.universe_hash = identity["universe_hash"]
+            Loader.revoked = True
+            with self.assertRaisesRegex(ValueError, "registry root revoked"):
+                module._recheck_sources(store, coverage, (batch,), "official_candidate",
+                    checkpoint, connection)
+            Loader.revoked = False
+            coverage.revoked = True
+            with self.assertRaisesRegex(ValueError, "revoked"):
+                module._recheck_sources(store, coverage, (batch,), "official_candidate",
+                    checkpoint, connection)
+
     def test_replaced_frame_provider_cannot_authenticate_prepare_or_controls(self):
         import ashare_pipeline.formal_final_publication as publication
         import ashare_pipeline.formal_final_repository as module

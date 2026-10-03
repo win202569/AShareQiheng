@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 import weakref
 
 import ashare_pipeline.formal_coverage_manifest as coverage_module
@@ -16,7 +17,7 @@ from ashare_pipeline.formal_snapshot_repository import FormalSnapshotRepository
 from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore
 from ashare_pipeline.formal_evidence import OfficialRequest
 from ashare_pipeline.formal_universe import FormalUniverseIngestor
-from ashare_pipeline.state_store import StateStore
+from ashare_pipeline.state_store import StateStore, SCHEMA_VERSION
 from tests.test_formal_coverage_manifest import good
 from tests.test_formal_registry_manifest import AcceptingVerifier, fixture_repository
 from tests.test_formal_universe import verified_listing_documents
@@ -236,10 +237,10 @@ class OwnerCoverageAdapterTests(unittest.TestCase):
             policy_registry=f.policy_registry, owner_scope=None)
         cls.status_path = f.root / "coverage-status.json"
         cls.status_path.write_text(json.dumps({
-            "generated_at_utc": "2026-09-01T00:00:00+00:00", "schema_version": 7,
+            "generated_at_utc": "2026-09-01T00:00:00+00:00", "schema_version": SCHEMA_VERSION,
             "db_sha256": hashlib.sha256(f.db_path.read_bytes()).hexdigest(),
             "db_generation_hash": digest(db_generation(f.db_path)),
-            "schema_versions": [2, 3, 4, 5, 6, 7],
+            "schema_versions": list(range(2, SCHEMA_VERSION + 1)),
         }), encoding="utf-8")
 
     def catalog(self, domain, *, change=None):
@@ -275,7 +276,7 @@ class OwnerCoverageAdapterTests(unittest.TestCase):
             approval_id=manifest.approval_id, signing_identity=manifest.key_id,
             registry_manifest_hash=manifest.manifest_hash, frozen_input_hash=f.frozen.frozen_input_hash,
             requirements=requirements, domain_owners={domain: owner}, selector_descriptors=descriptors,
-            expected_schema_version=7, report_period="2025", query_version="coverage-v1")
+            expected_schema_version=SCHEMA_VERSION, report_period="2025", query_version="coverage-v1")
 
     def audit(self, domain, *, wire=None, **changes):
         f = self.fixture
@@ -433,8 +434,9 @@ class MarketRangeCoverageAdapterTests(unittest.TestCase):
             policy_registry=f.policy_registry, owner_scope=None)
         cls.status_path = f.root / "coverage-status.json"
         cls.status_path.write_text(json.dumps(dict(generated_at_utc="2026-09-01T00:00:00+00:00",
-            schema_version=7, db_sha256=hashlib.sha256(f.db_path.read_bytes()).hexdigest(),
-            db_generation_hash=digest(db_generation(f.db_path)), schema_versions=[2, 3, 4, 5, 6, 7])), encoding="utf-8")
+            schema_version=SCHEMA_VERSION, db_sha256=hashlib.sha256(f.db_path.read_bytes()).hexdigest(),
+            db_generation_hash=digest(db_generation(f.db_path)),
+            schema_versions=list(range(2, SCHEMA_VERSION + 1)))), encoding="utf-8")
 
     def catalog(self, domain, *, change=None):
         f = self.fixture
@@ -464,7 +466,7 @@ class MarketRangeCoverageAdapterTests(unittest.TestCase):
             registry_manifest_hash=manifest.manifest_hash, frozen_input_hash=f.frozen.frozen_input_hash,
             requirements=requirements, selector_descriptors=descriptors,
             domain_owners={domain: "formal_policy_repository", "security_state": "formal_context_repository"},
-            expected_schema_version=7, report_period="2025", query_version="coverage-v1")
+            expected_schema_version=SCHEMA_VERSION, report_period="2025", query_version="coverage-v1")
 
     def test_genuine_market_and_range_requirements_use_policy_market_evidence(self):
         wire, ranges = self.catalog("market"), self.catalog("range")
@@ -571,8 +573,9 @@ class CalendarCoverageAdapterTests(unittest.TestCase):
     def write_status(self):
         f = self.fixture
         self.status_path.write_text(json.dumps(dict(generated_at_utc="2026-09-01T00:00:00+00:00",
-            schema_version=7, db_sha256=hashlib.sha256(f.db_path.read_bytes()).hexdigest(),
-            db_generation_hash=digest(db_generation(f.db_path)), schema_versions=[2, 3, 4, 5, 6, 7])), encoding="utf-8")
+            schema_version=SCHEMA_VERSION, db_sha256=hashlib.sha256(f.db_path.read_bytes()).hexdigest(),
+            db_generation_hash=digest(db_generation(f.db_path)),
+            schema_versions=list(range(2, SCHEMA_VERSION + 1)))), encoding="utf-8")
 
     def catalog(self, domain="trading_calendar", *, change=None):
         f = self.fixture
@@ -594,7 +597,8 @@ class CalendarCoverageAdapterTests(unittest.TestCase):
             approval_id=manifest.approval_id, signing_identity=manifest.key_id,
             registry_manifest_hash=manifest.manifest_hash, frozen_input_hash=f.frozen.frozen_input_hash,
             requirements=requirements, domain_owners={domain: "formal_context_repository"},
-            selector_descriptors=descriptors, expected_schema_version=7, report_period="2025", query_version="coverage-v1")
+            selector_descriptors=descriptors, expected_schema_version=SCHEMA_VERSION,
+            report_period="2025", query_version="coverage-v1")
 
     def audit(self, *, wire=None, **changes):
         f = self.fixture
@@ -766,10 +770,10 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
         self.status_path = self.temp_path / "status.json"
         self.status_path.write_text(json.dumps({
             "generated_at_utc": "2026-09-01T00:00:00+00:00",
-            "schema_version": 7,
+            "schema_version": SCHEMA_VERSION,
             "db_sha256": hashlib.sha256(self.db_path.read_bytes()).hexdigest(),
             "db_generation_hash": digest(db_generation(self.db_path)),
-            "schema_versions": [2, 3, 4, 5, 6, 7],
+            "schema_versions": list(range(2, SCHEMA_VERSION + 1)),
         }), encoding="utf-8")
         self.contract_wire = {
             "schema_version": "formal-coverage-contract-v1",
@@ -780,7 +784,7 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
             "requirements": [req.to_dict() for req in self.requirements],
             "domain_owners": {"financial": "formal_snapshot_repository"},
             "selector_descriptors": self.selector_descriptors,
-            "expected_schema_version": 7, "report_period": "2025",
+            "expected_schema_version": SCHEMA_VERSION, "report_period": "2025",
             "query_version": "coverage-v1",
         }
         self.contract = self.signed_contract(self.contract_wire)
@@ -1006,7 +1010,7 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
     def test_stale_status_blocks_audit_before_manifest_is_minted(self):
         self.status_path.write_text(json.dumps({
             "generated_at_utc": "2026-09-01T00:00:00+00:00",
-            "schema_version": 7,
+            "schema_version": SCHEMA_VERSION,
             "db_sha256": "0" * 64,
         }), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "database status"):
@@ -1018,10 +1022,10 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
         empty_status = self.temp_path / "empty-status.json"
         empty_status.write_text(json.dumps({
             "generated_at_utc": "2026-09-01T00:00:00+00:00",
-            "schema_version": 7,
+            "schema_version": SCHEMA_VERSION,
             "db_sha256": hashlib.sha256(empty_db.read_bytes()).hexdigest(),
             "db_generation_hash": digest(db_generation(empty_db)),
-            "schema_versions": [2, 3, 4, 5, 6, 7],
+            "schema_versions": list(range(2, SCHEMA_VERSION + 1)),
         }), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "repository|schema"):
             self.audit(db_path=empty_db, status_path=empty_status)
@@ -1045,7 +1049,7 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
         try:
             writer.execute("PRAGMA journal_mode=WAL")
             writer.execute("PRAGMA wal_autocheckpoint=0")
-            writer.execute("DELETE FROM schema_migration WHERE version=7")
+            writer.execute("DELETE FROM schema_migration WHERE version=?", (SCHEMA_VERSION,))
             writer.commit()
             self.assertTrue(self.db_path.with_name(self.db_path.name + "-wal").is_file())
             status = json.loads(self.status_path.read_text(encoding="utf-8"))
@@ -1054,7 +1058,8 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
             self.status_path.write_text(json.dumps(status), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "schema"):
                 coverage_module._read_environment(
-                    Path(__file__).resolve().parents[1], self.db_path, self.status_path, 7)
+                    Path(__file__).resolve().parents[1], self.db_path, self.status_path,
+                    SCHEMA_VERSION)
         finally:
             writer.close()
 
@@ -1063,7 +1068,8 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
         try:
             writer.execute("PRAGMA journal_mode=WAL")
             writer.execute("PRAGMA wal_autocheckpoint=0")
-            writer.execute("UPDATE schema_migration SET version=version WHERE version=7")
+            writer.execute("UPDATE schema_migration SET version=version WHERE version=?",
+                           (SCHEMA_VERSION,))
             writer.commit()
             self.assertTrue(self.db_path.with_name(self.db_path.name + "-wal").is_file())
             status = json.loads(self.status_path.read_text(encoding="utf-8"))
@@ -1071,11 +1077,49 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
             status["db_generation_hash"] = digest(db_generation(self.db_path))
             self.status_path.write_text(json.dumps(status), encoding="utf-8")
             first = coverage_module._read_environment(
-                Path(__file__).resolve().parents[1], self.db_path, self.status_path, 7)
+                Path(__file__).resolve().parents[1], self.db_path, self.status_path,
+                SCHEMA_VERSION)
             second = coverage_module._read_environment(
-                Path(__file__).resolve().parents[1], self.db_path, self.status_path, 7)
+                Path(__file__).resolve().parents[1], self.db_path, self.status_path,
+                SCHEMA_VERSION)
             self.assertEqual(first, second)
         finally:
+            writer.close()
+
+    def test_active_writer_reservation_never_reads_transient_shm_identity(self):
+        writer = sqlite3.connect(self.db_path)
+        try:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("UPDATE schema_migration SET version=version WHERE version=?",
+                           (SCHEMA_VERSION,))
+            writer.commit()
+            status = json.loads(self.status_path.read_text(encoding="utf-8"))
+            status["schema_version"] = SCHEMA_VERSION
+            status["schema_versions"] = list(range(2, SCHEMA_VERSION + 1))
+            status["db_sha256"] = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+            status["db_generation_hash"] = digest(db_generation(self.db_path))
+            self.status_path.write_text(json.dumps(status), encoding="utf-8")
+            writer.execute("BEGIN IMMEDIATE")
+            shm = self.db_path.with_name(self.db_path.name + "-shm")
+            self.assertTrue(shm.is_file())
+            original_open = Path.open
+
+            def deny_shm(path, *args, **kwargs):
+                if path == shm:
+                    raise PermissionError("SQLite owns transient SHM")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", deny_shm):
+                try:
+                    identity = coverage_module._read_environment(
+                        Path(__file__).resolve().parents[1], self.db_path,
+                        self.status_path, SCHEMA_VERSION)
+                except PermissionError as exc:
+                    self.fail(f"official environment read transient SHM: {exc}")
+            self.assertEqual(set(identity["db_sidecar_sha256"]), {"-wal"})
+        finally:
+            writer.rollback()
             writer.close()
 
     def test_recheck_timestamp_is_noncanonical_even_in_repository_receipt(self):

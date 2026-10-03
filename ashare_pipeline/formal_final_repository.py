@@ -114,7 +114,7 @@ class FormalFinalRunReceipt:
         return self.input_batch, self.score_batch, self.eligibility_batch, self.pool_batch
 
 
-def _coverage_identity(coverage, wire, ids, mode):
+def _coverage_identity(coverage, wire, ids):
     if type(coverage) is not VerifiedCoverageManifest:
         raise ValueError("run requires a genuine coverage manifest")
     coverage.require_verified()
@@ -131,9 +131,12 @@ def _coverage_identity(coverage, wire, ids, mode):
                 or data["universe_records_hash"] != wire["universe_hash"]
                 or data["member_count"] != len(ids)):
             raise ValueError("coverage root or universe identity mismatch")
+
+
+def _coverage_live_gate(coverage, mode):
     if mode == "official_candidate":
         coverage.require_official_ready()
-    elif not data["blockers"]:
+    elif not coverage.blockers:
         coverage.require_preview_ready()
 
 
@@ -141,7 +144,7 @@ def _recheck_sources(store, coverage, batches, mode, publication, connection):
     publication(connection)
     inputs = batches[0].to_dict()
     ids = tuple(inputs["security_ids"])
-    _coverage_identity(coverage, inputs, ids, mode)
+    _coverage_identity(coverage, inputs, ids)
     row = connection.execute("SELECT * FROM formal_universe_snapshot WHERE frozen_input_hash = ?",
         (inputs["frozen_input_hash"],)).fetchone()
     if row is None:
@@ -414,7 +417,8 @@ class FormalFinalRunRepository:
         for batch in batches:
             batch.require_verified()
         wires = tuple(batch.to_dict() for batch in batches)
-        _coverage_identity(coverage_manifest, wires[0], tuple(wires[0]["security_ids"]), mode)
+        _coverage_identity(coverage_manifest, wires[0], tuple(wires[0]["security_ids"]))
+        _coverage_live_gate(coverage_manifest, mode)
         publication = _prepare_publication(input_batch=input_batch, score_batch=score_batch,
             eligibility_batch=eligibility_batch, pool_batch=pool_batch)
         recheck, prevalidate, arm, mark_committed, revoke, source_hold = _publication_controls(publication)
@@ -461,6 +465,7 @@ class FormalFinalRunRepository:
                 source_guard.__enter__()
                 connection.execute("BEGIN IMMEDIATE")
                 _recheck_sources(self._store, coverage_manifest, batches, mode, recheck, connection)
+                _coverage_live_gate(coverage_manifest, mode)
                 for table in _TABLES:
                     items = expected[table]
                     columns = tuple(items[0]) if items else empty_columns.get(table)
