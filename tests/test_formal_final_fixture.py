@@ -1,12 +1,18 @@
 """One signed Stage D root feeding all three genuine scoring inputs."""
 
+from datetime import date, timedelta
+import json
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from ashare_pipeline.formal_policy_repository import VerifiedPolicyResultBatch
+from ashare_pipeline.formal_policy_market import evaluate_window
 from ashare_pipeline.formal_final_score_inputs import FormalFinalScoreInputRepository
 from ashare_pipeline.formal_score_inputs import FormalScoreInputBatch
 from ashare_pipeline.formal_valuation_engine import PolicyAdjustedValuationBatch
 from tests.formal_final_scoring_fixtures import FinalScoringFixture
+from tests.formal_valuation_fixtures import ValuationRuntimeFixture
 
 
 class FinalScoringFixtureTests(unittest.TestCase):
@@ -56,6 +62,46 @@ class FinalScoringFixtureTests(unittest.TestCase):
             if value.slot_id in required}
         self.assertEqual(len(required), 25)
         self.assertEqual(actual, {slot_id: "derived" for slot_id in required})
+
+
+class FinalScoringVetoMarketProtocolTests(unittest.TestCase):
+    def test_veto_reply_keeps_a_prior_positive_close_outside_twenty_quiet_days(self):
+        fixture = object.__new__(FinalScoringFixture)
+        fixture.veto_ids = ("SH600000",)
+        fixture.transport = SimpleNamespace()
+        end = date(2026, 8, 31)
+        days = {(end - timedelta(days=30 - index)).isoformat(): index >= 11
+                for index in range(31)}
+        produced = []
+
+        def capture_calendar(_fixture, *, days, generation="g1", omit_pages=()):
+            produced.append(days)
+
+        with patch.object(ValuationRuntimeFixture, "produce_calendar", capture_calendar):
+            FinalScoringFixture.produce_calendar(fixture, days=days)
+        self.assertEqual(len(produced), 1)
+        trading_days = tuple(day for day, opened in sorted(produced[0].items()) if opened)
+        self.assertGreaterEqual(len(trading_days), 21)
+        wire = {"security_id": "SH600000", "rows": [
+            {"date": day, "exchange_allows_trading": True,
+             "volume": "1", "turnover": "2",
+             "close": {"state": "positive", "value": "2"}}
+            for day in trading_days]}
+        fixture.reply(wire, original_url="https://www.cninfo.com.cn/fixture/range-market.json")
+        replied = json.loads(fixture.transport.response.raw_bytes)
+        rows = {row["date"]: {key: row[key] for key in
+            ("exchange_allows_trading", "volume", "turnover", "close")}
+            | {"coverage": "covered"} for row in replied["rows"]}
+        self.assertEqual((rows[trading_days[-21]]["volume"],
+                          rows[trading_days[-21]]["turnover"]), ("1", "2"))
+        self.assertEqual(rows[trading_days[-21]]["close"],
+                         {"state": "positive", "value": "2"})
+        self.assertTrue(all(rows[day]["volume"] == "0" and
+                            rows[day]["turnover"] == "0" for day in trading_days[-20:]))
+        result = evaluate_window(trading_days, rows)
+        self.assertEqual(result["veto_state"], "proven")
+        self.assertEqual(result["price_state"], "positive_close_complete")
+        self.assertEqual(result["pending"], [])
 
 
 class SignedTestRootFinalScoringFixtureTests(unittest.TestCase):

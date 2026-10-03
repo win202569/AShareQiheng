@@ -197,9 +197,21 @@ class FinalScoringFixture(ValuationRuntimeFixture):
 
     def reply(self, wire, **kwargs):
         if wire["security_id"] in self.veto_ids and "range-market" in kwargs.get("original_url", ""):
-            wire = dict(wire, rows=[dict(row, volume="0", turnover="0")
+            quiet_days = set(sorted(row["date"] for row in wire["rows"])[-20:])
+            wire = dict(wire, rows=[
+                dict(row, volume="0", turnover="0") if row["date"] in quiet_days else row
                 for row in wire["rows"]])
         return super().reply(wire, **kwargs)
+
+    def produce_calendar(self, *, days, generation="g1", omit_pages=()):
+        if self.veto_ids:
+            dates = sorted(days)
+            if len(dates) < 21:
+                raise ValueError("veto fixture needs a prior trading day")
+            days = dict(days)
+            days[dates[-21]] = True
+        return super().produce_calendar(days=days, generation=generation,
+                                        omit_pages=omit_pages)
 
     def build_d1_sources(self):
         return D1Sources(
