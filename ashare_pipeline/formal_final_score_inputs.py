@@ -98,7 +98,28 @@ def _install_final_inputs():
     repositories, proofs, prepared_gates, prepared_origins = {}, {}, {}, {}
     claim = _claim_preparation
     encode, digest, freeze = _canonical, _digest, _freeze
-    decode, sha256, reference = json.loads, hashlib.sha256, weakref.ref
+    json_module = json
+    decoder_module, scanner_module = json_module.decoder, json_module.scanner
+    decode, decoder_type = json_module.loads, json_module.JSONDecoder
+    decoder_bindings = (
+        (vars(json_module), "decoder", decoder_module),
+        (vars(json_module), "scanner", scanner_module),
+        (vars(json_module), "JSONDecoder", decoder_type),
+        (vars(json_module), "loads", decode),
+        (vars(decoder_module), "JSONDecoder", decoder_type),
+        (vars(decoder_module), "scanner", scanner_module),
+        *((vars(decoder_module), name, vars(decoder_module)[name]) for name in
+            ("JSONDecodeError", "JSONObject", "JSONArray", "scanstring", "c_scanstring",
+             "py_scanstring", "WHITESPACE", "WHITESPACE_STR", "STRINGCHUNK",
+             "BACKSLASH", "_CONSTANTS", "_decode_uXXXX")),
+        *((vars(scanner_module), name, vars(scanner_module)[name]) for name in
+            ("make_scanner", "c_make_scanner", "py_make_scanner", "NUMBER_RE")),
+    )
+    decoder_bases, decoder_mro = decoder_type.__bases__, decoder_type.__mro__
+    decoder_members = tuple(vars(decoder_type).items())
+    backslash_values = tuple(sorted(decoder_module.BACKSLASH.items()))
+    constant_values = tuple(sorted(decoder_module._CONSTANTS.items()))
+    sha256, reference = hashlib.sha256, weakref.ref
     guard_factory, load_root = _metric_batch_guard, FormalRegistryBundleLoader.load
     base_build = FormalScoreInputRepository.build_batch
     policy_build = FormalPolicyRepository.build_batch
@@ -124,7 +145,23 @@ def _install_final_inputs():
         if callable(value) or isinstance(value, (staticmethod, classmethod)))
 
     def interfaces():
-        if (owner.get("_prepare_final_inputs") is not prepare
+        current_decoder_members = vars(decoder_type)
+        decoder_namespace = vars(decoder_module)
+        current_backslash = decoder_namespace.get("BACKSLASH")
+        current_constants = decoder_namespace.get("_CONSTANTS")
+        if (owner.get("json") is not json_module
+                or any(source.get(name) is not original
+                    for source, name, original in decoder_bindings)
+                or decoder_type.__bases__ != decoder_bases
+                or decoder_type.__mro__ != decoder_mro
+                or set(current_decoder_members) != {name for name, _ in decoder_members}
+                or any(current_decoder_members[name] is not original
+                    for name, original in decoder_members)
+                or tuple(sorted(current_backslash.items())) != backslash_values
+                or set(current_constants) != {name for name, _ in constant_values}
+                or any(current_constants[name] is not original
+                    for name, original in constant_values)
+                or owner.get("_prepare_final_inputs") is not prepare
                 or metric_owner.get("_freeze") is not freeze
                 or metric_owner.get("_metric_definition_dependency_changes") is not metric_dependencies
                 or metric_dependencies()
@@ -321,6 +358,35 @@ def _install_final_inputs():
                 raise ValueError("final score member identity mismatch")
         return identity
 
+    def detached_source_payload(source):
+        interfaces()
+        source.require_verified()
+        raw = source.canonical_bytes()
+        if type(raw) is not bytes:
+            raise ValueError("final score source canonical bytes are invalid")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("final score source canonical bytes are not UTF-8") from error
+
+        def invalid_constant(value):
+            raise ValueError("final score source canonical bytes contain a nonfinite number")
+
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("final score source canonical bytes contain duplicate keys")
+                result[key] = value
+            return result
+
+        checked = decode(text, cls=decoder_type, parse_constant=invalid_constant,
+            object_pairs_hook=unique_object)
+        if encode(checked) != raw:
+            raise ValueError("final score source canonical bytes are noncanonical")
+        return decode(text, cls=decoder_type, parse_float=str, parse_constant=invalid_constant,
+            object_pairs_hook=unique_object)
+
     class FormalFinalScoreInputRepository(metaclass=SealedMeta):
         __slots__ = ("__weakref__",)
 
@@ -387,17 +453,20 @@ def _install_final_inputs():
                     rows, derived = [], []
                     for sid, policy_result in zip(ids, policy.results, strict=True):
                         policy_result.require_verified()
+                        detached_policy_result = detached_source_payload(policy_result)
                         original = base.input_for(sid)
                         base_reasons = tuple(base.pending_reasons.get(sid, ()))
                         reasons = {"base:" + reason for reason in base_reasons}
-                        policy_pending = policy_result.to_dict()["pending_requirements"]
+                        policy_pending = detached_policy_result["pending_requirements"]
                         if policy_result.evidence_state == "pending_evidence" or policy_pending:
                             reasons.add("policy:pending_evidence")
                         valuation_reasons, adjusted_slots = {}, {}
+                        detached_original = None
                         if original is not None:
                             if type(original) is not FormalScoreInput or original.security_id != sid:
                                 raise ValueError("final score base entry identity mismatch")
                             original.require_verified()
+                            detached_original = detached_source_payload(original)
                         valuation_inputs = tuple(valuation.input_for(sid, mid) for mid in v_metrics)
                         identity = member_identity(sid, policy.evidence_batch.industry["entries"][sid],
                             valuation_inputs, original)
@@ -423,15 +492,17 @@ def _install_final_inputs():
                                     or score.peer_context is not context):
                                 raise ValueError("final score Stage C score identity mismatch")
                             derived.append(score)
-                            if original is not None:
-                                slot = dict(original.slots[mid])
+                            if detached_original is not None:
+                                slot = dict(detached_original["slots"][mid])
                                 slot.update(value=score.percentile, evidence_kind="policy_adjusted_valuation",
-                                    metric_score=None, valuation_score=score.to_dict(),
-                                    valuation_context=context.to_dict(), valuation_input=adjusted.to_dict(),
+                                    metric_score=None,
+                                    valuation_score=detached_source_payload(score),
+                                    valuation_context=detached_source_payload(context),
+                                    valuation_input=detached_source_payload(adjusted),
                                     valuation_score_hash=score.score_hash,
                                     valuation_context_hash=context.context_hash)
                                 adjusted_slots[mid] = slot
-                        slots = {} if original is None else dict(original.slots)
+                        slots = {} if detached_original is None else dict(detached_original["slots"])
                         # A pending row must never expose an unadjusted V score as final.
                         for mid in v_metrics:
                             slots.pop(mid, None)
@@ -439,7 +510,7 @@ def _install_final_inputs():
                         if not reasons and (original is None or len(slots) != 25
                                 or len(set(slots) - set(v_metrics)) != 22 or len(adjusted_slots) != 3):
                             raise ValueError("ready final score requires 22 base and three Stage C slots")
-                        payload = {} if original is None else original.to_dict()
+                        payload = {} if detached_original is None else dict(detached_original)
                         payload.pop("batch_hash", None)
                         payload.pop("input_hash", None)
                         payload.update(identity)
@@ -447,7 +518,7 @@ def _install_final_inputs():
                             security_id=sid, status="pending_evidence" if reasons else "ready",
                             reasons=tuple(sorted(reasons)), slots=slots,
                             base_input_hash=None if original is None else original.input_hash,
-                            base_pending_reasons=base_reasons, policy_result=policy_result.to_dict(),
+                            base_pending_reasons=base_reasons, policy_result=detached_policy_result,
                             policy_result_hash=policy_result.result_hash,
                             policy_pending_requirements=policy_pending,
                             valuation_pending_reasons=valuation_reasons)

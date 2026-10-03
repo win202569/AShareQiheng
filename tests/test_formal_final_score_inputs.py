@@ -120,6 +120,108 @@ class FinalScoreInputContractTests(unittest.TestCase):
             self.assertEqual(replay.input_for(sid).entry_hash, self.batch.input_for(sid).entry_hash)
 
 
+class FinalScoreInputCanonicalDecodeTests(unittest.TestCase):
+    def test_detached_source_payload_preserves_fractional_lexemes_without_float(self):
+        import json
+
+        from ashare_pipeline.formal_final_repository import _serialize_payload
+
+        closure = inspect.getclosurevars(
+            FormalFinalScoreInputRepository.build_batch).nonlocals
+        self.assertIn("detached_source_payload", closure)
+        detach = closure["detached_source_payload"]
+        builder_source = inspect.getsource(FormalFinalScoreInputRepository.build_batch)
+        self.assertIn("detached_source_payload(original)", builder_source)
+        for forbidden in ("original.to_dict()", "policy_result.to_dict()", "score.to_dict()",
+                "context.to_dict()", "adjusted.to_dict()"):
+            self.assertNotIn(forbidden, builder_source)
+        for required in ('slot = dict(detached_original["slots"][mid])',
+                'dict(detached_original["slots"])',
+                "detached_policy_result = detached_source_payload(policy_result)",
+                "detached_original = detached_source_payload(original)",
+                "valuation_score=detached_source_payload(score)",
+                "valuation_context=detached_source_payload(context)",
+                "valuation_input=detached_source_payload(adjusted)",
+                "policy_pending = detached_policy_result[\"pending_requirements\"]",
+                "payload = {} if detached_original is None else dict(detached_original)",
+                "policy_result=detached_policy_result"):
+            self.assertIn(required, builder_source)
+        exact = "0.12345678901234568"
+        raw = ('{"count":7,"label":"深证","nested":[{"fraction":' + exact
+            + '},[2,3]],"whole":-2}').encode()
+
+        class Source:
+            def __init__(self, canonical):
+                self.canonical = canonical
+                self.calls = []
+
+            def require_verified(self):
+                self.calls.append("require_verified")
+
+            def canonical_bytes(self):
+                self.calls.append("canonical_bytes")
+                return self.canonical
+
+            def to_dict(self):
+                raise AssertionError("detached provenance must not use to_dict")
+
+        source = Source(raw)
+        payload = detach(source)
+        self.assertEqual(source.calls, ["require_verified", "canonical_bytes"])
+        self.assertEqual(payload["label"], "深证")
+        self.assertEqual(payload["nested"][0]["fraction"], exact)
+        self.assertIs(type(payload["count"]), int)
+        self.assertIs(type(payload["whole"]), int)
+
+        def values(value):
+            if type(value) is dict:
+                for item in value.values():
+                    yield from values(item)
+            elif type(value) is list:
+                for item in value:
+                    yield from values(item)
+            else:
+                yield value
+
+        self.assertFalse(any(type(value) is float for value in values(payload)))
+        serialized, _ = _serialize_payload(payload)
+        self.assertIn('"fraction":"' + exact + '"', serialized)
+        decoder = json.JSONDecoder
+        json.JSONDecoder = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("module JSONDecoder replacement escaped the captured boundary"))
+        try:
+            with self.assertRaisesRegex(ValueError, "dependency changed"):
+                detach(Source(raw))
+        finally:
+            json.JSONDecoder = decoder
+        self.assertEqual(detach(Source(raw)), payload)
+        decode_method = decoder.decode
+        decoder.decode = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("mutated JSONDecoder.decode reached the decode boundary"))
+        try:
+            with self.assertRaisesRegex(ValueError, "dependency changed"):
+                detach(Source(raw))
+        finally:
+            decoder.decode = decode_method
+        self.assertEqual(detach(Source(raw)), payload)
+        detect_encoding = json.detect_encoding
+        json.detect_encoding = lambda *_: (_ for _ in ()).throw(
+            AssertionError("detached source decoding must not detect bytes twice"))
+        try:
+            self.assertEqual(detach(Source(raw)), payload)
+        finally:
+            json.detect_encoding = detect_encoding
+        with self.assertRaisesRegex(ValueError, "canonical bytes are not UTF-8"):
+            detach(Source(b'{"label":"\xff"}'))
+        for invalid in (
+            b'{"value":NaN}', b'{"value":Infinity}', b'{"value":-Infinity}',
+            b' {"value":0.5}', b'{"z":1,"a":0.5}', b'{"value":0.5,"value":1}',
+            b'{"value":1e2}', b'{"value":1.2300}', b'{"value":1E+00}',
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                detach(Source(invalid))
+
+
 class FinalScoreInputReadyTests(unittest.TestCase):
     def test_ready_input_contains_22_base_slots_and_exactly_three_stage_c_scores(self):
         fixture = FinalScoringFixture(peer_count=20)
