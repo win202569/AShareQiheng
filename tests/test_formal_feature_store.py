@@ -23,7 +23,9 @@ from ashare_pipeline.formal_feature_store import (
 
 
 PROJECT_TEST_TEMP_ROOT = (
-    Path(__file__).resolve().parents[1] / ".tmp" / "formal-feature-store-tests"
+    Path(tempfile.gettempdir()).resolve()
+    / "AShareQiheng"
+    / "formal-feature-store-tests"
 )
 
 
@@ -90,6 +92,19 @@ def create_directory_link(link: Path, target: Path) -> None:
             raise OSError(result.stderr or result.stdout or "junction creation failed")
     else:
         os.symlink(target, link, target_is_directory=True)
+
+
+class ProjectTemporaryDirectoryTests(unittest.TestCase):
+    def test_helper_uses_writable_user_temp_root(self) -> None:
+        declared_temp_root = Path(tempfile.gettempdir()).resolve()
+        self.assertTrue(PROJECT_TEST_TEMP_ROOT.resolve().is_relative_to(declared_temp_root))
+
+        with project_temporary_directory() as directory:
+            probe = Path(directory) / "write-probe.txt"
+            probe.write_text("temporary root is writable", encoding="utf-8")
+            self.assertEqual(probe.read_text(encoding="utf-8"), "temporary root is writable")
+            probe.unlink()
+            self.assertEqual(Path(directory).parent.resolve(), PROJECT_TEST_TEMP_ROOT.resolve())
 
 
 class FormalFeatureStoreTests(unittest.TestCase):
