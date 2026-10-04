@@ -1158,6 +1158,25 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
             writer.rollback()
             writer.close()
 
+    def test_empty_wal_created_by_writer_connection_is_same_durable_generation(self):
+        wal = self.db_path.with_name(self.db_path.name + "-wal")
+        self.assertFalse(wal.exists())
+        coverage = self.audit()
+        self.assertFalse(wal.exists())
+        coverage.require_official_ready()
+        main_hash = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+        writer = self.registry_repository._connect()
+        try:
+            self.assertTrue(wal.is_file())
+            self.assertEqual(wal.stat().st_size, 0)
+            writer.execute("BEGIN IMMEDIATE")
+            self.assertEqual(wal.stat().st_size, 0)
+            self.assertEqual(hashlib.sha256(self.db_path.read_bytes()).hexdigest(), main_hash)
+            coverage.require_official_ready()
+        finally:
+            writer.rollback()
+            writer.close()
+
     def test_recheck_timestamp_is_noncanonical_even_in_repository_receipt(self):
         early = [dict(row, rechecked_at_utc="2026-10-01T00:00:00+00:00") for row in self.records]
         late = [dict(row, rechecked_at_utc="2026-10-02T00:00:00+00:00") for row in self.records]
@@ -1174,6 +1193,7 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
         result.require_official_ready()
         wal_path = self.db_path.with_name(self.db_path.name + "-wal")
         wal_path.write_bytes(b"new-uncheckpointed-content")
+        self.assertGreater(wal_path.stat().st_size, 0)
         with self.assertRaisesRegex(ValueError, "database"):
             result.require_official_ready()
 

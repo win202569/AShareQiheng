@@ -269,10 +269,14 @@ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
             if not path.is_file():
                 raise ValueError("official coverage database sidecar is invalid")
             digest = hashlib.sha256()
+            size = 0
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(chunk)
-            hashes[suffix] = digest.hexdigest()
+                    size += len(chunk)
+            # SQLite can create an empty WAL when a writer enters WAL mode. With no
+            # frames it carries no durable generation beyond the main DB.
+            hashes[suffix] = None if suffix == "-wal" and size == 0 else digest.hexdigest()
         return hashes
 
     before = db_hashes()
