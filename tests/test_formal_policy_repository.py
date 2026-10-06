@@ -18,6 +18,7 @@ class PolicyRepositoryTests(unittest.TestCase):
         self.api = importlib.import_module("ashare_pipeline.formal_policy_repository")
 
     def fixture(self, **kwargs):
+        kwargs.setdefault("valuation_adapter", True)
         fixture = PolicyRuntimeFixture(range_enabled=True, **kwargs)
         self.addCleanup(fixture.close)
         return fixture
@@ -118,7 +119,8 @@ class PolicyRepositoryTests(unittest.TestCase):
         thread.start()
         thread.join()
         self.assertEqual(len(thread_errors), 1)
-        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
+        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry,
+                    expected_purpose=fixture.purpose)
         with self.assertRaises(ValueError):
             fixture.policy_repository._build_batch_in_owner_scope(
                 fixture.frozen.frozen_input_hash, owner_scope=object(), **args)
@@ -146,7 +148,8 @@ class PolicyRepositoryTests(unittest.TestCase):
             as_of_utc=universe.as_of_utc,
             population=tuple(universe.security_ids),
             required_keys=tuple((sid,) for sid in universe.security_ids))
-        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
+        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry,
+                    expected_purpose=fixture.purpose)
         with patch.object(FormalPolicyFinancialRepository, "_batch_recheck_ticket", lambda *_: None):
             with self.assertRaises(ValueError):
                 fixture.policy_repository._build_batch_in_owner_scope(
@@ -168,7 +171,8 @@ class PolicyRepositoryTests(unittest.TestCase):
             as_of_utc=universe.as_of_utc,
             population=tuple(universe.security_ids),
             required_keys=tuple((sid,) for sid in universe.security_ids))
-        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
+        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry,
+                    expected_purpose=fixture.purpose)
         with self.assertRaises(ValueError):
             fixture.policy_repository._build_batch_in_owner_scope(
                 "0" * 64, owner_scope=scope, **args)

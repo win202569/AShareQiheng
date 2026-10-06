@@ -29,6 +29,16 @@ NO_CAP_PEER = "SH600000"
 _SHARED = None
 
 
+def _canonical_d1_decimal(value):
+    if type(value) is not str:
+        raise AssertionError(
+            f"canonical D1 number must be str, got {type(value).__name__}")
+    converted = Decimal(value)
+    if not converted.is_finite():
+        raise AssertionError("canonical D1 number must be finite")
+    return converted
+
+
 def d1_batch(fixture):
     repository = FormalFinalScoreInputRepository(fixture.feature_repository,
         fixture.context, fixture.range_store, registry_signature_verifier=fixture.verifier)
@@ -93,15 +103,18 @@ class FinalScoreArithmeticTests(unittest.TestCase):
 
     def test_final_card_rebuilds_all_seven_dimensions_from_final_slots(self):
         card, row = self.card, self.row
+        wire = row.to_dict()
         self.assertIsInstance(card, FinalScoreCard)
         self.assertEqual(row.status, "ready")
-        self.assertEqual(len(row.slots), 25)
-        self.assertEqual(len([s for s in row.slots.values()
+        self.assertEqual(len(wire["slots"]), 25)
+        self.assertEqual(len([s for s in wire["slots"].values()
             if s["evidence_kind"] == "policy_adjusted_valuation"]), 3)
         with localcontext(_arithmetic_context()):
             for dimension in DIMENSIONS:
-                expected = sum((slot["internal_weight"] * slot["value"]
-                    for mid, slot in row.slots.items() if mid.startswith(dimension + ".")),
+                expected = sum((_canonical_d1_decimal(slot["internal_weight"])
+                    * _canonical_d1_decimal(slot["value"])
+                    for mid, slot in wire["slots"].items()
+                    if mid.startswith(dimension + ".")),
                     Decimal("0"))
                 self.assertEqual(card.raw_dimensions[dimension], expected)
         self.assertEqual(tuple(card.raw_dimensions), DIMENSIONS)
@@ -136,7 +149,7 @@ class FinalScoreArithmeticTests(unittest.TestCase):
                 for item in card.cap_trace))
         self.assertEqual(card.confidence,
             _calculate_untrusted_confidence(dict(card.global_slot_weights),
-                {mid: self.row.slots[mid]["temporal_quality"]
+                {mid: _canonical_d1_decimal(self.row.slots[mid]["temporal_quality"])
                     for mid in card.global_slot_weights},
                 continuous_fy_count=self.row.continuous_fy_count,
                 confidence_cap=Decimal(self.row.confidence_cap)))
@@ -159,7 +172,8 @@ class FinalScoreArithmeticTests(unittest.TestCase):
             expected_b = Decimal("50") + card.confidence["C"] * (expected_sbase - Decimal("50"))
         self.assertEqual((card.S0, card.Sc, card.Sbase, card.B),
             (expected_s0, expected_sc, expected_sbase, expected_b))
-        risk = {mid: self.row.slots[mid]["value"] for mid in RISK_IDS}
+        risk = {mid: _canonical_d1_decimal(self.row.slots[mid]["value"])
+                for mid in RISK_IDS}
         expected = _calculate_untrusted_arithmetic(dimensions=dict(card.dimensions),
             confidence=card.confidence["C"], metric_values=risk)
         for key in ("M_persistence", "CA_downside", "R_safety", "risk_exposure"):
@@ -205,7 +219,8 @@ class FinalScoreArithmeticTests(unittest.TestCase):
         self.assertEqual(card.raw_dimensions, card.dimensions)
         expected = _calculate_untrusted_arithmetic(dimensions=dict(card.dimensions),
             confidence=card.confidence["C"],
-            metric_values={mid: row.slots[mid]["value"] for mid in RISK_IDS})
+            metric_values={mid: _canonical_d1_decimal(row.slots[mid]["value"])
+                for mid in RISK_IDS})
         for key, value in expected.items():
             self.assertEqual(getattr(card, key), value)
         self.assertNotEqual(type(card), type(calculate_pre_policy_score(

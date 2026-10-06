@@ -12,6 +12,21 @@ from ashare_pipeline.formal_universe import FormalUniverseDecision
 from tests.formal_metric_feature_fixtures import FinancialFixture, METRICS
 
 
+def _v2_financial_fixture(**kwargs):
+    purpose = kwargs.get("purpose", "official")
+    caller_mutate = kwargs.pop("mutate", None)
+
+    def add_valuation_adapter(documents):
+        documents["valuation_adapter"] = dict(
+            registry_role="valuation_adapter", schema_version="fixture-v1", purpose=purpose)
+        if caller_mutate is not None:
+            caller_mutate(documents)
+
+    kwargs["mutate"] = add_valuation_adapter
+    kwargs["manifest_version"] = "formal-registry-manifest-v2"
+    return FinancialFixture(**kwargs)
+
+
 class PercentileArithmeticTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_metric_engine"),
@@ -63,7 +78,7 @@ class CompleteMetricBatchTests(unittest.TestCase):
         cls.api = importlib.import_module("ashare_pipeline.formal_metric_engine")
         if not hasattr(cls.api, "FormalMetricInputRepository"):
             return
-        cls.fixture = FinancialFixture(population=True)
+        cls.fixture = _v2_financial_fixture(population=True)
         cls.addClassCleanup(cls.fixture.close)
         cls.fixture.populate()
         cls.repo = cls.api.FormalMetricInputRepository(cls.fixture.feature_repository, cls.fixture.context,
@@ -142,7 +157,7 @@ class CompleteMetricBatchTests(unittest.TestCase):
 class MetricClosureTests(unittest.TestCase):
     def setUp(self):
         self.api = importlib.import_module("ashare_pipeline.formal_metric_engine")
-        self.fixture = FinancialFixture()
+        self.fixture = _v2_financial_fixture()
         self.addCleanup(self.fixture.close)
         for sid in ("BJ430001", "SH600000", "SZ000001"):
             self.fixture.put_industry(sid)
@@ -216,7 +231,7 @@ class MetricClosureTests(unittest.TestCase):
         self.assertNotEqual(first.definition_hash, second.definition_hash)
 
     def test_definition_hash_is_stable_and_engine_captures_shared_producer(self):
-        expected = "96d0cb000910df365d981f826f125c2668bdbb55ca31d864f7a957cdafb4e774"
+        expected = "01c9d36af83611703d60bae286308cd39ff383486d95dcc1dc68f2f7db2c17fa"
         batch = self.build(metric_ids=(METRICS[0],))
         self.assertEqual(batch.input_for("BJ430001", METRICS[0]).definition_hash, expected)
         with patch.object(self.api, "_scoring_metric_definitions", side_effect=AssertionError("replacement called")):
@@ -299,7 +314,7 @@ class MetricClosureTests(unittest.TestCase):
 class AllPendingRepositoryTests(unittest.TestCase):
     def test_all_missing_memberships_do_not_allow_a_copied_feature_repository(self):
         api = importlib.import_module("ashare_pipeline.formal_metric_engine")
-        fixture = FinancialFixture(missing_memberships=True)
+        fixture = _v2_financial_fixture(missing_memberships=True)
         self.addCleanup(fixture.close)
         genuine = api.FormalMetricInputRepository(fixture.feature_repository, fixture.context,
             registry_signature_verifier=fixture.verifier)

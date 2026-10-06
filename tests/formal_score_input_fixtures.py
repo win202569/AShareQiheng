@@ -16,10 +16,13 @@ FOCAL = "BJ430001"
 
 
 class ScoreFixture(FinancialFixture):
-    def __init__(self, *, linked=True, cyclic=False, extra_required=False, date_only=False, population=True):
+    def __init__(self, *, linked=True, cyclic=False, extra_required=False, date_only=False,
+                 population=True, purpose="official"):
         self.calendar_requests = {}
         self.date_only = date_only
         def configure(docs):
+            docs["valuation_adapter"] = dict(registry_role="valuation_adapter",
+                schema_version="fixture-v1", purpose=purpose)
             # Twenty-four independently signed slots deliberately share one toy
             # source field; expectation remains separately missing-capable.
             for slot in docs["feature"]["slots"]:
@@ -57,7 +60,9 @@ class ScoreFixture(FinancialFixture):
                 docs["feature"]["slots"].append(slot)
                 docs["feature"]["slots"].sort(key=lambda s: s["slot_id"])
             docs["feature"]["source_registry_hash"] = hashlib.sha256(canonical(docs["source"])).hexdigest()
-        super().__init__(population=population, mutate=configure, calendar_binding_resolver=self.resolve_raw_calendar)
+        super().__init__(population=population, mutate=configure,
+            calendar_binding_resolver=self.resolve_raw_calendar,
+            manifest_version="formal-registry-manifest-v2", purpose=purpose)
 
     def resolve_raw_calendar(self, candidate):
         request = self.calendar_requests.get(candidate.canonical_json_bytes())
@@ -67,7 +72,8 @@ class ScoreFixture(FinancialFixture):
         if request.official_request.canonical_json_bytes() != candidate.canonical_json_bytes():
             raise ValueError("fixture calendar request identity mismatch")
         return self.context.resolve_verified_calendar_binding(CalendarSelector(**wire["calendar_selector"]),
-            candidate.exchange, wire["as_of_utc"], wire["registry_manifest_hash"])
+            candidate.exchange, wire["as_of_utc"], wire["registry_manifest_hash"],
+            expected_purpose=self.purpose)
 
     def populate_scores(self, *, missing=(), mature=True, five_years=False, consensus="covered"):
         for index, member in enumerate(self.industry["memberships"]):

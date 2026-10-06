@@ -171,7 +171,8 @@ class FinalScoreInputGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "authenticated v2 root"):
             snapshot(legacy.feature_repository, legacy.verifier,
                 legacy.bundle.manifest.manifest_hash, legacy.scoring,
-                legacy.policy_registry, self.fixture.valuation_registry)
+                legacy.policy_registry, self.fixture.valuation_registry,
+                expected_purpose="official")
         self.assertNotIsInstance(self.sources.base, PolicyAdjustedScoreInputBatch)
         self.assertIsInstance(self.sources.base, FormalScoreInputBatch)
         for candidate in (self.sources.base, self.sources.policy, self.sources.valuation,

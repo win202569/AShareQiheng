@@ -3,6 +3,7 @@
 from decimal import Decimal
 import hashlib
 import inspect
+import json
 import unittest
 
 from ashare_pipeline.formal_final_score_inputs import (
@@ -122,8 +123,6 @@ class FinalScoreInputContractTests(unittest.TestCase):
 
 class FinalScoreInputCanonicalDecodeTests(unittest.TestCase):
     def test_detached_source_payload_preserves_fractional_lexemes_without_float(self):
-        import json
-
         from ashare_pipeline.formal_final_repository import _serialize_payload
 
         closure = inspect.getclosurevars(
@@ -244,10 +243,22 @@ class FinalScoreInputReadyTests(unittest.TestCase):
         self.assertEqual(row.reasons, ())
         self.assertEqual(len(row.slots), 25)
         base = sources.base.input_for(FOCAL)
+        row_wire = json.loads(row.canonical_bytes(), parse_float=str)
+        base_wire = json.loads(base.canonical_bytes(), parse_float=str)
+
+        def contains_float(value):
+            if isinstance(value, dict):
+                return any(contains_float(item) for item in value.values())
+            if isinstance(value, (list, tuple)):
+                return any(contains_float(item) for item in value)
+            return isinstance(value, float)
+
+        self.assertFalse(contains_float(row_wire))
+        self.assertFalse(contains_float(base_wire))
         non_v = set(row.slots) - set(V_METRICS)
         self.assertEqual(len(non_v), 22)
         for mid in non_v:
-            self.assertEqual(row.slots[mid], base.slots[mid])
+            self.assertEqual(row_wire["slots"][mid], base_wire["slots"][mid])
         for mid in V_METRICS:
             context = build_valuation_peer_context(sources.valuation, metric_id=mid, security_id=FOCAL)
             score = score_valuation_percentile(sources.valuation, context)
@@ -256,8 +267,10 @@ class FinalScoreInputReadyTests(unittest.TestCase):
             slot = row.slots[mid]
             self.assertEqual(slot["evidence_kind"], "policy_adjusted_valuation")
             self.assertEqual(slot["value"], score.percentile)
-            self.assertEqual(row.to_dict()["slots"][mid]["valuation_score"], score.to_dict())
-            self.assertEqual(row.to_dict()["slots"][mid]["valuation_context"], context.to_dict())
+            self.assertEqual(row_wire["slots"][mid]["valuation_score"],
+                json.loads(score.canonical_bytes(), parse_float=str))
+            self.assertEqual(row_wire["slots"][mid]["valuation_context"],
+                json.loads(context.canonical_bytes(), parse_float=str))
             self.assertEqual(slot["valuation_score_hash"], score.score_hash)
             self.assertEqual(slot["valuation_context_hash"], context.context_hash)
             self.assertIsNone(slot["metric_score"])

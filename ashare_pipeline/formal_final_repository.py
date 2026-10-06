@@ -133,32 +133,57 @@ def _coverage_identity(coverage, wire, ids):
             raise ValueError("coverage root or universe identity mismatch")
 
 
-def _coverage_live_gate(coverage, mode):
-    if mode == "official_candidate":
-        coverage.require_official_ready()
-    elif not coverage.blockers:
-        coverage.require_preview_ready()
+def _require_official_code_version(mode, code_version, coverage):
+    if mode == "official_candidate" and (
+            type(code_version) is not str
+            or code_version != coverage.get("workspace_revision")):
+        raise ValueError("official candidate code version must equal coverage workspace revision")
 
 
-def _bind_coverage_postwrite_gate():
-    provenance_gate = VerifiedCoverageManifest._recheck_official_provenance
+def _bind_coverage_gates():
+    coverage_type = VerifiedCoverageManifest
+    require_code_version = _require_official_code_version
+    method_names = (
+        "_data", "require_verified", "require_preview_ready", "require_official_ready",
+        "_recheck_official_provenance", "_recheck_official_workspace",
+        "canonical_bytes", "to_dict",
+    )
+    methods = tuple((name, getattr(coverage_type, name)) for name in method_names)
+    captured = dict(methods)
+
+    def data(coverage):
+        if (type(coverage) is not coverage_type
+                or any(getattr(coverage_type, name) is not method
+                       for name, method in methods)):
+            raise ValueError("run coverage authority changed")
+        return captured["_data"](coverage)
+
+    def live_gate(coverage, mode, code_version=None):
+        wire = data(coverage)
+        require_code_version(mode, code_version, wire)
+        if mode == "official_candidate":
+            captured["require_official_ready"](coverage)
+        elif mode == "test_preview":
+            if not wire["blockers"]:
+                captured["require_preview_ready"](coverage)
+        else:
+            raise ValueError("Stage D run mode is invalid")
 
     def postwrite_gate(coverage, mode):
-        if (type(coverage) is not VerifiedCoverageManifest
-                or VerifiedCoverageManifest._recheck_official_provenance is not provenance_gate):
-            raise ValueError("run coverage provenance authority changed")
+        wire = data(coverage)
         if mode == "official_candidate" or (
-                mode == "test_preview" and not coverage.blockers
-                and coverage.to_dict().get("authenticated_context")):
-            provenance_gate(coverage)
+                mode == "test_preview" and not wire["blockers"]
+                and wire.get("authenticated_context")):
+            captured["_recheck_official_workspace"](coverage)
+            captured["_recheck_official_provenance"](coverage)
         elif mode != "test_preview":
             raise ValueError("Stage D run mode is invalid")
 
-    return postwrite_gate
+    return live_gate, postwrite_gate
 
 
-_coverage_postwrite_gate = _bind_coverage_postwrite_gate()
-del _bind_coverage_postwrite_gate
+_coverage_live_gate, _coverage_postwrite_gate = _bind_coverage_gates()
+del _bind_coverage_gates
 
 
 def _recheck_sources(store, coverage, batches, mode, publication, connection):
@@ -439,7 +464,7 @@ class FormalFinalRunRepository:
             batch.require_verified()
         wires = tuple(batch.to_dict() for batch in batches)
         _coverage_identity(coverage_manifest, wires[0], tuple(wires[0]["security_ids"]))
-        _coverage_live_gate(coverage_manifest, mode)
+        _coverage_live_gate(coverage_manifest, mode, self._code_version)
         publication = _prepare_publication(input_batch=input_batch, score_batch=score_batch,
             eligibility_batch=eligibility_batch, pool_batch=pool_batch)
         recheck, prevalidate, arm, mark_committed, revoke, source_hold = _publication_controls(publication)
@@ -486,7 +511,7 @@ class FormalFinalRunRepository:
                 source_guard.__enter__()
                 connection.execute("BEGIN IMMEDIATE")
                 _recheck_sources(self._store, coverage_manifest, batches, mode, recheck, connection)
-                _coverage_live_gate(coverage_manifest, mode)
+                _coverage_live_gate(coverage_manifest, mode, self._code_version)
                 for table in _TABLES:
                     items = expected[table]
                     columns = tuple(items[0]) if items else empty_columns.get(table)
@@ -576,7 +601,9 @@ def _install_rebuild_planner(repository_type):
     verify_sources = authorities["verify_sources"]
     input_type, coverage_type = PolicyAdjustedScoreInputBatch, VerifiedCoverageManifest
     coverage_methods = tuple((name, getattr(coverage_type, name)) for name in
-        ("require_verified", "require_preview_ready", "require_official_ready", "canonical_bytes", "to_dict", "_data"))
+        ("require_verified", "require_preview_ready", "require_official_ready",
+         "_recheck_official_provenance", "_recheck_official_workspace",
+         "canonical_bytes", "to_dict", "_data"))
     read_run = repository_type._read_run
     serialize, identity, coverage_identity = _serialize_payload, _input_identity, _coverage_identity
     coverage_live_gate = _coverage_live_gate
@@ -617,7 +644,7 @@ def _install_rebuild_planner(repository_type):
             if serialize(inputs)[0].encode() != raw:
                 raise ValueError("rebuild input bytes are not canonical")
             coverage_identity(coverage_manifest, inputs, tuple(inputs["security_ids"]))
-            coverage_live_gate(coverage_manifest, mode)
+            coverage_live_gate(coverage_manifest, mode, self._code_version)
             coverage_raw = coverage_manifest.canonical_bytes()
             coverage = json.loads(coverage_raw)
             with self._store._transaction() as connection:
@@ -639,7 +666,7 @@ def _install_rebuild_planner(repository_type):
                 raise ValueError("rebuild sources changed while deriving the plan")
             dependencies(retention[0])
             coverage_identity(coverage_manifest, inputs, tuple(inputs["security_ids"]))
-            coverage_live_gate(coverage_manifest, mode)
+            coverage_live_gate(coverage_manifest, mode, self._code_version)
             if coverage_manifest.canonical_bytes() != coverage_raw:
                 raise ValueError("rebuild coverage changed while deriving the plan")
             checkpoint.recheck()

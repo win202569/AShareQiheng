@@ -219,7 +219,8 @@ class OwnerCoverageAdapterTests(unittest.TestCase):
             for slot in documents["feature"]["slots"]:
                 if ".policy." not in slot["slot_id"]:
                     slot["formula"]["fact_key"] = "coverage.shared"
-        cls.fixture = PolicyRuntimeFixture(range_enabled=True, cyclic=False, mutate=shared_metric_fact)
+        cls.fixture = PolicyRuntimeFixture(
+            range_enabled=True, cyclic=False, mutate=shared_metric_fact, valuation_adapter=True)
         cls.addClassCleanup(cls.fixture.close)
         f = cls.fixture
         cls.features = {}
@@ -234,7 +235,7 @@ class OwnerCoverageAdapterTests(unittest.TestCase):
             cls.features[sid] = f.persist_features(sid)
         cls.batch, cls.revoke_batch, _ = f.policy_repository._build_batch(
             f.frozen.frozen_input_hash, scoring_registry=f.scoring,
-            policy_registry=f.policy_registry, owner_scope=None)
+            policy_registry=f.policy_registry, owner_scope=None, expected_purpose=f.purpose)
         cls.status_path = f.root / "coverage-status.json"
         cls.status_path.write_text(json.dumps({
             "generated_at_utc": "2026-09-01T00:00:00+00:00", "schema_version": SCHEMA_VERSION,
@@ -406,7 +407,8 @@ class OwnerCoverageAdapterTests(unittest.TestCase):
     def test_revoked_policy_publication_invalidates_both_coverage_gates(self):
         f = self.fixture
         batch, revoke, _ = f.policy_repository._build_batch(f.frozen.frozen_input_hash,
-            scoring_registry=f.scoring, policy_registry=f.policy_registry, owner_scope=None)
+            scoring_registry=f.scoring, policy_registry=f.policy_registry, owner_scope=None,
+            expected_purpose=f.purpose)
         result = self.audit("policy", policy_batch=batch)
         revoke(batch)
         for gate in (result.require_preview_ready, result.require_official_ready):
@@ -420,7 +422,7 @@ class MarketRangeCoverageAdapterTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
-        cls.fixture = PolicyRuntimeFixture(range_enabled=True, cyclic=False, templates={"SH600000": "bank"},
+        cls.fixture = PolicyRuntimeFixture(range_enabled=True, cyclic=False, valuation_adapter=True, templates={"SH600000": "bank"},
                                           extra_members=("BJ430001", "SZ000001"))
         cls.addClassCleanup(cls.fixture.close)
         f = cls.fixture
@@ -431,7 +433,7 @@ class MarketRangeCoverageAdapterTests(unittest.TestCase):
         cls.features = {}
         cls.batch, cls.revoke_batch, _ = f.policy_repository._build_batch(
             f.frozen.frozen_input_hash, scoring_registry=f.scoring,
-            policy_registry=f.policy_registry, owner_scope=None)
+            policy_registry=f.policy_registry, owner_scope=None, expected_purpose=f.purpose)
         cls.status_path = f.root / "coverage-status.json"
         cls.status_path.write_text(json.dumps(dict(generated_at_utc="2026-09-01T00:00:00+00:00",
             schema_version=SCHEMA_VERSION, db_sha256=hashlib.sha256(f.db_path.read_bytes()).hexdigest(),
@@ -834,11 +836,83 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
         self.assertEqual(sorted(set(self.calls)), sorted(req.security_id for req in self.requirements))
         self.assertEqual(len(result.rows), len(self.frozen.members))
         self.assertTrue(all("repository_provenance" in row for row in result.rows))
-        for field in ("workspace_revision", "db_path", "db_sha256", "db_schema_versions",
+        for field in ("workspace_revision", "workspace_tree", "db_path", "db_sha256", "db_schema_versions",
                       "expected_schema_version", "status_generated_at_utc", "universe_source",
                       "universe_records_hash", "frozen_input_hash", "registry_manifest_hash",
                       "member_count", "member_count_by_exchange", "report_period", "query_version"):
             with self.subTest(field=field): self.assertIn(field, result.to_dict())
+
+    def test_repository_gate_rejects_noop_official_method_on_real_official_manifest(self):
+        import ashare_pipeline.formal_final_repository as runs
+
+        identity = {"workspace_revision": "a" * 40, "workspace_tree": "b" * 40}
+        with patch.object(coverage_module, "_read_workspace_git_identity",
+                          return_value=identity):
+            coverage = self.audit()
+        original = type(coverage).require_official_ready
+        type.__setattr__(type(coverage), "require_official_ready", lambda _self: None)
+        try:
+            with self.assertRaisesRegex(ValueError, "coverage authority changed"):
+                runs._coverage_live_gate(
+                    coverage, "official_candidate", identity["workspace_revision"])
+        finally:
+            type.__setattr__(type(coverage), "require_official_ready", original)
+
+    def test_official_candidate_rejects_code_version_not_equal_to_workspace_revision(self):
+        import ashare_pipeline.formal_final_repository as runs
+
+        identity = {"workspace_revision": "a" * 40, "workspace_tree": "b" * 40}
+        with patch.object(coverage_module, "_read_workspace_git_identity",
+                          return_value=identity):
+            coverage = self.audit()
+            with self.assertRaisesRegex(ValueError, "code version"):
+                runs._coverage_live_gate(coverage, "official_candidate", "release-label")
+
+    def test_postwrite_gate_rechecks_only_workspace_identity_and_rejects_change(self):
+        import ashare_pipeline.formal_final_repository as runs
+
+        identity = {"workspace_revision": "a" * 40, "workspace_tree": "b" * 40}
+        with patch.object(coverage_module, "_read_workspace_git_identity",
+                          return_value=identity):
+            coverage = self.audit()
+        changed = dict(identity, workspace_tree="c" * 40)
+        with patch.object(coverage_module, "_read_workspace_git_identity",
+                          return_value=changed), self.assertRaisesRegex(
+                              ValueError, "workspace"):
+            runs._coverage_postwrite_gate(coverage, "official_candidate")
+
+    def test_official_gate_rechecks_workspace_tree_after_mint(self):
+        identity = {"workspace_revision": "a" * 40, "workspace_tree": "b" * 40}
+        with patch.object(coverage_module, "_read_workspace_git_identity",
+                          return_value=identity):
+            coverage = self.audit()
+        self.assertEqual(coverage.to_dict()["workspace_tree"], identity["workspace_tree"])
+        with patch.object(coverage_module, "_read_workspace_git_identity",
+                          return_value=dict(identity, workspace_tree="c" * 40)), \
+                self.assertRaisesRegex(ValueError, "workspace"):
+            coverage.require_official_ready()
+
+    def test_official_workspace_gate_rejects_helper_binding_and_code_replacement(self):
+        identity = {"workspace_revision": "a" * 40, "workspace_tree": "b" * 40}
+        with patch.object(coverage_module, "_read_workspace_git_identity",
+                          return_value=identity):
+            coverage = self.audit()
+
+        with patch.object(coverage_module, "_require_workspace_git_identity",
+                          lambda *_args, **_kwargs: None), patch.object(
+                              coverage_module, "_read_workspace_git_identity",
+                              lambda *_args, **_kwargs: identity):
+            with self.assertRaisesRegex(ValueError, "workspace authority changed"):
+                coverage._recheck_official_workspace()
+
+        require = coverage_module._require_workspace_git_identity
+        original_code = require.__code__
+        try:
+            require.__code__ = (lambda *_args, **_kwargs: None).__code__
+            with self.assertRaisesRegex(ValueError, "workspace authority changed"):
+                coverage._recheck_official_workspace()
+        finally:
+            require.__code__ = original_code
 
     def test_postwrite_gate_ignores_own_wal_but_rechecks_live_owner_provenance(self):
         import ashare_pipeline.formal_final_repository as runs

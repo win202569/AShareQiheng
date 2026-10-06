@@ -10,7 +10,7 @@ from contextlib import closing, nullcontext
 from unittest.mock import patch
 from types import SimpleNamespace
 
-from tests.test_formal_final_repository import minimal_batches
+from tests.test_formal_final_repository import fresh_minimal_batches, minimal_batches
 from tests.test_formal_final_migration import TABLES
 
 
@@ -107,6 +107,10 @@ class FormalFinalAuthorityBoundaryTests(unittest.TestCase):
         def postwrite_gate(_coverage, _mode):
             events.append(("provenance_gate", writer.in_transaction, inserted[0]))
 
+        def live_gate(coverage, mode, _code_version=None):
+            case.assertEqual(mode, "official_candidate")
+            coverage.require_official_ready()
+
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "ordering.sqlite",
                 registry_signature_verifier=AcceptingVerifier())
@@ -126,6 +130,7 @@ class FormalFinalAuthorityBoundaryTests(unittest.TestCase):
                     module, "_writer_connection", return_value=writer), patch.object(
                     module, "_insert_rows", insert), patch.object(
                     module, "_verify_persisted", return_value=None), patch.object(
+                    module, "_coverage_live_gate", live_gate), patch.object(
                     module, "_coverage_postwrite_gate", postwrite_gate):
                 repository.commit_complete_run(mode="official_candidate",
                     coverage_manifest=Coverage(), input_batch=batches[0],
@@ -636,17 +641,25 @@ class FormalFinalAtomicityContractTests(unittest.TestCase):
     def test_zz_real_source_correction_and_provider_change_after_preparation_abort(self):
         import ashare_pipeline.formal_final_repository as module
         from dataclasses import replace
-        before = self.counts()
+        fixture, batches = fresh_minimal_batches()
+        self.addCleanup(fixture.close)
+        repository = module.FormalFinalRunRepository(fixture.store, code_version="task9-test")
+
+        def counts():
+            with closing(fixture.store._connect()) as connection:
+                return tuple(connection.execute("SELECT COUNT(*) FROM " + name).fetchone()[0]
+                    for name in TABLES)
+        before = counts()
         prepare = module._prepare_publication
         captured = []
-        with closing(self.fixture.store._connect()) as connection:
+        with closing(fixture.store._connect()) as connection:
             row = connection.execute("SELECT id,content_sha256 FROM formal_source_snapshot LIMIT 1").fetchone()
         self.assertIsNotNone(row)
 
         def corrected_source(**kwargs):
             publication = prepare(**kwargs)
             captured.append(publication)
-            with closing(self.fixture.store._connect()) as connection:
+            with closing(fixture.store._connect()) as connection:
                 connection.execute("UPDATE formal_source_snapshot SET content_sha256=? WHERE id=?",
                     ("e" * 64, row["id"]))
                 connection.commit()
@@ -654,31 +667,33 @@ class FormalFinalAtomicityContractTests(unittest.TestCase):
         try:
             with patch.object(module, "_prepare_publication", corrected_source):
                 with self.assertRaisesRegex(ValueError, "current-source"):
-                    self.repository.commit_complete_run(**self.batches)
+                    repository.commit_complete_run(**batches)
         finally:
-            with closing(self.fixture.store._connect()) as connection:
+            with closing(fixture.store._connect()) as connection:
                 connection.execute("UPDATE formal_source_snapshot SET content_sha256=? WHERE id=?",
                     (row["content_sha256"], row["id"]))
                 connection.commit()
-        self.assertEqual(self.counts(), before)
-        for proof in captured.pop().batches:
+        self.assertEqual(counts(), before)
+        publication = captured.pop()
+        for proof in publication.batches + publication.children:
             with self.assertRaises(ValueError):
                 proof.require_verified()
 
         def changed_provider(**kwargs):
             publication = prepare(**kwargs)
             captured.append(publication)
-            sid = next(iter(self.fixture.templates))
-            snapshot = self.fixture.provider.resolve_current_inputs(security_id=sid,
-                as_of_utc=self.batches["input_batch"].as_of_utc,
-                template_id=self.fixture.templates[sid],
-                registry_manifest_hash=self.batches["input_batch"].registry_manifest_hash)
-            self.fixture.provider.publish(replace(snapshot, batch_id="post-preparation-correction"))
+            sid = next(iter(fixture.templates))
+            snapshot = fixture.provider.resolve_current_inputs(security_id=sid,
+                as_of_utc=batches["input_batch"].as_of_utc,
+                template_id=fixture.templates[sid],
+                registry_manifest_hash=batches["input_batch"].registry_manifest_hash)
+            fixture.provider.publish(replace(snapshot, batch_id="post-preparation-correction"))
             return publication
         with patch.object(module, "_prepare_publication", changed_provider):
             with self.assertRaisesRegex(ValueError, "current-source provider"):
-                self.repository.commit_complete_run(**self.batches)
-        self.assertEqual(self.counts(), before)
-        for proof in captured.pop().batches:
+                repository.commit_complete_run(**batches)
+        self.assertEqual(counts(), before)
+        publication = captured.pop()
+        for proof in publication.batches + publication.children:
             with self.assertRaises(ValueError):
                 proof.require_verified()

@@ -80,16 +80,21 @@ class FormalFeatureRepositoryTests(unittest.TestCase):
 
     def install_registry(self, *, required=True, templates=TEMPLATES, purpose="official", wrong_binding=False,
                          period_key="FY2025"):
-        roles = ("source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event")
+        roles = ("source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event",
+                 "valuation_adapter")
         raw = {role: canonical_bytes({"registry_role": role, "schema_version": "fixture-v1"}) for role in roles}
         raw["source"] = canonical_bytes({"registry_role": "source", "schema_version": "formal-source-registry-v1", "configs": []})
         raw["feature"] = feature_registry_bytes(template_ids=templates,
             source_registry_hash="f" * 64 if wrong_binding else hashlib.sha256(raw["source"]).hexdigest(),
             mapping_registry_hash=hashlib.sha256(raw["mapping"]).hexdigest(),
             slots=sorted([slot_wire(t, required=required, unit="CNY", formula={"op": "fact", "fact_key": "revenue", "period_key": period_key}) for t in templates], key=lambda s: s["slot_id"]))
+        raw["scoring"] = canonical_bytes({"registry_role": "scoring", "schema_version": "fixture-v1",
+            "scoring": {"purpose": purpose}})
+        for role in ("industry", "cyclic", "redline", "status", "event", "valuation_adapter"):
+            raw[role] = canonical_bytes({"registry_role": role, "schema_version": "fixture-v1", "purpose": purpose})
         hashes = {f"{role}_registry_hash": hashlib.sha256(value).hexdigest() for role, value in raw.items()}
         approval = "test-approval" if purpose == "official" else None
-        root_bytes = canonical_bytes({"schema_version": "formal-registry-manifest-v1", "purpose": purpose, "approval_id": approval, **hashes})
+        root_bytes = canonical_bytes({"schema_version": "formal-registry-manifest-v2", "purpose": purpose, "approval_id": approval, **hashes})
         self.manifest = FormalRegistryManifest.from_signed_bytes(root_bytes, hashlib.sha256(root_bytes).hexdigest(), "fixture-key", self.verifier)
         self.registry = load_signed_feature_registry(raw["feature"], hashes["feature_registry_hash"], "fixture-key", self.verifier, registry_manifest=self.manifest)
         self.blobs = {}
@@ -423,8 +428,8 @@ class FormalFeatureRepositoryTests(unittest.TestCase):
                     expected = self.build()
                     self.store.put_formal_feature_bundle(expected, self.files.write(expected))
                     original = self.api.FormalFeatureRepository.get_verified_formal_feature_bundle
-                    def raced_lookup(repository, *, input_hash):
-                        result = original(repository, input_hash=input_hash)
+                    def raced_lookup(repository, *, input_hash, expected_purpose="official"):
+                        result = original(repository, input_hash=input_hash, expected_purpose=expected_purpose)
                         changed = self.install_fact(value=130.0, generation="revision-v3", source_overrides={"source_updated_at_utc": "2026-03-22T08:30:00+00:00"})
                         self.store.insert_formal_financial_facts((changed,))
                         return result

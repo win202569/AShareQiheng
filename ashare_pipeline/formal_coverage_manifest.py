@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 import copy
 import hashlib
 import json
+import os
 import pickle
 from pathlib import Path
 import re
@@ -246,17 +247,178 @@ def _official_inputs(contract: Any, verifier: Any, bundle: Any, loader: Any, fro
     return wire
 
 
+_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+
+def _run_workspace_git(root: Path, args: tuple[str, ...], binary: bool = False,
+                       runner: Callable[..., Any] = subprocess.run,
+                       environ: Mapping[str, str] = os.environ) -> Any:
+    clean_environment = {key: value for key, value in environ.items()
+                         if not key.upper().startswith("GIT_")}
+    try:
+        result = runner(["git", "-C", str(root), *args], capture_output=True,
+                        text=not binary, check=False, env=clean_environment)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError("official coverage Git command failed") from exc
+    output_type = bytes if binary else str
+    if (type(getattr(result, "returncode", None)) is not int
+            or type(getattr(result, "stdout", None)) is not output_type
+            or type(getattr(result, "stderr", None)) is not output_type):
+        raise ValueError("official coverage Git command output is malformed")
+    if result.returncode != 0:
+        raise ValueError("official coverage Git command failed")
+    if result.stderr:
+        raise ValueError("official coverage Git command emitted stderr")
+    return result.stdout
+
+
+def _read_workspace_git_identity(workspace_root: Any,
+                                 _git: Callable[..., Any] = _run_workspace_git,
+                                 _oid_pattern: Any = _GIT_OBJECT_ID,
+                                 _path_type: Any = Path) -> dict[str, str]:
+    root = _path_type(workspace_root).resolve()
+    if not root.is_dir():
+        raise ValueError("official coverage workspace is missing")
+
+    def git(*args: str, binary: bool = False) -> Any:
+        return _git(root, tuple(args), binary)
+
+    def scalar(*args: str) -> str:
+        output = git(*args)
+        lines = output.splitlines()
+        if len(lines) != 1 or not lines[0] or output.strip() != lines[0]:
+            raise ValueError("official coverage Git command output is malformed")
+        return lines[0]
+
+    top = _path_type(scalar("rev-parse", "--show-toplevel")).resolve()
+    if top != root:
+        raise ValueError("official coverage workspace must be the Git project root")
+
+    def status() -> bytes:
+        return git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--",
+                   "ashare_pipeline", binary=True)
+
+    def objects() -> tuple[str, str]:
+        values = (scalar("rev-parse", "HEAD"),
+                  scalar("rev-parse", "HEAD:ashare_pipeline"))
+        if any(_oid_pattern.fullmatch(value) is None for value in values):
+            raise ValueError("official coverage workspace Git identity is invalid")
+        return values
+
+    def parse_head_tree() -> dict[str, tuple[str, str]]:
+        raw = git("ls-tree", "-r", "-z", "HEAD", "--", "ashare_pipeline", binary=True)
+        if not raw or not raw.endswith(b"\0") or b"\0\0" in raw:
+            raise ValueError("official coverage Git tree output is malformed")
+        records: dict[str, tuple[str, str]] = {}
+        for item in raw[:-1].split(b"\0"):
+            header, separator, path_bytes = item.partition(b"\t")
+            fields = header.split(b" ")
+            try:
+                mode, kind, object_id = (field.decode("ascii") for field in fields)
+                path = path_bytes.decode("utf-8")
+            except (UnicodeDecodeError, ValueError):
+                raise ValueError("official coverage Git tree output is malformed") from None
+            if (not separator or len(fields) != 3 or kind != "blob"
+                    or mode not in {"100644", "100755"}
+                    or _oid_pattern.fullmatch(object_id) is None
+                    or not path.startswith("ashare_pipeline/")
+                    or "\\" in path or "" in path.split("/")
+                    or any(part in {".", ".."} for part in path.split("/"))
+                    or path in records):
+                raise ValueError("official coverage Git tree output is malformed")
+            records[path] = (mode, object_id)
+        if not records:
+            raise ValueError("official coverage Git tree output is malformed")
+        return records
+
+    def parse_index() -> dict[str, tuple[str, str]]:
+        raw = git("ls-files", "--stage", "-z", "--", "ashare_pipeline", binary=True)
+        if not raw or not raw.endswith(b"\0") or b"\0\0" in raw:
+            raise ValueError("official coverage Git index output is malformed")
+        records: dict[str, tuple[str, str]] = {}
+        for item in raw[:-1].split(b"\0"):
+            header, separator, path_bytes = item.partition(b"\t")
+            fields = header.split(b" ")
+            try:
+                mode, object_id, stage = (field.decode("ascii") for field in fields)
+                path = path_bytes.decode("utf-8")
+            except (UnicodeDecodeError, ValueError):
+                raise ValueError("official coverage Git index output is malformed") from None
+            if (not separator or len(fields) != 3 or stage != "0"
+                    or mode not in {"100644", "100755"}
+                    or _oid_pattern.fullmatch(object_id) is None
+                    or not path.startswith("ashare_pipeline/") or "\\" in path
+                    or "" in path.split("/")
+                    or any(part in {".", ".."} for part in path.split("/"))
+                    or path in records):
+                raise ValueError("official coverage Git index output is malformed")
+            records[path] = (mode, object_id)
+        return records
+
+    if status():
+        raise ValueError("official coverage workspace source tree is dirty")
+    revision, tree = objects()
+    head_files = parse_head_tree()
+    if parse_index() != head_files:
+        raise ValueError("official coverage workspace index differs from HEAD")
+
+    def actual_blobs() -> dict[str, str]:
+        snapshot: dict[str, str] = {}
+        for path in head_files:
+            candidate = root.joinpath(*path.split("/"))
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError("official coverage workspace tracked source type changed")
+            actual_blob = scalar("hash-object", f"--path={path}", str(candidate))
+            if _oid_pattern.fullmatch(actual_blob) is None:
+                raise ValueError("official coverage Git command output is malformed")
+            snapshot[path] = actual_blob
+        return snapshot
+
+    expected_blobs = {path: blob for path, (_, blob) in head_files.items()}
+    first_blobs = actual_blobs()
+    if first_blobs != expected_blobs:
+        raise ValueError("official coverage workspace tracked source changed")
+    after_status = status()
+    after_revision, after_tree = objects()
+    if after_status:
+        raise ValueError("official coverage workspace source tree is dirty")
+    if (revision, tree) != (after_revision, after_tree):
+        raise ValueError("official coverage workspace identity changed during read")
+    if parse_index() != head_files:
+        raise ValueError("official coverage workspace index changed during read")
+    second_blobs = actual_blobs()
+    if second_blobs != expected_blobs or second_blobs != first_blobs:
+        raise ValueError("official coverage workspace tracked source changed during read")
+    final_status = status()
+    final_revision, final_tree = objects()
+    if final_status:
+        raise ValueError("official coverage workspace source tree is dirty")
+    if (revision, tree) != (final_revision, final_tree):
+        raise ValueError("official coverage workspace identity changed during read")
+    return {"workspace_revision": revision, "workspace_tree": tree}
+
+
+def _require_workspace_git_identity(workspace_root: Any,
+                                    expected: Mapping[str, Any],
+                                    _read: Callable[..., Any] = _read_workspace_git_identity) -> None:
+    if (type(expected) is not dict
+            or set(expected) != {"workspace_revision", "workspace_tree"}
+            or any(type(value) is not str for value in expected.values())):
+        raise ValueError("official coverage workspace identity is invalid")
+    if _read(workspace_root) != expected:
+        raise ValueError("official coverage workspace identity changed")
+
+
 def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
                       expected_schema_version: int) -> dict[str, Any]:
     if any(path is None for path in (workspace_root, db_path, status_path)):
         raise ValueError("official coverage requires read-only database and workspace identity")
     root, db, status = (Path(path).resolve() for path in (workspace_root, db_path, status_path))
+    if root != Path(__file__).resolve().parent.parent:
+        raise ValueError("official coverage workspace is not the loaded coverage project root")
     if not root.is_dir() or not db.is_file() or not status.is_file():
         raise ValueError("official coverage database or workspace identity is missing")
-    revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
-                              capture_output=True, text=True, check=False)
-    if revision.returncode != 0 or len(revision.stdout.strip()) != 40:
-        raise ValueError("official coverage workspace revision is unavailable")
+    workspace_identity = _read_workspace_git_identity(root)
     def db_hashes() -> dict[str, str | None]:
         hashes: dict[str, str | None] = {}
         for suffix in ("", "-wal"):
@@ -330,7 +492,7 @@ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
             or status_wire.get("schema_versions") != list(versions)
             or _aware(status_wire.get("generated_at_utc")) is None):
         raise ValueError("official coverage database status identity mismatch")
-    return {"workspace_revision": revision.stdout.strip(), "db_path": str(db),
+    return {**workspace_identity, "db_path": str(db),
             "db_sha256": db_sha256,
             "db_sidecar_sha256": {"-wal": before["-wal"]},
             "db_schema_versions": {"user_version": version,
@@ -710,6 +872,9 @@ class VerifiedCoverageManifest(_Proof):
     def _recheck_official_provenance(self) -> None:
         raise ValueError("coverage proof authority is unavailable")
 
+    def _recheck_official_workspace(self) -> None:
+        raise ValueError("coverage proof authority is unavailable")
+
     def require_preview_ready(self) -> None:
         data = self._data()
         if data["blockers"]:
@@ -960,6 +1125,19 @@ def _install_coverage_authority() -> None:
     seals: dict[int, tuple[weakref.ReferenceType[Any], bytes, type]] = {}
     live_contexts: dict[int, tuple[weakref.ReferenceType[Any], dict[str, Any]]] = {}
     build_payload = FormalCoverageAuditor._audit_payload
+    workspace_authorities = tuple((name, function, function.__code__, function.__defaults__)
+        for name, function in (
+            ("_run_workspace_git", _run_workspace_git),
+            ("_read_workspace_git_identity", _read_workspace_git_identity),
+            ("_require_workspace_git_identity", _require_workspace_git_identity)))
+    require_workspace = _require_workspace_git_identity
+
+    def require_workspace_authority() -> None:
+        if any(globals().get(name) is not function
+                or function.__code__ is not code
+                or function.__defaults__ is not defaults
+                for name, function, code, defaults in workspace_authorities):
+            raise ValueError("official coverage workspace authority changed")
 
     def read(obj: Any) -> Mapping[str, Any]:
         item = seals.get(id(obj))
@@ -1016,12 +1194,24 @@ def _install_coverage_authority() -> None:
             if row.get("repository_provenance") != provenance:
                 raise ValueError("official coverage repository provenance changed")
 
+    def official_workspace_gate(self: VerifiedCoverageManifest) -> None:
+        require_workspace_authority()
+        data = read(self)
+        if not data.get("authenticated_context"):
+            raise ValueError("official coverage requires authenticated production contract")
+        paths = data["diagnostics"]["identity_paths"]
+        require_workspace(paths["workspace_root"], {
+            "workspace_revision": data["workspace_revision"],
+            "workspace_tree": data["workspace_tree"],
+        })
+
     def official_gate(self: VerifiedCoverageManifest) -> None:
         data = read(self)
         if not data.get("authenticated_context"):
             raise ValueError("official coverage requires authenticated production contract")
         if data["blockers"]:
             raise ValueError("official coverage blocked: " + ",".join(data["blockers"]))
+        official_workspace_gate(self)
         paths = data["diagnostics"]["identity_paths"]
         current = _read_environment(paths["workspace_root"], paths["db_path"],
                                     paths["status_path"], data["expected_schema_version"])
@@ -1042,6 +1232,7 @@ def _install_coverage_authority() -> None:
 
     type.__setattr__(_Proof, "_data", read)
     type.__setattr__(VerifiedCoverageManifest, "_recheck_official_provenance", official_provenance_gate)
+    type.__setattr__(VerifiedCoverageManifest, "_recheck_official_workspace", official_workspace_gate)
     type.__setattr__(VerifiedCoverageManifest, "require_official_ready", official_gate)
     type.__setattr__(VerifiedCoverageManifest, "require_preview_ready", preview_gate)
     FormalCoverageAuditor.audit = audit

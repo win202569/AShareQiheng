@@ -167,12 +167,10 @@ class FormalFinalRecoveryBoundaryTests(unittest.TestCase):
                 _detach_eligibility_rows(damaged)
 
 
-def minimal_batches():
-    global _SHARED
-    if _SHARED is None:
-        print("Task 9 minimal fixture: signed three-member root", flush=True)
-        fixture = FinalScoringFixture(peer_count=3)
-        atexit.register(fixture.close)
+def fresh_minimal_batches():
+    print("Task 9 minimal fixture: signed three-member root", flush=True)
+    fixture = FinalScoringFixture(peer_count=3)
+    try:
         for sid in fixture.templates:
             fixture.put_industry(sid)
         print("Task 9 minimal fixture: D1", flush=True)
@@ -187,8 +185,18 @@ def minimal_batches():
             for sid in inputs.security_ids]
         coverage = FormalCoverageAuditor(repository_validators={
             "financial": lambda *_: True}).audit(requirements, [good(r) for r in requirements])
-        _SHARED = fixture, dict(mode="test_preview", coverage_manifest=coverage,
+        return fixture, dict(mode="test_preview", coverage_manifest=coverage,
             input_batch=inputs, score_batch=scores, eligibility_batch=eligibility, pool_batch=pools)
+    except BaseException:
+        fixture.close()
+        raise
+
+
+def minimal_batches():
+    global _SHARED
+    if _SHARED is None:
+        _SHARED = fresh_minimal_batches()
+        atexit.register(_SHARED[0].close)
     return _SHARED
 
 

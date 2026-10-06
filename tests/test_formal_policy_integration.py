@@ -33,6 +33,7 @@ def numbered(documents):
 
 class FormalPolicyIntegrationTests(unittest.TestCase):
     def policy_fixture(self, **kwargs):
+        kwargs.setdefault("valuation_adapter", True)
         fixture = PolicyRuntimeFixture(range_enabled=True, **kwargs)
         self.addCleanup(fixture.close)
         self.assertTrue(fixture.db_path.resolve().is_relative_to(fixture.root.resolve()))
