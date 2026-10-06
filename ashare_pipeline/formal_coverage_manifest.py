@@ -255,6 +255,11 @@ def _run_workspace_git(root: Path, args: tuple[str, ...], binary: bool = False,
                        environ: Mapping[str, str] = os.environ) -> Any:
     clean_environment = {key: value for key, value in environ.items()
                          if not key.upper().startswith("GIT_")}
+    clean_environment.update({
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": str(root),
+    })
     try:
         result = runner(["git", "-C", str(root), *args], capture_output=True,
                         text=not binary, check=False, env=clean_environment)

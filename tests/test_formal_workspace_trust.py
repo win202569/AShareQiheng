@@ -115,13 +115,40 @@ class WorkspaceGitIdentityTests(unittest.TestCase):
     def test_workspace_git_commands_ignore_inherited_git_environment(self):
         root = self.make_repository()
         poison = root / "attacker-index"
-        with patch.dict(os.environ, {"GIT_INDEX_FILE": str(poison)}):
+        environments = []
+
+        def capture(command, **kwargs):
+            environments.append(dict(kwargs["env"]))
+            return subprocess.run(command, **kwargs)
+
+        def controlled(command_root, args, binary=False):
+            return coverage_module._run_workspace_git(
+                command_root, args, binary, capture, os.environ)
+
+        poisoned = {
+            "GIT_INDEX_FILE": str(poison),
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": "attacker-root",
+            "GIT_CONFIG_KEY_1": "core.hooksPath",
+            "GIT_CONFIG_VALUE_1": str(root / "attacker-hooks"),
+        }
+        with patch.dict(os.environ, poisoned):
             try:
-                identity = self.helper()(root)
+                identity = self.helper()(root, _git=controlled)
             except ValueError as exc:
                 self.fail(f"workspace Git identity inherited GIT_INDEX_FILE: {exc}")
 
         self.assertEqual(identity["workspace_revision"], _git(root, "rev-parse", "HEAD"))
+        self.assertTrue(environments)
+        for environment in environments:
+            with self.subTest():
+                self.assertEqual(environment.get("GIT_CONFIG_COUNT"), "1")
+                self.assertEqual(environment.get("GIT_CONFIG_KEY_0"), "safe.directory")
+                self.assertEqual(environment.get("GIT_CONFIG_VALUE_0"), str(root))
+                self.assertNotIn("GIT_INDEX_FILE", environment)
+                self.assertNotIn("GIT_CONFIG_KEY_1", environment)
+                self.assertNotIn("GIT_CONFIG_VALUE_1", environment)
 
     def test_git_command_stderr_and_nonzero_fail_closed(self):
         command = getattr(coverage_module, "_run_workspace_git", None)
