@@ -100,3 +100,51 @@ full-project discovery run; no complete Task 2 or all-project GREEN is claimed.
 
 This is a prerequisite change, not completion of Task 2. The configured live
 validator, producer replay and twelve-gate capability are still pending.
+
+## Task 2 continuation: candidate binding and private replay diagnostics
+
+Code revision `2448a1f` adds data-only private comparisons for exact candidate
+run/root/freeze/universe/code/contract and one final classification per member.
+Pending/out-of-scope states are rejected; pool-vetoed data is not confused with
+pending. Four computational artifacts are compared by immutable raw bytes;
+operational coverage is deliberately not an equality target. These comparisons
+return no proof or release authority, and their synthetic DTO tests do not
+claim producer authentication.
+
+The private replay adapter invokes existing D1/D2/D3/pool producers with fixed
+official purpose. It checks exact producer/repository types and constructor
+ownership, genuine official coverage, retained source checkpoint, registry and
+source bytes, and producer method/code-object identity. It returns data only;
+it neither writes V8 runs nor signs validations nor creates publish capabilities.
+
+Focused command on this source implementation:
+
+```text
+python -m unittest tests.test_formal_release_validation.CandidateComparisonTests tests.test_formal_release_validation.OfficialReplayBoundaryTests tests.test_formal_release_validation_guards tests.test_formal_release_types tests.test_formal_release_migration tests.test_formal_final_repository.FormalFinalRecoveryBoundaryTests tests.test_formal_workspace_trust
+```
+
+Result: **63 tests OK in 15.054 seconds**. Local output is retained at
+`D:/Projects/AShareQiheng/.tmp/v9-candidate-boundary-regression.log`.
+Coverage method-code tampering was reproduced RED and closed by capturing
+code objects as well as method identities.
+
+An initial genuine official rejection test used a separate Git fixture and
+was stopped by the existing loaded-project-root protection. That fixture
+choice was removed; production root protection was not weakened. The source
+was committed before verification on the clean loaded worktree, as required
+by official workspace checks. The attempted alternate-root test helper change
+was reverted and is not part of the code commit.
+
+After correcting the fixture, the genuine official-producer rejection command
+`python -m unittest tests.test_formal_release_validation.GenuineOfficialReplayRejectionTests`
+passed **1 test in 422.061 seconds** on `2448a1f`. The genuine signed official
+coverage and D1/D2/D3/pool producers rejected the synthetic history's claimed
+formal classification because the actual three-peer data remains pending;
+the test verified that zero V8 runs were created. This is a live rejection test,
+not a successful publishable candidate, signed validation or release capability.
+Output: `D:/Projects/AShareQiheng/.tmp/v9-official-replay-rejection.log`.
+
+Task 2 is not complete: the configured run-id-only validator, fresh coverage
+configuration, signed diagnostics, all twelve gates and private release
+capability still require implementation and accepted-candidate replay testing.
+No full-project discovery or successful official-candidate replay is claimed.
