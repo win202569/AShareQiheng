@@ -27,6 +27,7 @@ from .state_store import StateStore
 _COMPUTATION_KINDS = ('score_input_batch', 'scorecard_batch',
                       'eligibility_batch', 'pool_selection_batch')
 _FREEZE = '2026-08-31T07:00:00+00:00'
+_FREEZE_REPRESENTATIONS = frozenset((_FREEZE, '2026-08-31T15:00:00+08:00'))
 _HASH = re.compile(r'[0-9a-f]{64}')
 _CODE = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64})')
 _SECURITY = re.compile(r'(?:SH|SZ|BJ)[0-9]{6}')
@@ -61,8 +62,12 @@ def _check_candidate_binding(snapshot, *, run_id, code_version, contract_version
         raise ValueError('candidate must be an official preview_ready V8 run')
     expected = dict(run_id=run_id, contract_version=contract_version,
                     registry_manifest_hash=registry_manifest_hash,
-                    frozen_input_hash=frozen_input_hash, universe_hash=universe_hash,
-                    as_of_utc=_FREEZE)
+                    frozen_input_hash=frozen_input_hash, universe_hash=universe_hash)
+    # Match only the two representations admitted by the trusted universe.
+    # Never rewrite historical signed bytes or accept arbitrary ISO timestamps.
+    if (type(header.get('as_of_utc')) is not str
+            or header['as_of_utc'] not in _FREEZE_REPRESENTATIONS):
+        raise ValueError('candidate identity mismatch: as_of_utc')
     for name, value in expected.items():
         if header.get(name) != value:
             raise ValueError('candidate identity mismatch: ' + name)
@@ -118,7 +123,7 @@ def _install_official_replay():
         'FormalValuationAdapterRegistry', 'VerifiedCoverageManifest',
         'build_final_score_card_batch', 'build_formal_eligibility_batch',
         'select_formal_pools', '_check_candidate_binding', '_compare_candidate_replay',
-        'Path', 'MethodType', 'StateStore', '_COMPUTATION_KINDS', '_FREEZE',
+        'Path', 'MethodType', 'StateStore', '_COMPUTATION_KINDS', '_FREEZE', '_FREEZE_REPRESENTATIONS',
         '_HASH', '_CODE', '_SECURITY'))
     methods = tuple((cls, name, getattr(cls, name)) for cls, names in (
         (FormalFinalScoreInputRepository, ('__init__', 'build_batch')),
@@ -174,7 +179,7 @@ def _install_official_replay():
         if (wire.get('registry_manifest_hash') != frozen.registry_manifest_hash
                 or wire.get('frozen_input_hash') != frozen.frozen_input_hash
                 or wire.get('universe_records_hash') != frozen.universe_hash
-                or wire.get('freeze_at_utc') != _FREEZE
+                or wire.get('freeze_at_utc') != frozen.as_of_utc
                 or wire.get('member_count') != len(ids)
                 or Path(wire.get('db_path', '')).resolve() != Path(feature._store.db_path).resolve()
                 or {row['security_id'] for row in wire['rows']} != set(ids)):

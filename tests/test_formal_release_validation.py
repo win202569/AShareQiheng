@@ -46,6 +46,20 @@ class CandidateComparisonTests(unittest.TestCase):
     def test_matching_detached_data_returns_no_authority(self):
         self.assertIsNone(self.check())
 
+    def test_supported_freeze_representations_preserve_original_data(self):
+        for value in ('2026-08-31T07:00:00+00:00', '2026-08-31T15:00:00+08:00'):
+            snapshot = self.changed_header(as_of_utc=value)
+            with self.subTest(value=value):
+                self.assertIsNone(self.check(snapshot))
+                self.assertEqual(snapshot.header['as_of_utc'], value)
+                self.assertEqual(snapshot.artifacts, self.snapshot.artifacts)
+
+    def test_freeze_comparison_does_not_admit_arbitrary_iso_strings(self):
+        for value in ('2026-08-31T07:00:00Z', '2026-08-31T07:00:00', '2026-08-31T07:00:00.000Z',
+                      '2026-08-31T15:00:01+08:00', '2026-08-31T07:00:00+08:00', None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.check(self.changed_header(as_of_utc=value))
+
     def test_test_preview_and_blocked_candidates_are_rejected(self):
         for changes in (dict(mode='test_preview'), dict(status='blocked'),
                         dict(mode='legacy'), dict(status='published')):
