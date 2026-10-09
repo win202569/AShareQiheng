@@ -722,7 +722,7 @@ class StateStoreTestCase(unittest.TestCase):
                 )
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,), (5,), (6,), (7,), (8,)],
+                [(2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)],
             )
             tables = {
                 row[0]
@@ -802,7 +802,7 @@ class StateStoreTestCase(unittest.TestCase):
                 connection.execute(
                     "SELECT version FROM schema_migration ORDER BY version"
                 ).fetchall(),
-                [(2,), (3,), (4,), (5,), (6,), (7,), (8,)],
+                [(2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)],
             )
             self.assertEqual(
                 connection.execute("SELECT * FROM source_snapshot").fetchall(),
@@ -851,7 +851,7 @@ class StateStoreTestCase(unittest.TestCase):
         with closing(sqlite3.connect(self.db_path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,), (5,), (6,), (7,), (8,)],
+                [(2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)],
             )
             counts = dict(
                 connection.execute(
@@ -960,7 +960,7 @@ class StateStoreTestCase(unittest.TestCase):
         with closing(sqlite3.connect(legacy_path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
-                [(2,), (3,), (4,), (5,), (6,), (7,), (8,)],
+                [(2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)],
             )
 
     def test_initialize_migrates_complete_v3_database_to_v5_preserving_issues(self) -> None:
@@ -987,7 +987,7 @@ class StateStoreTestCase(unittest.TestCase):
                 connection.execute(
                     "SELECT version FROM schema_migration ORDER BY version"
                 ).fetchall(),
-                [(2,), (3,), (4,), (5,), (6,), (7,), (8,)],
+                [(2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)],
             )
             self.assertEqual(
                 connection.execute("SELECT * FROM quality_issue").fetchall(),
@@ -8103,9 +8103,9 @@ class FormalV7RangePersistenceTests(unittest.TestCase):
                         self.assertEqual(connection.execute("SELECT max(version) FROM schema_migration").fetchone()[0], 6)
 
     def test_all_continuous_entrances_and_reopen(self):
-        self.assertEqual(state_store_module.SCHEMA_VERSION, 8)
+        self.assertEqual(state_store_module.SCHEMA_VERSION, 9)
         with tempfile.TemporaryDirectory() as directory:
-            for last in range(2, 8):
+            for last in range(2, 9):
                 with self.subTest(last=last):
                     path = Path(directory) / f"v{last}.sqlite"
                     with closing(sqlite3.connect(path)) as connection:
@@ -8121,7 +8121,7 @@ class FormalV7RangePersistenceTests(unittest.TestCase):
                     store.initialize()
                     with closing(sqlite3.connect(path)) as connection:
                         after = connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall()
-                        self.assertEqual([row[0] for row in after], [2, 3, 4, 5, 6, 7, 8])
+                        self.assertEqual([row[0] for row in after], [2, 3, 4, 5, 6, 7, 8, 9])
                         self.assertEqual(after[:len(before)], before)
                         self.assertEqual(connection.execute("SELECT count(*) FROM formal_range_task").fetchone()[0], 0)
 
@@ -8176,7 +8176,7 @@ class FormalV6PersistenceTests(unittest.TestCase):
                 with closing(sqlite3.connect(path)) as connection:
                     after = connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall()
                     tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                self.assertEqual([r[0] for r in after], [2, 3, 4, 5, 6, 7, 8])
+                self.assertEqual([r[0] for r in after], [2, 3, 4, 5, 6, 7, 8, 9])
                 self.assertEqual(after[:len(before)], before)
                 self.assertTrue({"formal_financial_fact", "formal_quarter_fact", "formal_feature_set", "formal_feature_value", "formal_context_fact", "formal_registry_manifest", "formal_registry_blob", "formal_source_circuit"} <= tables)
 

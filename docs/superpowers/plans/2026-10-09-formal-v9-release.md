@@ -40,24 +40,29 @@
 
 ## Task 1: Canonical values and additive V9 migration
 
-Files: create `formal_release_types.py`, `formal_release_repository.py`;
+Files: create `formal_release_types.py`;
 modify `state_store.py`; create `tests/test_formal_release_types.py`,
 `tests/test_formal_release_migration.py`, `tests/fixtures/schema_v8.sql`。
 
 Interfaces: `ValidationGate(name, passed, reason_codes, evidence_hashes)`；
 `ReleaseValidationPayload`、`ReleasePreparationPayload`、`ReleaseFile` frozen DTO；
 `canonical_validation_bytes(payload)` / `canonical_preparation_bytes(payload)`。
-构造 DTO 不授予发布权。规范 signer/verifier 用途和配置身份由 repository 检查。
+构造 DTO 不授予发布权。规范签名函数检查域、key_id 和原始字节；可信 signer/verifier
+配置所有权及写入授权在 Task 3 repository 实现，不创建空的 writer 模块。
 
-- [ ] 写值类型 RED：required gates 完整且唯一、bool 精确类型、hash/Decimal 合法、
+- [x] 写值类型 RED：required gates 完整且唯一、bool 精确类型、hash/Decimal 合法、
   未知字段/float/NaN/重复 JSON key、跨域签名、key_id/config mismatch 均拒绝。
-- [ ] 运行 `python -m unittest -v tests.test_formal_release_types`，确认失败原因来自缺失 API。
-- [ ] 实现 schema=`formal-release-validation-v1` 与 preparation counterpart 的规范值和校验。
-- [ ] 写迁移 RED：V8 八表 DDL/rows/hash 不变，V2–V8 连续 ledger 最终为 V9；
+- [x] 运行 `python -m unittest -v tests.test_formal_release_types`，确认失败原因来自缺失 API。
+- [x] 实现 schema=`formal-release-validation-v1` 与 preparation counterpart 的规范值和校验。
+- [x] 写迁移 RED：V8 八表 DDL/rows/hash 不变，V2–V8 连续 ledger 最终为 V9；
   少表、不连续/未来 ledger 失败关闭；空库包含完整旧表和五类新表。
-- [ ] 实现 V9 五表，外键绑定精确 V8 run，validation/preparation/event append-only；
+- [x] 实现 V9 五表，外键绑定精确 V8 run，定义 validation/preparation/event 记录结构；
   release 内容 identity unique，publishing/published/blocked 状态受约束。
-- [ ] 运行 types/migration tests 与现有 final migration tests，检查暂存仅代码测试后提交。
+  append-only 写入生命周期由 Task 3 的可信 API 强制，不宣称本任务 SQL 表本身是发布授权。
+- [x] 运行 types/migration tests 与现有 final migration tests，检查暂存仅代码、测试和本轮文档后提交。
+
+Task 1 验证：最终基础/StateStore 243 tests OK（56.802s）；最终 Stage D 受影响
+回归 58 tests OK（220.587s）。证据见 `../evidence/formal-v9-release/README.md`。
 
 ## Task 2: Producer-backed validator without V8 writes
 

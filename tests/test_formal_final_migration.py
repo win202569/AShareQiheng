@@ -46,24 +46,24 @@ class FormalFinalMigrationTests(unittest.TestCase):
         before = self.snapshot()
         StateStore(self.path).initialize()
         after = self.snapshot()
-        self.assertEqual([row[0] for row in after[1]], [2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual([row[0] for row in after[1]], [2, 3, 4, 5, 6, 7, 8, 9])
         self.assertEqual(after[1][:6], before[1])
         self.assertEqual(after[2], before[2])
         self.assertTrue(all(rows for name, rows in before[2].items() if name in RANGE_TABLES))
         self.assertEqual([row for row in after[0] if row[1] in {r[1] for r in before[0]}], before[0])
 
-    def test_fresh_database_records_contiguous_versions_2_through_8(self):
+    def test_fresh_database_records_contiguous_versions_2_through_9(self):
         path = self.root / "fresh.sqlite"
         store = StateStore(path)
         store.initialize()
         before = self.snapshot(path)
         StateStore(path).initialize()
         self.assertEqual(self.snapshot(path), before)
-        self.assertEqual([row[0] for row in before[1]], [2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual([row[0] for row in before[1]], [2, 3, 4, 5, 6, 7, 8, 9])
         self.assertEqual({row[1] for row in before[0] if row[0] == "table" and row[1].startswith("formal_final_")}, set(TABLES))
 
     def test_v8_migration_is_atomic_and_reopen_verifies_exact_ddl(self):
-        self.assertEqual(schema.SCHEMA_VERSION, 8)
+        self.assertEqual(schema.SCHEMA_VERSION, 9)
         before = self.snapshot()
         definitions = tuple(schema._V8_TABLE_DDL.values()) + tuple(schema._V8_INDEX_DDL.values())
         for fail_after in range(1, len(definitions) + 1):
@@ -108,7 +108,7 @@ class FormalFinalMigrationTests(unittest.TestCase):
         before = self.snapshot()
         StateStore(self.path).initialize()
         after = self.snapshot()
-        self.assertEqual([row[0] for row in after[1]], [2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual([row[0] for row in after[1]], [2, 3, 4, 5, 6, 7, 8, 9])
         for table in ("score_run", "score_item"):
             self.assertTrue(before[2][table])
             self.assertEqual(after[2][table], before[2][table])
@@ -130,7 +130,7 @@ class FormalFinalMigrationTests(unittest.TestCase):
             code_version="revision", contract_version="formal-final-v1", created_at=run_id)
 
     def test_v8_constraints_preserve_decimal_text_replays_and_same_run_members(self):
-        self.assertEqual(schema.SCHEMA_VERSION, 8)
+        self.assertEqual(schema.SCHEMA_VERSION, 9)
         store = StateStore(self.path)
         store.initialize()
         decimal = "0.1234567890123456789012345678901234567890123456789"
@@ -186,7 +186,7 @@ class FormalFinalMigrationTests(unittest.TestCase):
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_v8_missing_tampered_and_extra_objects_fail_on_reopen(self):
-        self.assertEqual(schema.SCHEMA_VERSION, 8)
+        self.assertEqual(schema.SCHEMA_VERSION, 9)
         mutations = [f"ALTER TABLE {table} ADD COLUMN foreign_payload TEXT" for table in TABLES]
         mutations += [f"DROP TABLE {table}" for table in TABLES]
         mutations += [f"DROP INDEX {name}" for name in schema._V8_INDEX_DDL]
@@ -209,7 +209,7 @@ class FormalFinalMigrationTests(unittest.TestCase):
                     self.assertEqual(connection.execute("SELECT * FROM schema_migration ORDER BY version").fetchall(), before)
 
     def test_v8_ledger_insert_and_commit_failure_roll_back_all_schema_objects(self):
-        self.assertEqual(schema.SCHEMA_VERSION, 8)
+        self.assertEqual(schema.SCHEMA_VERSION, 9)
         before = self.snapshot()
         original = StateStore._apply_v8_migration
         def fail_after_ledger(connection):

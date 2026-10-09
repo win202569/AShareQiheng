@@ -88,7 +88,82 @@ SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
 SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
 RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
 _OWNED_JOB_KINDS = frozenset({"deep_financial", "deep_statement", "feature_build"})
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
+
+# V9 persistence is owned by the release service. No public mark-published API
+# or conversion of historical Stage D DTOs into publication authority exists.
+_V9_TABLE_DDL = {
+    "formal_release_validation": """CREATE TABLE formal_release_validation (
+ validation_hash TEXT NOT NULL PRIMARY KEY,
+ run_id TEXT NOT NULL REFERENCES formal_final_run(run_id),
+ release_identity_hash TEXT NOT NULL,
+ purpose TEXT NOT NULL CHECK(purpose IN ('publish','audit')),
+ passed INTEGER NOT NULL CHECK(typeof(passed)='integer' AND passed IN (0,1)),
+ payload_json TEXT NOT NULL, signature TEXT NOT NULL CHECK(length(signature)>0),
+ key_id TEXT NOT NULL CHECK(length(key_id)>0), created_at TEXT NOT NULL,
+ UNIQUE(validation_hash,run_id,release_identity_hash)
+)""",
+    "formal_release": """CREATE TABLE formal_release (
+ release_id TEXT NOT NULL PRIMARY KEY,
+ release_identity_hash TEXT NOT NULL UNIQUE,
+ run_id TEXT NOT NULL REFERENCES formal_final_run(run_id),
+ input_manifest_hash TEXT NOT NULL, result_hash TEXT NOT NULL,
+ validation_hash TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('publishing','published','blocked')),
+ release_path TEXT NOT NULL UNIQUE,
+ active_preparation_hash TEXT,
+ manifest_sha256 TEXT,
+ attempt_token TEXT, attempt_expires_at TEXT,
+ fencing_generation INTEGER NOT NULL DEFAULT 0
+   CHECK(typeof(fencing_generation)='integer' AND fencing_generation>=0),
+ created_at TEXT NOT NULL, published_at TEXT, blocked_reason_json TEXT,
+ UNIQUE(release_id,run_id,release_identity_hash),
+ FOREIGN KEY(validation_hash,run_id,release_identity_hash)
+   REFERENCES formal_release_validation(validation_hash,run_id,release_identity_hash),
+ FOREIGN KEY(active_preparation_hash,release_id)
+   REFERENCES formal_release_preparation(preparation_hash,release_id),
+ CHECK((attempt_token IS NULL)=(attempt_expires_at IS NULL)),
+ CHECK(status!='published' OR (active_preparation_hash IS NOT NULL
+   AND manifest_sha256 IS NOT NULL AND published_at IS NOT NULL)),
+ CHECK(status='published' OR published_at IS NULL),
+ CHECK(status!='blocked' OR blocked_reason_json IS NOT NULL)
+)""",
+    "formal_release_preparation": """CREATE TABLE formal_release_preparation (
+ preparation_hash TEXT NOT NULL PRIMARY KEY,
+ release_id TEXT NOT NULL, run_id TEXT NOT NULL, release_identity_hash TEXT NOT NULL,
+ validation_hash TEXT NOT NULL,
+ payload_json TEXT NOT NULL, signature TEXT NOT NULL CHECK(length(signature)>0),
+ key_id TEXT NOT NULL CHECK(length(key_id)>0),
+ manifest_json TEXT NOT NULL, manifest_sha256 TEXT NOT NULL, manifest_byte_size INTEGER NOT NULL
+   CHECK(typeof(manifest_byte_size)='integer' AND manifest_byte_size>=0),
+ fencing_generation INTEGER NOT NULL CHECK(typeof(fencing_generation)='integer' AND fencing_generation>0),
+ created_at TEXT NOT NULL,
+ UNIQUE(preparation_hash,release_id),
+ FOREIGN KEY(release_id,run_id,release_identity_hash)
+   REFERENCES formal_release(release_id,run_id,release_identity_hash),
+ FOREIGN KEY(validation_hash,run_id,release_identity_hash)
+   REFERENCES formal_release_validation(validation_hash,run_id,release_identity_hash)
+)""",
+    "formal_release_file": """CREATE TABLE formal_release_file (
+ release_id TEXT NOT NULL, preparation_hash TEXT NOT NULL,
+ path TEXT NOT NULL COLLATE NOCASE, sha256 TEXT NOT NULL,
+ byte_size INTEGER NOT NULL CHECK(typeof(byte_size)='integer' AND byte_size>=0),
+ PRIMARY KEY(release_id,path),
+ FOREIGN KEY(preparation_hash,release_id)
+   REFERENCES formal_release_preparation(preparation_hash,release_id)
+)""",
+    "formal_release_event": """CREATE TABLE formal_release_event (
+ event_id TEXT NOT NULL PRIMARY KEY,
+ release_id TEXT NOT NULL REFERENCES formal_release(release_id),
+ event_kind TEXT NOT NULL CHECK(length(event_kind)>0),
+ validation_hash TEXT REFERENCES formal_release_validation(validation_hash),
+ detail_json TEXT NOT NULL, detail_hash TEXT NOT NULL, created_at TEXT NOT NULL
+)""",
+}
+_V9_INDEX_DDL = {
+    "formal_release_validation_run": "CREATE INDEX formal_release_validation_run ON formal_release_validation(run_id,created_at)",
+    "formal_release_event_release": "CREATE INDEX formal_release_event_release ON formal_release_event(release_id,created_at,event_id)",
+}
 
 # Stage D writes are owned by its repository and use _transaction; no table-level
 # public mutation API is exposed. Canonical payloads and Decimal projections are
@@ -1739,6 +1814,7 @@ class StateStore:
                 6: (_V6_TABLE_DDL, _V6_INDEX_DDL),
                 7: (_V7_TABLE_DDL, _V7_INDEX_DDL),
                 8: (_V8_TABLE_DDL, _V8_INDEX_DDL),
+                9: (_V9_TABLE_DDL, _V9_INDEX_DDL),
             }
             if not tables:
                 self._create_v2_schema(connection)
@@ -1757,11 +1833,12 @@ class StateStore:
                 versions = {row[0] for row in connection.execute("SELECT version FROM schema_migration")}
                 if any(type(v) is not int for v in versions) or versions not in (
                     {2}, {2, 3}, {2, 3, 4}, {2, 3, 4, 5}, {2, 3, 4, 5, 6}, {2, 3, 4, 5, 6, 7},
-                    {2, 3, 4, 5, 6, 7, 8}
+                    {2, 3, 4, 5, 6, 7, 8}, {2, 3, 4, 5, 6, 7, 8, 9}
                 ):
                     raise RuntimeError(f"unsupported migration versions: {sorted(versions, key=str)}")
             objects = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
             self._assert_v8_objects(connection, applied=8 in versions)
+            self._assert_v9_objects(connection, applied=9 in versions)
             for version, (table_ddl, index_ddl) in schemas.items():
                 if version in versions:
                     self._assert_schema_ddl(connection, table_ddl, index_ddl, f"v{version} schema")
@@ -1959,6 +2036,29 @@ class StateStore:
         cls._assert_schema_ddl(connection, _V8_TABLE_DDL, _V8_INDEX_DDL, "v8 schema")
         cls._assert_v8_objects(connection, applied=True)
         connection.execute("INSERT INTO schema_migration VALUES (8, ?)", (_utc_now(),))
+
+    @classmethod
+    def _assert_v9_objects(cls, connection: sqlite3.Connection, *, applied: bool) -> None:
+        approved = {('table', name) for name in _V9_TABLE_DDL} | {
+            ('index', name) for name in _V9_INDEX_DDL}
+        for kind, name, table, sql in connection.execute(
+                'SELECT type,name,tbl_name,sql FROM sqlite_master'):
+            if (name.lower() == 'formal_release' or name.lower().startswith('formal_release_')
+                    or table.lower() in _V9_TABLE_DDL):
+                if (applied and kind == 'index' and sql is None and table in _V9_TABLE_DDL
+                        and name.startswith('sqlite_autoindex_' + table + '_')):
+                    continue
+                if not applied or (kind, name) not in approved:
+                    raise RuntimeError('unexpected v9 schema object ' + name)
+
+    @classmethod
+    def _apply_v9_migration(cls, connection: sqlite3.Connection) -> None:
+        cls._assert_v9_objects(connection, applied=False)
+        for statement in (*_V9_TABLE_DDL.values(), *_V9_INDEX_DDL.values()):
+            connection.execute(statement)
+        cls._assert_schema_ddl(connection, _V9_TABLE_DDL, _V9_INDEX_DDL, 'v9 schema')
+        cls._assert_v9_objects(connection, applied=True)
+        connection.execute('INSERT INTO schema_migration VALUES (9, ?)', (_utc_now(),))
 
     @staticmethod
     def _formal_insert_row(connection, table: str, row: dict[str, object]) -> None:
