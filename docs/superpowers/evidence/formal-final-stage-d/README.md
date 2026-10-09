@@ -1,5 +1,42 @@
 # Stage D thin runner acceptance evidence
 
+## Performance acceptance completed (2026-10-09)
+
+All three tests in `tests.test_formal_final_performance.RunnerPerformanceTests`
+passed in separate fresh processes on commit
+`66d25618d1efe4545ae0dd5c3c3c75d9f793c9d0`. Start and finish revisions were
+identical. The driver completed at `2026-10-08T15:29:57.489536+00:00`
+(19:29 in Asia/Tbilisi), with state `passed` and all exit codes zero.
+
+Each process used `D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest -v`
+followed by the full test identifier below, from the Stage D worktree.
+`TMPDIR`, `TEMP`, and `TMP` were set to `D:/Projects/AShareQiheng/.tmp`;
+`PYTHONDONTWRITEBYTECODE=1` and `PYTHONUNBUFFERED=1` were set before imports.
+
+| Test (prefix: `tests.test_formal_final_performance.RunnerPerformanceTests.`) | unittest seconds | Driver seconds | Result |
+| --- | ---: | ---: | --- |
+| `test_each_stage_is_built_once_and_diagnostics_do_not_change_result_hash` | 3829.467 | 3830.640 | 1 test, OK |
+| `test_source_batch_parses_and_cohort_sorts_have_structural_bounds` | 7353.612 | 7359.438 | 1 test, OK |
+| `test_rebuild_appends_once_and_revalidates_even_when_no_input_changed` | 4142.911 | 4146.078 | 1 test, OK |
+
+The structural profiler recorded each observed cohort sort exactly once,
+each pool sort exactly once (`strong=1`, `wait=1`), and each observed source
+batch parse per stage exactly once. Stage C recorded six cohorts/sorts,
+23 securities, 69 valuation rows, one group-index build, one registry full
+parse, and zero full financial rederivations. Broader observed counts were
+7984 registry loads, 207 financial rederivations and six source checkpoint
+rechecks; these counts are diagnostics, not a claim that all repeated
+validation has been eliminated. No wall-clock performance threshold is claimed.
+
+An initial interactive run was interrupted to switch to durable logging;
+it is not counted as a passing test. The completed three-process run above
+supersedes only the performance rerun gap stated in the historical section
+below. The two historical combined wide commands remain unclaimed as GREEN.
+This acceptance does not establish production data readiness or authorize
+formal pool publication. Local driver status and logs are retained under
+`D:/Projects/AShareQiheng/.tmp/stage-d-performance-2026-10-08/` and are not
+included in this documentation commit.
+
 ## Current reviewed candidate (2026-10-06)
 
 The current reviewed Stage D candidate is commit
