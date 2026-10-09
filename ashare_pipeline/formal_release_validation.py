@@ -179,7 +179,7 @@ def _install_official_replay():
         if (wire.get('registry_manifest_hash') != frozen.registry_manifest_hash
                 or wire.get('frozen_input_hash') != frozen.frozen_input_hash
                 or wire.get('universe_records_hash') != frozen.universe_hash
-                or wire.get('freeze_at_utc') != frozen.as_of_utc
+                or wire.get('freeze_at_utc') != _FREEZE
                 or wire.get('member_count') != len(ids)
                 or Path(wire.get('db_path', '')).resolve() != Path(feature._store.db_path).resolve()
                 or {row['security_id'] for row in wire['rows']} != set(ids)):
