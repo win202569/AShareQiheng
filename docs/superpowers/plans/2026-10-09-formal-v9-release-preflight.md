@@ -76,4 +76,10 @@ Files: `ashare_pipeline/formal_release_reporting.py`, `ashare_pipeline/formal_cl
 - [ ] Test SH/SZ/BJ, zero-score contract cases, rejection of test roots, deterministic bytes and corrections preserving earlier releases.
 - [ ] Record exact revisions, commands and acceptance results before any production release action.
 
-This preflight is not a completed V9 design or implementation. Task 1 resolves the live proof and signed recovery interfaces before later tasks modify code or schema.
+Task 1 is captured in `../specs/2026-10-09-formal-v9-release-design.md` and
+`2026-10-09-formal-v9-release.md`. These documents select non-persisting producer
+replay, retain the original candidate coverage identity, add independent live
+coverage witnesses, and define signed preparation/recovery and V9 task boundaries.
+Implementation remains pending; the original checklist above is retained as the
+preflight record. Use the new plan for implementation rather than the historical
+V7/V8 release plan.
