@@ -75,3 +75,28 @@ re-reviewed. No claim of a final zero-finding independent review is made.
   foundation task; results above are the named affected suites, not all-project GREEN.
 - Tasks 2–6 remain pending, including the live official validator, trusted writer,
   deterministic renderer/publisher, signed recovery, reporting/CLI and end-to-end tests.
+
+## Task 2 prerequisite: source checkpoint and own V9 writes
+
+The existing source checkpoint treated release audit appends as source changes.
+The audit-append regression reproduced `final current-source database evidence
+changed` before the fix. Only row contents of the five exact V9 bookkeeping
+tables are now excluded; their DDL and unknown release-prefixed source tables
+remain part of the checkpoint. Existing V8 history exclusions are unchanged.
+
+`python -m unittest tests.test_formal_release_validation_guards` passed 5 tests
+in 0.522 seconds. These use a real migrated SQLite database and genuine current
+input provider, not mocked source guards. The database fixture is storage-only:
+it neither issues signed validations nor creates release capabilities.
+
+The initial affected command (four guard tests loaded before the fifth was
+added) ran `tests.test_formal_release_validation_guards`,
+`tests.test_formal_release_types`, `tests.test_formal_release_migration` and
+`tests.test_formal_final_atomicity`: **45 tests OK in 281.513 seconds**.
+The final command with all five guards, the two release foundation suites and
+`tests.test_formal_final_atomicity.FormalFinalAuthorityBoundaryTests` passed
+**31 tests in 2.217 seconds**. These are named affected regressions, not a
+full-project discovery run; no complete Task 2 or all-project GREEN is claimed.
+
+This is a prerequisite change, not completion of Task 2. The configured live
+validator, producer replay and twelve-gate capability are still pending.

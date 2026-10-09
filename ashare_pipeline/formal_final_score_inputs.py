@@ -35,6 +35,10 @@ def _install_source_checkpoint():
     # replaceable accessor. Like D3's D2 ownership check, no new mint is exposed.
     require = inspect.getclosurevars(FormalMetricCurrentInputProvider.resolve_current_inputs).nonlocals["require"]
     connect = StateStore._connect
+    release_bookkeeping = frozenset((
+        "formal_release_validation", "formal_release", "formal_release_preparation",
+        "formal_release_file", "formal_release_event",
+    ))
 
     def source_digest(connection):
         digest = hashlib.sha256()
@@ -45,7 +49,11 @@ def _install_source_checkpoint():
             # Content, not data_version: our own append-only Stage D history is
             # deliberately excluded. Conservative unrelated-source changes fail
             # closed; no expensive metric/policy/valuation calculations repeat.
-            rows = sorted(repr(tuple(row)) for row in connection.execute("SELECT * FROM " + quoted))
+            # Own V9 writes are bookkeeping, not source corrections. Keep the
+            # exact table DDL bound, and never exclude an arbitrary prefix:
+            # a foreign release-prefixed source table must still be checked.
+            rows = [] if name in release_bookkeeping else sorted(
+                repr(tuple(row)) for row in connection.execute("SELECT * FROM " + quoted))
             digest.update(repr((name, ddl, rows)).encode())
         return digest.digest()
 
