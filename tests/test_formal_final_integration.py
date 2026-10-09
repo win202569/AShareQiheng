@@ -46,9 +46,8 @@ def complete_score_history(fixture, ids):
         fixture.valuation_feature_bundles[sid] = fixture.persist_features(sid)
 
 
-def official_context_coverage(fixture):
-    """Authenticate a signed member-specific context catalog and live V8 DB."""
-    from ashare_pipeline.formal_registry_manifest import FormalRegistryBundleLoader
+def official_context_coverage_configuration(fixture):
+    """Build signed test configuration, not a coverage proof."""
     from ashare_pipeline.state_store import SCHEMA_VERSION
     from tests.test_formal_coverage_guards import canonical, db_generation, digest
     f = fixture
@@ -75,9 +74,17 @@ def official_context_coverage(fixture):
         schema_version=SCHEMA_VERSION, db_sha256=hashlib.sha256(f.db_path.read_bytes()).hexdigest(),
         db_generation_hash=digest(db_generation(f.db_path)),
         schema_versions=list(range(2, SCHEMA_VERSION + 1)))), encoding="utf-8")
+    return requirements, dict(canonical_json=raw, signature=f.verifier.sign(raw),
+                             key_id=f.bundle.manifest.key_id), status_path
+
+
+def official_context_coverage(fixture):
+    """Authenticate a signed member-specific context catalog and live V8 DB."""
+    from ashare_pipeline.formal_registry_manifest import FormalRegistryBundleLoader
+    f = fixture
+    requirements, contract, status_path = official_context_coverage_configuration(f)
     return FormalCoverageAuditor().audit(requirements,
-        production_contract=dict(canonical_json=raw, signature=f.verifier.sign(raw),
-                                 key_id=f.bundle.manifest.key_id),
+        production_contract=contract,
         contract_verifier=f.verifier, registry_bundle=f.bundle,
         registry_loader=FormalRegistryBundleLoader(f.store, f.verifier),
         snapshot_repository=f.snapshots, context_repository=f.context,

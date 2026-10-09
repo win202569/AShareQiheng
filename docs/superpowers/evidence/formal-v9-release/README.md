@@ -187,3 +187,21 @@ This does not include an accepted official-candidate refresh/replay success,
 the earlier long genuine rejection rerun, or full-project discovery. Public
 `FormalReleaseValidator`, twelve-gate signed diagnostics and private release
 capabilities remain pending; no release authorization is produced here.
+
+### Genuine coverage and candidate freeze representation boundary
+
+Added a clearly labelled storage-only V8 fixture, not a producer-backed official
+candidate. Its context coverage is genuinely audited against signed official
+registries and the live fixture database. Fixed-input refresh nevertheless rejects
+the historical freeze string `2026-08-31T15:00:00+08:00`: the candidate guard
+requires `2026-08-31T07:00:00+00:00`. These denote the same instant, but the current
+boundary compares exact representations. No signed historical bytes are rewritten
+and no guard is bypassed. The test checks unchanged V8 header/artifacts and empty
+V9 validation/release tables. This is rejection evidence, not accepted-candidate
+fresh refresh/replay success. Time representation compatibility remains an open
+Task 2 item; a complete producer-backed acceptance test remains required.
+
+Final command: `python -m unittest tests.test_formal_release_input_refresh`.
+Result: **12 tests OK in 131.260 seconds**; log
+`D:/Projects/AShareQiheng/.tmp/v9-fresh-coverage-integration.log`.
+This is the input-refresh suite only, not full-project discovery.

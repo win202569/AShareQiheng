@@ -143,5 +143,47 @@ class ReleaseInputRefreshTests(unittest.TestCase):
                                                       f.frozen.registry_manifest_hash)
 
 
+class GenuineInputRefreshTests(unittest.TestCase):
+    def test_genuine_coverage_cannot_override_noncanonical_candidate_freeze(self):
+        from pathlib import Path
+        from ashare_pipeline.formal_release_inputs import _ReleaseInputRefresh
+        from ashare_pipeline.formal_coverage_manifest import _read_workspace_git_identity
+        from tests.test_formal_final_integration import (
+            official_context_coverage, official_context_coverage_configuration)
+        from tests.formal_release_refresh_fixtures import put_storage_only_history
+
+        print('V9 input refresh: signed official roots and storage-only history', flush=True)
+        f = FinalScoringFixture(peer_count=3, purpose='official')
+        self.addCleanup(f.close)
+        for sid in f.templates:
+            f.put_industry(sid)
+        code = _read_workspace_git_identity(Path(__file__).resolve().parents[1])['workspace_revision']
+        run_id = put_storage_only_history(f, code_version=code)
+        # The existing genuine auditor owns signature/provenance checks and
+        # supplies a signed fixed context catalog; no callback or proof override.
+        first_coverage = official_context_coverage(f)
+        first_coverage.require_official_ready()
+        self.assertEqual(f.frozen.as_of_utc, '2026-08-31T15:00:00+08:00')
+        _, contract, status_path = official_context_coverage_configuration(f)
+        inputs = FormalFinalScoreInputRepository(f.feature_repository, f.context,
+            f.range_store, registry_signature_verifier=f.verifier)
+        runs = FormalFinalRunRepository(f.store, code_version=code)
+        before = runs.get_run(run_id)
+        config = dict(state_store=f.store, input_repository=inputs, run_repository=runs,
+            registry_signature_verifier=f.verifier, coverage_contract=contract,
+            coverage_contract_verifier=f.verifier, status_path=status_path)
+        # Known compatibility gap: the universe admits +08:00, while the candidate
+        # guard requires +00:00. Keep the rejection visible; do not normalize
+        # signed historical bytes or describe this as refresh/replay success.
+        with self.assertRaisesRegex(ValueError, 'candidate identity mismatch: as_of_utc'):
+            _ReleaseInputRefresh(**config).refresh(run_id)
+        self.assertEqual(runs.get_run(run_id).header, before.header)
+        self.assertEqual(runs.get_run(run_id).artifacts, before.artifacts)
+        with closing(f.store._connect()) as connection:
+            self.assertEqual(connection.execute('SELECT count(*) FROM formal_final_run').fetchone()[0], 1)
+            self.assertEqual(connection.execute('SELECT count(*) FROM formal_release_validation').fetchone()[0], 0)
+            self.assertEqual(connection.execute('SELECT count(*) FROM formal_release').fetchone()[0], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
