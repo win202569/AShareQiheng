@@ -148,3 +148,42 @@ Task 2 is not complete: the configured run-id-only validator, fresh coverage
 configuration, signed diagnostics, all twelve gates and private release
 capability still require implementation and accepted-candidate replay testing.
 No full-project discovery or successful official-candidate replay is claimed.
+
+## Task 2 continuation: fixed read-only input refresh configuration
+
+`formal_release_inputs.py` isolates configuration from replay diagnostics. Its
+private `_ReleaseInputRefresh.refresh(run_id)` reads the selected history through
+the captured V8 repository reader, refuses test/blocked history, reloads the
+official ten-role root and feature/scoring/policy/valuation registries, and wires
+a new audit through the existing official coverage auditor. Configuration is
+closure-owned, contracts are detached canonical bytes, and verifier methods,
+repository registration/paths and method/code-object identities are rechecked.
+No callbacks, skip flags or caller-provided coverage are accepted by refresh.
+
+The constructor checks configuration ownership and canonical representation;
+contract authenticity/completeness is checked by the existing auditor during
+refresh, not inferred merely from constructing the object. Contracts requiring
+snapshot-owner callbacks cannot be silently downgraded: no such callbacks are
+supplied by this component, so the auditor rejects unsupported requirements.
+Trusted snapshot-owner integration remains a production coverage gap.
+
+New tests exercise real historical reader rejection, no-write missing-run
+behavior, copied/foreign repositories, verifier/reader/service code tampering,
+detached configuration and real fresh official registry loading. Service-method
+code replacement was reproduced RED and closed with guarded attribute access
+and captured class method/code identities. An earlier 15-test run included five
+imported historical tests; the import was moved inside the consuming test so
+the final new suite contains **11 tests OK in 7.613 seconds**.
+
+Final affected command:
+
+```text
+python -m unittest tests.test_formal_release_input_refresh tests.test_formal_release_validation.CandidateComparisonTests tests.test_formal_release_validation.OfficialReplayBoundaryTests tests.test_formal_release_validation_guards tests.test_formal_release_types tests.test_formal_release_migration tests.test_formal_final_repository.FormalFinalRecoveryBoundaryTests tests.test_formal_workspace_trust
+```
+
+Result: **74 tests OK in 15.759 seconds**. Output:
+`D:/Projects/AShareQiheng/.tmp/v9-input-refresh-regression.log`.
+This does not include an accepted official-candidate refresh/replay success,
+the earlier long genuine rejection rerun, or full-project discovery. Public
+`FormalReleaseValidator`, twelve-gate signed diagnostics and private release
+capabilities remain pending; no release authorization is produced here.
