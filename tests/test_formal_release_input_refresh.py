@@ -144,7 +144,7 @@ class ReleaseInputRefreshTests(unittest.TestCase):
 
 
 class GenuineInputRefreshTests(unittest.TestCase):
-    def test_genuine_coverage_cannot_override_noncanonical_candidate_freeze(self):
+    def test_genuine_refresh_preserves_supported_historical_freeze_bytes(self):
         from pathlib import Path
         from ashare_pipeline.formal_release_inputs import _ReleaseInputRefresh
         from ashare_pipeline.formal_coverage_manifest import _read_workspace_git_identity
@@ -172,11 +172,11 @@ class GenuineInputRefreshTests(unittest.TestCase):
         config = dict(state_store=f.store, input_repository=inputs, run_repository=runs,
             registry_signature_verifier=f.verifier, coverage_contract=contract,
             coverage_contract_verifier=f.verifier, status_path=status_path)
-        # Known compatibility gap: the universe admits +08:00, while the candidate
-        # guard requires +00:00. Keep the rejection visible; do not normalize
-        # signed historical bytes or describe this as refresh/replay success.
-        with self.assertRaisesRegex(ValueError, 'candidate identity mismatch: as_of_utc'):
-            _ReleaseInputRefresh(**config).refresh(run_id)
+        snapshot, scoring, policy, adapter, coverage = _ReleaseInputRefresh(**config).refresh(run_id)
+        coverage.require_official_ready()
+        self.assertIsNot(coverage, first_coverage)
+        self.assertEqual(snapshot.header['as_of_utc'], '2026-08-31T15:00:00+08:00')
+        self.assertEqual(coverage.to_dict()['freeze_at_utc'], '2026-08-31T07:00:00+00:00')
         self.assertEqual(runs.get_run(run_id).header, before.header)
         self.assertEqual(runs.get_run(run_id).artifacts, before.artifacts)
         with closing(f.store._connect()) as connection:

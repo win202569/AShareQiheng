@@ -205,3 +205,36 @@ Final command: `python -m unittest tests.test_formal_release_input_refresh`.
 Result: **12 tests OK in 131.260 seconds**; log
 `D:/Projects/AShareQiheng/.tmp/v9-fresh-coverage-integration.log`.
 This is the input-refresh suite only, not full-project discovery.
+
+### Freeze representation compatibility continuation
+
+Root cause: the trusted universe already admits the historical CN `+08:00`
+and canonical UTC `+00:00` representations, whereas the new candidate boundary
+admitted UTC only. Ruling: preserve both existing representations without
+rewriting signed V8 bytes; do not broaden to arbitrary ISO strings (including
+`Z`, fractional and naive strings). Genuine coverage already canonicalizes its
+freeze to UTC, independently bound to the verified frozen universe. Keep that
+existing UTC gate unchanged. Wrong-instant inputs remain rejected.
+
+The +08:00 candidate test failed before implementation and passed afterward.
+Final comparison/replay-boundary/guard suite: **26 tests OK in 1.138 seconds**.
+Types/migration/historical recovery/workspace trust: **39 tests OK in 13.517
+seconds**, log `D:/Projects/AShareQiheng/.tmp/v9-freeze-regression.log`.
+These do not establish complete official-candidate replay or publication.
+
+The first real refresh continuation completed refresh but failed its test's
+incorrect expectation that coverage preserves the historical CN representation
+(12 tests, one assertion failure, 274.843 seconds). This established that
+coverage correctly emits canonical UTC. The attempted coverage comparison
+change was reverted before the final run; the only production behavior change
+is the candidate representation compatibility check.
+
+Final input-refresh command: `python -m unittest tests.test_formal_release_input_refresh`.
+Result: **12 tests OK in 144.137 seconds**, log
+`D:/Projects/AShareQiheng/.tmp/v9-freeze-refresh.log`. The genuine fresh coverage
+passes while original historical CN timestamp/header/artifacts remain unchanged;
+V9 validation/release tables remain empty. Historical input is explicitly a
+storage-only fixture, not a fully scored producer-backed candidate. Together
+with the two focused suites above, 77 relevant tests passed. Full-project
+discovery and complete official-candidate replay have not been run in this
+continuation. No public validator, capability or publication was added.
