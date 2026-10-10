@@ -636,20 +636,23 @@ def build_effective_time_resolver(repository):
                 raise ValueError("exact verified calendar binding required")
             wire = asdict(calendar_binding)
             root = wire["registry_manifest_hash"]
-            repository._load(root)
+            repository._load(root, expected_purpose="official")
             facts = repository._state_store.list_formal_context_facts(registry_manifest_hash=root,
-                context_kind="trading_calendar", as_of_utc=wire["freeze_at_utc"], source_snapshot_id=wire["snapshot_id"])
+                context_kind="trading_calendar", as_of_utc=wire["freeze_at_utc"],
+                source_snapshot_id=wire["snapshot_id"], expected_purpose="official")
             matches = [fact for fact in facts if fact.source_snapshot_id == wire["snapshot_id"] and fact.value["exchange"] == exchange]
             if len(matches) != 1:
                 raise ValueError("calendar binding source is absent or ambiguous")
             fact = matches[0]
             selector = CalendarSelector("trading_calendar", fact.scope_key, exchange, "visible_at_freeze")
-            current = repository.resolve_verified_calendar_binding(selector, exchange, wire["freeze_at_utc"], root)
+            current = repository.resolve_verified_calendar_binding(
+                selector, exchange, wire["freeze_at_utc"], root, expected_purpose="official")
             if _canonical(asdict(current)) != _canonical(wire) or asdict(calendar_binding) != wire:
                 raise ValueError("calendar binding changed or was substituted")
             if type(disclosure_date_cn) is not str or date.fromisoformat(disclosure_date_cn).isoformat() != disclosure_date_cn:
                 raise ValueError("disclosure must be an exact ISO date")
-            selected = repository._select("trading_calendar", fact.scope_key, None, wire["freeze_at_utc"], root, exchange)
+            selected = repository._select("trading_calendar", fact.scope_key, None,
+                wire["freeze_at_utc"], root, exchange, expected_purpose="official")
             if selected.source_snapshot_id != wire["snapshot_id"]:
                 raise ValueError("calendar binding changed during final selection")
             next_days = [day for day in selected.value["trading_days"] if day > disclosure_date_cn]

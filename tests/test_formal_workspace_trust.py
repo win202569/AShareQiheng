@@ -5,6 +5,7 @@ import inspect
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -53,6 +54,102 @@ class WorkspaceGitIdentityTests(unittest.TestCase):
             "workspace_revision": _git(root, "rev-parse", "HEAD"),
             "workspace_tree": _git(root, "rev-parse", "HEAD:ashare_pipeline"),
         })
+
+    def test_blob_reads_batch_files_but_keep_two_independent_passes(self):
+        root = self.make_repository()
+        for name in ('space name.py', 'second.py', 'third.py'):
+            (root / 'ashare_pipeline' / name).write_text('VALUE = 1\n', encoding='utf-8')
+        _git(root, 'add', 'ashare_pipeline')
+        _git(root, 'commit', '-m', 'more files')
+        calls = []
+
+        def observed(command_root, args, binary=False):
+            if args[0] == 'hash-object':
+                calls.append(args)
+            return coverage_module._run_workspace_git(command_root, args, binary)
+
+        identity = self.helper()(root, _git=observed)
+        self.assertEqual(identity['workspace_revision'], _git(root, 'rev-parse', 'HEAD'))
+        self.assertEqual(len(calls), 2)
+
+    def test_batch_hashes_preserve_text_and_ident_filters(self):
+        root = self.make_repository()
+        source = root / 'ashare_pipeline'
+        _git(root, 'config', 'filter.trim.clean', 'git stripspace')
+        _git(root, 'config', 'filter.trim.required', 'true')
+        (source / '.gitattributes').write_text(
+            '*.py text eol=crlf ident filter=trim\n', encoding='utf-8')
+        (source / 'tracked.py').write_bytes(b'# $Id$\r\nVALUE = 1   \r\n')
+        _git(root, 'add', 'ashare_pipeline')
+        _git(root, 'commit', '-m', 'attributes')
+        paths = ('ashare_pipeline/.gitattributes', 'ashare_pipeline/tracked.py')
+        expected = [coverage_module._run_workspace_git(
+            root, ('hash-object', '--path=' + path, str(root / path))).strip()
+            for path in paths]
+        actual = coverage_module._run_workspace_git(
+            root, ('hash-object', '--', *paths)).splitlines()
+        self.assertEqual(actual, expected)
+        identity = self.helper()(root)
+        self.assertEqual(identity['workspace_tree'], _git(root, 'rev-parse', 'HEAD:ashare_pipeline'))
+
+    def test_large_batch_matches_scalar_reference_with_bounded_arguments(self):
+        root = self.make_repository()
+        for index in range(40):
+            name = f'{index:03d}_' + 'x' * 160 + '.py'
+            (root / 'ashare_pipeline' / name).write_text('VALUE = 1\n', encoding='utf-8')
+        _git(root, 'add', 'ashare_pipeline')
+        _git(root, 'commit', '-m', 'large batch')
+        calls = []
+
+        def scalar_reference(command_root, args, binary=False):
+            if args[0] == 'hash-object' and args[1] == '--':
+                return ''.join(coverage_module._run_workspace_git(
+                    command_root, ('hash-object', '--path=' + path, str(command_root / path)))
+                    for path in args[2:])
+            return coverage_module._run_workspace_git(command_root, args, binary)
+
+        def observed(command_root, args, binary=False):
+            if args[0] == 'hash-object':
+                calls.append(args)
+                self.assertLessEqual(sum(2 * len(path) + 4 for path in args[2:]), 8000)
+            return coverage_module._run_workspace_git(command_root, args, binary)
+
+        start = time.perf_counter()
+        expected = self.helper()(root, _git=scalar_reference)
+        scalar_seconds = time.perf_counter() - start
+        start = time.perf_counter()
+        actual = self.helper()(root, _git=observed)
+        batch_seconds = time.perf_counter() - start
+        self.assertEqual(actual, expected)
+        self.assertEqual(len(calls), 4)
+        print(f'\nworkspace diagnostic: scalar={scalar_seconds:.3f}s '
+              f'batch={batch_seconds:.3f}s; hash processes 82 -> {len(calls)}', flush=True)
+
+    def test_malformed_batch_hash_output_fails_closed(self):
+        root = self.make_repository()
+        for output in ('', 'a' * 40 + '\n' + 'b' * 40 + '\n', 'a' * 40, 'z' * 40 + '\n'):
+            with self.subTest(output=output):
+                def malformed(command_root, args, binary=False):
+                    if args[0] == 'hash-object':
+                        return output
+                    return coverage_module._run_workspace_git(command_root, args, binary)
+                with self.assertRaisesRegex(ValueError, 'output is malformed'):
+                    self.helper()(root, _git=malformed)
+
+    def test_oversized_single_path_is_rejected_before_filesystem_or_hash_read(self):
+        root = self.make_repository()
+        oversized = 'ashare_pipeline/' + ('segment/' * 500) + 'tracked.py'
+
+        def boundary(command_root, args, binary=False):
+            output = coverage_module._run_workspace_git(command_root, args, binary)
+            if args[0] in ('ls-tree', 'ls-files'):
+                return output.replace(b'ashare_pipeline/tracked.py', oversized.encode())
+            if args[0] == 'hash-object':
+                self.fail('oversized argument must never reach Git')
+            return output
+
+        with self.assertRaisesRegex(ValueError, 'argument budget'):
+            self.helper()(root, _git=boundary)
 
     def test_workspace_identity_rejects_every_source_worktree_change(self):
         cases = ("unstaged", "staged", "deleted", "untracked")

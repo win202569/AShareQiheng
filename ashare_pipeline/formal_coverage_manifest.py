@@ -369,14 +369,34 @@ def _read_workspace_git_identity(workspace_root: Any,
 
     def actual_blobs() -> dict[str, str]:
         snapshot: dict[str, str] = {}
+        batch: list[str] = []
+        argument_size = 0
+
+        def read_batch() -> None:
+            # Git applies each relative filename's attributes/clean filters.
+            # Bound argv size for Windows; neither pass reuses previous hashes.
+            output = git("hash-object", "--", *batch)
+            lines = output.splitlines()
+            if (len(lines) != len(batch) or output != "\n".join(lines) + "\n"
+                    or any(_oid_pattern.fullmatch(value) is None for value in lines)):
+                raise ValueError("official coverage Git command output is malformed")
+            snapshot.update(zip(batch, lines))
+
         for path in head_files:
+            cost = 2 * len(path) + 4
+            if cost > 8000:
+                raise ValueError("official coverage tracked path exceeds Git argument budget")
             candidate = root.joinpath(*path.split("/"))
             if candidate.is_symlink() or not candidate.is_file():
                 raise ValueError("official coverage workspace tracked source type changed")
-            actual_blob = scalar("hash-object", f"--path={path}", str(candidate))
-            if _oid_pattern.fullmatch(actual_blob) is None:
-                raise ValueError("official coverage Git command output is malformed")
-            snapshot[path] = actual_blob
+            if batch and argument_size + cost > 8000:
+                read_batch()
+                batch = []
+                argument_size = 0
+            batch.append(path)
+            argument_size += cost
+        if batch:
+            read_batch()
         return snapshot
 
     expected_blobs = {path: blob for path, (_, blob) in head_files.items()}

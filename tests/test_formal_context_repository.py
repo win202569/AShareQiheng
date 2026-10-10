@@ -622,6 +622,17 @@ class ContextIntegrationTests(unittest.TestCase):
                 with self.subTest(exchange=exchange, field=field), self.assertRaises(ValueError):
                     resolver.next_exchange_close(exchange, "2026-08-31", replace(binding, **{field: bad}))
 
+    def test_effective_time_resolver_rejects_test_calendar_root(self):
+        self.install_calendars(exchanges=("SZ",))
+        selector = CalendarSelector("trading_calendar", "fixture-calendar-SZ", "SZ", "visible_at_freeze")
+        binding = self.repo.resolve_verified_calendar_binding(
+            selector, "SZ", FREEZE, self.manifest.manifest_hash)
+        resolver = self.api.build_effective_time_resolver(self.repo)
+        self.install(purpose="test")
+        foreign = replace(binding, registry_manifest_hash=self.manifest.manifest_hash)
+        with self.assertRaisesRegex(ValueError, "official registry manifest approval|purpose"):
+            resolver.next_exchange_close("SZ", "2026-08-31", foreign)
+
     def test_date_only_uses_calendar_provenance_without_recursive_self_lookup(self):
         self.install_calendars(date_only=True)
         request = self.request()
