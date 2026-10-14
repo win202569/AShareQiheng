@@ -345,8 +345,8 @@ class FormalInvalidationScopeTests(unittest.TestCase):
                 input_batch=Batch(), coverage_manifest=coverage, mode="test_preview")
             self.assertIsInstance(plan, FormalRebuildPlan)
             self.assertEqual(gate.call_count, 2)
-            self.assertEqual(gate.call_args_list[0].args, (coverage, "test_preview"))
-            self.assertEqual(gate.call_args_list[1].args, (coverage, "test_preview"))
+            self.assertEqual(gate.call_args_list[0].args, (coverage, "test_preview", "code"))
+            self.assertEqual(gate.call_args_list[1].args, (coverage, "test_preview", "code"))
 
 
 class FormalInvalidationRepositoryTests(unittest.TestCase):
