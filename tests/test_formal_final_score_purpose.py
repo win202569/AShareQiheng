@@ -264,9 +264,9 @@ class FormalFinalScorePurposeTests(unittest.TestCase):
         self.assertIn("expected_purpose=expected_purpose", call.group(1))
 
     def test_genuine_metric_context_requires_explicit_matching_test_purpose(self):
-        from tests.formal_metric_feature_fixtures import FinancialFixture
+        from tests.formal_valuation_fixtures import ValuationRuntimeFixture
 
-        test_fixture = FinancialFixture(purpose="test")
+        test_fixture = ValuationRuntimeFixture(peer_count=3, purpose="test")
         self.addCleanup(test_fixture.close)
         with self.assertRaises(ValueError):
             FormalContextRegistry.load(
@@ -314,7 +314,7 @@ class FormalFinalScorePurposeTests(unittest.TestCase):
         )
         proof.require_verified()
 
-        official_fixture = FinancialFixture()
+        official_fixture = ValuationRuntimeFixture(peer_count=3, purpose="official")
         self.addCleanup(official_fixture.close)
         official_context = FormalMetricContextRepository(
             official_fixture.store,
