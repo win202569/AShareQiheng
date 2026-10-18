@@ -12,6 +12,7 @@ import weakref
 
 from tests.formal_metric_feature_fixtures import FinancialFixture, METRICS
 from tests.formal_metric_fixtures import FREEZE
+from tests.test_formal_metric_engine import _v2_financial_fixture
 from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
 
 
@@ -30,7 +31,7 @@ class Spoof(str):
 
 class MetricBatchReviewTests(unittest.TestCase):
     def fixture(self, *, missing=True):
-        fixture = FinancialFixture(missing_memberships=missing)
+        fixture = _v2_financial_fixture(missing_memberships=missing)
         self.addCleanup(fixture.close)
         api = importlib.import_module("ashare_pipeline.formal_metric_engine")
         repo = api.FormalMetricInputRepository(fixture.feature_repository, fixture.context,
@@ -198,7 +199,7 @@ class MetricBatchReviewTests(unittest.TestCase):
 class DerivedProofPublicationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.fixture = FinancialFixture(population=True)
+        cls.fixture = _v2_financial_fixture(population=True)
         cls.addClassCleanup(cls.fixture.close)
         # Genuine complete population with one independently controlled selected
         # FY2025 metric; every source/industry/feature receipt is persisted.
