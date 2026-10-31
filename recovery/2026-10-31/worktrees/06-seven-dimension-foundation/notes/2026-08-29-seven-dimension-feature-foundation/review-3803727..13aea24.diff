@@ -1,0 +1,525 @@
+# Review package: 38037273f4710f4b70cc684884a51502607c1d09..13aea24636744490115f21b78bd696fd538f6400
+
+## Commits
+13aea24 fix: enforce financial-ready feature contract
+
+## Files changed
+ ashare_pipeline/feature_contract.py   |  66 ++++++++++++++++++++++
+ ashare_pipeline/financial_features.py |  11 +---
+ tests/test_feature_contract.py        |  85 +++++++++++++++++++++++++++-
+ tests/test_orchestrator.py            | 103 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 255 insertions(+), 10 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/feature_contract.py b/ashare_pipeline/feature_contract.py
+index ce5de4f..1058ef4 100644
+--- a/ashare_pipeline/feature_contract.py
++++ b/ashare_pipeline/feature_contract.py
+@@ -6,20 +6,31 @@ from dataclasses import dataclass
+ from datetime import date, datetime, timezone
+ import hashlib
+ import json
+ import math
+ import re
+ from typing import Any, Mapping
+ from types import MappingProxyType
+ 
+ CONTRACT_VERSION = "feature-contract-v1"
+ DIMENSIONS = ("G", "V", "M", "EQ", "FS", "CA", "T")
++FINANCIAL_DIMENSIONS = ("G", "M", "EQ", "FS", "CA")
++FINANCIAL_PERIODS = (
++    ("2021-12-31", "FY2021"),
++    ("2022-12-31", "FY2022"),
++    ("2023-12-31", "FY2023"),
++    ("2024-12-31", "FY2024"),
++    ("2025-12-31", "FY2025"),
++    ("2025-06-30", "2025H1"),
++    ("2026-06-30", "2026H1"),
++)
++FINANCIAL_PERIOD_KEYS = tuple(period_key for _period_end, period_key in FINANCIAL_PERIODS)
+ FEATURE_VALUE_STATES = frozenset({"observed", "derived", "missing", "not_applicable", "blocked"})
+ DIMENSION_INPUT_STATES = frozenset({"input_ready", "partial", "missing", "not_applicable", "blocked"})
+ FINANCIAL_STATUSES = frozenset({"partial", "financial_ready", "blocked"})
+ UNITS = frozenset({"CNY", "shares", "ratio", "CNY_per_share"})
+ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+ _SECURITY_ID = re.compile(r"^(?:SH|SZ)\d{6}$")
+ _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+ 
+ 
+ def _require_exact_keys(
+@@ -369,20 +380,22 @@ class FeatureBundle:
+     def __post_init__(self) -> None:
+         if not isinstance(self.dimension_inputs, Mapping):
+             raise ValueError("dimension_inputs must be a mapping")
+         object.__setattr__(self, "dimension_inputs", MappingProxyType(dict(self.dimension_inputs)))
+         if not isinstance(self.blockers, (list, tuple)):
+             raise ValueError("blockers must be a list")
+         object.__setattr__(self, "blockers", tuple(self.blockers))
+         self.validate()
+ 
+     def validate(self) -> None:
++        from .industry_templates import TEMPLATES
++
+         if (
+             isinstance(self.schema_version, bool)
+             or not isinstance(self.schema_version, int)
+             or self.schema_version != 1
+             or self.contract_version != CONTRACT_VERSION
+         ):
+             raise ValueError("unsupported feature contract")
+         if not isinstance(self.security_id, str) or _SECURITY_ID.fullmatch(self.security_id) is None:
+             raise ValueError("security_id must use SH/SZ plus six digits")
+         _require_iso_date(self.report_period, "report_period")
+@@ -413,29 +426,82 @@ class FeatureBundle:
+         if any(
+             not isinstance(blocker, str) or not blocker
+             for blocker in self.blockers
+         ):
+             raise ValueError("blockers must contain non-empty strings")
+         if len(self.blockers) != len(set(self.blockers)):
+             raise ValueError("blockers must not contain duplicates")
+         financial_blockers = set(self.blockers) - {
+             "formal_industry_mapping_missing"
+         }
++        template = TEMPLATES[self.industry.template_id]
++        specialized_inputs_pending = (
++            template.template_id != "unclassified"
++            and template.specialized_inputs_required
++        )
++        if specialized_inputs_pending and (
++            self.financial_status != "blocked"
++            or "specialized_financial_inputs_missing" not in financial_blockers
++        ):
++            raise ValueError(
++                "specialized financial template requires blocked status and missing-input blocker"
++            )
+         if self.financial_status == "financial_ready":
+             if (
+                 coverage != 1.0
+                 or financial_blockers
+                 or self.industry.template_id == "unclassified"
+             ):
+                 raise ValueError(
+                     "financial_ready requires full coverage and no financial blocker"
+                 )
++            financial_inputs = {
++                dimension: self.dimension_inputs[dimension]
++                for dimension in FINANCIAL_DIMENSIONS
++            }
++            if any(
++                dimension.status not in {"input_ready", "not_applicable"}
++                for dimension in financial_inputs.values()
++            ) or any(
++                value.status in {"missing", "blocked"}
++                for dimension in financial_inputs.values()
++                for value in dimension.values
++            ):
++                raise ValueError(
++                    "financial_ready requires complete applicable financial dimensions"
++                )
++            registered_slot_periods = {
++                (slot, period_key)
++                for slot in template.financial_slots
++                for period_key in FINANCIAL_PERIOD_KEYS
++            }
++            supplied_slot_periods: list[tuple[str, str]] = []
++            for dimension_name, dimension in financial_inputs.items():
++                for value in dimension.values:
++                    parts = value.key.split(".")
++                    if (
++                        len(parts) == 3
++                        and parts[0] == dimension_name.lower()
++                        and parts[1] in template.financial_slots
++                        and parts[2] == value.period_key
++                        and value.period_key in FINANCIAL_PERIOD_KEYS
++                        and value.status in {"observed", "derived"}
++                    ):
++                        supplied_slot_periods.append((parts[1], value.period_key))
++            if (
++                not registered_slot_periods
++                or len(supplied_slot_periods) != len(registered_slot_periods)
++                or set(supplied_slot_periods) != registered_slot_periods
++            ):
++                raise ValueError(
++                    "financial_ready requires every registered slot for every financial period"
++                )
+ 
+     def to_dict(self) -> dict[str, Any]:
+         return {"schema_version": self.schema_version, "contract_version": self.contract_version,
+                 "security_id": self.security_id, "report_period": self.report_period, "as_of_utc": require_aware_utc(self.as_of_utc, "as_of_utc"),
+                 "candidate_set_hash": self.candidate_set_hash, "industry": self.industry.to_dict(), "input_hash": self.input_hash,
+                 "financial_status": self.financial_status, "financial_coverage": self.financial_coverage,
+                 "confidence_inputs": self.confidence_inputs.to_dict(),
+                 "dimension_inputs": {key: self.dimension_inputs[key].to_dict() for key in DIMENSIONS},
+                 "blockers": sorted(self.blockers), "is_formal_score_ready": False}
+ 
+diff --git a/ashare_pipeline/financial_features.py b/ashare_pipeline/financial_features.py
+index 4461000..4c5f3bb 100644
+--- a/ashare_pipeline/financial_features.py
++++ b/ashare_pipeline/financial_features.py
+@@ -6,20 +6,21 @@ from dataclasses import dataclass
+ from datetime import date, datetime, time, timedelta, timezone
+ import math
+ import re
+ from types import MappingProxyType
+ from typing import Iterable, Mapping, Sequence
+ from zoneinfo import ZoneInfo
+ 
+ from ashare_pipeline.feature_contract import (
+     CONTRACT_VERSION,
+     DIMENSIONS,
++    FINANCIAL_PERIODS,
+     ConfidenceInputs,
+     DimensionInput,
+     EvidenceRef,
+     FeatureBundle,
+     FeatureValue,
+     IndustryContext,
+     canonical_sha256,
+     require_aware_utc,
+ )
+ from ashare_pipeline.financial_schema import (
+@@ -43,29 +44,21 @@ _CALENDAR_START = date(2021, 1, 1)
+ _CALENDAR_END = date(2026, 9, 7)
+ _MISSING_UPDATED_AT = datetime.min.replace(tzinfo=timezone.utc)
+ _EXACT_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+ _SOURCE_TIMESTAMP = re.compile(
+     r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+     r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?$"
+ )
+ _SECURITY_CODE = re.compile(r"^\d{6}$")
+ _SECUCODE = re.compile(r"^(\d{6})\.(SH|SZ)$")
+ 
+-_REQUIRED_PERIODS = (
+-    ("2021-12-31", "FY2021"),
+-    ("2022-12-31", "FY2022"),
+-    ("2023-12-31", "FY2023"),
+-    ("2024-12-31", "FY2024"),
+-    ("2025-12-31", "FY2025"),
+-    ("2025-06-30", "2025H1"),
+-    ("2026-06-30", "2026H1"),
+-)
++_REQUIRED_PERIODS = FINANCIAL_PERIODS
+ _PERIOD_KEY = dict(_REQUIRED_PERIODS)
+ _OPENING_PERIOD = {
+     "2022-12-31": "2021-12-31",
+     "2023-12-31": "2022-12-31",
+     "2024-12-31": "2023-12-31",
+     "2025-12-31": "2024-12-31",
+     "2025-06-30": "2024-12-31",
+     "2026-06-30": "2025-12-31",
+ }
+ 
+diff --git a/tests/test_feature_contract.py b/tests/test_feature_contract.py
+index 7a33386..c0d67da 100644
+--- a/tests/test_feature_contract.py
++++ b/tests/test_feature_contract.py
+@@ -1,16 +1,16 @@
+ import copy
+ import math
+ import unittest
+ 
+ from ashare_pipeline.feature_contract import (
+-    CONTRACT_VERSION, DIMENSIONS, ConfidenceInputs, DimensionInput,
++    CONTRACT_VERSION, DIMENSIONS, FINANCIAL_DIMENSIONS, ConfidenceInputs, DimensionInput,
+     EvidenceRef, FeatureBundle, FeatureValue, IndustryContext,
+ )
+ 
+ 
+ def evidence(snapshot_id="snapshot-a"):
+     return EvidenceRef("fact-a", snapshot_id, "TOTAL_ASSETS", "a" * 64,
+                        "2026-08-20T15:59:59+00:00", "2026-08-21T07:00:00+00:00")
+ 
+ 
+ def dimensions():
+@@ -30,20 +30,32 @@ def bundle(dimension_inputs=None, *, is_formal_score_ready=False, coverage=0.5,
+         "2026-08-29T16:00:00+00:00", "c" * 64,
+         IndustryContext("eastmoney-provisional", None, "包装印刷",
+                         "general_nonfinancial", "template-registry-v1", False),
+         "1" * 64, "partial", coverage,
+         ConfidenceInputs(coverage, {"timestamp": 0, "date_only": 1}, 3,
+                           True, formal_confidence),
+         dimension_inputs or dimensions(), ("formal_industry_mapping_missing",),
+         is_formal_score_ready)
+ 
+ 
++def real_general_ready_bundle():
++    from tests.test_financial_features import build_bundle_with_overrides
++
++    return build_bundle_with_overrides()
++
++
++def real_specialized_bundle(industry_name):
++    from tests.test_financial_features import build_bundle_with_overrides
++
++    return build_bundle_with_overrides(source_industry_name=industry_name)
++
++
+ class FeatureContractTests(unittest.TestCase):
+     def test_bundle_requires_exactly_seven_dimensions_and_is_never_formal(self):
+         self.assertEqual(DIMENSIONS, ("G", "V", "M", "EQ", "FS", "CA", "T"))
+         with self.assertRaisesRegex(ValueError, "dimension keys"):
+             bundle({key: value for key, value in dimensions().items() if key != "G"})
+         with self.assertRaisesRegex(ValueError, "formal score"):
+             bundle(dimensions(), is_formal_score_ready=True)
+ 
+     def test_zero_missing_and_nonfinite_values_have_distinct_contracts(self):
+         self.assertEqual(dimensions()["G"].values[0].value, 0.0)
+@@ -203,13 +215,84 @@ class FeatureContractTests(unittest.TestCase):
+             ),
+         }
+         baseline = bundle().to_dict()
+         for field, mutate in cases.items():
+             with self.subTest(field=field):
+                 payload = copy.deepcopy(baseline)
+                 mutate(payload)
+                 with self.assertRaises(ValueError):
+                     FeatureBundle.from_dict(payload)
+ 
++    def test_public_parse_rejects_ready_missing_or_blocked_financial_inputs(self):
++        baseline = real_general_ready_bundle().to_dict()
++
++        def replace_first_applicable_value(value, dimension, status):
++            target = next(
++                item
++                for item in value["dimension_inputs"][dimension]["values"]
++                if item["status"] in {"observed", "derived"}
++            )
++            target.update({
++                "value": None,
++                "status": status,
++                "evidence": [],
++                "missing_reason": f"forged_{status}",
++            })
++            value["dimension_inputs"][dimension]["status"] = "partial"
++
++        for dimension in FINANCIAL_DIMENSIONS:
++            cases = {
++                "missing_dimension": lambda value, dimension=dimension: value[
++                    "dimension_inputs"
++                ].__setitem__(dimension, {"status": "missing", "values": []}),
++                "blocked_dimension": lambda value, dimension=dimension: value[
++                    "dimension_inputs"
++                ][dimension].__setitem__("status", "blocked"),
++                "missing_value": lambda value, dimension=dimension: replace_first_applicable_value(
++                    value, dimension, "missing"
++                ),
++                "blocked_value": lambda value, dimension=dimension: replace_first_applicable_value(
++                    value, dimension, "blocked"
++                ),
++            }
++            for attack, mutate in cases.items():
++                with self.subTest(dimension=dimension, attack=attack):
++                    payload = copy.deepcopy(baseline)
++                    mutate(payload)
++                    with self.assertRaises(ValueError):
++                        FeatureBundle.from_dict(payload)
++
++    def test_public_parse_rejects_ready_with_registered_slot_period_omitted(self):
++        payload = real_general_ready_bundle().to_dict()
++        payload["dimension_inputs"]["G"]["values"] = [
++            value
++            for value in payload["dimension_inputs"]["G"]["values"]
++            if value["key"] != "g.revenue.FY2021"
++        ]
++
++        with self.assertRaises(ValueError):
++            FeatureBundle.from_dict(payload)
++
++    def test_public_parse_enforces_specialized_template_blocker(self):
++        for industry_name in ("房地产开发", "工业金属", "银行"):
++            baseline = real_specialized_bundle(industry_name).to_dict()
++            self.assertIn("specialized_financial_inputs_missing", baseline["blockers"])
++            for status in ("financial_ready", "blocked"):
++                with self.subTest(industry=industry_name, status=status):
++                    payload = copy.deepcopy(baseline)
++                    payload["financial_status"] = status
++                    payload["blockers"].remove("specialized_financial_inputs_missing")
++                    with self.assertRaises(ValueError):
++                        FeatureBundle.from_dict(payload)
++
++    def test_general_ready_bundle_still_has_canonical_public_round_trip(self):
++        candidate = real_general_ready_bundle()
++
++        restored = FeatureBundle.from_dict(candidate.to_dict())
++
++        self.assertEqual(restored.financial_status, "financial_ready")
++        self.assertEqual(restored.financial_coverage, 1.0)
++        self.assertEqual(restored.canonical_bytes(), candidate.canonical_bytes())
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+index 015a54d..765e15e 100644
+--- a/tests/test_orchestrator.py
++++ b/tests/test_orchestrator.py
+@@ -1,44 +1,47 @@
++import copy
+ import io
+ import hashlib
+ import json
+ import os
+ import sqlite3
+ import tempfile
+ import unittest
+ from contextlib import closing, redirect_stdout
+ from datetime import date, timedelta
+ from pathlib import Path
+ from unittest.mock import patch
+ 
+ from ashare_pipeline.deep_worker import (
+     CandidateContext,
+     STATEMENT_DATASETS,
+     deep_statement_key,
++    read_verified_feature_bundle,
+     write_feature_bundle,
+ )
+ from ashare_pipeline.feature_contract import (
+     CONTRACT_VERSION,
+     DIMENSIONS,
+     ConfidenceInputs,
+     DimensionInput,
+     FeatureBundle,
+     FeatureValue,
+     IndustryContext,
+     canonical_sha256,
+ )
+ from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
+ from ashare_pipeline.snapshot_repository import SnapshotRepository
+ from ashare_pipeline.snapshot_store import SnapshotStore
+ from ashare_pipeline.sources import FetchBatch, SourceBlocked
+ from ashare_pipeline.state_store import StateStore
+ from ashare_pipeline import orchestrator
++from tests.test_financial_features import build_bundle_with_overrides
+ 
+ 
+ def batch(source, dataset, records, request=None, fetched_at="2026-08-29T12:00:00+00:00"):
+     return FetchBatch(source, dataset, request or {}, records, fetched_at, "test", {})
+ 
+ 
+ def records_hash(records):
+     payload = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+     return hashlib.sha256(payload).hexdigest()
+ 
+@@ -1075,20 +1078,120 @@ class OrchestratorTestCase(unittest.TestCase):
+             progress["feature_set_counts"],
+             {"partial": 1, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertEqual(progress["template_counts"], {"general_nonfinancial": 1})
+         self.assertEqual(
+             progress["missing_reason_counts"],
+             {"financial_fact_missing:revenue": 1},
+         )
+         self.assertNotIn("g.revenue.FY2025", json.dumps(progress))
+ 
++    def test_forged_ready_cannot_cross_write_or_persistence_boundary_or_count_ready(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        valid = build_bundle_with_overrides(
++            candidate_set_hash=context.candidate_set_hash
++        )
++        forged = copy.copy(valid)
++        forged_dimensions = dict(valid.dimension_inputs)
++        forged_dimensions["G"] = DimensionInput(
++            "input_ready",
++            tuple(
++                value
++                for value in valid.dimension_inputs["G"].values
++                if value.key != "g.revenue.FY2021"
++            ),
++        )
++        object.__setattr__(forged, "dimension_inputs", forged_dimensions)
++        forged_path = (
++            "data/curated/formal_features/2026-06-30/SH600001/"
++            f"{forged.input_hash}.json"
++        )
++
++        with self.assertRaises(ValueError):
++            store.put_feature_bundle(
++                forged,
++                bundle_path=forged_path,
++                bundle_hash=forged.bundle_hash(),
++            )
++        with self.assertRaisesRegex(OSError, "malformed"):
++            write_feature_bundle(self.base, forged)
++
++        with closing(sqlite3.connect(store.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
++                0,
++            )
++        feature_root = self.root / "curated" / "formal_features"
++        self.assertEqual(list(feature_root.rglob("*.json")), [])
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-29T20:00:00+08:00",
++        )
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 0, "blocked": 0},
++        )
++        self.assertFalse(status["formal_score_ready"])
++        self.assertFalse(status["seven_dimension_ready"])
++        self.assertEqual(
++            status["official_pool_counts"],
++            {"waiting_price": 0, "strong_attention": 0},
++        )
++
++    def test_general_ready_round_trips_through_verified_storage_and_progress(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        built = build_bundle_with_overrides(
++            candidate_set_hash=context.candidate_set_hash
++        )
++        parsed = FeatureBundle.from_dict(built.to_dict())
++
++        relative_path, bundle_hash, created = write_feature_bundle(self.base, parsed)
++        feature_id, stored = store.put_feature_bundle(
++            parsed,
++            bundle_path=relative_path,
++            bundle_hash=bundle_hash,
++        )
++        verified = read_verified_feature_bundle(
++            self.base, relative_path, bundle_hash
++        )
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-29T20:00:00+08:00",
++        )
++
++        self.assertTrue(created)
++        self.assertTrue(stored)
++        self.assertEqual(feature_id, bundle_hash)
++        self.assertEqual(verified.canonical_bytes(), parsed.canonical_bytes())
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 1, "blocked": 0},
++        )
++        self.assertFalse(status["formal_score_ready"])
++        self.assertFalse(status["seven_dimension_ready"])
++        self.assertEqual(
++            status["official_pool_counts"],
++            {"waiting_price": 0, "strong_attention": 0},
++        )
++
+     def test_progress_excludes_deleted_and_tampered_bundle_files(self):
+         write_candidate_documents(
+             self.root,
+             {"SH600001": "包装印刷", "SH600002": "包装印刷"},
+         )
+         store = StateStore(self.root / "state.sqlite3")
+         store.initialize()
+         context = orchestrator.load_candidate_context(self.root)
+         targets = []
+         for security_id, input_hash in (

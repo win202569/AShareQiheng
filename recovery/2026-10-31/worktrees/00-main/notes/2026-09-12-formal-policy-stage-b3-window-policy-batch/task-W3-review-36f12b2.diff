@@ -1,0 +1,1124 @@
+diff --git a/ashare_pipeline/formal_metric_batch_guard.py b/ashare_pipeline/formal_metric_batch_guard.py
+index 2a75aab89ad80fe94d157ce2b415a85d86a9518d..8d51862fa506b3ec6c4f99fc333ef863aa91482d 100644
+--- a/ashare_pipeline/formal_metric_batch_guard.py
++++ b/ashare_pipeline/formal_metric_batch_guard.py
+@@ -8,7 +8,7 @@ feature repository reads still authenticate all published facts and receipts.
+ from contextlib import contextmanager
+ import json
+ import sqlite3
+-from threading import RLock
++from threading import RLock, get_ident
+ import weakref
+ 
+ from .formal_feature_repository import (
+@@ -23,6 +23,7 @@ from .state_store import StateStore
+ 
+ def _owned_provider():
+     records = {}
++    active_finalizations = {}
+     connect = StateStore._connect
+     initialized = _require_repository_initialization
+     identity = FormalFeatureRepository._snapshot_identity
+@@ -109,6 +110,37 @@ def _owned_provider():
+     @contextmanager
+     def guard(provider, store):
+         record = require(provider, store)
++        thread = get_ident()
++        enclosing = active_finalizations.get(thread)
++        if enclosing is not None:
++            if enclosing[0] is not provider or enclosing[1] is not store:
++                raise ValueError("nested metric guard requires the exact finalization owner")
++            _, _, owner_record, observer, epoch, database_epoch = enclosing
++            nested_active, nested_finalized = True, False
++
++            class NestedGuard:
++                __slots__ = ()
++
++                def finalize(self, mint):
++                    nonlocal nested_finalized
++                    if not nested_active or nested_finalized or active_finalizations.get(thread) is not enclosing:
++                        raise ValueError("nested metric batch guard is closed or already finalized")
++                    nested_finalized = True
++                    require(provider, store)
++                    if not owner_record["finalizing"] or owner_record["epoch"] != epoch:
++                        raise ValueError("metric provider changed during complete batch finalization")
++                    if observer.execute("PRAGMA data_version").fetchone()[0] != database_epoch:
++                        raise ValueError("metric database changed during complete batch")
++                    result = mint()
++                    if owner_record["epoch"] != epoch:
++                        raise ValueError("metric provider changed during complete batch finalization")
++                    return result
++
++            try:
++                yield NestedGuard()
++            finally:
++                nested_active = False
++            return
+         observer = None
+         active, finalized = False, False
+         try:
+@@ -140,11 +172,13 @@ def _owned_provider():
+                             observer.execute("BEGIN IMMEDIATE")
+                             if observer.execute("PRAGMA data_version").fetchone()[0] != database_epoch:
+                                 raise ValueError("metric database changed during complete batch")
++                            active_finalizations[thread] = (provider, store, record, observer, epoch, database_epoch)
+                             result = mint()
+                             if record["epoch"] != epoch:
+                                 raise ValueError("metric provider changed during complete batch finalization")
+                             return result
+                         finally:
++                            active_finalizations.pop(thread, None)
+                             try:
+                                 observer.rollback()
+                             finally:
+diff --git a/ashare_pipeline/formal_policy_repository.py b/ashare_pipeline/formal_policy_repository.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..118778c810535fc2e647b0748027fa89f4a20ec7
+--- /dev/null
++++ b/ashare_pipeline/formal_policy_repository.py
+@@ -0,0 +1,372 @@
++"""Sole complete-universe policy publication authority.
++
++Detached evaluator dictionaries are data. Eligibility resides only in this
++module's closure-owned records and the shared, revocable publication state.
++"""
++
++import json
++from types import MappingProxyType
++import weakref
++
++from . import formal_policy_evaluator as evaluator_module
++from . import formal_policy_market as market_module
++from . import formal_range_store as range_module
++from . import formal_policy_registry as registry_module
++from .formal_context_repository import FormalContextRepository
++from .formal_feature_repository import FormalFeatureRepository
++from .formal_metric_batch_guard import FormalMetricCurrentInputProvider, _metric_batch_guard
++from .formal_metric_context import FormalMetricContextRepository, _require_authentic_metric_context_repository
++from .formal_policy_financial import FormalPolicyFinancialRepository, PolicyFinancialSelection, _feature_dependencies
++from .formal_policy_state import FormalPolicyStateRepository, PolicyStateSelection
++from .formal_policy_market import (
++    FormalPolicyMarketRepository, MarketSelection, CalendarSelection,
++    VerifiedMarketWindowV1, VerifiedCalendarCoverageV1,
++)
++from .formal_policy_values import PolicyValue, canonical_bytes, digest, _policy_value_operations
++from .formal_range_contract import load_policy_range_bindings
++from .formal_registry_manifest import FormalRegistryBundleLoader
++from .formal_scoring_registry import FormalScoringRegistry
++
++
++def _install_repository():
++    repositories, proofs = {}, {}
++    owner = globals()
++    encode, hash_payload = canonical_bytes, digest
++    parse_value, serialize_value, check_values = _policy_value_operations()
++    read_policy = registry_module._read_authenticated_policy_registry
++    range_identity = range_module._require_range_store_identity
++    feature_check = _feature_dependencies
++    context_check = _require_authentic_metric_context_repository
++    guard_factory = _metric_batch_guard
++    load_root = FormalRegistryBundleLoader.load
++    load_bindings = load_policy_range_bindings
++    evaluate, aggregate = evaluator_module.evaluate_rule, evaluator_module.aggregate_decisions
++    roles = ("source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event")
++    captured = tuple((owner, name, value) for name, value in owner.items()
++                     if callable(value) and name != "_install_repository")
++    captured += tuple((vars(evaluator_module), name, value)
++                      for name, value in vars(evaluator_module).items()
++                      if callable(value) or name.startswith("_DECISION"))
++    captured += tuple((vars(module), name, value)
++                      for module in (market_module, range_module)
++                      for name, value in vars(module).items() if callable(value))
++    captured += ((vars(range_module), "_require_range_store_identity", range_identity),
++                 (vars(registry_module), "_read_authenticated_policy_registry", read_policy),
++                 (vars(range_module), "FormalRangeStore", range_module.FormalRangeStore),
++                 (vars(evaluator_module), "copy", evaluator_module.copy),
++                 (vars(evaluator_module.copy), "deepcopy", evaluator_module.copy.deepcopy),
++                 (owner, "range_module", range_module), (owner, "registry_module", registry_module),
++                 (owner, "evaluator_module", evaluator_module), (owner, "market_module", market_module))
++    dependencies_classes = (FormalFeatureRepository, FormalContextRepository,
++        FormalMetricCurrentInputProvider, FormalMetricContextRepository,
++        FormalPolicyFinancialRepository, PolicyFinancialSelection,
++        FormalPolicyStateRepository, PolicyStateSelection, FormalPolicyMarketRepository,
++        MarketSelection, CalendarSelection, VerifiedMarketWindowV1, VerifiedCalendarCoverageV1,
++        range_module.FormalRangeStore, FormalRegistryBundleLoader, FormalScoringRegistry)
++    checked = tuple((cls, name, value) for cls in dependencies_classes
++                    for name, value in vars(cls).items()
++                    if callable(value) or isinstance(value, (staticmethod, classmethod)))
++
++    def interfaces():
++        check_values()
++        if any(namespace.get(name) is not original for namespace, name, original in captured):
++            raise ValueError("policy publication dependency changed")
++        if any(vars(cls).get(name) is not original for cls, name, original in checked):
++            raise ValueError("policy publication reader interface changed")
++        if any(owner.get(name) is not original for name, original in entries):
++            raise ValueError("policy publication entry point changed")
++
++    def state(feature, context, ranges, verifier, companion):
++        interfaces()
++        if (type(feature) is not FormalFeatureRepository or type(context) is not FormalContextRepository
++                or feature._store is not context._state_store or feature._verifier is not verifier
++                or context._verifier is not verifier):
++            raise ValueError("policy repository requires exact same-Store repositories and verifier")
++        feature_check(feature, feature._current_input_provider)
++        context_check(companion)
++        range_identity(ranges, feature._store, verifier)
++        for cls, name, _ in checked:
++            for instance in (feature, context, ranges):
++                if type(instance) is cls and name in vars(instance):
++                    raise ValueError("policy repository dependency has an instance override")
++        return (id(feature), id(context), id(ranges), id(verifier), id(feature._store),
++                id(feature._bundle_store), id(feature._current_input_provider), id(context._snapshots))
++
++    def dependencies(repository):
++        interfaces()
++        saved = repositories.get(id(repository))
++        if type(repository) is not FormalPolicyRepository or saved is None or saved[0]() is not repository:
++            raise ValueError("policy repository is forged or copied")
++        feature, context, ranges, verifier, companion, original = saved[1:7]
++        if state(feature, context, ranges, verifier, companion) != original:
++            raise ValueError("policy repository graph changed")
++        return saved
++
++    def freeze(value):
++        if type(value) is dict:
++            return MappingProxyType({key: freeze(item) for key, item in value.items()})
++        if type(value) in (list, tuple):
++            return tuple(freeze(item) for item in value)
++        return value
++
++    def plain(value):
++        if type(value) is PolicyValue:
++            return serialize_value(value)
++        if isinstance(value, (dict, MappingProxyType)):
++            return {key: plain(item) for key, item in value.items()}
++        if type(value) in (list, tuple):
++            return [plain(item) for item in value]
++        return value
++
++    def record(proof):
++        interfaces()
++        saved = proofs.get(id(proof))
++        if (type(proof) not in proof_types or saved is None or saved[0]() is not proof
++                or saved[6] is not type(proof)
++                or not saved[3]["published"] or saved[4] is not saved[3]["parent_link"]
++                or saved[5] != saved[3]["batch_hash"]):
++            raise ValueError("policy proof is forged, copied, unpublished or revoked")
++        return saved
++
++    class SealedMeta(type):
++        def __setattr__(cls, name, value):
++            raise TypeError("policy authority types are immutable")
++
++        def __delattr__(cls, name):
++            raise TypeError("policy authority types are immutable")
++
++    class Proof(metaclass=SealedMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("policy proofs require a complete authenticated publication")
++
++        def __getattribute__(self, name):
++            record(self)
++            return object.__getattribute__(self, name)
++
++        def __getattr__(self, name):
++            saved = record(self)
++            if name not in saved[1]:
++                raise AttributeError(name)
++            return saved[1][name]
++
++        def require_verified(self):
++            record(self)
++
++        require_official = require_verified
++
++        def to_dict(self):
++            return json.loads(record(self)[2])
++
++        def canonical_bytes(self):
++            return record(self)[2]
++
++        def __copy__(self):
++            raise TypeError("policy proofs cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("policy proofs cannot be copied")
++
++    class VerifiedPolicyEvidenceBatch(Proof):
++        __slots__ = ()
++
++    class PolicyDecision(Proof):
++        __slots__ = ()
++
++    class PolicyResult(Proof):
++        __slots__ = ()
++
++    class VerifiedPolicyResultBatch(Proof):
++        __slots__ = ()
++
++    proof_types = (VerifiedPolicyEvidenceBatch, PolicyDecision, PolicyResult, VerifiedPolicyResultBatch)
++
++    def mint(cls, payload, publication, attributes=None):
++        proof = object.__new__(cls)
++        key = id(proof)
++        wire = dict(payload, batch_hash=publication["batch_hash"])
++        data = dict(wire)
++        data.update(attributes or {})
++        proofs[key] = (weakref.ref(proof, lambda _: proofs.pop(key, None)), freeze(data), encode(wire),
++                       publication, publication["parent_link"], publication["batch_hash"], cls)
++        return proof
++
++    class FormalPolicyRepository(metaclass=SealedMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, feature_repository, context_repository, range_store, *, registry_signature_verifier):
++            if type(self) is not FormalPolicyRepository or id(self) in repositories:
++                raise ValueError("policy repository initialization must be exact and single-use")
++            if type(feature_repository) is not FormalFeatureRepository:
++                raise ValueError("policy repository needs a genuine feature repository")
++            companion = FormalMetricContextRepository(feature_repository._store, context_repository,
++                registry_signature_verifier=registry_signature_verifier)
++            original = state(feature_repository, context_repository, range_store,
++                             registry_signature_verifier, companion)
++            financial = FormalPolicyFinancialRepository(feature_repository,
++                current_input_provider=feature_repository._current_input_provider)
++            states = FormalPolicyStateRepository(context_repository)
++            market = FormalPolicyMarketRepository(range_store)
++            key = id(self)
++            repositories[key] = (weakref.ref(self, lambda _: repositories.pop(key, None)),
++                feature_repository, context_repository, range_store, registry_signature_verifier,
++                companion, original, financial, states, market)
++
++        def __copy__(self):
++            raise TypeError("policy repositories cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("policy repositories cannot be copied")
++
++        def build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry):
++            saved = dependencies(self)
++            feature, _, ranges, verifier, context = saved[1:6]
++            financial, states, market = saved[7:]
++            if type(frozen_input_hash) is not str or type(scoring_registry) is not FormalScoringRegistry:
++                raise ValueError("policy publication requires exact frozen and registry identities")
++            prepared = None
++            selections = []
++            market_markers = []
++            publication = dict(published=False, parent_link=object(), batch_hash=None)
++
++            def registry_snapshot(root_hash):
++                dependencies(self)
++                bundle = load_root(FormalRegistryBundleLoader(feature._store, verifier), root_hash)
++                scoring_registry.require_official(bundle)
++                policy = read_policy(policy_registry)
++                role_bytes = {role: bundle.blob(role).canonical_json for role in roles}
++                if (policy["registry_manifest_hash"] != root_hash
++                        or any(policy["role_hashes"][role] != hash_payload(json.loads(raw))
++                               for role, raw in role_bytes.items())):
++                    raise ValueError("policy and scoring signature roots differ")
++                return bundle, policy, role_bytes
++
++            def prepare():
++                nonlocal universe, industry, policy_wire, source_bytes, root_hash
++                universe = context.load_universe(frozen_input_hash, scoring_registry=scoring_registry)
++                if universe is None:
++                    raise ValueError("policy frozen universe is absent")
++                root_hash = universe.registry_manifest_hash
++                bundle, policy_wire, source_bytes = registry_snapshot(root_hash)
++                bindings = load_bindings(bundle, scoring_registry=scoring_registry, policy_registry=policy_registry)
++                industry = context.resolve_industries(universe)
++                common = dict(registry_manifest_hash=root_hash, frozen_input_hash=frozen_input_hash,
++                    universe_hash=universe.universe_hash, as_of_utc=universe.as_of_utc,
++                    policy_contract_hash=policy_wire["contract_hash"], role_hashes=policy_wire["role_hashes"])
++                evidence = dict(common, schema_version="formal-policy-evidence-batch-v1",
++                    universe=universe.to_dict(), industry=industry.to_dict(),
++                    source_specification=json.loads(source_bytes["source"]), selections={}, rule_inputs={})
++                result_wires = []
++                for sid in universe.security_ids:
++                    entry = industry.entries[sid]
++                    decisions, evidence_selections, inputs = [], {}, {}
++                    if entry["status"] == "assigned":
++                        template = entry["template_id"]
++                        args = dict(template_id=template, policy_registry=policy_registry)
++                        fin = financial.select(sid, universe.as_of_utc, industry_batch=industry, **args)
++                        state_selection = states.select(sid, universe.as_of_utc, **args)
++                        selections.extend((fin, state_selection))
++                        values = dict(fin.values)
++                        values.update(dict(state_selection.values))
++                        annual = {key: tuple(dict(item) for item in series) for key, series in fin.annual.items()}
++                        evidence_selections.update(financial=dict(values=plain(fin.values), annual=plain(fin.annual),
++                            lineage=plain(fin.lineage), selection_hash=fin.selection_hash),
++                            state=dict(values=plain(state_selection.values), lineage=plain(state_selection.lineage),
++                                       selection_hash=state_selection.selection_hash))
++                        for rule in policy_wire["rules"]:
++                            if rule["template_id"] != template:
++                                continue
++                            applicability = "applicable"
++                            if rule["kind"] == "cyclic_protection" and entry["secondary_industry"] not in policy_wire["cyclic_secondary_industries"]:
++                                applicability = "not_applicable"
++                            market_wire = None
++                            if rule["kind"] == "market_liquidity":
++                                binding = bindings.for_rule(rule["rule_id"], sid[:2])
++                                selected = market.select(sid, universe.as_of_utc, binding=binding)
++                                if type(selected) is not MarketSelection:
++                                    raise ValueError("market repository returned an unknown selection")
++                                market_markers.append((selected, selected.window, selected.pending,
++                                    selected.lineage, selected.selection_hash, selected._check))
++                                selections.append(selected)
++                                market_wire = None if selected.window is None else selected.window.to_dict()
++                                evidence_selections[rule["rule_id"]] = dict(window=market_wire,
++                                    pending=list(selected.pending), lineage=list(selected.lineage), selection_hash=selected.selection_hash)
++                                if market_wire is not None and any(market_wire[key] != expected for key, expected in
++                                    (("security_id", sid), ("as_of_utc", universe.as_of_utc), ("registry_manifest_hash", root_hash),
++                                     ("rule_id", rule["rule_id"]), ("exchange", sid[:2]))):
++                                    raise ValueError("market selection identity differs from policy request")
++                            inputs[rule["rule_id"]] = dict(rule=rule, applicability=applicability,
++                                values=plain(values), annual=plain(annual), market=market_wire)
++                            decisions.append(evaluate(rule, security_id=sid, applicability=applicability,
++                                values=values, annual=annual, market=market_wire))
++                    result = dict(common, security_id=sid, **aggregate(tuple(decisions)))
++                    if entry["status"] != "assigned":
++                        result["pending_requirements"].append(dict(origin="runtime", code="applicability_unresolved",
++                            security_id=sid, reason=entry["pending_reason"], evidence_hashes=[industry.batch_hash]))
++                        result["evidence_state"] = "pending_evidence"
++                    for decision in result["decisions"]:
++                        decision["decision_hash"] = hash_payload(decision)
++                    result["result_hash"] = hash_payload(result)
++                    result_wires.append(result)
++                    evidence["selections"][sid] = evidence_selections
++                    evidence["rule_inputs"][sid] = inputs
++                evidence["evidence_hash"] = hash_payload(evidence)
++                payload = dict(common, schema_version="formal-policy-result-batch-v1",
++                    security_ids=list(universe.security_ids), evidence_batch=evidence, results=result_wires)
++                publication["batch_hash"] = hash_payload(payload)
++                evidence_proof = mint(VerifiedPolicyEvidenceBatch, evidence, publication)
++                results = []
++                for wire in result_wires:
++                    children = tuple(mint(PolicyDecision, decision, publication) for decision in wire["decisions"])
++                    results.append(mint(PolicyResult, wire, publication, dict(decisions=children)))
++                return mint(VerifiedPolicyResultBatch, payload, publication,
++                            dict(results=tuple(results), evidence_batch=evidence_proof))
++
++            def read_and_recheck(batch):
++                dependencies(self)
++                _, current_policy, current_bytes = registry_snapshot(root_hash)
++                if current_policy != policy_wire or current_bytes != source_bytes:
++                    raise ValueError("policy signed source configuration changed")
++                context.recheck_batch(universe, industry)
++                for selected, window, pending, lineage, selection_hash, check in market_markers:
++                    if (selected.window is not window or selected._check is not check
++                            or selected.pending != pending or selected.lineage != lineage
++                            or selected.selection_hash != selection_hash):
++                        raise ValueError("market selection identity changed")
++                for selection in selections:
++                    selection.recheck()
++                dependencies(self)
++
++            def mark_published(batch):
++                publication["published"] = True
++
++            def revoke(batch):
++                publication["published"] = False
++
++            universe = industry = policy_wire = source_bytes = root_hash = None
++            try:
++                with guard_factory(feature._current_input_provider, feature._store) as guard:
++                    prepared = prepare()
++                    read_and_recheck(prepared)
++                    def finalize():
++                        read_and_recheck(prepared)
++                        mark_published(prepared)
++                        return prepared
++                    result = guard.finalize(finalize)
++                return result
++            except BaseException:
++                # Also revoke children if prepare failed after its first mint.
++                revoke(prepared)
++                raise
++
++    entries = tuple((cls.__name__, cls) for cls in (FormalPolicyRepository, *proof_types))
++    return FormalPolicyRepository, *proof_types
++
++
++(FormalPolicyRepository, VerifiedPolicyEvidenceBatch, PolicyDecision, PolicyResult,
++ VerifiedPolicyResultBatch) = _install_repository()
++del _install_repository
++
++__all__ = ["FormalPolicyRepository", "VerifiedPolicyEvidenceBatch", "PolicyDecision",
++           "PolicyResult", "VerifiedPolicyResultBatch"]
+diff --git a/ashare_pipeline/formal_range_source.py b/ashare_pipeline/formal_range_source.py
+index e37ddbd5de39514e8ad5cfdea49bef46c655d106..73face1efbbab273ab635c151b582a9bf69a71c6 100644
+--- a/ashare_pipeline/formal_range_source.py
++++ b/ashare_pipeline/formal_range_source.py
+@@ -1308,7 +1308,7 @@ def _build_source_type():
+ 
+     trusted_parse = FormalRangeSource._parse
+     from . import formal_range_store as store_module
+-    Store, store_read, store_require_current, store_record = store_module._build_range_store_type(
++    Store, store_read, store_require_current, store_record, store_identity = store_module._build_range_store_type(
+         describe_request=describe_request, restore_request=restore_request,
+         source_type=FormalRangeSource, source_binding=lambda source: source_record(source).binding,
+         bind_source_store=bind_source_store,
+@@ -1317,6 +1317,7 @@ def _build_source_type():
+         require_execution=require_execution)
+     store_module.FormalRangeStore = Store
+     store_module.RangeObservation = RangeObservation
++    store_module._require_range_store_identity = store_identity
+     del store_module._build_range_store_type
+     observation_anchors = (RangeObservation, RangeObservation.require_current, RangeObservation.to_dict)
+ 
+diff --git a/ashare_pipeline/formal_range_store.py b/ashare_pipeline/formal_range_store.py
+index 591a9c56b3c90629566fa236701ec7f2c946d145..e6e6b57562169fa05b2ff4c904eebb64b0fcd2a9 100644
+--- a/ashare_pipeline/formal_range_store.py
++++ b/ashare_pipeline/formal_range_store.py
+@@ -582,7 +582,13 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
+             finish_current_check(self, snapshots)
+             return candidates[0]
+ 
+-    return FormalRangeStore, read, require_current, record
++    def require_identity(store, expected_state_store, expected_signature_verifier):
++        """Check ownership without exposing any captured dependency or authority."""
++        state, _, verifier, _, _ = record(store)
++        if state is not expected_state_store or verifier is not expected_signature_verifier:
++            raise ValueError("range store requires the same StateStore and signature verifier")
++
++    return FormalRangeStore, read, require_current, record, require_identity
+ 
+ 
+ # Source completes both paired types; this import is safe in either entry order.
+diff --git a/tests/formal_policy_runtime_fixtures.py b/tests/formal_policy_runtime_fixtures.py
+index f7072b823ab0dcfd01d2a6c5516e40a66534eb75..c46ed973f8f4e3611d1977e5e3d6bc28bcfe8d0b 100644
+--- a/tests/formal_policy_runtime_fixtures.py
++++ b/tests/formal_policy_runtime_fixtures.py
+@@ -144,6 +144,10 @@ class PolicyRuntimeFixture(FinancialFixture):
+             if range_enabled:
+                 from tests.formal_range_fixtures import add_range_documents
+                 add_range_documents(documents)
++                # W3 needs a genuine recent window, not a 400-day fixture.
++                # Tests needing larger ranges may explicitly override this cap.
++                for entry in documents["source"]["range_configs"]:
++                    entry["max_calendar_days_per_request"] = 20
+             if mutate is not None:
+                 mutate(documents)
+             rehash_documents(documents)
+@@ -191,6 +195,69 @@ class PolicyRuntimeFixture(FinancialFixture):
+             current_input_provider=self.provider)
+         self._policy_industry_ids = set()
+         self._policy_context_generations = {}
++        if range_enabled:
++            from ashare_pipeline.formal_policy_repository import FormalPolicyRepository
++            self.policy_repository = FormalPolicyRepository(self.feature_repository, self.context,
++                self.range_store, registry_signature_verifier=self.verifier)
++
++    def build_policy_batch(self):
++        return self.policy_repository.build_batch(self.frozen.frozen_input_hash,
++            scoring_registry=self.scoring, policy_registry=self.policy_registry)
++
++    def populate_policy_evidence(self):
++        """Populate every frozen security through the genuine temporary producers."""
++        from tests.formal_policy_fixtures import REGULATORY_SEMANTICS
++        from ashare_pipeline.formal_range_contract import load_policy_range_bindings
++        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
++        from tests.test_formal_range_source import document_wire
++        bindings = load_policy_range_bindings(self.bundle, scoring_registry=self.scoring,
++                                              policy_registry=self.policy_registry)
++        rules = self.policy_registry.to_dict()["rules"]
++        templates = {member["security_id"]: member["template_id"] for member in self.industry["memberships"]}
++        for member in self.frozen.members:
++            sid = member.security_id
++            self.put_industry(sid)
++            self._policy_industry_ids.add(sid)
++            self.put_policy_context(sid, "security_state", dict(is_st=False, is_star_st=False,
++                listing_status="listed", forced_delist_risk=False, suspended=False))
++            self.put_policy_context(sid, "regulatory_state", dict(flags=[
++                dict(flag_id=flag, active=False) for flag in REGULATORY_SEMANTICS]))
++            self.policy_financial_values(sid)
++            rule = next(rule for rule in rules if rule["template_id"] == templates[sid]
++                        and rule["kind"] == "market_liquidity")
++            self.binding = bindings.for_rule(rule["rule_id"], sid[:2])
++            self.source = self.source_factory(self.binding)
++            first = self.source.first_calendar_request(FREEZE)
++            cursor, end = date.fromisoformat(first.start_date), date.fromisoformat(first.end_date)
++            days = {}
++            while cursor <= end:
++                days[cursor.isoformat()] = cursor >= end - timedelta(days=19)
++                cursor += timedelta(days=1)
++            self.produce_calendar(days=days)
++            calendar = FormalPolicyMarketRepository(self.range_store).select_calendar(self.binding, FREEZE)
++            _, source = self.range_store.resolve_planning_binding(self.binding)
++            for request in source.market_requests(sid, calendar_coverage=calendar.coverage):
++                rows = []
++                sample = document_wire(request)["rows"][0]
++                base = {key: sample[key] for key in ("published_at_utc", "published_precision",
++                    "effective_at_utc", "effective_time_evidence_hash", "captured_at_utc")}
++                for day in calendar.coverage.trading_days:
++                    if request.start_date <= day <= request.end_date:
++                        rows.append(dict(base, date=day, exchange_allows_trading=True,
++                            volume="1", volume_unit="shares", turnover="2", turnover_unit="CNY",
++                            close={"state": "positive", "value": "2"}, close_unit="CNY_per_share"))
++                config = source.range_config(request)
++                wire = document_wire(request, rows=rows, record_count=len(rows), page_record_count=len(rows),
++                    coverage=dict(start_date=request.start_date, end_date=request.end_date, complete=True),
++                    parser_id=config.parser_id, parser_version=config.parser_version,
++                    mapping_version=config.mapping_version, normalizer_version=config.normalizer_version,
++                    request_version=config.request_version)
++                task = self.range_store.enqueue(request, refresh_generation="g1")
++                self.reply(wire, original_url="https://www.cninfo.com.cn/fixture/range-market.json")
++                lease = self.range_store.lease_next("policy-market-fixture", lease_seconds=3600)
++                self.assertEqual(lease["id"], task["id"])
++                self.range_store.persist(task["id"], "policy-market-fixture", lease["attempt_id"],
++                                         fetch=source.fetch_verified(request))
+ 
+     def source_factory(self, binding):
+         from ashare_pipeline.formal_range_source import FormalRangeSource
+diff --git a/tests/test_formal_metric_batch_guard.py b/tests/test_formal_metric_batch_guard.py
+index 30d491d7ee522e6054d48397bb2d4ac5377d5b54..52d7f658559c155442f057955ef308f6ae05d75b 100644
+--- a/tests/test_formal_metric_batch_guard.py
++++ b/tests/test_formal_metric_batch_guard.py
+@@ -333,6 +333,33 @@ class OwnedProviderGuardTests(unittest.TestCase):
+         with self.api._metric_batch_guard(self.provider, self.fixture.store) as guard:
+             self.assertEqual(guard.finalize(lambda: "recovered"), "recovered")
+ 
++    def test_exact_owner_nested_guard_reuses_finalization_and_rejects_other_owners(self):
++        other_provider = self.api.FormalMetricCurrentInputProvider(self.fixture.store)
++        other_fixture = FinancialFixture(missing_memberships=True)
++        self.addCleanup(other_fixture.close)
++        other_store_provider = self.api.FormalMetricCurrentInputProvider(other_fixture.store)
++
++        def inside_outer():
++            with self.api._metric_batch_guard(self.provider, self.fixture.store) as nested:
++                self.assertEqual(nested.finalize(lambda: "nested"), "nested")
++                with self.assertRaises(ValueError):
++                    nested.finalize(lambda: "twice")
++            with self.assertRaises(ValueError):
++                with self.api._metric_batch_guard(self.provider, other_fixture.store):
++                    pass
++            with self.assertRaises(ValueError):
++                with self.api._metric_batch_guard(other_provider, self.fixture.store) as foreign:
++                    foreign.finalize(lambda: "foreign")
++            with self.assertRaises(ValueError):
++                with self.api._metric_batch_guard(other_store_provider, self.fixture.store):
++                    pass
++            return "outer"
++
++        with self.api._metric_batch_guard(self.provider, self.fixture.store) as outer:
++            self.assertEqual(outer.finalize(inside_outer), "outer")
++        with self.api._metric_batch_guard(self.provider, self.fixture.store) as fresh:
++            self.assertEqual(fresh.finalize(lambda: "released"), "released")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_formal_policy_batch_guards.py b/tests/test_formal_policy_batch_guards.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b76534b45f9bb20945d31cc948db1a4eab63756c
+--- /dev/null
++++ b/tests/test_formal_policy_batch_guards.py
+@@ -0,0 +1,228 @@
++"""Adversarial changes throughout the genuine complete policy read interval."""
++
++import importlib
++import inspect
++import sqlite3
++import sys
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++
++
++class PolicyBatchGuardTests(unittest.TestCase):
++    def setUp(self):
++        self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_policy_repository"),
++                             "W3 atomic policy publication is missing")
++        self.api = importlib.import_module("ashare_pipeline.formal_policy_repository")
++        self.fixture = PolicyRuntimeFixture(range_enabled=True)
++        self.addCleanup(self.fixture.close)
++
++    def run_hook(self, hook):
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(hook)
++            return self.fixture.build_policy_batch()
++        finally:
++            sys.setprofile(previous)
++
++    def test_after_first_security_read_second_security_provider_changes(self):
++        self.fixture.put_industry("BJ430001")
++        self.fixture.put_industry("SH600000")
++        touched = []
++        def hook(frame, event, result):
++            if (not touched and event == "return" and frame.f_code.co_name == "select"
++                    and frame.f_code.co_filename.endswith("formal_policy_financial.py")
++                    and frame.f_locals.get("security_id") == "BJ430001"):
++                touched.append(True)
++                self.fixture.set_generation("SH600000", "changed-mid-batch")
++        with self.assertRaises(ValueError):
++            self.run_hook(hook)
++        self.assertEqual(touched, [True])
++
++    def test_initially_missing_industry_then_present_rejects(self):
++        touched = []
++        def hook(frame, event, result):
++            if not touched and event == "return" and frame.f_code.co_name == "prepare":
++                touched.append(True)
++                self.fixture.put_industry("SH600000")
++        with self.assertRaises(ValueError):
++            self.run_hook(hook)
++        self.assertEqual(touched, [True])
++
++    def test_database_write_during_evaluation_rejects(self):
++        touched = []
++        def hook(frame, event, result):
++            if not touched and event == "return" and frame.f_code.co_name == "prepare":
++                touched.append(True)
++                self.fixture.sql("UPDATE formal_collection_task SET updated_at='2026-09-08T00:00:00+00:00'")
++        with self.assertRaises(ValueError):
++            self.run_hook(hook)
++        self.assertEqual(touched, [True])
++
++    def test_equal_leading_state_ambiguity_rejects(self):
++        from tests.test_formal_policy_state import SECURITY
++        fixture = self.fixture
++        fixture.put_industry("SH600000")
++        fixture.put_policy_context("SH600000", "security_state", SECURITY)
++        fixture._policy_context_generations[("SH600000", "security_state")]["tie"] = 0
++        fixture.put_policy_context("SH600000", "security_state", SECURITY, generation="tie")
++        with self.assertRaises(ValueError):
++            fixture.build_policy_batch()
++
++    def test_source_raw_bytes_change_without_database_write_rejects(self):
++        _, ref = self.fixture.put_industry("SH600000")
++        touched = []
++        def hook(frame, event, result):
++            if not touched and event == "return" and frame.f_code.co_name == "prepare":
++                touched.append(True)
++                path = Path(ref.content_path)
++                path.write_bytes(b"corrupt")
++        with self.assertRaises(ValueError):
++            self.run_hook(hook)
++        self.assertEqual(touched, [True])
++
++    def test_signed_source_configuration_replacement_revokes_prepared_children(self):
++        blob = self.fixture.bundle.blob("source")
++        original = blob.canonical_json
++        captured, touched = [], []
++        def hook(frame, event, result):
++            if (event == "return" and frame.f_code.co_name == "mint"
++                    and frame.f_code.co_filename.endswith("formal_policy_repository.py")):
++                captured.append(result)
++            if not touched and event == "return" and frame.f_code.co_name == "prepare":
++                touched.append(True)
++                object.__setattr__(blob, "canonical_json", b"{}")
++        try:
++            with self.assertRaises(ValueError):
++                self.run_hook(hook)
++        finally:
++            object.__setattr__(blob, "canonical_json", original)
++        self.assertEqual(touched, [True])
++        self.assertGreaterEqual(len(captured), 5)
++        for proof in captured:
++            with self.assertRaises(ValueError):
++                proof.require_official()
++
++    def test_prepare_has_no_writer_reservation_and_children_are_unpublished(self):
++        captured = []
++        def hook(frame, event, result):
++            if (event == "return" and frame.f_code.co_name == "mint"
++                    and frame.f_code.co_filename.endswith("formal_policy_repository.py")):
++                captured.append(result)
++                for method in ("require_verified", "require_official"):
++                    with self.assertRaises(ValueError):
++                        getattr(result, method)()
++                connection = sqlite3.connect(self.fixture.db_path, timeout=0, isolation_level=None)
++                try:
++                    connection.execute("BEGIN IMMEDIATE")
++                    connection.rollback()
++                finally:
++                    connection.close()
++        batch = self.run_hook(hook)
++        self.assertGreaterEqual(len(captured), 5)
++        self.assertIn(batch, captured)
++        for proof in captured:
++            proof.require_official()
++
++    def test_captured_decisions_and_results_remain_revoked_after_failed_prepare_interval(self):
++        self.fixture.put_industry("SH600000")
++        captured, touched = [], []
++        def hook(frame, event, result):
++            if (event == "return" and frame.f_code.co_name == "mint"
++                    and frame.f_code.co_filename.endswith("formal_policy_repository.py")):
++                captured.append(result)
++                with self.assertRaises(ValueError):
++                    result.require_official()
++            if not touched and event == "return" and frame.f_code.co_name == "prepare":
++                touched.append(True)
++                self.fixture.set_generation("SH600000", "invalidate-prepared-decisions")
++        with self.assertRaises(ValueError):
++            self.run_hook(hook)
++        self.assertTrue(any(type(proof) is self.api.PolicyDecision for proof in captured))
++        self.assertTrue(any(type(proof) is self.api.PolicyResult for proof in captured))
++        for proof in captured:
++            for method in ("require_official", "require_verified"):
++                with self.assertRaises(ValueError):
++                    getattr(proof, method)()
++
++    def test_final_reentrant_publication_or_cleanup_failure_revokes_every_child(self):
++        for failure in ("provider", "rollback", "close"):
++            captured, fired = [], []
++            def hook(frame, event, result):
++                if (event == "return" and frame.f_code.co_name == "mint"
++                        and frame.f_code.co_filename.endswith("formal_policy_repository.py")):
++                    captured.append(result)
++                if (not fired and event == "return" and frame.f_code.co_name == "finalize"
++                        and frame.f_code.co_filename.endswith("formal_policy_repository.py")):
++                    fired.append(True)
++                    guard_frame = frame.f_back
++                    if failure == "provider":
++                        with self.assertRaises(ValueError):
++                            self.fixture.set_generation("SH600000", "reentrant-swallowed")
++                    elif failure == "rollback":
++                        guard_frame.f_locals["observer"].close()
++                    else:
++                        # A real close of the observer after finalize forces the
++                        # context-manager's final rollback/close cleanup to fail.
++                        pass
++                if (failure == "close" and fired == [True] and event == "return"
++                        and frame.f_code.co_name == "finalize"
++                        and frame.f_code.co_filename.endswith("formal_metric_batch_guard.py")):
++                    fired.append(True)
++                    frame.f_locals["observer"].close()
++            with self.subTest(failure=failure), self.assertRaises((ValueError, sqlite3.Error)):
++                self.run_hook(hook)
++            self.assertTrue(fired)
++            self.assertGreaterEqual(len(captured), 5)
++            for proof in captured:
++                for method in ("require_verified", "require_official", "to_dict", "canonical_bytes"):
++                    with self.assertRaises(ValueError):
++                        getattr(proof, method)()
++            self.fixture.build_policy_batch().require_verified()
++
++    def test_literal_observer_close_failure_revokes_published_children(self):
++        real_connect = sqlite3.connect
++        captured = []
++        wrapped = []
++
++        class ClosingObserver:
++            def __init__(self, connection):
++                self.connection = connection
++
++            def __getattr__(self, name):
++                return getattr(self.connection, name)
++
++            def close(self):
++                self.connection.close()
++                raise RuntimeError("literal observer close failure")
++
++        def connect(*args, **kwargs):
++            connection = real_connect(*args, **kwargs)
++            caller = inspect.currentframe().f_back
++            owner = caller.f_back if caller is not None else None
++            if (not wrapped and owner is not None and owner.f_code.co_name == "guard"
++                    and owner.f_code.co_filename.endswith("formal_metric_batch_guard.py")):
++                wrapped.append(True)
++                return ClosingObserver(connection)
++            return connection
++
++        def hook(frame, event, result):
++            if (event == "return" and frame.f_code.co_name == "mint"
++                    and frame.f_code.co_filename.endswith("formal_policy_repository.py")):
++                captured.append(result)
++
++        with patch.object(sqlite3, "connect", connect):
++            with self.assertRaisesRegex(RuntimeError, "literal observer close failure"):
++                self.run_hook(hook)
++        self.assertEqual(wrapped, [True])
++        self.assertGreaterEqual(len(captured), 5)
++        for proof in captured:
++            with self.assertRaises(ValueError):
++                proof.require_verified()
++        self.fixture.build_policy_batch().require_verified()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_formal_policy_repository.py b/tests/test_formal_policy_repository.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dbe7855362cb95f7029f02df17697d8398b1eeab
+--- /dev/null
++++ b/tests/test_formal_policy_repository.py
+@@ -0,0 +1,239 @@
++"""The policy authority publishes exactly one complete frozen population."""
++
++import copy
++import importlib
++import unittest
++from dataclasses import replace
++from unittest.mock import patch
++
++from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++
++
++class PolicyRepositoryTests(unittest.TestCase):
++    def setUp(self):
++        self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_policy_repository"),
++                             "W3 complete policy publication is missing")
++        self.api = importlib.import_module("ashare_pipeline.formal_policy_repository")
++
++    def fixture(self, **kwargs):
++        fixture = PolicyRuntimeFixture(range_enabled=True, **kwargs)
++        self.addCleanup(fixture.close)
++        return fixture
++
++    def test_complete_enumeration_includes_pending_security(self):
++        fixture = self.fixture()
++        batch = fixture.build_policy_batch()
++        batch.require_official()
++        self.assertEqual(batch.security_ids, ("BJ430001", "SH600000", "SZ000001"))
++        self.assertEqual(tuple(item.security_id for item in batch.results), batch.security_ids)
++        self.assertEqual(len(batch.results), 3)
++        self.assertTrue(all(item.pending_requirements for item in batch.results))
++        self.assertTrue(all(item.decisions == () for item in batch.results))
++
++    def test_genuine_all_member_evidence_reaches_complete_results(self):
++        fixture = self.fixture(cyclic=False)
++        fixture.populate_policy_evidence()
++        batch = fixture.build_policy_batch()
++        self.assertEqual(len(batch.results), 3)
++        for item in batch.results:
++            item.require_verified()
++            self.assertEqual(item.evidence_state, "complete")
++            self.assertFalse(item.pending_requirements)
++            self.assertTrue(item.decisions)
++            self.assertEqual(item.batch_hash, batch.batch_hash)
++            self.assertTrue(all(decision.security_id == item.security_id for decision in item.decisions))
++
++    def test_unknown_membership_never_fabricates_five_template_decisions(self):
++        fixture = self.fixture()
++        batch = fixture.build_policy_batch()
++        for item in batch.results:
++            self.assertEqual(item.decisions, ())
++            self.assertEqual(item.evidence_state, "pending_evidence")
++            self.assertEqual(dict(item.dimension_caps), {})
++            self.assertEqual(dict(item.pool_prohibitions), {})
++
++    def test_missing_universe_is_failure(self):
++        fixture = self.fixture()
++        with self.assertRaises(ValueError):
++            fixture.policy_repository.build_batch("0" * 64,
++                scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
++
++    def test_forged_scoring_and_policy_registries_are_rejected(self):
++        fixture = self.fixture()
++        for name in ("scoring", "policy_registry"):
++            original = getattr(fixture, name)
++            for impostor in (object(), object.__new__(type(original))):
++                setattr(fixture, name, impostor)
++                try:
++                    with self.subTest(registry=name), self.assertRaises(ValueError):
++                        fixture.build_policy_batch()
++                finally:
++                    setattr(fixture, name, original)
++
++    def test_same_root_foreign_store_range_and_context_are_rejected(self):
++        owner, foreign = self.fixture(), self.fixture()
++        for context, ranges in ((foreign.context, owner.range_store),
++                                (owner.context, foreign.range_store)):
++            with self.assertRaises(ValueError):
++                repository = self.api.FormalPolicyRepository(owner.feature_repository, context, ranges,
++                    registry_signature_verifier=owner.verifier)
++                repository.build_batch(owner.frozen.frozen_input_hash,
++                    scoring_registry=owner.scoring, policy_registry=owner.policy_registry)
++
++    def test_foreign_signature_root_rejected(self):
++        fixture = self.fixture()
++        foreign = self.fixture(cyclic=False)
++        with self.assertRaises(ValueError):
++            fixture.policy_repository.build_batch(fixture.frozen.frozen_input_hash,
++                scoring_registry=foreign.scoring, policy_registry=foreign.policy_registry)
++
++    def test_provider_unpublished_assigned_fails_unknown_membership_does_not_fetch(self):
++        from ashare_pipeline.formal_metric_batch_guard import FormalMetricCurrentInputProvider
++        from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
++        fixture = self.fixture()
++        provider = FormalMetricCurrentInputProvider(fixture.store)
++        feature = FormalFeatureRepository(fixture.store, fixture.files,
++            registry_signature_verifier=fixture.verifier, current_input_provider=provider)
++        repository = self.api.FormalPolicyRepository(feature, fixture.context, fixture.range_store,
++            registry_signature_verifier=fixture.verifier)
++        arguments = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
++        repository.build_batch(fixture.frozen.frozen_input_hash, **arguments).require_verified()
++        fixture.put_industry("SH600000")
++        with self.assertRaises(ValueError):
++            repository.build_batch(fixture.frozen.frozen_input_hash, **arguments)
++
++    def test_proofs_reject_construction_copy_shadowing_and_cross_batch_composition(self):
++        fixture = self.fixture()
++        fixture.put_industry("SH600000")
++        batch = fixture.build_policy_batch()
++        other = fixture.build_policy_batch()
++        proofs = (batch, batch.evidence_batch, *batch.results, *batch.results[1].decisions)
++        self.assertTrue(batch.results[1].decisions)
++        for proof in proofs:
++            with self.subTest(proof=type(proof).__name__):
++                for copier in (copy.copy, copy.deepcopy):
++                    with self.assertRaises(TypeError):
++                        copier(proof)
++                with self.assertRaises((ValueError, TypeError)):
++                    type(proof)(**proof.to_dict())
++                with self.assertRaises(ValueError):
++                    type(proof).require_official(object.__new__(type(proof)))
++                with self.assertRaises((AttributeError, TypeError)):
++                    proof.require_official = lambda: None
++                with self.assertRaises((AttributeError, TypeError)):
++                    type(proof).require_official = lambda self: None
++                with self.assertRaises(ValueError):
++                    type(proof).require_official(proof.to_dict())
++        with self.assertRaises((TypeError, ValueError)):
++            self.api.VerifiedPolicyResultBatch(results=(batch.results[0], *other.results[1:]))
++        with self.assertRaises((AttributeError, TypeError)):
++            object.__setattr__(batch, "results", other.results)
++
++    def test_entry_and_dependency_replacement_fail_closed(self):
++        fixture = self.fixture()
++        repository = fixture.policy_repository
++        batch = fixture.build_policy_batch()
++        with patch.object(self.api, "FormalPolicyRepository", object):
++            with self.assertRaises(ValueError):
++                repository.build_batch(fixture.frozen.frozen_input_hash,
++                    scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
++            with self.assertRaises(ValueError):
++                batch.require_verified()
++        with patch.object(type(fixture.context), "get_verified_many", lambda *a, **k: {}):
++            with self.assertRaises(ValueError):
++                fixture.build_policy_batch()
++
++    def test_configuration_missing_and_ambiguous_fail_before_publication(self):
++        def missing(documents):
++            documents["source"]["range_configs"] = []
++        def ambiguous(documents):
++            entry = dict(documents["source"]["range_configs"][0])
++            entry["retry_base_seconds"] = 2.0
++            documents["source"]["range_configs"].append(entry)
++        for mutate in (missing, ambiguous):
++            with self.subTest(mutate=mutate.__name__), self.assertRaises(ValueError):
++                fixture = self.fixture(mutate=mutate)
++                fixture.build_policy_batch()
++
++    def test_whole_dependency_graph_replacement_and_repository_copy_fail(self):
++        fixture, foreign = self.fixture(), self.fixture()
++        for copier in (copy.copy, copy.deepcopy):
++            with self.assertRaises(TypeError):
++                copier(fixture.policy_repository)
++        forged = object.__new__(self.api.FormalPolicyRepository)
++        with self.assertRaises(ValueError):
++            forged.build_batch(fixture.frozen.frozen_input_hash,
++                scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
++        with self.assertRaises(AttributeError):
++            fixture.policy_repository.build_batch = lambda *a, **k: None
++        original_feature = dict(vars(fixture.feature_repository))
++        original_context = dict(vars(fixture.context))
++        try:
++            vars(fixture.feature_repository).clear()
++            vars(fixture.feature_repository).update(vars(foreign.feature_repository))
++            vars(fixture.context).clear()
++            vars(fixture.context).update(vars(foreign.context))
++            with self.assertRaises(ValueError):
++                fixture.build_policy_batch()
++        finally:
++            vars(fixture.feature_repository).clear()
++            vars(fixture.feature_repository).update(original_feature)
++            vars(fixture.context).clear()
++            vars(fixture.context).update(original_context)
++
++    def test_provider_security_template_and_freeze_cannot_be_spliced(self):
++        from ashare_pipeline.formal_metric_batch_guard import FormalMetricCurrentInputProvider
++        from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
++        from tests.formal_metric_fixtures import FREEZE
++        fixture = self.fixture()
++        fixture.put_industry("SH600000")
++        snapshot = fixture.provider.resolve_current_inputs(security_id="SH600000", as_of_utc=FREEZE,
++            template_id="bank", registry_manifest_hash=fixture.bundle.manifest.manifest_hash)
++        for changes in (dict(security_id="SZ000001"), dict(template_id="insurance"),
++                        dict(as_of_utc="2026-08-30T07:00:00+00:00")):
++            provider = FormalMetricCurrentInputProvider(fixture.store)
++            provider.publish(replace(snapshot, **changes))
++            feature = FormalFeatureRepository(fixture.store, fixture.files,
++                registry_signature_verifier=fixture.verifier, current_input_provider=provider)
++            repository = self.api.FormalPolicyRepository(feature, fixture.context, fixture.range_store,
++                registry_signature_verifier=fixture.verifier)
++            with self.subTest(changes=changes), self.assertRaises(ValueError):
++                repository.build_batch(fixture.frozen.frozen_input_hash,
++                    scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
++
++    def test_market_recheck_class_replacement_cannot_disable_final_verification(self):
++        from ashare_pipeline.formal_policy_market import MarketSelection
++        fixture = self.fixture()
++        with patch.object(MarketSelection, "recheck", lambda self: None):
++            with self.assertRaises(ValueError):
++                fixture.build_policy_batch()
++
++    def test_relabeling_a_minted_proof_class_cannot_change_its_authority(self):
++        fixture = self.fixture()
++        batch = fixture.build_policy_batch()
++        result = batch.results[0]
++        object.__setattr__(result, "__class__", self.api.PolicyDecision)
++        try:
++            with self.assertRaises(ValueError):
++                result.require_verified()
++        finally:
++            object.__setattr__(result, "__class__", self.api.PolicyResult)
++        result.require_verified()
++
++    def test_calculation_and_deepcopy_dependencies_cannot_be_replaced(self):
++        from ashare_pipeline import formal_policy_evaluator, formal_policy_market, formal_range_store
++
++        fixture = self.fixture()
++        for owner, name, replacement in (
++            (formal_policy_market, "evaluate_window", lambda *args: {}),
++            (formal_range_store, "_digest", lambda *args: "0" * 64),
++            (formal_policy_evaluator, "copy", object()),
++            (formal_policy_evaluator.copy, "deepcopy", lambda value: value),
++        ):
++            with self.subTest(name=name), patch.object(owner, name, replacement):
++                with self.assertRaises(ValueError):
++                    fixture.build_policy_batch()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_formal_range_store.py b/tests/test_formal_range_store.py
+index 443b64e4aff67959b558b30ce4d2a4c6c4104338..472e46640914f3f5121654a629b77c31f67f6901 100644
+--- a/tests/test_formal_range_store.py
++++ b/tests/test_formal_range_store.py
+@@ -16,6 +16,26 @@ NOW = "2026-09-01T00:00:00+00:00"
+ 
+ 
+ class FormalRangeStoreTests(unittest.TestCase):
++    def test_private_owner_check_accepts_only_genuine_same_store_and_verifier(self):
++        from ashare_pipeline import formal_range_store as module
++        self.assertTrue(hasattr(module, "_require_range_store_identity"),
++                        "W3 range owner identity validator is missing")
++        from tests.formal_range_fixtures import RangeStoreFixture
++        owner, peer = RangeStoreFixture(), RangeStoreFixture()
++        self.addCleanup(owner.close)
++        self.addCleanup(peer.close)
++        check = module._require_range_store_identity
++        self.assertIsNone(check(owner.range_store, owner.store, owner.verifier))
++        for ranges, store, verifier in (
++            (owner.range_store, peer.store, owner.verifier),
++            (owner.range_store, owner.store, peer.verifier),
++            (object.__new__(type(owner.range_store)), owner.store, owner.verifier),
++            (copy.copy(owner.range_store), owner.store, owner.verifier),
++            (object(), owner.store, owner.verifier),
++        ):
++            with self.subTest(ranges=type(ranges).__name__), self.assertRaises(ValueError):
++                check(ranges, store, verifier)
++
+     def test_planning_resolution_uses_owning_store_graph_and_reconstructed_binding(self):
+         from tests.formal_range_fixtures import RangeStoreFixture
+         fixture = RangeStoreFixture()

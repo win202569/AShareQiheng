@@ -1,0 +1,1267 @@
+# Review package: e8c7ed8fdca882275c53fe9af9332629403e1060..56b0343ce1781e5138fb5de66cb1db8e1e6c5596
+
+## Commits
+56b0343 fix final feature trust boundaries
+
+## Files changed
+ ashare_pipeline/financial_features.py |  26 +----
+ ashare_pipeline/financial_schema.py   |  33 +++++-
+ ashare_pipeline/orchestrator.py       |  18 ++-
+ ashare_pipeline/state_store.py        |  29 +++++
+ progress.md                           |   8 ++
+ tests/test_financial_features.py      |  14 +++
+ tests/test_orchestrator.py            | 210 +++++++++++++++++++++++++++++++--
+ tests/test_state_store.py             | 213 ++++++++++++++++++++++++++++++++++
+ 8 files changed, 514 insertions(+), 37 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/financial_features.py b/ashare_pipeline/financial_features.py
+index ec74bf8..511a2aa 100644
+--- a/ashare_pipeline/financial_features.py
++++ b/ashare_pipeline/financial_features.py
+@@ -28,20 +28,21 @@ from ashare_pipeline.financial_formulas import (
+     DerivedFormulaResult,
+     FormulaFact,
+     evaluate_derived_financial,
+     positive_cagr,
+     symmetric_growth,
+ )
+ from ashare_pipeline.financial_schema import (
+     DATASET_TO_STATEMENT,
+     MAPPING_VERSION,
+     FinancialFact,
++    balance_equation_blockers,
+     classify_period,
+     field_rules,
+     raw_financial_slot_descriptor,
+ )
+ from ashare_pipeline.industry_templates import (
+     TEMPLATE_VERSION,
+     TemplateDefinition,
+     resolve_template,
+ )
+ from ashare_pipeline.sources import FetchBatch
+@@ -393,42 +394,20 @@ def build_financial_facts(
+             ))
+     return FactBuildResult(tuple(sorted(facts, key=lambda item: item.id)), tuple(issues))
+ 
+ 
+ def _utc_datetime(value: object, field: str) -> datetime:
+     if not isinstance(value, str):
+         raise ValueError(f"{field} must be an ISO timestamp string")
+     return datetime.fromisoformat(require_aware_utc(value, field))
+ 
+ 
+-def _balance_blockers(facts: Sequence[FinancialFact]) -> set[str]:
+-    blockers: set[str] = set()
+-    by_period: dict[tuple[str, str], dict[str, FinancialFact]] = {}
+-    for fact in facts:
+-        if fact.metric_key in {"total_assets", "total_liabilities", "total_equity"}:
+-            by_period.setdefault((fact.security_id, fact.period_end), {})[fact.metric_key] = fact
+-    for period_facts in by_period.values():
+-        if set(period_facts) != {"total_assets", "total_liabilities", "total_equity"}:
+-            continue
+-        units = {item.unit for item in period_facts.values()}
+-        if len(units) != 1:
+-            blockers.add("conflicting_fact_units")
+-            continue
+-        assets = period_facts["total_assets"].value
+-        liabilities = period_facts["total_liabilities"].value
+-        equity = period_facts["total_equity"].value
+-        tolerance = max(1000.0, 0.001 * abs(assets))
+-        if abs(assets - liabilities - equity) > tolerance:
+-            blockers.add("balance_equation_mismatch")
+-    return blockers
+-
+-
+ def select_visible_facts(
+     facts: Iterable[FinancialFact],
+     *,
+     as_of_utc: str,
+     snapshot_fetched_at: Mapping[str, str],
+ ) -> FactSelection:
+     as_of = _utc_datetime(as_of_utc, "as_of_utc")
+     visible = [
+         fact for fact in facts
+         if _utc_datetime(fact.effective_at_utc, "effective_at_utc") <= as_of
+@@ -472,21 +451,21 @@ def select_visible_facts(
+         values = {fact.value for fact in tied}
+         natures = {fact.nature for fact in tied}
+         if len(units) > 1:
+             blockers.add("conflicting_fact_units")
+         if len(values) > 1 or len(natures) > 1:
+             blockers.add("conflicting_fact_versions")
+         if len(units) > 1 or len(values) > 1 or len(natures) > 1:
+             continue
+         selected.append(max(tied, key=lambda item: (item.raw_row_hash, item.id)))
+ 
+-    blockers.update(_balance_blockers(selected))
++    blockers.update(balance_equation_blockers(selected))
+     return FactSelection(
+         tuple(sorted(selected, key=lambda item: (item.security_id, item.period_end, item.metric_key, item.id))),
+         tuple(blockers),
+     )
+ 
+ 
+ def feature_input_hash(
+     *,
+     security_id: str,
+     report_period: str,
+@@ -798,20 +777,21 @@ def build_feature_bundle(
+         financial_blockers.add("financial_fact_security_mismatch")
+     if any(fact.mapping_version != MAPPING_VERSION for fact in supplied_facts):
+         financial_blockers.add("financial_fact_mapping_version_mismatch")
+     selected = tuple(sorted(
+         (
+             fact for fact in supplied_facts
+             if fact.security_id == security_id and fact.mapping_version == MAPPING_VERSION
+         ),
+         key=lambda item: (item.metric_key, item.period_end, item.effective_at_utc, item.id),
+     ))
++    financial_blockers.update(balance_equation_blockers(selected))
+     if template.template_id == "unclassified":
+         financial_blockers.add("industry_template_unclassified")
+     if (
+         template.specialized_inputs_required
+         and template.template_id != "unclassified"
+     ):
+         financial_blockers.add("specialized_financial_inputs_missing")
+     if trade_calendar_snapshot_hash is None:
+         financial_blockers.add("trade_calendar_missing")
+     missing_statement = any(
+diff --git a/ashare_pipeline/financial_schema.py b/ashare_pipeline/financial_schema.py
+index b9f5ddf..3fb2888 100644
+--- a/ashare_pipeline/financial_schema.py
++++ b/ashare_pipeline/financial_schema.py
+@@ -1,19 +1,19 @@
+ """Versioned contracts for normalized, point-in-time financial facts."""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ from datetime import date, datetime
+ import math
+ import re
+-from typing import Any, Literal, Mapping
++from typing import Any, Iterable, Literal, Mapping
+ 
+ from ashare_pipeline.feature_contract import (
+     FINANCIAL_DIMENSIONS,
+     canonical_sha256,
+     require_aware_utc,
+ )
+ 
+ 
+ MAPPING_VERSION = "eastmoney-financial-mapping-v1"
+ FINANCIAL_REQUEST_VERSION = "eastmoney-financial-request-v1"
+@@ -370,10 +370,41 @@ class FinancialFact:
+             "nature": self.nature,
+             "announced_at_utc": self.announced_at_utc,
+             "effective_at_utc": self.effective_at_utc,
+             "source_updated_at_utc": self.source_updated_at_utc,
+             "source_snapshot_id": self.source_snapshot_id,
+             "source_field": self.source_field,
+             "raw_row_hash": self.raw_row_hash,
+             "mapping_version": self.mapping_version,
+             "created_at": self.created_at,
+         }
++
++
++def balance_equation_blockers(
++    facts: Iterable[FinancialFact],
++) -> frozenset[str]:
++    """Evaluate the canonical balance identity with frozen applicability/tolerance."""
++    blockers: set[str] = set()
++    by_period: dict[tuple[str, str], dict[str, FinancialFact]] = {}
++    for fact in facts:
++        if fact.metric_key in {"total_assets", "total_liabilities", "total_equity"}:
++            by_period.setdefault(
++                (fact.security_id, fact.period_end), {}
++            )[fact.metric_key] = fact
++    for period_facts in by_period.values():
++        if set(period_facts) != {
++            "total_assets",
++            "total_liabilities",
++            "total_equity",
++        }:
++            continue
++        units = {item.unit for item in period_facts.values()}
++        if len(units) != 1:
++            blockers.add("conflicting_fact_units")
++            continue
++        assets = period_facts["total_assets"].value
++        liabilities = period_facts["total_liabilities"].value
++        equity = period_facts["total_equity"].value
++        tolerance = max(1000.0, 0.001 * abs(assets))
++        if abs(assets - liabilities - equity) > tolerance:
++            blockers.add("balance_equation_mismatch")
++    return frozenset(blockers)
+diff --git a/ashare_pipeline/orchestrator.py b/ashare_pipeline/orchestrator.py
+index 472f5a5..bbdba97 100644
+--- a/ashare_pipeline/orchestrator.py
++++ b/ashare_pipeline/orchestrator.py
+@@ -22,20 +22,21 @@ from .deep_worker import (
+     STATEMENT_DATASETS,
+     CandidateContext,
+     build_candidate_context,
+     deep_statement_key,
+     load_candidate_context,
+     read_verified_feature_bundle,
+     run_deep,
+ )
+ from .feature_contract import CONTRACT_VERSION, canonical_sha256
+ from .financial_schema import FINANCIAL_REQUEST_VERSION
++from .industry_templates import resolve_template
+ from .scoring import PREFILTER_REASON, build_prefilter
+ from .snapshot_repository import SnapshotRef, SnapshotRepository
+ from .state_store import StateStore
+ 
+ 
+ SCHEMA_VERSION = 1
+ CURATED_SCHEMA_VERSION = 2
+ SHANGHAI = ZoneInfo("Asia/Shanghai")
+ RULESET_HASH = hashlib.sha256(b"a-share-scoring-v2-partial-prefilter-only").hexdigest()
+ PREFILTER_RULESET_HASH = hashlib.sha256(
+@@ -1048,39 +1049,54 @@ def build_deep_progress(
+             and _progress_instant(job["next_retry_at"], "next_retry_at") > now_utc
+         }
+     )
+ 
+     feature_rows: dict[str, dict[str, object]] = {}
+     seen_feature_securities: set[str] = set()
+     with store._transaction() as connection:
+         rows = connection.execute(
+             """SELECT * FROM feature_set
+             WHERE candidate_set_hash=? AND contract_version=? AND report_period=?
++            AND as_of_utc<=?
+             ORDER BY security_id,as_of_utc DESC,created_at DESC,id DESC""",
+-            (context.candidate_set_hash, CONTRACT_VERSION, report_period),
++            (
++                context.candidate_set_hash,
++                CONTRACT_VERSION,
++                report_period,
++                now_utc.isoformat(),
++            ),
+         ).fetchall()
+         for row in rows:
+             security_id = str(row["security_id"])
+             if security_id not in members or security_id in seen_feature_securities:
+                 continue
+             seen_feature_securities.add(security_id)
+             try:
+                 public = store._feature_set_public(row)
+                 bundle = read_verified_feature_bundle(
+                     resolved_root.parent,
+                     public["bundle_path"],
+                     public["bundle_hash"],
+                 )
+                 store._validate_stored_feature_bundle_content(
+                     connection, row, bundle
+                 )
+                 store._validate_feature_bundle_evidence(connection, bundle)
++                source_industry_name = context.industries[security_id]
++                expected_template = resolve_template(source_industry_name)
++                if (
++                    bundle.industry.name != source_industry_name
++                    or bundle.industry.template_id != expected_template.template_id
++                ):
++                    raise ValueError(
++                        "feature bundle industry does not match candidate context"
++                    )
+             except (KeyError, OSError, TypeError, UnicodeError, ValueError):
+                 unknown_failures += 1
+                 continue
+             feature_rows[security_id] = public
+     feature_counts = {"partial": 0, "financial_ready": 0, "blocked": 0}
+     templates: list[str] = []
+     missing_reasons: list[str] = []
+     for row in feature_rows.values():
+         status = str(row["status"])
+         if status in feature_counts:
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index 58256ba..8823508 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -19,20 +19,21 @@ from ashare_pipeline.feature_contract import (
+     FeatureBundle,
+     financial_projection_values,
+ )
+ from ashare_pipeline.financial_formulas import (
+     DERIVED_FORMULA_SPECS,
+     FormulaFact,
+     evaluate_derived_financial,
+ )
+ from ashare_pipeline.financial_schema import (
+     FinancialFact,
++    balance_equation_blockers,
+     raw_financial_slot_descriptor,
+ )
+ 
+ 
+ JOB_STATES = {"pending", "running", "succeeded", "retryable_failed", "terminal_failed"}
+ SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
+ SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
+ RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
+ _OWNED_JOB_KINDS = frozenset({"deep_financial", "deep_statement", "feature_build"})
+ SCHEMA_VERSION = 3
+@@ -826,20 +827,24 @@ class StateStore:
+ 
+         evidence_by_id: dict[str, EvidenceRef] = {}
+         for dimension in bundle.dimension_inputs.values():
+             for value in dimension.values:
+                 for evidence in value.evidence:
+                     existing = evidence_by_id.get(evidence.financial_fact_id)
+                     if existing is not None and existing != evidence:
+                         raise ValueError("feature evidence metadata conflicts for one fact")
+                     evidence_by_id[evidence.financial_fact_id] = evidence
+         if not evidence_by_id:
++            if "balance_equation_mismatch" in bundle.blockers:
++                raise ValueError(
++                    "balance equation semantics do not match canonical facts"
++                )
+             return
+ 
+         facts_by_id: dict[str, FinancialFact] = {}
+         fact_ids = sorted(evidence_by_id)
+         try:
+             for offset in range(0, len(fact_ids), _EVIDENCE_QUERY_BATCH_SIZE):
+                 batch = fact_ids[offset : offset + _EVIDENCE_QUERY_BATCH_SIZE]
+                 marks = ",".join("?" for _item in batch)
+                 rows = connection.execute(
+                     f"SELECT * FROM financial_fact WHERE id IN ({marks})", batch
+@@ -880,20 +885,21 @@ class StateStore:
+                 or evidence.announced_at_utc != fact.announced_at_utc
+                 or evidence.effective_at_utc != fact.effective_at_utc
+             ):
+                 raise ValueError("feature evidence does not match canonical financial fact")
+ 
+         period_end_by_key = {
+             period_key: period_end for period_end, period_key in FINANCIAL_PERIODS
+         }
+         formula_inputs: dict[tuple[str, str], FormulaFact] = {}
+         observed_raw_fact_ids: set[str] = set()
++        observed_raw_facts: list[FinancialFact] = []
+         for dimension_name, dimension in bundle.dimension_inputs.items():
+             for value in dimension.values:
+                 if value.status != "observed":
+                     continue
+                 parts = value.key.split(".")
+                 if len(parts) != 3:
+                     continue
+                 try:
+                     descriptor = raw_financial_slot_descriptor(parts[1])
+                 except ValueError:
+@@ -925,20 +931,43 @@ class StateStore:
+                 slot = (descriptor.metric_key, period_end)
+                 if slot in formula_inputs:
+                     raise ValueError("raw observed financial slot is duplicated")
+                 formula_inputs[slot] = FormulaFact(
+                     fact.metric_key,
+                     fact.period_end,
+                     fact.value,
+                     fact.unit,
+                     fact.id,
+                 )
++                observed_raw_facts.append(fact)
++
++        expected_balance_mismatch = (
++            "balance_equation_mismatch"
++            in balance_equation_blockers(observed_raw_facts)
++        )
++        advertised_balance_mismatch = (
++            "balance_equation_mismatch" in bundle.blockers
++        )
++        if expected_balance_mismatch != advertised_balance_mismatch:
++            raise ValueError(
++                "balance equation semantics do not match canonical facts"
++            )
++        if expected_balance_mismatch and (
++            bundle.financial_status != "blocked"
++            or any(
++                bundle.dimension_inputs[dimension].status != "blocked"
++                for dimension in FINANCIAL_DIMENSIONS
++            )
++        ):
++            raise ValueError(
++                "balance equation semantics require blocked financial status"
++            )
+ 
+         formula_identities = {
+             (spec.dimension, spec.canonical_key, spec.period_key)
+             for spec in DERIVED_FORMULA_SPECS
+         }
+         formula_values = {
+             (dimension_name, value.key, value.period_key): value
+             for dimension_name, value in projection_entries
+             if (dimension_name, value.key, value.period_key) in formula_identities
+         }
+diff --git a/progress.md b/progress.md
+index e9cfff6..fae0509 100644
+--- a/progress.md
++++ b/progress.md
+@@ -72,10 +72,18 @@
+ - 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
+ - `formal_score_ready=false`，未发布 formal scores；正式等待价格池与正式强烈关注池均保持关闭且为空。
+ 
+ ## 七维派生公式与 DB 镜像认证（2026-08-31）
+ 
+ - `financial-derived-v1` 的 90 个派生逻辑输出现由单一中立公式目录与 evaluator 生成并按 canonical raw facts 重算认证；公共合约同时强制 common template 的完整 raw + formula 闭集、元数据与覆盖率，无输出模板仍保持空财务命名空间。
+ - verified artifact 与 SQLite `feature_set` header 及完整 `feature_value` child set 现按 canonical 标量/JSON 精确比较；首写、幂等复用和 progress 共用同一 validator，progress 在一个 read transaction 内保持 newest-only、no-fallback 与每候选至多一个 bounded unknown。
+ - V/T 维容器现同样参与全局财务命名空间认证，common template 的财务公式/原始槽位不能通过复制到非财务容器绕过闭集，无输出模板也拒绝该类值；本轮 fresh full `unittest` 回归为 391/391 通过。后续独立 scoped review 与 fresh whole-branch review 仍是必须门闸，本记录不预判结论。
+ - 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
+ - `formal_score_ready=false`，未发布 formal scores；正式等待价格池与正式强烈关注池继续关闭且为空。
++
++## 七维最终信任边界收口（2026-09-01）
++
++- verified progress 现将 bundle 的精确行业来源名称与注册模板绑定到当前冻结的 `CandidateContext`；不匹配记录 fail closed，且保持 visible newest-only、no-fallback。
++- 资产负债恒等式及容差/适用性由单一生产 authority 定义；builder 与 StateStore 首写、幂等复用、verified progress 路径均从已认证 canonical raw facts 重算，拒绝 blocker 或财务状态的语义伪造。
++- progress 在按证券选择最新记录之前强制 `feature_set.as_of_utc <= now_utc`；未来 bundle 不计数、不制造 unknown，也不能压制当前时点可见的较旧记录，等于截止时刻仍可见。
++- 本轮 focused 9/9、受影响模块 294/294、fresh full `unittest` 399/399 通过；尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
++- `formal_score_ready=false`、`seven_dimension_ready=false`；未发布 formal scores，正式等待价格池与正式强烈关注池继续关闭且为空。
+diff --git a/tests/test_financial_features.py b/tests/test_financial_features.py
+index 5f9e92e..10c64ea 100644
+--- a/tests/test_financial_features.py
++++ b/tests/test_financial_features.py
+@@ -959,20 +959,34 @@ class FeatureBundleBuildTests(unittest.TestCase):
+                 "conflicting_fact_versions",
+             )
+         )
+         self.assertEqual(bundle.blockers, (
+             "conflicting_fact_versions",
+             "formal_industry_mapping_missing",
+             "trade_calendar_missing_next_session",
+         ))
+         self.assertEqual(bundle.financial_status, "blocked")
+ 
++    def test_builder_recomputes_balance_equation_when_caller_omits_blocker(self):
++        imbalanced = self.replace_fact(
++            complete_general_facts(), "total_assets", "2021-12-31", 10_000.0
++        )
++
++        bundle = build_bundle_with_overrides(
++            facts=imbalanced, fact_blockers=()
++        )
++
++        self.assertEqual(bundle.financial_status, "blocked")
++        self.assertIn("balance_equation_mismatch", bundle.blockers)
++        for dimension in ("G", "M", "EQ", "FS", "CA"):
++            self.assertEqual(bundle.dimension_inputs[dimension].status, "blocked")
++
+     def test_complete_financial_inputs_are_ready_despite_formal_mapping_blocker(self):
+         bundle = build_bundle_with_overrides()
+         self.assertEqual(bundle.financial_status, "financial_ready")
+         self.assertEqual(bundle.financial_coverage, 1.0)
+         self.assertEqual(tuple(bundle.dimension_inputs), DIMENSIONS)
+         self.assertEqual(bundle.blockers, ("formal_industry_mapping_missing",))
+         self.assertIsNone(bundle.confidence_inputs.formal_confidence)
+         self.assertFalse(bundle.is_formal_score_ready)
+         self.assertNotIn("score", bundle.to_dict())
+         serialized = json.dumps(bundle.to_dict(), ensure_ascii=False)
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+index b27dae4..302a0b0 100644
+--- a/tests/test_orchestrator.py
++++ b/tests/test_orchestrator.py
+@@ -34,21 +34,25 @@ from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
+ from ashare_pipeline.snapshot_repository import SnapshotRepository
+ from ashare_pipeline.snapshot_store import SnapshotStore
+ from ashare_pipeline.sources import FetchBatch, SourceBlocked
+ from ashare_pipeline.state_store import StateStore
+ from ashare_pipeline import orchestrator
+ from tests.test_feature_contract import (
+     bundle_with_copied_financial_value,
+     retag_missing_revenue_slot,
+ )
+ from tests.test_financial_features import build_bundle_with_overrides, rebuild_fact
+-from tests.test_state_store import installed_ready_bundle
++from tests.test_state_store import (
++    forge_balance_semantics,
++    installed_ready_bundle,
++    unsafe_materialize_feature_bundle,
++)
+ 
+ 
+ def batch(source, dataset, records, request=None, fetched_at="2026-08-29T12:00:00+00:00"):
+     return FetchBatch(source, dataset, request or {}, records, fetched_at, "test", {})
+ 
+ 
+ def records_hash(records):
+     payload = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+     return hashlib.sha256(payload).hexdigest()
+ 
+@@ -320,21 +324,21 @@ class OrchestratorTestCase(unittest.TestCase):
+         self.assertEqual(after, expected_count)
+         self.assertEqual(
+             read_verified_feature_bundle(self.base, newer_path, newer_hash).canonical_bytes(),
+             newer.canonical_bytes(),
+         )
+ 
+         status, exit_code = orchestrator.run_command(
+             self.root,
+             store.db_path,
+             "status",
+-            now_cn="2026-08-29T20:00:00+08:00",
++            now_cn="2026-08-30T00:00:00+08:00",
+         )
+         self.assertEqual(exit_code, 0)
+         self.assertEqual(
+             status["deep"]["feature_set_counts"],
+             {"partial": 0, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertEqual(status["deep"]["template_counts"], {})
+         self.assertEqual(status["deep"]["missing_reason_counts"], {})
+         self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+         self.assertFalse(status["formal_score_ready"])
+@@ -1137,21 +1141,21 @@ class OrchestratorTestCase(unittest.TestCase):
+             bundle,
+             bundle_path=relative_path,
+             bundle_hash=bundle_hash,
+         )
+ 
+         progress = orchestrator.build_deep_progress(
+             self.root,
+             store,
+             SnapshotRepository(self.root, store),
+             context,
+-            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++            orchestrator._now_cn("2026-08-30T00:00:00+08:00"),
+         )
+ 
+         self.assertEqual(
+             progress["feature_set_counts"],
+             {"partial": 1, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertEqual(progress["template_counts"], {"general_nonfinancial": 1})
+         self.assertEqual(
+             progress["missing_reason_counts"]["financial_fact_missing:revenue"],
+             7,
+@@ -1290,39 +1294,221 @@ class OrchestratorTestCase(unittest.TestCase):
+             bundle_path=relative_path,
+             bundle_hash=bundle_hash,
+         )
+         verified = read_verified_feature_bundle(
+             self.base, relative_path, bundle_hash
+         )
+         status, exit_code = orchestrator.run_command(
+             self.root,
+             store.db_path,
+             "status",
+-            now_cn="2026-08-29T20:00:00+08:00",
++            now_cn="2026-08-30T00:00:00+08:00",
+         )
+ 
+         self.assertTrue(created)
+         self.assertTrue(stored)
+         self.assertEqual(feature_id, bundle_hash)
+         self.assertEqual(verified.canonical_bytes(), parsed.canonical_bytes())
+         self.assertEqual(exit_code, 0)
+         self.assertEqual(
+             status["deep"]["feature_set_counts"],
+             {"partial": 0, "financial_ready": 1, "blocked": 0},
+         )
+         self.assertFalse(status["formal_score_ready"])
+         self.assertFalse(status["seven_dimension_ready"])
+         self.assertEqual(
+             status["official_pool_counts"],
+             {"waiting_price": 0, "strong_attention": 0},
+         )
+ 
++    def test_progress_rejects_bundle_industry_that_mismatches_current_context(self):
++        write_candidate_documents(self.root, {"SH600001": "不存在行业"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        bundle, _facts, _snapshots = installed_ready_bundle(
++            store,
++            candidate_set_hash=context.candidate_set_hash,
++            snapshot_tag="context-substitution",
++            source_industry_name="包装印刷",
++        )
++        relative_path, bundle_hash, _created = write_feature_bundle(
++            self.base, bundle
++        )
++        _feature_id, stored = store.put_feature_bundle(
++            bundle, bundle_path=relative_path, bundle_hash=bundle_hash
++        )
++        self.assertTrue(stored)
++        self.assertEqual(
++            read_verified_feature_bundle(
++                self.base, relative_path, bundle_hash
++            ).industry.template_id,
++            "general_nonfinancial",
++        )
++
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-30T00:00:00+08:00",
++        )
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 0, "blocked": 0},
++        )
++        self.assertEqual(status["deep"]["template_counts"], {})
++        self.assertEqual(status["deep"]["unknown_failure_count"], 1)
++        self.assertFalse(status["formal_score_ready"])
++        self.assertFalse(status["seven_dimension_ready"])
++        self.assertEqual(
++            status["official_pool_counts"],
++            {"waiting_price": 0, "strong_attention": 0},
++        )
++
++    def test_progress_reauthenticates_balance_equation_without_fallback(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        older, _older_facts, _older_snapshots = installed_ready_bundle(
++            store,
++            candidate_set_hash=context.candidate_set_hash,
++            snapshot_tag="balance-older",
++            as_of_utc="2026-08-28T16:00:00+00:00",
++        )
++        older_path, older_hash, _created = write_feature_bundle(self.base, older)
++        _older_id, stored = store.put_feature_bundle(
++            older, bundle_path=older_path, bundle_hash=older_hash
++        )
++        self.assertTrue(stored)
++
++        built, _facts, _snapshots = installed_ready_bundle(
++            store,
++            candidate_set_hash=context.candidate_set_hash,
++            snapshot_tag="balance-newer",
++            as_of_utc="2026-08-29T16:00:00+00:00",
++            fact_values={("total_assets", "2021-12-31"): 10_000.0},
++        )
++        forged = forge_balance_semantics(
++            built,
++            status="financial_ready",
++            include_mismatch_blocker=False,
++        )
++        forged_path, forged_hash, _created = write_feature_bundle(
++            self.base, forged
++        )
++        unsafe_materialize_feature_bundle(
++            store, forged, bundle_path=forged_path
++        )
++        self.assertEqual(
++            read_verified_feature_bundle(
++                self.base, forged_path, forged_hash
++            ).canonical_bytes(),
++            forged.canonical_bytes(),
++        )
++
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-30T00:00:00+08:00",
++        )
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 0, "blocked": 0},
++        )
++        self.assertEqual(status["deep"]["unknown_failure_count"], 1)
++        self.assertFalse(status["formal_score_ready"])
++        self.assertFalse(status["seven_dimension_ready"])
++        self.assertEqual(
++            status["official_pool_counts"],
++            {"waiting_price": 0, "strong_attention": 0},
++        )
++
++    def test_progress_ignores_only_future_feature_bundle(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        future, _facts, _snapshots = installed_ready_bundle(
++            store,
++            candidate_set_hash=context.candidate_set_hash,
++            snapshot_tag="future-only",
++            as_of_utc="2026-09-10T00:00:00+00:00",
++        )
++        relative_path, bundle_hash, _created = write_feature_bundle(
++            self.base, future
++        )
++        _feature_id, stored = store.put_feature_bundle(
++            future, bundle_path=relative_path, bundle_hash=bundle_hash
++        )
++        self.assertTrue(stored)
++
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-29T20:00:00+08:00",
++        )
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 0, "blocked": 0},
++        )
++        self.assertEqual(status["deep"]["unknown_failure_count"], 0)
++
++    def test_future_bundle_does_not_suppress_exact_cutoff_visible_bundle(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        visible, _visible_facts, _visible_snapshots = installed_ready_bundle(
++            store,
++            candidate_set_hash=context.candidate_set_hash,
++            snapshot_tag="visible-cutoff",
++            as_of_utc="2026-08-29T16:00:00+00:00",
++            source_industry_name="包装印刷",
++        )
++        future, _future_facts, _future_snapshots = installed_ready_bundle(
++            store,
++            candidate_set_hash=context.candidate_set_hash,
++            snapshot_tag="future-suppressor",
++            as_of_utc="2026-09-10T00:00:00+00:00",
++            source_industry_name="电力",
++        )
++        for bundle in (visible, future):
++            relative_path, bundle_hash, _created = write_feature_bundle(
++                self.base, bundle
++            )
++            _feature_id, stored = store.put_feature_bundle(
++                bundle, bundle_path=relative_path, bundle_hash=bundle_hash
++            )
++            self.assertTrue(stored)
++
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-30T00:00:00+08:00",
++        )
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 1, "blocked": 0},
++        )
++        self.assertEqual(
++            status["deep"]["template_counts"], {"general_nonfinancial": 1}
++        )
++        self.assertEqual(status["deep"]["unknown_failure_count"], 0)
++
+     def test_progress_rejects_newest_derived_numeric_mutation_without_fallback(self):
+         store, newer, newer_path, _newer_hash, newer_id = self.install_ready_history(
+             "derived-numeric"
+         )
+         payload = newer.to_dict()
+         gross = next(
+             value
+             for value in payload["dimension_inputs"]["M"]["values"]
+             if value["key"] == "m.gross_profit.FY2021"
+         )
+@@ -1346,21 +1532,21 @@ class OrchestratorTestCase(unittest.TestCase):
+             connection.commit()
+         self.assertEqual(
+             read_verified_feature_bundle(self.base, newer_path, forged_hash).canonical_bytes(),
+             forged_bytes,
+         )
+ 
+         status, exit_code = orchestrator.run_command(
+             self.root,
+             store.db_path,
+             "status",
+-            now_cn="2026-08-29T20:00:00+08:00",
++            now_cn="2026-08-30T00:00:00+08:00",
+         )
+         self.assertEqual(exit_code, 0)
+         self.assertEqual(
+             status["deep"]["feature_set_counts"],
+             {"partial": 0, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+         self.assertFalse(status["formal_score_ready"])
+         self.assertFalse(status["seven_dimension_ready"])
+         self.assertEqual(
+@@ -1408,21 +1594,21 @@ class OrchestratorTestCase(unittest.TestCase):
+                 ),
+             )
+             self.assertEqual(cursor.rowcount, 1)
+             connection.commit()
+         self.assertEqual((self.base / newer_path).read_bytes(), forged_bytes)
+ 
+         status, exit_code = orchestrator.run_command(
+             self.root,
+             store.db_path,
+             "status",
+-            now_cn="2026-08-29T20:00:00+08:00",
++            now_cn="2026-08-30T00:00:00+08:00",
+         )
+         self.assertEqual(exit_code, 0)
+         self.assertEqual(
+             status["deep"]["feature_set_counts"],
+             {"partial": 0, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertEqual(status["deep"]["template_counts"], {})
+         self.assertEqual(status["deep"]["missing_reason_counts"], {})
+         self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+         self.assertFalse(status["formal_score_ready"])
+@@ -1539,21 +1725,21 @@ class OrchestratorTestCase(unittest.TestCase):
+                 (forged_payload["as_of_utc"], forged_hash, newer_hash),
+             )
+             connection.commit()
+ 
+         with self.assertRaises(OSError):
+             read_verified_feature_bundle(self.base, newer_path, forged_hash)
+         status, exit_code = orchestrator.run_command(
+             self.root,
+             store.db_path,
+             "status",
+-            now_cn="2026-08-29T20:00:00+08:00",
++            now_cn="2026-08-30T00:00:00+08:00",
+         )
+         self.assertEqual(exit_code, 0)
+         self.assertEqual(
+             status["deep"]["feature_set_counts"],
+             {"partial": 0, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+         self.assertFalse(status["formal_score_ready"])
+         self.assertFalse(status["seven_dimension_ready"])
+         self.assertEqual(
+@@ -1625,21 +1811,21 @@ class OrchestratorTestCase(unittest.TestCase):
+         _feature_id, stored = store.put_feature_bundle(
+             built, bundle_path=relative_path, bundle_hash=bundle_hash
+         )
+         verified = read_verified_feature_bundle(
+             self.base, relative_path, bundle_hash
+         )
+         status, exit_code = orchestrator.run_command(
+             self.root,
+             store.db_path,
+             "status",
+-            now_cn="2026-08-29T20:00:00+08:00",
++            now_cn="2026-08-30T00:00:00+08:00",
+         )
+ 
+         self.assertTrue(stored)
+         self.assertEqual(verified.financial_status, "blocked")
+         self.assertEqual(verified.financial_coverage, 0.0)
+         self.assertIn("industry_template_unclassified", verified.blockers)
+         self.assertEqual(exit_code, 0)
+         self.assertEqual(
+             status["deep"]["feature_set_counts"],
+             {"partial": 0, "financial_ready": 0, "blocked": 1},
+@@ -1682,21 +1868,21 @@ class OrchestratorTestCase(unittest.TestCase):
+             connection.execute(
+                 "DELETE FROM source_snapshot WHERE id=?",
+                 (newer_snapshots["income"],),
+             )
+             connection.commit()
+ 
+         status, exit_code = orchestrator.run_command(
+             self.root,
+             store.db_path,
+             "status",
+-            now_cn="2026-08-29T20:00:00+08:00",
++            now_cn="2026-08-30T00:00:00+08:00",
+         )
+ 
+         self.assertEqual(exit_code, 0)
+         self.assertEqual(
+             status["deep"]["feature_set_counts"],
+             {"partial": 0, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+         self.assertFalse(status["formal_score_ready"])
+         self.assertFalse(status["seven_dimension_ready"])
+@@ -1733,21 +1919,21 @@ class OrchestratorTestCase(unittest.TestCase):
+             )
+             targets.append(self.base / relative_path)
+         targets[0].unlink()
+         targets[1].write_bytes(b'{"tampered":true}')
+ 
+         progress = orchestrator.build_deep_progress(
+             self.root,
+             store,
+             SnapshotRepository(self.root, store),
+             context,
+-            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++            orchestrator._now_cn("2026-08-30T00:00:00+08:00"),
+         )
+ 
+         self.assertEqual(
+             progress["feature_set_counts"],
+             {"partial": 0, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertEqual(progress["template_counts"], {})
+         self.assertEqual(progress["missing_reason_counts"], {})
+         self.assertEqual(progress["unknown_failure_count"], 2)
+ 
+@@ -1768,21 +1954,21 @@ class OrchestratorTestCase(unittest.TestCase):
+                 "UPDATE feature_set SET status='financial_ready' WHERE input_hash=?",
+                 (bundle.input_hash,),
+             )
+             connection.commit()
+ 
+         progress = orchestrator.build_deep_progress(
+             self.root,
+             store,
+             SnapshotRepository(self.root, store),
+             context,
+-            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++            orchestrator._now_cn("2026-08-30T00:00:00+08:00"),
+         )
+ 
+         self.assertEqual(
+             progress["feature_set_counts"],
+             {"partial": 0, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertEqual(progress["unknown_failure_count"], 1)
+ 
+     def test_progress_reports_corrupt_database_summary_as_unknown(self):
+         write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+@@ -1801,21 +1987,21 @@ class OrchestratorTestCase(unittest.TestCase):
+                 "UPDATE feature_set SET missing_json='{' WHERE input_hash=?",
+                 (bundle.input_hash,),
+             )
+             connection.commit()
+ 
+         progress = orchestrator.build_deep_progress(
+             self.root,
+             store,
+             SnapshotRepository(self.root, store),
+             context,
+-            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++            orchestrator._now_cn("2026-08-30T00:00:00+08:00"),
+         )
+ 
+         self.assertEqual(
+             progress["feature_set_counts"],
+             {"partial": 0, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertEqual(progress["unknown_failure_count"], 1)
+ 
+     def test_status_fails_closed_when_curated_candidate_documents_are_tampered(self):
+         write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+diff --git a/tests/test_state_store.py b/tests/test_state_store.py
+index f67c5c0..3d94544 100644
+--- a/tests/test_state_store.py
++++ b/tests/test_state_store.py
+@@ -5,20 +5,21 @@ import tempfile
+ import threading
+ import unittest
+ from contextlib import closing
+ from dataclasses import FrozenInstanceError, replace
+ from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+ 
+ from ashare_pipeline.feature_contract import (
+     CONTRACT_VERSION,
+     DIMENSIONS,
++    FINANCIAL_DIMENSIONS,
+     ConfidenceInputs,
+     DimensionInput,
+     EvidenceRef,
+     FeatureBundle,
+     FeatureValue,
+     IndustryContext,
+     canonical_sha256,
+ )
+ from ashare_pipeline.financial_schema import MAPPING_VERSION, FinancialFact
+ from ashare_pipeline.state_store import FinalizationBlocked, JobSpec, StateStore
+@@ -75,20 +76,109 @@ def valid_feature_bundle(
+     )
+ 
+ 
+ def installed_ready_bundle(
+     store: StateStore, **overrides: object
+ ) -> tuple[FeatureBundle, tuple[FinancialFact, ...], dict[str, str]]:
+     """Share the real evidence prerequisite without exporting a TestCase class."""
+     return StateStoreTestCase.installed_ready_bundle(store, **overrides)
+ 
+ 
++def forge_balance_semantics(
++    bundle: FeatureBundle,
++    *,
++    status: str,
++    include_mismatch_blocker: bool,
++) -> FeatureBundle:
++    forged = copy.copy(bundle)
++    blockers = set(bundle.blockers)
++    if include_mismatch_blocker:
++        blockers.add("balance_equation_mismatch")
++    else:
++        blockers.discard("balance_equation_mismatch")
++    dimensions = dict(bundle.dimension_inputs)
++    dimension_status = "blocked" if status == "blocked" else status
++    if dimension_status == "financial_ready":
++        dimension_status = "input_ready"
++    for dimension in FINANCIAL_DIMENSIONS:
++        dimensions[dimension] = DimensionInput(
++            dimension_status,
++            bundle.dimension_inputs[dimension].values,
++        )
++    object.__setattr__(forged, "financial_status", status)
++    object.__setattr__(forged, "blockers", tuple(sorted(blockers)))
++    object.__setattr__(forged, "dimension_inputs", dimensions)
++    forged.validate()
++    return forged
++
++
++def unsafe_materialize_feature_bundle(
++    store: StateStore,
++    bundle: FeatureBundle,
++    *,
++    bundle_path: str,
++) -> str:
++    """Create reviewed pre-fix state without invoking a production validator."""
++    bundle_hash = bundle.bundle_hash()
++    header, values = store._feature_bundle_content(bundle, bundle_hash)
++    with closing(sqlite3.connect(store.db_path)) as connection:
++        connection.execute(
++            """INSERT INTO feature_set
++            (id,security_id,report_period,as_of_utc,candidate_set_hash,
++             template_id,template_version,contract_version,input_hash,status,
++             financial_coverage,dimension_status_json,confidence_inputs_json,
++             blockers_json,bundle_hash,bundle_path,missing_json,created_at)
++            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
++            (
++                bundle_hash,
++                header["security_id"],
++                header["report_period"],
++                header["as_of_utc"],
++                header["candidate_set_hash"],
++                header["template_id"],
++                header["template_version"],
++                header["contract_version"],
++                header["input_hash"],
++                header["status"],
++                header["financial_coverage"],
++                header["dimension_status_json"],
++                header["confidence_inputs_json"],
++                header["blockers_json"],
++                header["bundle_hash"],
++                bundle_path,
++                header["missing_json"],
++                utc_at(99),
++            ),
++        )
++        for value in values:
++            connection.execute(
++                """INSERT INTO feature_value
++                (feature_set_id,dimension,feature_key,period_key,value,unit,status,
++                 formula_version,evidence_json,missing_reason)
++                VALUES (?,?,?,?,?,?,?,?,?,?)""",
++                (
++                    bundle_hash,
++                    value["dimension"],
++                    value["feature_key"],
++                    value["period_key"],
++                    value["value"],
++                    value["unit"],
++                    value["status"],
++                    value["formula_version"],
++                    value["evidence_json"],
++                    value["missing_reason"],
++                ),
++            )
++        connection.commit()
++    return bundle_hash
++
++
+ class StateStoreTestCase(unittest.TestCase):
+     """Each test guards a durable public state-transition contract."""
+ 
+     def setUp(self) -> None:
+         self.tempdir = tempfile.TemporaryDirectory()
+         self.db_path = Path(self.tempdir.name) / "state.sqlite3"
+         self.store = StateStore(self.db_path)
+         self.store.initialize()
+ 
+     def tearDown(self) -> None:
+@@ -120,20 +210,22 @@ class StateStoreTestCase(unittest.TestCase):
+         return replace(build_bundle_with_overrides(facts=(fact,)), **overrides)
+ 
+     @staticmethod
+     def installed_ready_bundle(
+         store: StateStore,
+         *,
+         security_id: str = "SH600001",
+         snapshot_tag: str = "current",
+         **overrides: object,
+     ) -> tuple[FeatureBundle, tuple[FinancialFact, ...], dict[str, str]]:
++        fact_values = dict(overrides.pop("fact_values", {}))
++        omitted_slots = set(overrides.pop("omit_fact_slots", ()))
+         dataset_by_statement = {
+             "income": "profit_sheet",
+             "balance": "balance_sheet",
+             "cash_flow": "cash_flow_sheet",
+         }
+         snapshot_ids: dict[str, str] = {}
+         snapshot_hashes: dict[str, str] = {}
+         for index, (statement, dataset) in enumerate(
+             dataset_by_statement.items(), start=1
+         ):
+@@ -151,22 +243,28 @@ class StateStoreTestCase(unittest.TestCase):
+                 1,
+                 utc_at(index),
+             )
+             snapshot_ids[statement] = snapshot_id
+             snapshot_hashes[dataset] = payload_hash
+         facts = tuple(
+             rebuild_fact(
+                 fact,
+                 security_id=security_id,
+                 source_snapshot_id=snapshot_ids[fact.statement],
++                **(
++                    {"value": fact_values[(fact.metric_key, fact.period_end)]}
++                    if (fact.metric_key, fact.period_end) in fact_values
++                    else {}
++                ),
+             )
+             for fact in complete_general_facts()
++            if (fact.metric_key, fact.period_end) not in omitted_slots
+         )
+         self_inserted, ignored = store.insert_financial_facts(facts)
+         if self_inserted != len(facts) or ignored:
+             raise AssertionError("ready evidence fixture must insert canonical facts once")
+         arguments: dict[str, object] = {
+             "security_id": security_id,
+             "facts": facts,
+             "statement_snapshot_hashes": snapshot_hashes,
+         }
+         arguments.update(overrides)
+@@ -909,20 +1007,135 @@ class StateStoreTestCase(unittest.TestCase):
+                             f"derived-{case}.json"
+                         ),
+                         bundle_hash=forged.bundle_hash(),
+                     )
+                 with closing(sqlite3.connect(case_store.db_path)) as connection:
+                     self.assertEqual(
+                         connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                         0,
+                     )
+ 
++    def test_balance_equation_semantics_reject_forged_ready_partial_and_blocked(self) -> None:
++        cases = (
++            ("ready_omission", 10_000.0, "financial_ready", False),
++            ("partial_omission", 10_000.0, "partial", False),
++            ("blocked_addition", 900.0, "blocked", True),
++        )
++        for case, assets, status, include_marker in cases:
++            with self.subTest(case=case):
++                case_store = StateStore(Path(self.tempdir.name) / f"{case}.sqlite3")
++                case_store.initialize()
++                built, _facts, _snapshots = self.installed_ready_bundle(
++                    case_store,
++                    snapshot_tag=case,
++                    fact_values={("total_assets", "2021-12-31"): assets},
++                )
++                forged = forge_balance_semantics(
++                    built,
++                    status=status,
++                    include_mismatch_blocker=include_marker,
++                )
++
++                with self.assertRaisesRegex(ValueError, "balance equation"):
++                    case_store.put_feature_bundle(
++                        forged,
++                        bundle_path=(
++                            "data/curated/formal_features/2026-06-30/SH600001/"
++                            f"{case}.json"
++                        ),
++                        bundle_hash=forged.bundle_hash(),
++                    )
++                with closing(sqlite3.connect(case_store.db_path)) as connection:
++                    self.assertEqual(
++                        connection.execute(
++                            "SELECT COUNT(*) FROM feature_set"
++                        ).fetchone()[0],
++                        0,
++                    )
++
++    def test_balance_equation_is_reauthenticated_before_idempotent_success(self) -> None:
++        built, _facts, _snapshots = self.installed_ready_bundle(
++            self.store,
++            snapshot_tag="balance-idempotent",
++            fact_values={("total_assets", "2021-12-31"): 10_000.0},
++        )
++        forged = forge_balance_semantics(
++            built,
++            status="financial_ready",
++            include_mismatch_blocker=False,
++        )
++        path = (
++            "data/curated/formal_features/2026-06-30/SH600001/"
++            "balance-idempotent.json"
++        )
++        feature_id = unsafe_materialize_feature_bundle(
++            self.store, forged, bundle_path=path
++        )
++        stored = self.store.get_feature_bundle_row(
++            forged.security_id, forged.report_period, forged.input_hash
++        )
++        self.assertEqual(stored["status"], "financial_ready")
++        self.assertEqual(stored["id"], feature_id)
++
++        with self.assertRaisesRegex(ValueError, "balance equation"):
++            self.store.put_feature_bundle(
++                forged, bundle_path=path, bundle_hash=forged.bundle_hash()
++            )
++
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
++                1,
++            )
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0],
++                363,
++            )
++
++    def test_balance_equation_accepts_exact_tolerance_and_missing_triplet(self) -> None:
++        cases = (
++            (
++                "exact_tolerance",
++                {("total_assets", "2021-12-31"): 1_900.0},
++                (),
++                "financial_ready",
++            ),
++            (
++                "missing_equity",
++                {},
++                (("total_equity", "2021-12-31"),),
++                "partial",
++            ),
++        )
++        for case, values, omitted, expected_status in cases:
++            with self.subTest(case=case):
++                case_store = StateStore(Path(self.tempdir.name) / f"{case}.sqlite3")
++                case_store.initialize()
++                bundle, _facts, _snapshots = self.installed_ready_bundle(
++                    case_store,
++                    snapshot_tag=case,
++                    fact_values=values,
++                    omit_fact_slots=omitted,
++                )
++                feature_id, created = case_store.put_feature_bundle(
++                    bundle,
++                    bundle_path=(
++                        "data/curated/formal_features/2026-06-30/SH600001/"
++                        f"{case}.json"
++                    ),
++                    bundle_hash=bundle.bundle_hash(),
++                )
++                self.assertTrue(created)
++                self.assertEqual(feature_id, bundle.bundle_hash())
++                self.assertEqual(bundle.financial_status, expected_status)
++                self.assertNotIn("balance_equation_mismatch", bundle.blockers)
++
+     def test_first_persistence_rejects_financial_formula_copy_in_t(self) -> None:
+         honest, _facts, _snapshots = self.installed_ready_bundle(
+             self.store, snapshot_tag="formula-copy-first"
+         )
+         forged = bundle_with_copied_financial_value(honest, "T")
+ 
+         with self.assertRaisesRegex(ValueError, "financial projection"):
+             self.store.put_feature_bundle(
+                 forged,
+                 bundle_path=(

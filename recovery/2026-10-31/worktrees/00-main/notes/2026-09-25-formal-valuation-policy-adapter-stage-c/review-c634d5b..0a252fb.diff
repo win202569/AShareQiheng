@@ -1,0 +1,423 @@
+# Review package: c634d5b6..0a252fb
+
+## Commits
+0a252fb Optimize authenticated policy reads in adapter and range contracts
+
+## Files changed
+ ashare_pipeline/formal_policy_registry.py          | 12 +++--
+ ashare_pipeline/formal_range_contract.py           | 14 ++---
+ .../formal_valuation_adapter_contract.py           | 11 ++--
+ tests/test_formal_range_contract.py                | 63 +++++++++++++++++++++-
+ tests/test_formal_valuation_adapter_contract.py    | 34 ++++++++++++
+ 5 files changed, 119 insertions(+), 15 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_policy_registry.py b/ashare_pipeline/formal_policy_registry.py
+index 1186880..7e22d61 100644
+--- a/ashare_pipeline/formal_policy_registry.py
++++ b/ashare_pipeline/formal_policy_registry.py
+@@ -365,21 +365,22 @@ def _install_policy_registry():
+     source_bases = tuple((cls, cls.__bases__, cls.__mro__) for cls, _ in source_interfaces)
+ 
+     def class_snapshot(classes):
+         return tuple((cls, tuple(vars(cls).items()), cls.__bases__, cls.__mro__) for cls in classes)
+ 
+     def dependencies():
+         if any(owner.get(name) is not expected for owner, name, expected in bindings):
+             raise ValueError("policy proof dependency changed")
+         if (module_globals.get("FormalPolicyRegistry") is not proof_type
+                 or module_globals.get("load_formal_policy_registry") is not load
+-                or module_globals.get("_read_authenticated_policy_registry") is not read):
++                or module_globals.get("_read_authenticated_policy_registry") is not read
++                or module_globals.get("_read_authenticated_policy_sources") is not read_sources):
+             raise ValueError("policy proof entry point changed")
+         if (any(resolved_member(cls, name) is not expected for cls, name, expected in source_members)
+                 or any(cls.__bases__ != bases or cls.__mro__ != mro for cls, bases, mro in source_bases)):
+             raise ValueError("policy proof source interface changed")
+         for cls, expected, bases, mro in own_members:
+             current = vars(cls)
+             if (cls.__bases__ != bases or cls.__mro__ != mro
+                     or set(current) != {name for name, _ in expected}
+                     or any(current[name] is not value for name, value in expected)):
+                 raise ValueError("policy proof class member or inheritance changed")
+@@ -498,20 +499,25 @@ def _install_policy_registry():
+ 
+         records[identity] = (weak_ref(result, forget), frozen_payload, canonical,
+             bundle, scoring_registry, feature_registry, root_hash, hashes)
+         return result
+ 
+     def read(proof):
+         """Internal consumer read anchored in this owner's original proof record."""
+         record = proof_record(proof)
+         return dict(loads(record[2]), contract_hash=record[1]["contract_hash"])
+ 
++    def read_sources(proof):
++        """Internal read of original sources and bytes after one complete proof check."""
++        record = proof_record(proof)
++        return record[3], record[4], record[5], record[2]
++
+     own_members = class_snapshot((ProofMeta, Proof, proof_type))
+-    return proof_type, load, read
++    return proof_type, load, read, read_sources
+ 
+ 
+ (FormalPolicyRegistry, load_formal_policy_registry,
+- _read_authenticated_policy_registry) = _install_policy_registry()
++ _read_authenticated_policy_registry, _read_authenticated_policy_sources) = _install_policy_registry()
+ del _install_policy_registry
+ 
+ 
+ __all__ = ["FormalPolicyRegistry", "load_formal_policy_registry"]
+diff --git a/ashare_pipeline/formal_range_contract.py b/ashare_pipeline/formal_range_contract.py
+index f4cf9d8..1375452 100644
+--- a/ashare_pipeline/formal_range_contract.py
++++ b/ashare_pipeline/formal_range_contract.py
+@@ -57,31 +57,32 @@ def _load_canonical_object(raw: object, label: str) -> dict[str, object]:
+         raise ValueError(f"{label} is invalid") from error
+     if type(value) is not dict or _canonical(value) != raw:
+         raise ValueError(f"{label} must be a canonical JSON object")
+     return value
+ 
+ 
+ def _build_range_bindings_contract():
+     # Source imports only the pure format module, so trust interfaces can be
+     # captured now, before callers can replace methods ahead of the first load.
+     from .formal_context_schema import _descriptor as validate_descriptor
++    from . import formal_policy_registry as policy_module
+     from .formal_policy_registry import FormalPolicyRegistry as policy_type
+     from .formal_registry_manifest import VerifiedRegistryBundle as bundle_type
+     from .formal_scoring_registry import FormalScoringRegistry as scoring_type
+     from .formal_range_format import RangeConfig, parse_range_entry, _range_config_to_dict
+     from . import formal_range_format as format_module
+     from . import formal_context_schema as context_module
+ 
+     require_bundle = bundle_type.require_official
+     blob_for = bundle_type.blob
+     require_scoring = scoring_type.require_official
+-    policy_bytes_for = policy_type.canonical_bytes
++    read_policy_sources = policy_module._read_authenticated_policy_sources
+ 
+     module_globals = globals()
+     # _range_catalog_from_source reads _load_canonical_object and the immutable
+     # _LEGACY_CONFIG_FIELDS global; its parser/type/serializer are captured
+     # closure references. parse_range_entry -> _bridge/_context_selector,
+     # _request_template and its text/tree helpers, numeric validators and
+     # _freeze. The serializer used by
+     # current checks -> _thaw (recursive). Inventory every non-builtin global
+     # reached by those call chains, including the module aliases they use.
+     dependencies = tuple((module_globals, name, module_globals[name]) for name in (
+@@ -99,21 +100,21 @@ def _build_range_bindings_contract():
+     )) + ((vars(context_module), "_descriptor", validate_descriptor),
+           (vars(json), "loads", json.loads), (vars(json), "dumps", json.dumps),
+           (vars(hashlib), "sha256", hashlib.sha256),
+           (vars(format_module.math), "isfinite", format_module.math.isfinite),
+           (vars(format_module.re), "fullmatch", format_module.re.fullmatch))
+     config_members = tuple(vars(RangeConfig).items())
+     interfaces = (
+         (bundle_type, "require_official", require_bundle),
+         (bundle_type, "blob", blob_for),
+         (scoring_type, "require_official", require_scoring),
+-        (policy_type, "canonical_bytes", policy_bytes_for),
++        (policy_module, "_read_authenticated_policy_sources", read_policy_sources),
+     )
+ 
+     def _check_dependencies() -> None:
+         if any(owner.get(name) is not expected for owner, name, expected in dependencies):
+             raise ValueError("range binding dependency changed")
+         current_members = vars(RangeConfig)
+         if (set(current_members) != {name for name, _ in config_members}
+                 or any(current_members[name] is not value for name, value in config_members)):
+             raise ValueError("range configuration interface changed")
+         if any(getattr(cls, name, None) is not expected for cls, name, expected in interfaces):
+@@ -127,24 +128,25 @@ def _build_range_bindings_contract():
+         roles: tuple[tuple[str, bytes, str], ...]
+         policy_bytes: bytes
+         policy_hash: str
+ 
+ 
+     def _capture_graph_snapshot(bundle, scoring_registry, policy_registry) -> _GraphSnapshot:
+         _check_dependencies()
+         if (type(bundle) is not bundle_type or type(scoring_registry) is not scoring_type
+                 or type(policy_registry) is not policy_type):
+             raise ValueError("range bindings require exact genuine registry types")
+-        require_bundle(bundle)
+-        require_scoring(scoring_registry, bundle)
+-        # canonical_bytes executes the original complete policy proof verifier.
+-        policy_bytes = policy_bytes_for(policy_registry)
++        original_bundle, original_scoring, _, policy_bytes = read_policy_sources(policy_registry)
++        if bundle is not original_bundle:
++            require_bundle(bundle)
++        if bundle is not original_bundle or scoring_registry is not original_scoring:
++            require_scoring(scoring_registry, bundle)
+         manifest = bundle.manifest
+         manifest_bytes = manifest.canonical_json
+         root_hash = hashlib.sha256(manifest_bytes).hexdigest()
+         if root_hash != manifest.manifest_hash:
+             raise ValueError("range binding registry root hash mismatch")
+         roles = ("source", "mapping", "feature", "scoring", "industry", "cyclic",
+                  "redline", "status", "event")
+         if manifest.schema_version == "formal-registry-manifest-v2":
+             roles += ("valuation_adapter",)
+         snapshots = []
+diff --git a/ashare_pipeline/formal_valuation_adapter_contract.py b/ashare_pipeline/formal_valuation_adapter_contract.py
+index ea7359e..1576474 100644
+--- a/ashare_pipeline/formal_valuation_adapter_contract.py
++++ b/ashare_pipeline/formal_valuation_adapter_contract.py
+@@ -3,21 +3,21 @@
+ from __future__ import annotations
+ 
+ from dataclasses import asdict, dataclass
+ import hashlib
+ import json
+ from typing import Literal
+ import weakref
+ 
+ from . import formal_metric_engine as metric_module
+ from .formal_metric_engine import _scoring_metric_definitions
+-from .formal_policy_registry import FormalPolicyRegistry
++from .formal_policy_registry import FormalPolicyRegistry, _read_authenticated_policy_registry
+ from .formal_registry_manifest import VerifiedRegistryBundle, _load_canonical_object
+ from .formal_scoring_registry import FormalScoringRegistry
+ 
+ 
+ _COVERAGE_KEYS = frozenset(("template_id", "metric_id", "policy_dependency"))
+ _ADAPTER_KEYS = frozenset(("template_id", "metric_id", "adapter_id", "adapter_version",
+     "operation", "profit_semantic_id", "metric_unit", "profit_unit", "output_unit",
+     "policy_role", "rule_id", "decimal_contract", "preconditions", "definition_basis"))
+ _CHILD_KEYS = frozenset(("registry_role", "schema_version", "purpose", "registry_version",
+     "coverage", "adapters"))
+@@ -64,21 +64,21 @@ def _entries(value, keys, path):
+     for index, entry in enumerate(value):
+         if type(entry) is not dict or set(entry) != keys:
+             _fail(f"{path}[{index}]", "has wrong fields")
+     return value
+ 
+ 
+ def _install_registry():
+     records = {}
+     bundle_type, scoring_type, policy_type = VerifiedRegistryBundle, FormalScoringRegistry, FormalPolicyRegistry
+     require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
+-    require_scoring, require_policy = scoring_type.require_official, policy_type.require_verified
++    require_scoring, read_policy = scoring_type.require_official, _read_authenticated_policy_registry
+     definitions = _scoring_metric_definitions
+     metric_owner = metric_module
+     definition_guard = metric_owner._metric_definition_dependency_changes
+     definition_type, serialize_definition = ValuationAdapterDefinition, asdict
+     dumps, loads, sha256 = json.dumps, json.loads, hashlib.sha256
+     parse = _load_canonical_object
+ 
+     def canonical(value):
+         return dumps(value, sort_keys=True, ensure_ascii=False,
+             separators=(",", ":"), allow_nan=False).encode("utf-8")
+@@ -90,23 +90,24 @@ def _install_registry():
+                 or vars(metric_owner).get("_metric_definition_dependency_changes") is not definition_guard):
+             _fail("graph.definition dependencies", "metric definition encoder or producer guard changed")
+         changes = definition_guard()
+         if changes:
+             _fail("graph.definition dependencies",
+                 "metric definition encoder or producer changed: " + ", ".join(changes))
+         require_bundle(bundle)
+         if bundle.manifest.schema_version != "formal-registry-manifest-v2":
+             raise ValueError("valuation_adapter role is unavailable for this manifest version")
+         require_scoring(scoring, bundle)
+-        require_policy(policy)
+-        if (policy.registry_manifest_hash != bundle.manifest.manifest_hash
+-                or policy.role_hashes != {role: scoring.role_hashes[role] for role in policy.role_hashes}):
++        policy_wire = read_policy(policy)
++        if (policy_wire["registry_manifest_hash"] != bundle.manifest.manifest_hash
++                or policy_wire["role_hashes"] != {
++                    role: scoring.role_hashes[role] for role in policy_wire["role_hashes"]}):
+             _fail("graph", "policy and scoring have different roots")
+         blob = blob_for(bundle, "valuation_adapter")
+         if (sha256(blob.canonical_json).hexdigest() != blob.registry_hash
+                 or blob.registry_hash != bundle.manifest.valuation_adapter_registry_hash):
+             _fail("graph", "signed child hash differs from root")
+         return blob.canonical_json
+ 
+     def contract(bundle, scoring, policy):
+         raw = sources(bundle, scoring, policy)
+         try:
+diff --git a/tests/test_formal_range_contract.py b/tests/test_formal_range_contract.py
+index 78da271..a4bae70 100644
+--- a/tests/test_formal_range_contract.py
++++ b/tests/test_formal_range_contract.py
+@@ -14,20 +14,48 @@ from unittest.mock import patch
+ 
+ from ashare_pipeline.formal_evidence import OfficialRequest
+ from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
+ from ashare_pipeline.formal_sources import SignedSourceRegistry
+ from tests.formal_range_fixtures import range_entry, range_graph
+ from tests.test_formal_scoring_registry import HmacVerifier, canonical
+ from tests.test_formal_sources import config
+ 
+ 
+ class FormalRangeContractTests(unittest.TestCase):
++    def test_current_authenticates_each_original_source_once_per_snapshot(self):
++        bindings, *_ = self._load()
++        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
++        counts = {"proof_record": 0, "scoring_fingerprint": 0,
++                  "feature_fingerprint": 0}
++
++        def profile(frame, event, _arg):
++            if event != "call":
++                return
++            name, path = frame.f_code.co_name, frame.f_code.co_filename
++            if name == "proof_record" and path.endswith("formal_policy_registry.py"):
++                counts["proof_record"] += 1
++            elif (name == "fingerprint" and path.endswith("formal_scoring_registry.py")
++                    and frame.f_back.f_code.co_name == "sealed"):
++                counts["scoring_fingerprint"] += 1
++            elif name == "fingerprint" and path.endswith("formal_feature_contract.py"):
++                counts["feature_fingerprint"] += 1
++
++        sys.setprofile(profile)
++        try:
++            binding.require_current()
++            binding.require_current()
++        finally:
++            sys.setprofile(None)
++        self.assertEqual(counts, {"proof_record": 2,
++                                  "scoring_fingerprint": 2,
++                                  "feature_fingerprint": 4})
++
+     def test_equal_identity_replacement_of_legacy_fields_before_load_is_rejected(self):
+         from ashare_pipeline import formal_range_contract as contract
+ 
+         bundle, vocabulary, scoring, *_ = range_graph()
+         policy = load_formal_policy_registry(
+             bundle, scoring_registry=scoring, feature_registry=vocabulary)
+         replacement = frozenset(list(contract._LEGACY_CONFIG_FIELDS))
+         self.assertEqual(replacement, contract._LEGACY_CONFIG_FIELDS)
+         self.assertIsNot(replacement, contract._LEGACY_CONFIG_FIELDS)
+         with patch.object(contract, "_LEGACY_CONFIG_FIELDS", replacement):
+@@ -66,21 +94,54 @@ class FormalRangeContractTests(unittest.TestCase):
+             for _ in range(2):
+                 binding.require_current()
+                 owner_read(binding)
+         finally:
+             sys.setprofile(None)
+ 
+         for name in ("_derive_graph", "_range_catalog_from_source", "parse_range_entry",
+                      "_definitions_fingerprint"):
+             self.assertEqual(counts.get(name, 0), 0, name)
+         self.assertGreaterEqual(counts.get("require_official", 0), 8)
+-        self.assertGreaterEqual(counts.get("canonical_bytes", 0), 4)
++        self.assertGreaterEqual(counts.get("read_sources", 0), 4)
++
++    def test_replaced_policy_source_reader_revokes_warm_binding(self):
++        from ashare_pipeline import formal_policy_registry as policy_module
++
++        bindings, *_ = self._load()
++        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
++        original = policy_module._read_authenticated_policy_sources
++        with patch.object(policy_module, "_read_authenticated_policy_sources",
++                          lambda proof: original(proof)):
++            with self.assertRaises(ValueError):
++                binding.require_current()
++        binding.require_current()
++
++    def test_equal_root_separate_scoring_is_verified_against_passed_bundle(self):
++        from ashare_pipeline.formal_range_contract import load_policy_range_bindings
++
++        bundle1, vocabulary1, scoring1, *_ = range_graph()
++        policy1 = load_formal_policy_registry(
++            bundle1, scoring_registry=scoring1, feature_registry=vocabulary1)
++        bundle2, _, scoring2, *_ = range_graph()
++        self.assertIsNot(bundle1, bundle2)
++        self.assertEqual(bundle1.manifest.manifest_hash, bundle2.manifest.manifest_hash)
++        bindings = load_policy_range_bindings(
++            bundle2, scoring_registry=scoring2, policy_registry=policy1)
++        bindings.for_rule("bank_no_effective_trade_20d", "SH").require_current()
++        original_hash = scoring2.content_sha256
++        try:
++            object.__setattr__(scoring2, "content_sha256", "0" * 64)
++            with self.assertRaises(ValueError):
++                load_policy_range_bindings(
++                    bundle2, scoring_registry=scoring2, policy_registry=policy1)
++        finally:
++            object.__setattr__(scoring2, "content_sha256", original_hash)
+ 
+     def test_range_config_method_replacement_is_rejected_before_first_load_and_current(self):
+         from ashare_pipeline import formal_range_format as range_format
+         from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+ 
+         bundle, vocabulary, scoring, *_ = range_graph()
+         policy = load_formal_policy_registry(
+             bundle, scoring_registry=scoring, feature_registry=vocabulary)
+         original = range_format.RangeConfig.to_dict
+         with patch.object(range_format.RangeConfig, "to_dict", lambda self: original(self)):
+diff --git a/tests/test_formal_valuation_adapter_contract.py b/tests/test_formal_valuation_adapter_contract.py
+index 9c8de6c..25286fb 100644
+--- a/tests/test_formal_valuation_adapter_contract.py
++++ b/tests/test_formal_valuation_adapter_contract.py
+@@ -1,15 +1,16 @@
+ """Signed valuation adapter definitions bind exactly to same-root policy and metrics."""
+ 
+ import copy
+ from dataclasses import asdict, replace
+ import json
++import sys
+ from types import SimpleNamespace
+ import unittest
+ from unittest.mock import patch
+ 
+ import ashare_pipeline.formal_valuation_adapter_contract as adapter_module
+ import ashare_pipeline.formal_metric_engine as metric_engine
+ from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
+ from ashare_pipeline.formal_valuation_adapter_contract import (
+     FormalValuationAdapterRegistry, load_formal_valuation_adapter_registry,
+ )
+@@ -20,20 +21,53 @@ from ashare_pipeline.formal_scoring_registry import FormalScoringRegistry
+ def load_graph(*, mutate=None):
+     bundle, vocabulary, scoring, _, _ = policy_graph(
+         manifest_version="formal-registry-manifest-v2",
+         with_valuation_adapter=True, mutate=mutate)
+     policy = load_formal_policy_registry(bundle, scoring_registry=scoring,
+         feature_registry=vocabulary)
+     return bundle, scoring, policy
+ 
+ 
+ class ValuationAdapterContractTests(unittest.TestCase):
++    def test_each_source_read_authenticates_policy_once(self):
++        bundle, scoring, policy = load_graph()
++        registry = load_formal_valuation_adapter_registry(bundle,
++            scoring_registry=scoring, policy_registry=policy)
++        calls = 0
++
++        def profile(frame, event, _arg):
++            nonlocal calls
++            if (event == "call" and frame.f_code.co_name == "proof_record"
++                    and frame.f_code.co_filename.endswith("formal_policy_registry.py")):
++                calls += 1
++
++        sys.setprofile(profile)
++        try:
++            registry.require_official(bundle)
++            registry.require_official(bundle)
++        finally:
++            sys.setprofile(None)
++        self.assertEqual(calls, 2)
++
++    def test_replaced_policy_reader_revokes_warm_adapter(self):
++        from ashare_pipeline import formal_policy_registry as policy_module
++
++        bundle, scoring, policy = load_graph()
++        registry = load_formal_valuation_adapter_registry(bundle,
++            scoring_registry=scoring, policy_registry=policy)
++        original = policy_module._read_authenticated_policy_registry
++        with patch.object(policy_module, "_read_authenticated_policy_registry",
++                          lambda proof: original(proof)):
++            with self.assertRaises(ValueError):
++                registry.require_official(bundle)
++        registry.require_official(bundle)
++
+     def test_exact_signed_coverage_and_derived_definition_hash(self):
+         bundle, scoring, policy = load_graph()
+         registry = load_formal_valuation_adapter_registry(bundle,
+             scoring_registry=scoring, policy_registry=policy)
+         self.assertIs(type(registry), FormalValuationAdapterRegistry)
+         registry.require_official(bundle)
+         wire = registry.to_dict()
+         self.assertEqual(wire["registry_manifest_hash"], bundle.manifest.manifest_hash)
+         self.assertEqual(len(wire["coverage"]), 15)
+         self.assertEqual(len(wire["adapters"]), 5)

@@ -1,0 +1,379 @@
+# Task 2B review round 1 — scoped fix package
+
+Fix base: frozen seven-file working tree reviewed in task-2b-review.diff, on HEAD 9d5c6d1a449a82209a9169b3c326252d2c1c81ab.
+Fix head: current frozen working tree, no commit yet. Parent owns post-review pure-code staging/commit.
+This package compares the captured original reviewed source text with current files; unchanged code from the original review is excluded. Original/full artifacts are retained. New helper was absent from fix base.
+
+ashare_pipeline/formal_metric_context.py: +5 -1
+ashare_pipeline/state_store.py: +3 -0
+ashare_pipeline/formal_snapshot_repository.py: +3 -0
+ashare_pipeline/formal_snapshot_store.py: +3 -0
+tests/test_formal_metric_context.py: +70 -0
+ashare_pipeline/formal_repository_identity.py: +30 -0
+
+diff --git a/ashare_pipeline/formal_metric_context.py b/ashare_pipeline/formal_metric_context.py
+--- a/ashare_pipeline/formal_metric_context.py
++++ b/ashare_pipeline/formal_metric_context.py
+@@ -6,20 +6,21 @@
+ 
+ from datetime import date, datetime
+ import hashlib
+ from types import MappingProxyType
+ import weakref
+ 
+ from . import formal_context_repository as context_module
+ from .formal_context_repository import FormalContextRepository
+ from .formal_context_schema import FormalContextFact, FormalContextRegistry, SignedContextRequestResolver, _canonical, _load
+ from .formal_registry_manifest import FormalRegistryBundleLoader, FormalRegistryManifest, VerifiedRegistryBundle
++from .formal_repository_identity import _require_repository_initialization
+ from .formal_scoring_registry import FormalScoringRegistry
+ from .formal_snapshot_repository import FormalSnapshotRepository
+ from .formal_snapshot_store import FormalSnapshotStore
+ from .formal_universe import canonical_security_id
+ from .state_store import StateStore, _formal_frozen_universe_payload, _plain_formal_universe_json
+ 
+ 
+ _FREEZE = "2026-08-31T07:00:00+00:00"
+ 
+ 
+@@ -74,23 +75,24 @@
+ 
+ def _metric_context_types():
+     """Keep mint authority and all proof state outside publicly writable slots."""
+     repositories, proofs = {}, {}
+     reader = StateStore.get_verified_formal_frozen_universe
+     batch_reader = FormalContextRepository.get_verified_many
+     loader = FormalRegistryBundleLoader.load
+     parse_industry = _industry
+     serialize_universe = _formal_frozen_universe_payload
+     require_context = context_module._require_authentic_context_repository
++    require_initialized = _require_repository_initialization
+     # Only paths consumed by universe, registry and Context/raw verification.
+     paths = {
+-        StateStore: "_connect _transaction _require_registry_verifier _formal_token _verify_formal_signature _formal_blob_snapshot _formal_blob_from_connection _formal_root_snapshot _formal_root_from_connection get_formal_registry_blob get_formal_registry_manifest _require_formal_snapshot_store _configured_formal_snapshot_store_for_repository get_verified_formal_frozen_universe _formal_universe_from_connection _formal_universe_extraction_from_payload _require_formal_universe_source_lineage _formal_snapshot_row_to_ref _formal_verified_snapshot_ref_from_connection _require_formal_snapshot_receipt_lineage _formal_task_snapshot_receipt_from_connection get_formal_task_snapshot_receipt _formal_task_public _require_formal_verified_task_state _get_formal_snapshot_verified_by_manifest _formal_ref_matches_projection list_formal_context_facts get_formal_snapshot".split(),
++        StateStore: "__init__ _connect _transaction _require_registry_verifier _formal_token _verify_formal_signature _formal_blob_snapshot _formal_blob_from_connection _formal_root_snapshot _formal_root_from_connection get_formal_registry_blob get_formal_registry_manifest _require_formal_snapshot_store _configured_formal_snapshot_store_for_repository get_verified_formal_frozen_universe _formal_universe_from_connection _formal_universe_extraction_from_payload _require_formal_universe_source_lineage _formal_snapshot_row_to_ref _formal_verified_snapshot_ref_from_connection _require_formal_snapshot_receipt_lineage _formal_task_snapshot_receipt_from_connection get_formal_task_snapshot_receipt _formal_task_public _require_formal_verified_task_state _get_formal_snapshot_verified_by_manifest _formal_ref_matches_projection list_formal_context_facts get_formal_snapshot".split(),
+         FormalContextRepository: "__init__ _load _candidates _select get_verified_many resolve_verified_calendar_binding".split(),
+         FormalSnapshotRepository: "__init__ get_verified_by_manifest read_verified_raw".split(),
+         FormalSnapshotStore: "__init__ read_verified_raw validate_stored_snapshot _validate_inspection_inputs _validate_formal_fetch_values _validate_request_values _require_version_identifier _require_recomputed_verification _read_calendar_binding _resolve_calendar_binding _require_calendar_binding_identity _official_request_from_manifest _require_exact_manifest_payload _validate_content_file _read_manifest _require_sha256 _safe_path_component _path_inside_root _require_target_within_root".split(),
+         FormalRegistryBundleLoader: ["__init__", "load"],
+         VerifiedRegistryBundle: ["require_official", "blob"],
+         FormalRegistryManifest: ["from_signed_bytes", "require_official", "assert_member_hashes"],
+         FormalScoringRegistry: ["require_official", "template_for"],
+         FormalContextRegistry: ["load", "descriptor_for"],
+         SignedContextRequestResolver: ["__init__", "resolve", "_resolve", "_resolve_historical"],
+         FormalContextFact: ["from_dict", "to_dict", "canonical_bytes"],
+@@ -100,20 +102,22 @@
+         ("_validate_stored_fact", "_list_context_facts", "_row_fact", "_require_context_producer", "_prove_historical_calendar"))
+ 
+     def method_identity(method):
+         return (id(getattr(method, "__self__", None)), id(getattr(method, "__func__", method)))
+ 
+     def state(store, context, verifier):
+         try:
+             require_context(context)
+             snapshots = context._snapshots
+             raw = store._formal_snapshot_store
++            for dependency in (store, snapshots, raw):
++                require_initialized(dependency)
+             if (type(store) is not StateStore or type(context) is not FormalContextRepository
+                     or type(snapshots) is not FormalSnapshotRepository or type(raw) is not FormalSnapshotStore
+                     or context._state_store is not store or snapshots._state_store is not store
+                     or snapshots._raw_store is not raw or context._verifier is not verifier
+                     or store._registry_signature_verifier is not verifier
+                     or snapshots.root != raw.root or not callable(getattr(verifier, "verify", None))):
+                 raise ValueError("metric Context requires exact matching stores, repositories and verifier")
+             for cls, name, method in checked:
+                 if vars(cls).get(name) is not method:
+                     raise ValueError("metric Context validation dependency changed")
+
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -6,20 +6,22 @@
+ import hashlib
+ import json
+ import sqlite3
+ import uuid
+ from contextlib import closing, contextmanager
+ from dataclasses import dataclass, field
+ from datetime import date, datetime, timedelta, timezone
+ from pathlib import Path, PurePosixPath, PureWindowsPath
+ from typing import Callable, Iterable, Iterator, Mapping, Sequence
+ 
++from .formal_repository_identity import _track_repository_constructor
++
+ from ashare_pipeline.feature_contract import (
+     DIMENSIONS,
+     FINANCIAL_DIMENSIONS,
+     FINANCIAL_PERIODS,
+     EvidenceRef,
+     FeatureBundle,
+     canonical_sha256,
+     financial_projection_values,
+ )
+ from ashare_pipeline.financial_features import (
+@@ -1523,20 +1525,21 @@
+             "legacy quality issue does not fall within current job lifetime"
+         )
+     connection.execute(
+         """INSERT INTO quality_issue_binding
+         (issue_id,job_id,source_snapshot_id) VALUES (?,?,?)""",
+         (issue_id, job_id, source_snapshot_id),
+     )
+ 
+ 
+ class StateStore:
++    @_track_repository_constructor
+     def __init__(
+         self,
+         db_path: str | Path,
+         *,
+         formal_snapshot_store: FormalSnapshotStore | None = None,
+         registry_signature_verifier: object | None = None,
+         formal_feature_bundle_store: FormalFeatureBundleStore | None = None,
+     ):
+         if formal_snapshot_store is not None and not isinstance(
+             formal_snapshot_store, FormalSnapshotStore
+
+diff --git a/ashare_pipeline/formal_snapshot_repository.py b/ashare_pipeline/formal_snapshot_repository.py
+--- a/ashare_pipeline/formal_snapshot_repository.py
++++ b/ashare_pipeline/formal_snapshot_repository.py
+@@ -1,16 +1,18 @@
+ """Verified persistence and point-in-time lookup for formal official evidence."""
+ 
+ from __future__ import annotations
+ 
+ from pathlib import Path
+ 
++from .formal_repository_identity import _track_repository_constructor
++
+ from .formal_evidence import (
+     EvidenceVerification,
+     OfficialFetch,
+     OfficialRequest,
+     OfficialSnapshotRef,
+ )
+ from .formal_snapshot_store import FormalSnapshotStore, FormalStoredSnapshot
+ from .state_store import StateStore
+ 
+ 
+@@ -38,20 +40,21 @@
+     "parser_id",
+     "parser_version",
+     "mapping_version",
+     "verification_status",
+ )
+ 
+ 
+ class FormalSnapshotRepository:
+     """The sole application boundary for verified formal snapshot references."""
+ 
++    @_track_repository_constructor
+     def __init__(self, root: str | Path, state_store: StateStore) -> None:
+         if type(state_store) is not StateStore:
+             raise ValueError("state_store must have exact type StateStore")
+         resolved_root = Path(root).resolve()
+         raw_store = state_store._configured_formal_snapshot_store_for_repository()
+         if type(raw_store) is not FormalSnapshotStore:
+             raise ValueError("configured formal snapshot store is invalid")
+         if resolved_root != raw_store.root:
+             raise ValueError("formal snapshot repository root must match configured raw store root")
+         self.root = resolved_root
+
+diff --git a/ashare_pipeline/formal_snapshot_store.py b/ashare_pipeline/formal_snapshot_store.py
+--- a/ashare_pipeline/formal_snapshot_store.py
++++ b/ashare_pipeline/formal_snapshot_store.py
+@@ -5,20 +5,22 @@
+ from dataclasses import dataclass
+ from datetime import date, datetime
+ import hashlib
+ import json
+ import os
+ from pathlib import Path, PureWindowsPath
+ import re
+ import tempfile
+ from typing import Callable
+ 
++from .formal_repository_identity import _track_repository_constructor
++
+ from .formal_evidence import (
+     EvidenceVerification,
+     OfficialFetch,
+     OfficialRequest,
+     SourcePolicy,
+     VerifiedCalendarBinding,
+     verify_official_fetch,
+ )
+ 
+ 
+@@ -95,20 +97,21 @@
+     for key, value in pairs:
+         if key in result:
+             raise _DuplicateManifestKeyError(key)
+         result[key] = value
+     return result
+ 
+ 
+ class FormalSnapshotStore:
+     """Persist verified official fetches without decoding or re-encoding their bytes."""
+ 
++    @_track_repository_constructor
+     def __init__(
+         self,
+         root: str | Path,
+         *,
+         calendar_binding_resolver: CalendarBindingResolver | None = None,
+     ):
+         self.root = Path(root).resolve()
+         if calendar_binding_resolver is not None and not callable(calendar_binding_resolver):
+             raise ValueError("calendar_binding_resolver must be callable or None")
+         self._calendar_binding_resolver = calendar_binding_resolver
+
+diff --git a/tests/test_formal_metric_context.py b/tests/test_formal_metric_context.py
+--- a/tests/test_formal_metric_context.py
++++ b/tests/test_formal_metric_context.py
+@@ -1,18 +1,19 @@
+ """Authenticated complete-universe industry prerequisites; no metric arithmetic."""
+ 
+ import copy
+ import hashlib
+ import importlib
+ import importlib.util
+ import json
+ import sys
++import subprocess
+ import unittest
+ from unittest.mock import patch
+ 
+ from tests.formal_metric_fixtures import FREEZE, IDS, MetricFixture, update_mapping_digest
+ 
+ 
+ class FormalMetricContextTests(unittest.TestCase):
+     def fixture(self, **kwargs):
+         fixture = MetricFixture(**kwargs)
+         self.addCleanup(fixture.close)
+@@ -189,20 +190,89 @@
+         with self.assertRaises(ValueError):
+             repo.resolve_industries(universe)
+ 
+     def test_copied_context_repository_cannot_supply_provenance(self):
+         f = self.fixture()
+         api = self.api()
+         copied = copy.copy(f.context)
+         with self.assertRaises(ValueError):
+             api.FormalMetricContextRepository(f.store, copied, registry_signature_verifier=f.verifier)
+ 
++    def test_combined_copied_stores_cannot_mint_a_universe(self):
++        from ashare_pipeline.formal_context_repository import FormalContextRepository
++        f = self.fixture()
++        api = self.api()
++        store, snapshots, raw = copy.copy(f.store), copy.copy(f.snapshots), copy.copy(f.raw)
++        store._formal_snapshot_store = raw
++        snapshots._state_store, snapshots._raw_store = store, raw
++        context = FormalContextRepository(store, snapshots, f.verifier)
++        with self.assertRaises(ValueError):
++            repository = api.FormalMetricContextRepository(store, context, registry_signature_verifier=f.verifier)
++            repository.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++
++    def test_individual_copied_or_fabricated_dependencies_cannot_mint(self):
++        from ashare_pipeline.formal_context_repository import FormalContextRepository
++        from ashare_pipeline.formal_snapshot_repository import FormalSnapshotRepository
++        from ashare_pipeline.state_store import StateStore
++        f = self.fixture()
++        api = self.api()
++        def fabricated(original):
++            item = object.__new__(type(original))
++            item.__dict__.update(original.__dict__)
++            return item
++        for clone in (copy.copy, fabricated):
++            for dependency in ("store", "snapshots", "raw"):
++                with self.subTest(clone=clone.__name__, dependency=dependency):
++                    if dependency == "store":
++                        store = clone(f.store)
++                        snapshots = FormalSnapshotRepository(f.raw.root, store)
++                    elif dependency == "snapshots":
++                        store, snapshots = f.store, clone(f.snapshots)
++                    else:
++                        raw = clone(f.raw)
++                        store = StateStore(f.db_path, formal_snapshot_store=raw, registry_signature_verifier=f.verifier)
++                        snapshots = FormalSnapshotRepository(raw.root, store)
++                    context = FormalContextRepository(store, snapshots, f.verifier)
++                    with self.assertRaises(ValueError):
++                        repository = api.FormalMetricContextRepository(store, context, registry_signature_verifier=f.verifier)
++                        repository.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++
++    def test_genuine_dependencies_constructed_before_metric_import_are_accepted(self):
++        program = '''
++import sys
++from tests.formal_metric_fixtures import MetricFixture, IDS
++assert "ashare_pipeline.formal_metric_context" not in sys.modules
++fixture = MetricFixture()
++try:
++    from ashare_pipeline.formal_metric_context import FormalMetricContextRepository
++    repository = FormalMetricContextRepository(fixture.store, fixture.context, registry_signature_verifier=fixture.verifier)
++    proof = repository.load_universe(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++    assert proof.security_ids == IDS
++    repository.recheck_batch(proof, repository.resolve_industries(proof))
++finally:
++    fixture.close()
++'''
++        result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=90)
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++    def test_legitimate_dependency_reinitialization_preserves_metric_reads(self):
++        f = self.fixture()
++        # Legitimate explicit constructor invocation remains legal for legacy
++        # callers; copied fields without such construction remain insufficient.
++        type(f.raw).__init__(f.raw, f.raw.root)
++        type(f.store).__init__(f.store, f.db_path, formal_snapshot_store=f.raw, registry_signature_verifier=f.verifier)
++        type(f.snapshots).__init__(f.snapshots, f.raw.root, f.store)
++        repository = self.repo(f)
++        proof = repository.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        self.assertEqual(proof.security_ids, IDS)
++        self.assertIsNone(repository.recheck_batch(proof, repository.resolve_industries(proof)))
++
+     def test_every_context_metadata_mismatch_is_explicit_pending(self):
+         f = self.fixture()
+         repo = self.repo(f)
+         universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
+         for index, (field, value) in enumerate((
+             ("primary_industry", "other"), ("source_version", "different-v2"),
+             ("effective_date", "2026-08-27"), ("mapping_sha256", "0" * 64))):
+             f.put_industry("BJ430001", changes={field: value}, generation=f"metadata-{index}",
+                 published=f"2026-08-{20 + index:02d}T07:00:00+00:00")
+             batch = repo.resolve_industries(universe)
+
+diff --git a/ashare_pipeline/formal_repository_identity.py b/ashare_pipeline/formal_repository_identity.py
+--- /dev/null
++++ b/ashare_pipeline/formal_repository_identity.py
+@@ -0,0 +1,30 @@
++"""Constructor identity bookkeeping used only by the metric trust boundary."""
++
++from functools import wraps
++import weakref
++
++
++def _constructor_identity():
++    initialized = {}
++
++    def track(constructor):
++        @wraps(constructor)
++        def initialize(instance, *args, **kwargs):
++            identity = id(instance)
++            # A failed explicit reinitialization must not retain an earlier seal.
++            initialized.pop(identity, None)
++            result = constructor(instance, *args, **kwargs)
++            initialized[identity] = (weakref.ref(instance, lambda _: initialized.pop(identity, None)), initialize)
++            return result
++        return initialize
++
++    def require(instance):
++        record = initialized.get(id(instance))
++        if record is None or record[0]() is not instance or record[1] is not type(instance).__init__:
++            raise ValueError("metric dependency requires its genuine constructor identity; copies are not eligible")
++
++    return track, require
++
++
++_track_repository_constructor, _require_repository_initialization = _constructor_identity()
++del _constructor_identity

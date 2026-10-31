@@ -1,0 +1,278 @@
+diff --git a/docs/superpowers/plans/2026-09-28-formal-final-scoring-stage-d.md b/docs/superpowers/plans/2026-09-28-formal-final-scoring-stage-d.md
+index 9c9e674..82b8590 100644
+--- a/docs/superpowers/plans/2026-09-28-formal-final-scoring-stage-d.md
++++ b/docs/superpowers/plans/2026-09-28-formal-final-scoring-stage-d.md
+@@ -108,7 +108,7 @@ git commit -m "test: add genuine Stage D scoring fixture"
+ - Consumes: `FormalScoreInputRepository.build_batch(...) -> FormalScoreInputBatch`、`FormalPolicyRepository.build_batch(...) -> VerifiedPolicyResultBatch`、`FormalValuationRepository.build_batch(...) -> PolicyAdjustedValuationBatch`、同一 authenticated v2 root 的三个 registries 和同一 frozen input；purpose 与 mode 的正式资格由 Task 11 gate 决定。
+ - Produces: `PolicyAdjustedScoreInput`；`PolicyAdjustedScoreInputBatch.input_for(security_id)`；`FormalFinalScoreInputRepository(...).build_batch(frozen_input_hash, *, scoring_registry, policy_registry, valuation_adapter_registry)`。
+ 
+-- [ ] **Step 1: 写 D1 RED 测试。** 精确测试名：
++- [x] **Step 1: 写 D1 RED 测试。** 精确测试名：
+   - `test_ready_input_contains_22_base_slots_and_exactly_three_stage_c_scores`
+   - `test_batch_enumerates_every_frozen_member_in_canonical_order`
+   - `test_member_business_gaps_become_explicit_pending_entries_not_none`
+@@ -117,13 +117,13 @@ git commit -m "test: add genuine Stage D scoring fixture"
+ 
+ 断言 pending 也是具备 `entry_hash` 的 `PolicyAdjustedScoreInput`，状态只允许 `ready/pending_evidence`；ready 恰有 25 slots，三个 V slot 带 Stage C score/context/hash，22 个非 V 保留 genuine base 来源。
+ 
+-- [ ] **Step 2: 运行 RED。**
++- [x] **Step 2: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_score_inputs -v`
+ 
+ Expected: 新模块不存在。
+ 
+-- [ ] **Step 3: 实现闭包 proof 和完整组合。**
++- [x] **Step 3: 实现闭包 proof 和完整组合。**
+ 
+ ```python
+ class PolicyAdjustedScoreInput: ...
+@@ -141,13 +141,13 @@ class FormalFinalScoreInputRepository:
+ 
+ 先闭合三批共同身份，再逐证券合并 reasons；policy pending 不因 veto/cap 消失。只从 Stage C 的三项 genuine score 取得最终 V。发布前重验三 source batches、registries 和规范字节。
+ 
+-- [ ] **Step 4: 运行 GREEN。**
++- [x] **Step 4: 运行 GREEN。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_score_inputs -v`
+ 
+ Expected: 全部 PASS。
+ 
+-- [ ] **Step 5: 运行来源回归、独立审查并提交。**
++- [x] **Step 5: 运行来源回归、独立审查并提交。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_score_inputs tests.test_formal_policy_repository tests.test_formal_valuation_batch tests.test_formal_valuation_ranking -v`
+ 
+@@ -165,15 +165,15 @@ git commit -m "feat: compose policy-adjusted final score inputs"
+ **Interfaces:**
+ - Consumes/Produces: Task 2 API unchanged；增加 exact-type、current-method、canonical-byte、publication capability 和 outer revocation guards。
+ 
+-- [ ] **Step 1: 写攻击矩阵 RED。** 精确测试名覆盖：`test_cross_root_frozen_security_and_source_batch_are_rejected`、`test_raw_v_percentile_cannot_replace_stage_c_score`、`test_forged_copied_pickled_inherited_or_weakref_redirected_proofs_are_rejected`、`test_v1_root_prepolicy_and_plain_v2_objects_cannot_impersonate_d1`、`test_method_or_encoder_replacement_is_rejected`、`test_source_change_during_final_sweep_revokes_all_d1_children`、`test_capability_cannot_be_replayed_across_batch_or_context`。
+-- [ ] **Step 2: 运行 RED。**
++- [x] **Step 1: 写攻击矩阵 RED。** 精确测试名覆盖：`test_cross_root_frozen_security_and_source_batch_are_rejected`、`test_raw_v_percentile_cannot_replace_stage_c_score`、`test_forged_copied_pickled_inherited_or_weakref_redirected_proofs_are_rejected`、`test_v1_root_prepolicy_and_plain_v2_objects_cannot_impersonate_d1`、`test_method_or_encoder_replacement_is_rejected`、`test_source_change_during_final_sweep_revokes_all_d1_children`、`test_capability_cannot_be_replayed_across_batch_or_context`。
++- [x] **Step 2: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_score_input_guards -v`
+ 
+ Expected: 至少一种拼批或生命周期攻击被当前最小实现接受。
+ 
+-- [ ] **Step 3: 最小加固。** 在 install closure 中捕获来源类型和方法身份；proof 普通构造、copy/deepcopy/pickle/继承失败；batch 外 selector 失败；结构错误拒整批，业务缺口才转换 pending。若真实性能 RED 证明逐成员 Stage C accessor 是瓶颈，才增加闭包私有只读 batch snapshot，不公开 mint 权限。
+-- [ ] **Step 4: 运行 GREEN、Task 2 回归、独立审查并提交。**
++- [x] **Step 3: 最小加固。** 在 install closure 中捕获来源类型和方法身份；proof 普通构造、copy/deepcopy/pickle/继承失败；batch 外 selector 失败；结构错误拒整批，业务缺口才转换 pending。若真实性能 RED 证明逐成员 Stage C accessor 是瓶颈，才增加闭包私有只读 batch snapshot，不公开 mint 权限。
++- [x] **Step 4: 运行 GREEN、Task 2 回归、独立审查并提交。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_score_inputs tests.test_formal_final_score_input_guards -v`
+ 
+@@ -194,22 +194,22 @@ git commit -m "test: seal final score input provenance"
+ - Produces: `FinalScoreCard`；`FinalScoreCardBatch.card_for(security_id)`；`.pending_for(security_id)`；`build_final_score_card_batch(inputs) -> FinalScoreCardBatch`。
+ - Reuses: captured `formal_scoring._calculate_untrusted_confidence`、`_calculate_untrusted_arithmetic`、`_arithmetic_context` 和 `grade_for_score`；这些纯 helper 不授予 proof。
+ 
+-- [ ] **Step 1: 写算术 RED。** 精确测试名：`test_final_card_rebuilds_all_seven_dimensions_from_final_slots`、`test_multiple_caps_take_minimum_without_changing_confidence`、`test_cap_never_raises_a_dimension`、`test_exact_sc_b_risk_and_grades_use_unrounded_decimal`、`test_verified_no_consensus_caps_confidence_at_point_90`、`test_pending_input_has_no_card_and_preserves_all_reasons`、`test_no_cap_parity_matches_existing_arithmetic_but_not_proof_type`。
+-- [ ] **Step 2: 写 guard RED。** 覆盖普通 dict、`PrePolicyScoreCalculation`、跨 D1 batch、未知 cap dimension、bool/int/float/string、NaN/Infinity/超大指数、全局 Decimal context 修改、copy/pickle、方法替换和 revoked source。
+-- [ ] **Step 3: 运行 RED。**
++- [x] **Step 1: 写算术 RED。** 精确测试名：`test_final_card_rebuilds_all_seven_dimensions_from_final_slots`、`test_multiple_caps_take_minimum_without_changing_confidence`、`test_cap_never_raises_a_dimension`、`test_exact_sc_b_risk_and_grades_use_unrounded_decimal`、`test_verified_no_consensus_caps_confidence_at_point_90`、`test_pending_input_has_no_card_and_preserves_all_reasons`、`test_no_cap_parity_matches_existing_arithmetic_but_not_proof_type`。
++- [x] **Step 2: 写 guard RED。** 覆盖普通 dict、`PrePolicyScoreCalculation`、跨 D1 batch、未知 cap dimension、bool/int/float/string、NaN/Infinity/超大指数、全局 Decimal context 修改、copy/pickle、方法替换和 revoked source。
++- [x] **Step 3: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_scoring tests.test_formal_final_scoring_guards -v`
+ 
+ Expected: 新模块不存在。
+ 
+-- [ ] **Step 4: 实现纯计算核心和 proof wrapper。** 顺序固定为 raw dimensions → 同维 cap 取最小 → `min(raw, cap)` → 原 coverage 重算 C → S0/Sc/Sbase/B/R/grades。保存 raw/capped、cap rule/evidence trace、D/P/H/K/C、risk components 和全部 hash；pending 不生成 card。
+-- [ ] **Step 5: 运行 GREEN 与 pre-policy 回归。**
++- [x] **Step 4: 实现纯计算核心和 proof wrapper。** 顺序固定为 raw dimensions → 同维 cap 取最小 → `min(raw, cap)` → 原 coverage 重算 C → S0/Sc/Sbase/B/R/grades。保存 raw/capped、cap rule/evidence trace、D/P/H/K/C、risk components 和全部 hash；pending 不生成 card。
++- [x] **Step 5: 运行 GREEN 与 pre-policy 回归。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_scoring tests.test_formal_final_scoring_guards tests.test_formal_scoring tests.test_formal_scoring_consensus_registry -v`
+ 
+ Expected: 全部 PASS；旧 pre-policy bytes/type/字段不变。
+ 
+-- [ ] **Step 6: 独立审查并提交。**
++- [x] **Step 6: 独立审查并提交。**
+ 
+ ```powershell
+ git add ashare_pipeline/formal_final_scoring.py tests/test_formal_final_scoring.py tests/test_formal_final_scoring_guards.py
+@@ -227,16 +227,16 @@ git commit -m "feat: calculate capped formal scorecards"
+ - Consumes: matching genuine `PolicyAdjustedScoreInputBatch` and `FinalScoreCardBatch`。
+ - Produces: `FormalEligibility`；`FormalEligibilityBatch.eligibility_for(security_id)`；`build_formal_eligibility_batch(inputs, scores)`。`formal_scored/pool_vetoed` 且有 card 的条目必须携带由 D2 card hash 锁定的不可变 `Sc/C/R_safety/B/V` 排序值及由 D1 input hash 锁定的二级行业；`pending_evidence/out_of_scope` 的 card hash 和排序值必须显式 absent。D3b 不回读数据库或未绑定 DTO。
+ 
+-- [ ] **Step 1: 写状态/阈值 RED。** 精确测试名：`test_pending_precedes_known_veto_and_emits_no_score_eligibility`、`test_pending_has_no_card_hash_or_sort_fields_but_remains_not_qualified_traceable`、`test_hard_veto_or_both_prohibition_yields_pool_vetoed`、`test_single_pool_prohibition_only_blocks_that_pool`、`test_threshold_equalities_are_inclusive_except_wait_t_is_strictly_below_55`、`test_each_threshold_uses_unrounded_decimal_at_both_adjacent_values`、`test_sort_fields_and_industry_are_bound_to_exact_d1_d2_hashes`、`test_each_frozen_member_has_exactly_one_state_and_complete_threshold_trace`、`test_genuine_ordinary_a_batch_has_zero_out_of_scope_members`。
+-- [ ] **Step 2: 写 guard RED。** `test_mismatched_d1_d2_batches_are_rejected`、`test_missing_duplicate_or_extra_scorecards_are_rejected`、`test_caller_cannot_forge_out_of_scope_state`、`test_plain_mapping_or_prepolicy_score_cannot_enter_eligibility`。
+-- [ ] **Step 3: 运行 RED。**
++- [x] **Step 1: 写状态/阈值 RED。** 精确测试名：`test_pending_precedes_known_veto_and_emits_no_score_eligibility`、`test_pending_has_no_card_hash_or_sort_fields_but_remains_not_qualified_traceable`、`test_hard_veto_or_both_prohibition_yields_pool_vetoed`、`test_single_pool_prohibition_only_blocks_that_pool`、`test_threshold_equalities_are_inclusive_except_wait_t_is_strictly_below_55`、`test_each_threshold_uses_unrounded_decimal_at_both_adjacent_values`、`test_sort_fields_and_industry_are_bound_to_exact_d1_d2_hashes`、`test_each_frozen_member_has_exactly_one_state_and_complete_threshold_trace`、`test_genuine_ordinary_a_batch_has_zero_out_of_scope_members`。
++- [x] **Step 2: 写 guard RED。** `test_mismatched_d1_d2_batches_are_rejected`、`test_missing_duplicate_or_extra_scorecards_are_rejected`、`test_caller_cannot_forge_out_of_scope_state`、`test_plain_mapping_or_prepolicy_score_cannot_enter_eligibility`。
++- [x] **Step 3: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_eligibility tests.test_formal_final_eligibility_guards -v`
+ 
+ Expected: 新模块不存在。
+ 
+-- [ ] **Step 4: 实现唯一状态与门槛分解。** strong 固定 `Sc>=70,C>=.75,M/EQ/FS>=45,T>=55`；wait 固定 `B>=65,C>=.75,M/EQ/FS>=45,T<55`。保存 hard veto、prohibition、每项布尔门槛、reason codes、不可变排序字段和来源 hashes，并显式断言两池资格互斥。对每个阈值用 `Decimal.next_minus()/next_plus()` 或精确等价值测试上下邻域，不经过显示舍入。
+-- [ ] **Step 5: 运行 GREEN、独立审查并提交。**
++- [x] **Step 4: 实现唯一状态与门槛分解。** strong 固定 `Sc>=70,C>=.75,M/EQ/FS>=45,T>=55`；wait 固定 `B>=65,C>=.75,M/EQ/FS>=45,T<55`。保存 hard veto、prohibition、每项布尔门槛、reason codes、不可变排序字段和来源 hashes，并显式断言两池资格互斥。对每个阈值用 `Decimal.next_minus()/next_plus()` 或精确等价值测试上下邻域，不经过显示舍入。
++- [x] **Step 5: 运行 GREEN、独立审查并提交。** 修复轮 `caa5306` 解决 D2 原始 card 行误读 proof-only `score_batch_hash` 及可替换模块全局 authority 两项问题；定向复审均标记 ADDRESSED，无新 Critical/Important 发现。真实 D1/D2 ready/scored 全链路在性能窗口内未完成，已记录为 Task 11 集成验收限制。
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_eligibility tests.test_formal_final_eligibility_guards -v`
+ 
+@@ -256,16 +256,16 @@ git commit -m "feat: derive formal score eligibility"
+ - Consumes: genuine `FormalEligibilityBatch`；内部纯函数只消费 detached validated rows。
+ - Produces: `PoolSelectionDecision`；`PoolSelectionBatch.decision_for(security_id, pool)`；`select_formal_pools(eligibility)`；immutable `strong_security_ids`、`wait_security_ids` 和规范 count mapping `{"strong": n, "wait": n}`。
+ 
+-- [ ] **Step 1: 写纯选择 RED。** 精确测试名：`test_strong_sort_is_sc_confidence_safety_then_security_id`、`test_wait_sort_is_b_confidence_v_then_security_id`、`test_fifth_strong_industry_member_is_skipped_and_scan_continues`、`test_eleventh_wait_industry_member_is_skipped_and_scan_continues`、`test_overall_caps_are_20_and_50_without_forced_fill`、`test_strong_cap_rejection_never_falls_into_wait`、`test_pools_are_disjoint_and_every_candidate_has_decision_trace`。
+-- [ ] **Step 2: 写 proof guard RED。** 覆盖重复/缺失/未知 security、缺行业、非规范 ID、NaN/Infinity/float/bool key、跨 batch、普通 DTO、trace/hash 篡改。
+-- [ ] **Step 3: 运行 RED。**
++- [x] **Step 1: 写纯选择 RED。** 精确测试名：`test_strong_sort_is_sc_confidence_safety_then_security_id`、`test_wait_sort_is_b_confidence_v_then_security_id`、`test_fifth_strong_industry_member_is_skipped_and_scan_continues`、`test_eleventh_wait_industry_member_is_skipped_and_scan_continues`、`test_overall_caps_are_20_and_50_without_forced_fill`、`test_strong_cap_rejection_never_falls_into_wait`、`test_pools_are_disjoint_and_every_candidate_has_decision_trace`。
++- [x] **Step 2: 写 proof guard RED。** 覆盖重复/缺失/未知 security、缺行业、非规范 ID、NaN/Infinity/float/bool key、跨 batch、普通 DTO、trace/hash 篡改，并补 pending `None` 行回归。
++- [x] **Step 3: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_pool tests.test_formal_pool_guards -v`
+ 
+ Expected: 新模块不存在。
+ 
+-- [ ] **Step 4: 实现稳定排序与独立扫描。** 先生成每池完整候选排序，再独立应用行业/总容量；所有成员每池都保存 `selected/not_qualified/industry_cap_reached/overall_capacity_reached` 之一。内部 key 固定 `strong/wait`。
+-- [ ] **Step 5: 运行 GREEN、独立审查并提交。**
++- [x] **Step 4: 实现稳定排序与独立扫描。** 先生成每池完整候选排序，再独立应用行业/总容量；所有成员每池都保存 `selected/not_qualified/industry_cap_reached/overall_capacity_reached` 之一。内部 key 固定 `strong/wait`。pending 非候选行允许缺少行业/排序字段，但候选仍严格校验。
++- [x] **Step 5: 运行 GREEN、独立审查并提交。** 初始 11/11 通过；复审发现 pending 行集成缺陷，修复提交 `7f71934` 后 13/13 通过，定向复审标记 ADDRESSED，无新增问题。真实 D1/D2 长链路未运行，保留 Task 11 验收。
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_pool tests.test_formal_pool_guards -v`
+ 
+@@ -285,16 +285,16 @@ git commit -m "feat: select deterministic formal stock pools"
+ - Consumes: verified frozen universe、registry bundle、repository validation callbacks、数据库/工作区只读身份和每项 `(frozen_input_hash, security_id, domain, selector_hash, period_or_window, exchange)` 需求。
+ - Produces: `VerifiedCoverageManifest`；`FormalCoverageAuditor.audit(...)`；`.require_preview_ready()`；`.require_official_ready()`；规范 member requirement rows、blockers、manifest hash 和非规范 timing diagnostics。
+ 
+-- [ ] **Step 1: 写 coverage class RED。** 允许值严格为规格 15 类。精确测试名：`test_absent_record_is_blocked_not_verified_no_coverage`、`test_verified_no_coverage_requires_authenticated_explicit_source_statement`、`test_missing_table_is_blocked_schema_not_zero_rows`、`test_exchange_calendar_cannot_be_reused_across_sh_sz_bj`、`test_every_required_member_domain_key_is_unique_and_enumerated`、`test_sql_counts_are_diagnostic_only_and_never_grant_readiness`、`test_audit_time_and_timing_diagnostics_do_not_change_canonical_hash`。
+-- [ ] **Step 2: 写 gate/guard RED。** 覆盖 registry purpose、approval、签名/哈希、temporal cutoff、units、parser/mapping version、ambiguous duplicate、source correction、DB/status stale mismatch；缺 production contract 时 preview 可审计但 official 阻断。另加 `test_coverage_proof_rejects_plain_construction_copy_pickle_weakref_redirect_method_replacement_and_revocation` 及旧 v1/v2 普通对象冒充测试。
+-- [ ] **Step 3: 运行 RED。**
++- [x] **Step 1: 写 coverage class RED。** 允许值严格为规格 15 类。精确测试名：`test_absent_record_is_blocked_not_verified_no_coverage`、`test_verified_no_coverage_requires_authenticated_explicit_source_statement`、`test_missing_table_is_blocked_schema_not_zero_rows`、`test_exchange_calendar_cannot_be_reused_across_sh_sz_bj`、`test_every_required_member_domain_key_is_unique_and_enumerated`、`test_sql_counts_are_diagnostic_only_and_never_grant_readiness`、`test_audit_time_and_timing_diagnostics_do_not_change_canonical_hash`。
++- [x] **Step 2: 写 gate/guard RED。** 覆盖 registry purpose、approval、签名/哈希、temporal cutoff、units、parser/mapping version、ambiguous duplicate、source correction、DB/status stale mismatch；缺 production contract 时 preview 可审计但 official 阻断。另加 `test_coverage_proof_rejects_plain_construction_copy_pickle_weakref_redirect_method_replacement_and_revocation` 及旧 v1/v2 普通对象冒充测试。
++- [x] **Step 3: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_coverage_manifest tests.test_formal_coverage_guards -v`
+ 
+ Expected: 新模块不存在。
+ 
+-- [ ] **Step 4: 实现验证器。** 每个 formal domain 必须调用所属 repository 验证入口；记录 source/dataset/request/refresh/task/snapshot/content/manifest/parser/mapping/timestamps/units/class/reasons/evidence hashes。`audit_at_utc` 与 timing diagnostics 不进入规范结果 hash。
+-- [ ] **Step 5: 运行 GREEN、独立审查并提交。**
++- [x] **Step 4: 实现验证器。** 每个 formal source domain 调用所属 repository 验证入口；记录 source/dataset/request/refresh/task/snapshot/content/manifest/parser/mapping/timestamps/units/class/reasons/evidence hashes。`audit_at_utc` 与 timing diagnostics 不进入规范结果 hash。Calendar 走 exchange selector；Market/Range 仅通过签名 `market_liquidity` Policy 窗口；下游 Metric/Valuation/score/final-input proof 不冒充 source domain。
++- [x] **Step 5: 运行 GREEN、独立审查并提交。** 最终 focused 64/64（2379.728s），指定四模块 95/95（2421.151s）；fix round 5 定向复审结论 ADDRESSED，无残留 Critical/Important。生产合同/真实数据 readiness 与全宇宙性能留待 Task 11。
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_coverage_manifest tests.test_formal_coverage_guards tests.test_formal_snapshot_repository tests.test_formal_universe -v`
+ 
+@@ -315,22 +315,22 @@ git commit -m "feat: audit formal production coverage"
+ - Consumes: exact V2–V7 migration ledger and existing tables。
+ - Produces: `SCHEMA_VERSION = 8`、`_V8_TABLE_DDL`、`_V8_INDEX_DDL`、`StateStore._apply_v8_migration(connection)`；仅提供给 `formal_final_repository` 使用的内部事务边界，不增加逐表公共写 API。
+ 
+-- [ ] **Step 1: 写 migration RED。** 精确测试名：`test_v7_range_schema_and_rows_survive_v8_migration_exactly`、`test_fresh_database_records_contiguous_versions_2_through_8`、`test_v8_migration_is_atomic_and_reopen_verifies_exact_ddl`、`test_partial_or_extra_v8_object_rejects_without_advancing_ledger`、`test_legacy_score_run_and_score_item_are_not_repurposed`。
+-- [ ] **Step 2: 运行 RED。**
++- [x] **Step 1: 写 migration RED。** 精确测试名：`test_v7_range_schema_and_rows_survive_v8_migration_exactly`、`test_fresh_database_records_contiguous_versions_2_through_8`、`test_v8_migration_is_atomic_and_reopen_verifies_exact_ddl`、`test_partial_or_extra_v8_object_rejects_without_advancing_ledger`、`test_legacy_score_run_and_score_item_are_not_repurposed`。
++- [x] **Step 2: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_migration -v`
+ 
+ Expected: schema version 7 且 V8 表不存在。
+ 
+-- [ ] **Step 3: 实现八表 schema。** 新增 `formal_final_run`、`formal_final_artifact`、`formal_final_input`、`formal_final_scorecard`、`formal_final_status`、`formal_final_eligibility`、`formal_final_pool_decision`、`formal_final_dependency`。所有 Decimal 使用规范文本，禁止 REAL；run id/time 不进入 canonical result hash；同一 input manifest 允许独立重放。
+-- [ ] **Step 4: 加约束与索引。** pool name/decision 精确 CHECK；run `mode IN ('test_preview','official_candidate')`、`status IN ('preview_ready','blocked')`；selected ordinal partial unique；dependency 按 source 和 effect scope 索引；外键和主键保证全表从属同一 run。
+-- [ ] **Step 5: 运行 GREEN 与完整 state-store migration 回归。**
++- [x] **Step 3: 实现八表 schema。** 新增 `formal_final_run`、`formal_final_artifact`、`formal_final_input`、`formal_final_scorecard`、`formal_final_status`、`formal_final_eligibility`、`formal_final_pool_decision`、`formal_final_dependency`。所有 Decimal 使用规范文本，禁止 REAL；run id/time 不进入 canonical result hash；同一 input manifest 允许独立重放。
++- [x] **Step 4: 加约束与索引。** pool name/decision 精确 CHECK；run `mode IN ('test_preview','official_candidate')`、`status IN ('preview_ready','blocked')`；selected ordinal partial unique；dependency 按 source 和 effect scope 索引；外键和主键保证全表从属同一 run。对象验证使用精确 `(type,name)` 白名单并限制 PK autoindex 例外，拒绝同名 trigger/index/view。
++- [x] **Step 5: 运行 GREEN 与完整 state-store migration 回归。** focused 11/11；migration + state-store 222/222（758.587s）。
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_migration tests.test_state_store -v`
+ 
+ Expected: 全部 PASS，现有 V7 range DDL/数据逐字节保留。
+ 
+-- [ ] **Step 6: 独立审查并提交。**
++- [x] **Step 6: 独立审查并提交。** 初审发现同名 trigger 绕过；修复提交 `ec8781a` 后定向复审标记 ADDRESSED，无新增 Critical/Important。
+ 
+ ```powershell
+ git add ashare_pipeline/state_store.py tests/test_state_store.py tests/test_formal_final_migration.py tests/fixtures/schema_v7.sql
+@@ -360,17 +360,17 @@ def commit_complete_run(self, *, mode, coverage_manifest, input_batch,
+                         ) -> FormalFinalRunReceipt: ...
+ ```
+ 
+-- [ ] **Step 1: 写 repository RED。** `test_complete_run_persists_exact_universe_and_all_artifact_hashes`、`test_decimals_round_trip_as_canonical_text_without_float`、`test_same_input_allows_two_append_only_replays_with_same_result_hash`、`test_historical_run_cannot_be_updated_or_rebound`、`test_cross_root_or_forged_batch_is_rejected_before_write`、`test_recovery_dto_never_authenticates_as_live_proof`。
+-- [ ] **Step 2: 写原子故障矩阵 RED。** 对每张子表插入、规范序列化、最终来源复验、集合复验、`arm()` 和 SQLite commit 注入异常；`test_every_commit_failure_leaves_zero_stage_d_rows_and_revokes_children` 断言全无或全有，`test_armed_proofs_remain_invisible_until_commit_returns` 断言无短暂可见窗口，`test_post_commit_mark_committed_is_prevalidated_and_cannot_fail` 固定 flip 合同。另测合法 blocked run 一次性写入且无伪池，并覆盖普通构造/copy/pickle/弱引用重定向/方法替换与撤销攻击。
+-- [ ] **Step 3: 运行 RED。**
++- [x] **Step 1: 写 repository RED。** `test_complete_run_persists_exact_universe_and_all_artifact_hashes`、`test_decimals_round_trip_as_canonical_text_without_float`、`test_same_input_allows_two_append_only_replays_with_same_result_hash`、`test_historical_run_cannot_be_updated_or_rebound`、`test_cross_root_or_forged_batch_is_rejected_before_write`、`test_recovery_dto_never_authenticates_as_live_proof`。
++- [x] **Step 2: 写原子故障矩阵 RED。** 对每张子表插入、规范序列化、最终来源复验、集合复验、`arm()` 和 SQLite commit 注入异常；`test_every_commit_failure_leaves_zero_stage_d_rows_and_revokes_children` 断言全无或全有，`test_armed_proofs_remain_invisible_until_commit_returns` 断言无短暂可见窗口，`test_post_commit_mark_committed_is_prevalidated_and_cannot_fail` 固定 flip 合同。另测合法 blocked run 一次性写入且无伪池，并覆盖普通构造/copy/pickle/弱引用重定向/方法替换与撤销攻击。
++- [x] **Step 3: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_repository tests.test_formal_final_atomicity -v`
+ 
+ Expected: repository 不存在。
+ 
+-- [ ] **Step 4: 实现唯一批量写入口。** 事务前完成长计算并预检 committed flip；事务内重验冻结宇宙/根/依赖，写 header、五种 canonical artifacts、全成员 input/status/eligibility/两池 decision、可用 scorecards 和 dependency rows，逐表比较精确 security 集合及 hash，最后只 `arm()` 并提交 SQLite。commit 返回后立即执行不可失败 `mark_committed()`；异常路径 rollback/revoke，绝不先开放 proof。
+-- [ ] **Step 5: 明确禁止逐表 API。** 不实现 `put_*`、`replace_*`、`mark_ready`；run status 只允许 `preview_ready/blocked`，`validated/published` 留给 V9 release。
+-- [ ] **Step 6: 运行 GREEN、独立审查并提交。**
++- [x] **Step 4: 实现唯一批量写入口。** 事务前完成长计算并预检 committed flip；事务内重验冻结宇宙/根/依赖，写 header、五种 canonical artifacts、全成员 input/status/eligibility/两池 decision、可用 scorecards 和 dependency rows，逐表比较精确 security 集合及 hash，最后只 `arm()` 并提交 SQLite。commit 返回后立即执行不可失败 `mark_committed()`；异常路径 rollback/revoke，绝不先开放 proof。
++- [x] **Step 5: 明确禁止逐表 API。** 不实现 `put_*`、`replace_*`、`mark_ready`；run status 只允许 `preview_ready/blocked`，`validated/published` 留给 V9 release。
++- [x] **Step 6: 运行 GREEN、独立审查并提交。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_repository tests.test_formal_final_atomicity tests.test_formal_final_migration -v`
+ 
+@@ -390,16 +390,16 @@ git commit -m "feat: persist atomic formal final runs"
+ - Consumes: prior run dependency rows and a current verified final input/coverage manifest；不接受调用方自报 changed IDs。
+ - Produces: `FormalRebuildPlan` with `full_rebuild`、direct/expanded security IDs、cohort keys、D1/D2/eligibility rebuild IDs、`rescan_pools`、reason codes and prior/current manifest hashes；`FormalFinalRunRepository.plan_rebuild(...)`。
+ 
+-- [ ] **Step 1: 写传播 RED。** 精确测试名：`test_single_non_peer_evidence_change_rebuilds_one_security_and_rescans_pools`、`test_peer_or_v_change_expands_to_complete_cohort`、`test_policy_cap_prohibition_pending_and_normalization_have_distinct_effects`、`test_universe_industry_registry_frozen_or_contract_change_forces_full_rebuild`、`test_diagnostic_timing_or_display_change_does_not_rebuild`、`test_caller_supplied_changed_ids_are_not_an_api_or_authority`。
+-- [ ] **Step 2: 写恢复 RED。** `test_restart_selects_prior_exact_manifest_not_later_correction`、`test_old_run_bytes_never_change_after_new_rebuild`、`test_reuse_requires_current_hash_and_capability_revalidation`。
+-- [ ] **Step 3: 运行 RED。**
++- [x] **Step 1: 写传播 RED。** 精确测试名：`test_single_non_peer_evidence_change_rebuilds_one_security_and_rescans_pools`、`test_peer_or_v_change_expands_to_complete_cohort`、`test_policy_cap_prohibition_pending_and_normalization_have_distinct_effects`、`test_universe_industry_registry_frozen_or_contract_change_forces_full_rebuild`、`test_diagnostic_timing_or_display_change_does_not_rebuild`、`test_caller_supplied_changed_ids_are_not_an_api_or_authority`。
++- [x] **Step 2: 写恢复 RED。** `test_restart_selects_prior_exact_manifest_not_later_correction`、`test_old_run_bytes_never_change_after_new_rebuild`、`test_reuse_requires_current_hash_and_capability_revalidation`。
++- [x] **Step 3: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_invalidation -v`
+ 
+ Expected: 模块/API 不存在。
+ 
+-- [ ] **Step 4: 实现规范 dependency diff。** effect scopes 固定 `security/cohort/pool/global`；任何会改变资格或排序的变化都 `rescan_pools=True`。policy normalization 扩展 Stage C cohort；cap 进入 D2；prohibition/pending 进入状态/资格；global context 进入全宇宙。
+-- [ ] **Step 5: 运行 GREEN、独立审查并提交。**
++- [x] **Step 4: 实现规范 dependency diff。** effect scopes 固定 `security/cohort/pool/global`；任何会改变资格或排序的变化都 `rescan_pools=True`。policy normalization 扩展 Stage C cohort；cap 进入 D2；prohibition/pending 进入状态/资格；global context 进入全宇宙。
++- [x] **Step 5: 运行 GREEN、独立审查并提交。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_invalidation tests.test_formal_final_repository -v`
+ 
+@@ -408,6 +408,42 @@ git add ashare_pipeline/formal_final_invalidation.py ashare_pipeline/formal_fina
+ git commit -m "feat: plan formal score invalidation scopes"
+ ```
+ 
++### Task 10A: Add a signed test-root computation gate without release authority
++
++**Ruling:** Task 11 preflight proved the existing Stage A/B/C/D1 computation chain
++unconditionally calls `require_official`, so a genuine signed `purpose=test` root
++cannot currently reach the runner.  A runner-only bypass or placeholder batches
++would weaken proof closure.  Add an explicit authenticated computation gate before
++Task 11; keep every official-candidate, official-coverage, and V9 release gate
++unchanged and stricter.
++
++**Files:** root/scoring/feature/context and Stage A/B/C/D1 authentication boundaries,
++their genuine fixture builders, and focused contract tests only.  No schema,
++repository persistence, coverage official gate, formula, score, eligibility, pool,
++capacity, or release-policy change is allowed.
++
++- [x] **Step 1: Write RED contract tests.** Prove a genuine HMAC-signed v2 ten-role
++  `purpose=test` bundle is accepted only by an exact-purpose authenticated gate,
++  remains rejected by every official gate, and can load matching scoring, policy,
++  feature, range, and valuation-adapter contracts.  Reject mixed purpose, approval
++  on test roots, missing roles, cross-root objects, copied/forged/mutated proofs,
++  and test-to-official promotion.
++- [x] **Step 2: Run RED.** The new authenticated computation API is absent and the
++  existing genuine test-root probe fails at the first official-only boundary.
++- [x] **Step 3: Implement the minimal gate.** `test_preview -> test` and
++  `official_candidate -> official` are exact mappings; no boolean downgrade flag.
++  Test roots require loader-verified signatures/bindings, v2 ten-role closure,
++  null approval identity, and matching `purpose=test` child contracts.  Existing
++  `require_official` behavior, approval hash/id checks, and official method identity
++  guards remain intact.
++- [x] **Step 4: Run GREEN and affected regressions.** Include a genuine test-root
++  D1 build and official-gate rejection.  Genuine fixture suites run only through
++  the main authorized path because the managed-worktree sandbox cannot create their
++  temporary directories.
++- [x] **Step 5: Independent trust-boundary review and commit.** Review specifically
++  for downgrade paths, mixed-purpose graphs, forged proof acceptance, and any
++  weakening of official coverage/repository/V9 release eligibility.
++
+ ### Task 11: Wire the offline runner and complete full-chain acceptance
+ 
+ **Files:**

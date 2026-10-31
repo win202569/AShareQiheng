@@ -1,0 +1,235 @@
+# Review package: 18aa67ed526ca880680b3a62fd8ab72b10d37d5e..c91dac09292de22c31e525f6a67ffd245101f4f3
+
+## Commits
+c91dac0 test: make Stage D focal features trustworthy
+87492bc docs: mark Stage D task 1 complete
+
+## Files changed
+ .../2026-09-28-formal-final-scoring-stage-d.md     | 10 +--
+ tests/formal_final_scoring_fixtures.py             | 76 +++++++++++++++++++++-
+ tests/test_formal_final_fixture.py                 | 10 +++
+ 3 files changed, 90 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/docs/superpowers/plans/2026-09-28-formal-final-scoring-stage-d.md b/docs/superpowers/plans/2026-09-28-formal-final-scoring-stage-d.md
+index b391d75..9c9e674 100644
+--- a/docs/superpowers/plans/2026-09-28-formal-final-scoring-stage-d.md
++++ b/docs/superpowers/plans/2026-09-28-formal-final-scoring-stage-d.md
+@@ -70,35 +70,35 @@ Stage D 不访问网络、不生成 V9 release、不对外发布股票池。run
+ 
+ **Files:**
+ - Create: `tests/formal_final_scoring_fixtures.py`
+ - Modify: `tests/formal_valuation_fixtures.py`
+ - Create: `tests/test_formal_final_fixture.py`
+ 
+ **Interfaces:**
+ - Consumes: `ValuationRuntimeFixture`、v2 十角色签名图、真实 Formal Feature/Context/Metric/Policy/Range/Valuation producers。
+ - Produces: `FinalScoringFixture`；`populate_final_inputs(...)`；`build_d1_sources()`；可配置 20/23 人 cohort、pending、cap、prohibition、veto 和 consensus no-coverage，但不直接 mint 任何 proof。
+ 
+-- [ ] **Step 1: 写失败测试。** 新增 `test_one_v2_root_builds_base_policy_and_adjusted_valuation_batches`，断言三批的 `registry_manifest_hash`、`frozen_input_hash`、`universe_hash`、`security_ids` 完全相同；新增 `test_fixture_never_exposes_proof_mint_or_plain_proof_double`，断言 fixture 无 mint API，返回值均为真实公开 proof 类型。
+-- [ ] **Step 2: 运行 RED。**
++- [x] **Step 1: 写失败测试。** 新增 `test_one_v2_root_builds_base_policy_and_adjusted_valuation_batches`，断言三批的 `registry_manifest_hash`、`frozen_input_hash`、`universe_hash`、`security_ids` 完全相同；新增 `test_fixture_never_exposes_proof_mint_or_plain_proof_double`，断言 fixture 无 mint API，返回值均为真实公开 proof 类型。
++- [x] **Step 2: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_fixture -v`
+ 
+ Expected: 因 fixture/module 不存在失败。
+ 
+-- [ ] **Step 3: 最小实现。** 仅给 `ValuationRuntimeFixture.__init__` 增加默认 `None` 的 test-only 签名前文档配置回调；默认路径的签名字节和既有行为不得变化。新 fixture 在一个 v2 root 内配置完整 25 slots、consensus alternative、policy、range 和 valuation adapter。
+-- [ ] **Step 4: 运行 GREEN 与 fixture 回归。**
++- [x] **Step 3: 最小实现。** 仅给 `ValuationRuntimeFixture.__init__` 增加默认 `None` 的 test-only 签名前文档配置回调；默认路径的签名字节和既有行为不得变化。新 fixture 在一个 v2 root 内配置完整 25 slots、consensus alternative、policy、range 和 valuation adapter。
++- [x] **Step 4: 运行 GREEN 与 fixture 回归。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_final_fixture tests.test_formal_valuation_integration tests.test_formal_score_inputs tests.test_formal_policy_integration -v`
+ 
+ Expected: 全部 PASS，现有 fixture 默认输出不变。
+ 
+-- [ ] **Step 5: 独立审查并提交。**
++- [x] **Step 5: 独立审查并提交。**
+ 
+ ```powershell
+ git add tests/formal_final_scoring_fixtures.py tests/formal_valuation_fixtures.py tests/test_formal_final_fixture.py
+ git commit -m "test: add genuine Stage D scoring fixture"
+ ```
+ 
+ ### Task 2: Compose the complete policy-adjusted score input batch
+ 
+ **Files:**
+ - Create: `ashare_pipeline/formal_final_score_inputs.py`
+diff --git a/tests/formal_final_scoring_fixtures.py b/tests/formal_final_scoring_fixtures.py
+index c963565..eba784f 100644
+--- a/tests/formal_final_scoring_fixtures.py
++++ b/tests/formal_final_scoring_fixtures.py
+@@ -1,19 +1,23 @@
+ """One real signed Stage D test root for base, policy, and valuation inputs."""
+ 
+ from collections import namedtuple
+ import hashlib
+ 
++from ashare_pipeline.formal_evidence import (
++    OfficialFetch, OfficialRequest, SourcePolicy, verify_official_fetch,
++)
+ from ashare_pipeline.formal_score_inputs import FormalScoreInputRepository
+ from tests.formal_score_input_fixtures import ScoreFixture
+ from tests.formal_valuation_fixtures import ValuationRuntimeFixture
+ from tests.test_formal_context_repository import descriptor
++from tests.test_formal_feature_contract import formal_fact
+ from tests.test_formal_scoring_registry import canonical
+ from tests.test_formal_sources import config
+ 
+ 
+ D1Sources = namedtuple("D1Sources", "base policy valuation")
+ FOCAL = "BJ430001"
+ 
+ 
+ def _stage_d_documents(documents):
+     for range_config in documents["source"]["range_configs"]:
+@@ -40,20 +44,88 @@ def _stage_d_documents(documents):
+         for exchange in ("BJ", "SH", "SZ")
+     )
+ 
+ 
+ class FinalScoringFixture(ValuationRuntimeFixture):
+     """Genuine producer-backed proofs; no fixture-level proof constructor."""
+ 
+     put_context = ScoreFixture.put_context
+     put_consensus = ScoreFixture.put_consensus
+ 
++    def _put_policy_quarter(self, sid, values, units, year, kind, end):
++        period_end = f"{year}-{end}"
++        generation = f"stage-d-policy-quarter-{year}-{kind}"
++        raw = canonical(values)
++        task = self.store.enqueue_formal_task("formal_statement",
++            f"{sid}:{generation}", generation, {})
++        leased = self.store.lease_next_formal_task(
++            ("formal_statement",), "stage-d-policy-quarter-fixture", 300)
++        self.assertEqual(leased["id"], task)
++        fetch = OfficialFetch(
++            request=OfficialRequest("cninfo", "annual_report", sid, period_end, sid[:2]),
++            raw_bytes=raw,
++            original_url="https://www.cninfo.com.cn/fixture/annual.json",
++            published_at_utc="2026-03-20T08:00:00+00:00",
++            published_precision="timestamp",
++            source_updated_at_utc=None,
++            captured_at_utc="2026-09-04T07:00:00+00:00",
++            effective_at_utc="2026-03-20T08:00:00+00:00",
++            effective_time_evidence_hash=None,
++            refresh_generation=generation,
++            parser_id="fixture-annual",
++            parser_version="fixture-annual-v1",
++            mapping_version="fixture-annual-map-v1",
++            declared_security_id=sid,
++            declared_period=period_end,
++        )
++        ref = self.snapshots.persist_verified(fetch, verify_official_fetch(
++            fetch, SourcePolicy.cninfo()), producing_task_id=task,
++            worker_id="stage-d-policy-quarter-fixture")
++        self.store.insert_formal_financial_facts(tuple(formal_fact(
++            security_id=sid, statement="income", metric_key=key,
++            period_start=f"{year}-01-01", period_end=period_end,
++            period_kind=kind, value=value, unit=units[key], nature="duration",
++            published_at_utc=ref.published_at_utc,
++            published_precision=ref.published_precision,
++            effective_at_utc=ref.effective_at_utc,
++            effective_time_evidence_hash=ref.effective_time_evidence_hash,
++            source_updated_at_utc=ref.source_updated_at_utc,
++            captured_at_utc=ref.captured_at_utc,
++            source_snapshot_id=ref.snapshot_id,
++            source_content_sha256=ref.content_sha256,
++            source_refresh_generation=ref.refresh_generation,
++            source_producing_task_id=ref.producing_task_id,
++            source_field=key,
++            raw_value_sha256=hashlib.sha256(canonical(value)).hexdigest(),
++            parser_id=ref.parser_id, parser_version=ref.parser_version,
++            mapping_version=ref.mapping_version,
++        ) for key, value in values.items()))
++        self.store.complete_formal_task(task, "stage-d-policy-quarter-fixture",
++            {"snapshot": ref.snapshot_id})
++
++    def _populate_policy_quarter_prerequisites(self, sid):
++        facts = [fact.to_dict() for fact in self.store.list_formal_financial_facts(
++            security_id=sid)]
++        for year in (2024, 2025):
++            annual = {wire["metric_key"]: wire for wire in facts
++                if wire["period_end"] == f"{year}-12-31"
++                and wire["period_kind"] == "FY"
++                and wire["nature"] == "duration"
++                and wire["metric_key"].startswith("fixture.policy.")}
++            units = {key: wire["unit"] for key, wire in annual.items()}
++            for index, (kind, end) in enumerate((
++                    ("Q1", "03-31"), ("H1", "06-30"), ("Q3", "09-30")), 1):
++                values = {key: wire["value"] * index / 4
++                    for key, wire in annual.items()}
++                self._put_policy_quarter(sid, values, units, year, kind, end)
++        self.publish_current(sid)
++
+     def __init__(self, *, peer_count=3, pending_ids=None, cap_ids=(FOCAL,),
+                  prohibition_ids=(), veto_ids=(), consensus_no_coverage=False):
+         if peer_count not in (3, 20, 23):
+             raise ValueError("Stage D fixture supports 3, 20, or 23 members")
+         self.date_only = False
+         self.calendar_requests = {}
+         self.cap_ids = tuple(cap_ids)
+         self.prohibition_ids = tuple(prohibition_ids)
+         self.veto_ids = tuple(veto_ids)
+         self.consensus_no_coverage = consensus_no_coverage
+@@ -83,28 +155,30 @@ class FinalScoringFixture(ValuationRuntimeFixture):
+         for sid in set(self.prohibition_ids) & active_policy_ids:
+             financial_overrides[sid]["current_equity"] = 0.0
+         original_industry = self.industry
+         self.industry = dict(original_industry, memberships=[member
+             for member in original_industry["memberships"]
+             if member["security_id"] in active_policy_ids])
+         try:
+             self.populate_policy_evidence(financial_overrides=financial_overrides)
+         finally:
+             self.industry = original_industry
++        for sid in sorted(active_policy_ids):
++            self._populate_policy_quarter_prerequisites(sid)
+         for index, sid in enumerate(sorted(self.templates)):
+             if sid not in active_policy_ids:
+                 self.put_industry(sid)
+             self.put_financial(sid, {
+                 "V.enterprise_value_or_sustainable_roe": 0.1 + index / 1000,
+                 "V.normalized_earnings_yield": 0.20 if sid == FOCAL else 0.1 + index / 1000,
+                 "V.normalized_free_cash_flow_yield": 0.08 + index / 1000,
+-            }, generation="stage-d-valuation")
++            }, generation="stage-d-valuation", nature="instant")
+             score_values = {"score_leaf": index + 10}
+             if not (sid == FOCAL and self.consensus_no_coverage):
+                 score_values["T.expectation_change"] = index + 10
+             self.put_financial(sid, score_values,
+                 generation="stage-d-score", nature="instant")
+             if sid == FOCAL:
+                 for year in range(2021, 2026):
+                     self.put_financial(sid, {"history": 1},
+                         generation=f"stage-d-history-{year}",
+                         period_end=f"{year}-12-31", publish=False)
+diff --git a/tests/test_formal_final_fixture.py b/tests/test_formal_final_fixture.py
+index 9a28243..5421e14 100644
+--- a/tests/test_formal_final_fixture.py
++++ b/tests/test_formal_final_fixture.py
+@@ -39,13 +39,23 @@ class FinalScoringFixtureTests(unittest.TestCase):
+ 
+     def test_fixture_never_exposes_proof_mint_or_plain_proof_double(self):
+         fixture, sources = self.fixture, self.sources
+         self.assertFalse(any("mint" in name.lower() for name in dir(fixture)))
+         for proof, proof_type in ((sources.base, FormalScoreInputBatch),
+                 (sources.policy, VerifiedPolicyResultBatch),
+                 (sources.valuation, PolicyAdjustedValuationBatch)):
+             self.assertIs(type(proof), proof_type)
+             proof.require_verified()
+ 
++    def test_focal_full_feature_bundle_has_trustworthy_required_slots(self):
++        bundle = self.fixture.valuation_feature_bundles["BJ430001"]
++        self.assertEqual(bundle.blockers, ())
++        required = {slot.slot_id for slot in self.fixture.vocabulary.slots_for_template(
++            "general_nonfinancial") if slot.required}
++        actual = {value.slot_id: value.status for value in bundle.values
++            if value.slot_id in required}
++        self.assertEqual(len(required), 25)
++        self.assertEqual(actual, {slot_id: "derived" for slot_id in required})
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

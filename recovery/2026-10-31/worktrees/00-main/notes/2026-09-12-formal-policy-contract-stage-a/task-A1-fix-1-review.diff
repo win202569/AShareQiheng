@@ -1,0 +1,290 @@
+# A1 fix round 1
+
+Fix base: frozen original staged snapshot from task-A1-review.diff; HEAD remains b9b367d.
+Only unstaged two-file delta below; fixture unchanged.
+
+warning: in the working copy of 'ashare_pipeline/formal_policy_contract.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_formal_policy_contract.py', LF will be replaced by CRLF the next time Git touches it
+ ashare_pipeline/formal_policy_contract.py | 48 ++++++++++++++++++----------
+ tests/test_formal_policy_contract.py      | 53 +++++++++++++++++--------------
+ 2 files changed, 60 insertions(+), 41 deletions(-)
+
+warning: in the working copy of 'ashare_pipeline/formal_policy_contract.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_formal_policy_contract.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/ashare_pipeline/formal_policy_contract.py b/ashare_pipeline/formal_policy_contract.py
+index 8674ab9..1b0750b 100644
+--- a/ashare_pipeline/formal_policy_contract.py
++++ b/ashare_pipeline/formal_policy_contract.py
+@@ -101,21 +101,20 @@ def _load(raw, path):
+         raise ValueError(f"nonfinite JSON {value}")
+ 
+     if type(raw) is not bytes:
+         raise PolicyContractError(
+             "canonical JSON must be immutable UTF-8 bytes", path=path
+         )
+     try:
+         value = json.loads(
+             raw.decode("utf-8"),
+             object_pairs_hook=unique,
+-            parse_float=Decimal,
+             parse_constant=invalid,
+         )
+         if type(value) is not dict or _canonical(value).encode("utf-8") != raw:
+             raise ValueError("canonical JSON object required")
+     except (UnicodeError, ValueError, TypeError, RecursionError) as error:
+         raise PolicyContractError("invalid canonical JSON", path=path) from error
+     return value
+ 
+ 
+ def _exact_keys(value, expected, path):
+@@ -141,20 +140,29 @@ def _decimal_parameter(value, path):
+         raise PolicyContractError("finite decimal string required", path=path)
+     try:
+         number = Decimal(value)
+     except InvalidOperation as error:
+         raise PolicyContractError("invalid decimal", path=path) from error
+     if not number.is_finite():
+         raise PolicyContractError("nonfinite decimal", path=path)
+     return number
+ 
+ 
++def _algorithm_identifier(value, allowed, path):
++    _identifier(value, path)
++    if value not in allowed:
++        raise PolicyContractError(
++            "unsupported algorithm identifier", code="unsupported_contract", path=path
++        )
++    return value
++
++
+ def _ordered_texts(value, path, *, expected=None):
+     if type(value) is not list or not value:
+         raise PolicyContractError("nonempty string array required", path=path)
+     result = tuple(_text(item, f"{path}[{index}]") for index, item in enumerate(value))
+     if result != tuple(sorted(set(result))):
+         raise PolicyContractError("array must be sorted and unique", path=path)
+     if expected is not None and result != tuple(expected):
+         raise PolicyContractError("array has unsupported fixed values", path=path)
+     return result
+ 
+@@ -364,38 +372,39 @@ def _validate_parameters(kind, value, path, semantic_id):
+                 "fy_ends",
+                 "quantile_method",
+                 "quantile_level",
+                 "median_method",
+                 "profit_basis_method",
+                 "valuation_dependencies",
+             ),
+             path,
+         )
+         _ordered_texts(value["fy_ends"], f"{path}.fy_ends", expected=_FY_ENDS)
+-        if value["quantile_method"] not in (
+-            "linear_type7_v1",
+-            "nearest_rank_v1",
+-        ):
++        _algorithm_identifier(
++            value["quantile_method"],
++            ("linear_type7_v1", "nearest_rank_v1"),
++            f"{path}.quantile_method",
++        )
++        if value["quantile_level"] != "0.80":
+             raise PolicyContractError(
+-                "unsupported quantile method",
+-                code="unsupported_contract",
+-                path=f"{path}.quantile_method",
++                "unsupported fixed cyclic parameter", path=f"{path}.quantile_level"
+             )
+-        for field, expected in (
+-            ("quantile_level", "0.80"),
+-            ("median_method", "ordered_middle_v1"),
+-            ("profit_basis_method", "minimum_current_and_five_fy_median_v1"),
+-        ):
+-            if value[field] != expected:
+-                raise PolicyContractError(
+-                    "unsupported fixed cyclic parameter", path=f"{path}.{field}"
+-                )
++        _algorithm_identifier(
++            value["median_method"],
++            ("ordered_middle_v1",),
++            f"{path}.median_method",
++        )
++        _algorithm_identifier(
++            value["profit_basis_method"],
++            ("minimum_current_and_five_fy_median_v1",),
++            f"{path}.profit_basis_method",
++        )
+         _valuation_dependencies(
+             value["valuation_dependencies"],
+             f"{path}.valuation_dependencies",
+             semantic_id,
+         )
+     else:
+         _exact_keys(
+             value,
+             (
+                 "effective_trade_method",
+@@ -404,20 +413,25 @@ def _validate_parameters(kind, value, path, semantic_id):
+                 "required_evidence_capability",
+             ),
+             path,
+         )
+         expected = {
+             "effective_trade_method": "exchange_allows_and_positive_volume_turnover_v1",
+             "veto_trading_days": 20,
+             "close_search_trading_days": 250,
+             "required_evidence_capability": "verified_market_window_v1",
+         }
++        _algorithm_identifier(
++            value["effective_trade_method"],
++            ("exchange_allows_and_positive_volume_turnover_v1",),
++            f"{path}.effective_trade_method",
++        )
+         for field, required in expected.items():
+             actual = value[field]
+             if type(required) is int:
+                 valid = type(actual) is int and actual == required
+             else:
+                 valid = actual == required
+             if not valid:
+                 raise PolicyContractError(
+                     "unsupported fixed market parameter", path=f"{path}.{field}"
+                 )
+diff --git a/tests/test_formal_policy_contract.py b/tests/test_formal_policy_contract.py
+index 47b6328..ddaf0c8 100644
+--- a/tests/test_formal_policy_contract.py
++++ b/tests/test_formal_policy_contract.py
+@@ -218,40 +218,43 @@ class PolicyRuleFamilyTests(unittest.TestCase):
+         wire = cyclic_rule()
+         del wire["parameters"]["quantile_method"]
+         self.assert_rejected("cyclic", wire)
+         wire = cyclic_rule(quantile_method="implicit_default")
+         with self.assertRaises(PolicyContractError) as caught:
+             parse_policy_rule("cyclic", "cyclic_top", canonical(wire))
+         self.assertEqual(caught.exception.code, "unsupported_contract")
+ 
+     def test_cyclic_fixed_parameters_and_valuation_dependencies_are_enforced(self):
+         mutations = (
+-            lambda wire: wire["parameters"].update(fy_ends=FY_ENDS[:-1]),
+-            lambda wire: wire["parameters"].update(quantile_level="0.8"),
+-            lambda wire: wire["parameters"].update(median_method="average_middle_v1"),
+-            lambda wire: wire["parameters"].update(profit_basis_method="current_only_v1"),
+-            lambda wire: wire["parameters"]["valuation_dependencies"].reverse(),
+-            lambda wire: wire["parameters"]["valuation_dependencies"][0].update(
++            (lambda wire: wire["parameters"].update(fy_ends=FY_ENDS[:-1]), "malformed_contract"),
++            (lambda wire: wire["parameters"].update(quantile_level="0.8"), "malformed_contract"),
++            (lambda wire: wire["parameters"].update(median_method="average_middle_v1"), "unsupported_contract"),
++            (lambda wire: wire["parameters"].update(profit_basis_method="current_only_v1"), "unsupported_contract"),
++            (lambda wire: wire["parameters"]["valuation_dependencies"].reverse(), "malformed_contract"),
++            (lambda wire: wire["parameters"]["valuation_dependencies"][0].update(
+                 metric_id="G.enterprise_value"
+-            ),
+-            lambda wire: wire["parameters"]["valuation_dependencies"][0].update(
++            ), "malformed_contract"),
++            (lambda wire: wire["parameters"]["valuation_dependencies"][0].update(
+                 adapter_id="forbidden"
+-            ),
+-            lambda wire: wire["parameters"]["valuation_dependencies"][1].update(
++            ), "malformed_contract"),
++            (lambda wire: wire["parameters"]["valuation_dependencies"][1].update(
+                 profit_semantic_id="other"
+-            ),
++            ), "malformed_contract"),
+         )
+-        for mutate in mutations:
++        for mutate, expected_code in mutations:
+             wire = cyclic_rule()
+             mutate(wire)
+-            with self.subTest(parameters=wire["parameters"]):
+-                self.assert_rejected("cyclic", wire)
++            with self.subTest(parameters=wire["parameters"]), self.assertRaises(
++                PolicyContractError
++            ) as caught:
++                parse_policy_rule("cyclic", "fixture", canonical(wire))
++            self.assertEqual(caught.exception.code, expected_code)
+ 
+     def test_cyclic_requires_exact_g_and_m_caps_profit_basis_status_and_pool_effects(self):
+         def effect(wire, kind, **fields):
+             return next(
+                 item
+                 for item in wire["outcomes"]["on_match"]
+                 if item["kind"] == kind and all(item.get(key) == value for key, value in fields.items())
+             )
+ 
+         mutations = (
+@@ -311,32 +314,33 @@ class PolicyRuleFamilyTests(unittest.TestCase):
+     def test_pending_evidence_effect_does_not_mint_a_required_veto_in_a1(self):
+         wire = numeric_rule()
+         wire["outcomes"]["on_match"] = [
+             {"kind": "pending_evidence", "reason_code": "equity-source-missing"}
+         ]
+         rule = parse_policy_rule("redline", "nonpositive_equity", canonical(wire))
+         self.assertEqual(rule.outcomes["on_match"][0]["kind"], "pending_evidence")
+ 
+     def test_market_liquidity_constants_and_both_pool_veto_are_fixed(self):
+         mutations = (
+-            lambda wire: wire["parameters"].update(veto_trading_days=19),
+-            lambda wire: wire["parameters"].update(veto_trading_days=True),
+-            lambda wire: wire["parameters"].update(close_search_trading_days=249),
+-            lambda wire: wire["parameters"].update(effective_trade_method="weekdays_v1"),
+-            lambda wire: wire["parameters"].update(required_evidence_capability="market_record_v1"),
+-            lambda wire: wire["outcomes"]["on_match"][0].update(pool="strong"),
++            (lambda wire: wire["parameters"].update(veto_trading_days=19), "malformed_contract"),
++            (lambda wire: wire["parameters"].update(veto_trading_days=True), "malformed_contract"),
++            (lambda wire: wire["parameters"].update(close_search_trading_days=249), "malformed_contract"),
++            (lambda wire: wire["parameters"].update(effective_trade_method="weekdays_v1"), "unsupported_contract"),
++            (lambda wire: wire["parameters"].update(required_evidence_capability="market_record_v1"), "malformed_contract"),
++            (lambda wire: wire["outcomes"]["on_match"][0].update(pool="strong"), "malformed_contract"),
+         )
+-        for mutate in mutations:
++        for mutate, expected_code in mutations:
+             wire = market_rule()
+             mutate(wire)
+-            with self.subTest(wire=wire):
+-                self.assert_rejected("status", wire)
++            with self.subTest(wire=wire), self.assertRaises(PolicyContractError) as caught:
++                parse_policy_rule("status", "fixture", canonical(wire))
++            self.assertEqual(caught.exception.code, expected_code)
+ 
+     def test_rule_kind_role_template_and_schema_are_closed(self):
+         cases = (
+             ("event", numeric_rule()),
+             ("redline", boolean_rule()),
+             ("status", cyclic_rule()),
+             ("cyclic", market_rule()),
+         )
+         for role, wire in cases:
+             with self.subTest(role=role, kind=wire["kind"]):
+@@ -488,30 +492,31 @@ class PolicyEntryPointTests(unittest.TestCase):
+         self.mutate_wrapper(children, "event", duplicate)
+         self.assert_contract_rejected(children)
+ 
+     def test_inactive_legacy_rule_is_not_parsed_but_remains_in_content_identity(self):
+         baseline = parse_policy_contract(policy_children())
+         children = policy_children()
+ 
+         def add_legacy(wrapper):
+             wrapper["rules"]["legacy_rule"] = {
+                 "schema_version": "legacy-policy-v0",
+-                "opaque": ["preserved", 1],
++                "opaque": ["preserved", 1, 1e-6],
+             }
+ 
+         self.mutate_wrapper(children, "redline", add_legacy)
+         changed = parse_policy_contract(children)
+         self.assertEqual(
+             tuple((rule.role, rule.rule_id) for rule in changed.rules),
+             tuple((rule.role, rule.rule_id) for rule in baseline.rules),
+         )
+         self.assertNotEqual(changed.canonical_json, baseline.canonical_json)
++        self.assertIn(b"1e-06", changed.canonical_json)
+ 
+     def test_children_must_be_exact_bytes_and_child_json_must_be_canonical(self):
+         children = policy_children()
+         children["event"] = bytearray(children["event"])
+         self.assert_contract_rejected(children)
+         children = policy_children()
+         children["event"] = b" " + children["event"]
+         self.assert_contract_rejected(children)
+ 
+ 
+

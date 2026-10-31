@@ -1,0 +1,79 @@
+# Review package: 930e1d2..750e091
+
+## Commits
+750e091 test: bound market constructor guard subprocess
+
+## Files changed
+ tests/test_formal_policy_market_ticket.py | 35 ++++++++++++++++++++++++-------
+ 1 file changed, 28 insertions(+), 7 deletions(-)
+
+## Diff
+diff --git a/tests/test_formal_policy_market_ticket.py b/tests/test_formal_policy_market_ticket.py
+index 4b4ef37..0477390 100644
+--- a/tests/test_formal_policy_market_ticket.py
++++ b/tests/test_formal_policy_market_ticket.py
+@@ -60,36 +60,57 @@ def _check_new_constructor_guard_in_child(phase, selection_name):
+                 pass
+             else:
+                 raise AssertionError("constructor replacement was accepted")
+         if vars(selection_type).get("__new__", _MISSING) is not original_new:
+             raise AssertionError("constructor patch left a class attribute behind")
+     finally:
+         fixture.close()
+ 
+ 
+ def _check_new_constructor_guard(phase, selection_type):
+-    result = subprocess.run(
+-        [sys.executable, "-c",
+-         "import sys; from tests.test_formal_policy_market_ticket import "
+-         "_check_new_constructor_guard_in_child; "
+-         "_check_new_constructor_guard_in_child(*sys.argv[1:])",
+-         phase, selection_type.__name__],
+-        capture_output=True, text=True, check=False)
++    try:
++        result = subprocess.run(
++            [sys.executable, "-c",
++             "import sys; from tests.test_formal_policy_market_ticket import "
++             "_check_new_constructor_guard_in_child; "
++             "_check_new_constructor_guard_in_child(*sys.argv[1:])",
++             phase, selection_type.__name__],
++            capture_output=True, text=True, check=False, timeout=60)
++    except subprocess.TimeoutExpired as error:
++        raise AssertionError(
++            f"constructor guard timed out after {error.timeout}s; "
++            f"stdout={error.stdout!r}; stderr={error.stderr!r}") from error
+     if result.returncode:
+         raise AssertionError(result.stdout + result.stderr)
+ 
+ 
+ class MarketTicketTests(unittest.TestCase):
+     def setUp(self):
+         self.fixture = RangeStoreFixture()
+         self.addCleanup(self.fixture.close)
+ 
++    def test_new_constructor_guard_timeout_fails_with_child_diagnostics(self):
++        def expire(command, **kwargs):
++            timeout = kwargs.get("timeout")
++            self.assertIsInstance(timeout, (int, float))
++            self.assertGreater(timeout, 0)
++            self.assertLessEqual(timeout, 60)
++            raise subprocess.TimeoutExpired(command, timeout,
++                output=b"child-progress", stderr=b"child-stalled")
++
++        with _temporary_attribute(subprocess, "run", expire):
++            with self.assertRaisesRegex(AssertionError, "constructor guard timed out") as caught:
++                _check_new_constructor_guard("preopen", CalendarSelection)
++        self.assertIn("child-progress", str(caught.exception))
++        self.assertIn("child-stalled", str(caught.exception))
++        self.assertIsInstance(caught.exception.__cause__, subprocess.TimeoutExpired)
++
+     def test_absent_calendar_is_bound_without_reselection_at_checkpoint(self):
+         fixture = self.fixture
+         repository = FormalPolicyMarketRepository(fixture.range_store)
+         root = fixture.graph.manifest.manifest_hash
+         journal = FormalBatchReadJournal.open(repository, registry_manifest_hash=root,
+             as_of_utc=FREEZE, population=("SH600000",),
+             required_keys=(("SH600000",),))
+         implementation_codes = set()
+         def capture_implementation(frame, event, arg):
+             if event == "call" and frame.f_code.co_filename.endswith("formal_policy_market.py"):

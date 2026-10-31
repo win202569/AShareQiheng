@@ -1,0 +1,12 @@
+TEST_STARTED test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_lease_loss_at_raw_parse_insert_and_completion_recovers
+test_finalizer_lease_loss_at_raw_parse_insert_and_completion_recovers (test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_lease_loss_at_raw_parse_insert_and_completion_recovers) ... ok
+TEST_STARTED test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_rejects_date_only_raw_replay_when_calendar_bridge_is_missing
+test_finalizer_rejects_date_only_raw_replay_when_calendar_bridge_is_missing (test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_rejects_date_only_raw_replay_when_calendar_bridge_is_missing) ... ok
+TEST_STARTED test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_rejects_parser_row_drift_including_excluded_rows
+test_finalizer_rejects_parser_row_drift_including_excluded_rows (test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_rejects_parser_row_drift_including_excluded_rows) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 74.676s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_lease_loss_at_raw_parse_insert_and_completion_recovers", "test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_rejects_date_only_raw_replay_when_calendar_bridge_is_missing", "test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_rejects_parser_row_drift_including_excluded_rows"], "passed": ["test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_lease_loss_at_raw_parse_insert_and_completion_recovers", "test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_rejects_date_only_raw_replay_when_calendar_bridge_is_missing", "test_formal_deep_worker.FormalUniverseFinalizerTests.test_finalizer_rejects_parser_row_drift_including_excluded_rows"], "tests_run": 3, "failures": 0, "errors": 0, "skipped": 0}

@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_score_inputs.FinalScoreInputReadyTests.test_ready_input_contains_22_base_slots_and_exactly_three_stage_c_scores
+test_ready_input_contains_22_base_slots_and_exactly_three_stage_c_scores (test_formal_final_score_inputs.FinalScoreInputReadyTests.test_ready_input_contains_22_base_slots_and_exactly_three_stage_c_scores) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 2207.039s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_score_inputs.FinalScoreInputReadyTests.test_ready_input_contains_22_base_slots_and_exactly_three_stage_c_scores"], "passed": ["test_formal_final_score_inputs.FinalScoreInputReadyTests.test_ready_input_contains_22_base_slots_and_exactly_three_stage_c_scores"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

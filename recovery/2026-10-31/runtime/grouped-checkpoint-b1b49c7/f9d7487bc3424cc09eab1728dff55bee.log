@@ -1,0 +1,12 @@
+TEST_STARTED test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_genuine_market_and_range_requirements_use_policy_market_evidence
+test_genuine_market_and_range_requirements_use_policy_market_evidence (test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_genuine_market_and_range_requirements_use_policy_market_evidence) ... ok
+TEST_STARTED test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_market_and_range_cannot_be_relabelled_unrelated_policy_decisions
+test_market_and_range_cannot_be_relabelled_unrelated_policy_decisions (test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_market_and_range_cannot_be_relabelled_unrelated_policy_decisions) ... ok
+TEST_STARTED test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_market_range_gates_recheck_calendar_and_market_raw_bytes
+test_market_range_gates_recheck_calendar_and_market_raw_bytes (test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_market_range_gates_recheck_calendar_and_market_raw_bytes) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 178.957s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_genuine_market_and_range_requirements_use_policy_market_evidence", "test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_market_and_range_cannot_be_relabelled_unrelated_policy_decisions", "test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_market_range_gates_recheck_calendar_and_market_raw_bytes"], "passed": ["test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_genuine_market_and_range_requirements_use_policy_market_evidence", "test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_market_and_range_cannot_be_relabelled_unrelated_policy_decisions", "test_formal_coverage_guards.MarketRangeCoverageAdapterTests.test_market_range_gates_recheck_calendar_and_market_raw_bytes"], "tests_run": 3, "failures": 0, "errors": 0, "skipped": 0}

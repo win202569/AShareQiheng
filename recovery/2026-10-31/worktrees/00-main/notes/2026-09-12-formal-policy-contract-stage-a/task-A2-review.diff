@@ -1,0 +1,859 @@
+# A2 task review package
+Base: 6809363ed3e96f039fb300dbb9be36da40d49305
+Head: staged frozen three-file snapshot (not committed)
+Commits: none yet; parent owns reviewed commit.
+
+ ashare_pipeline/formal_policy_registry.py | 279 +++++++++++++++++++++
+ tests/formal_policy_fixtures.py           | 140 ++++++++++-
+ tests/test_formal_policy_registry.py      | 391 ++++++++++++++++++++++++++++++
+ 3 files changed, 809 insertions(+), 1 deletion(-)
+
+diff --git a/ashare_pipeline/formal_policy_registry.py b/ashare_pipeline/formal_policy_registry.py
+new file mode 100644
+index 0000000..e0205fb
+--- /dev/null
++++ b/ashare_pipeline/formal_policy_registry.py
+@@ -0,0 +1,279 @@
++"""Static same-root policy definitions; returned bytes are not policy proofs."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from decimal import Decimal
++from types import MappingProxyType
++
++from .formal_context_schema import _canonical as _context_canonical, _descriptor
++from .formal_feature_contract import SignedFormalFeatureRegistry
++from .formal_policy_contract import PolicyContractError, parse_policy_contract
++from .formal_registry_manifest import VerifiedRegistryBundle
++from .formal_scoring_registry import FormalScoringRegistry, _formula_requirements
++
++
++_POLICY_ROLES = ("cyclic", "redline", "status", "event")
++_ROLES = ("source", "mapping", "feature", "scoring", "industry", *_POLICY_ROLES)
++_TEMPLATES = ("general_nonfinancial", "bank", "broker", "insurance", "real_estate")
++
++
++def _canonical(value):
++    return json.dumps(value, ensure_ascii=False, sort_keys=True,
++        separators=(",", ":"), allow_nan=False).encode("utf-8")
++
++
++def _signed_periods(slot):
++    return _formula_requirements(slot.to_dict()["formula"])[0]
++
++
++def _context_index(wrapper):
++    result, scopes = {}, set()
++    for entry in wrapper["descriptors"]:
++        _descriptor(entry)
++        identity = hashlib.sha256(_context_canonical(entry)).hexdigest()
++        scope = (entry["context_kind"], entry["scope_key"], entry["security_scope"])
++        if identity in result or scope in scopes:
++            raise PolicyContractError("duplicate Context descriptor", path="descriptors")
++        result[identity] = entry
++        scopes.add(scope)
++    return result
++
++
++def _source_index(source):
++    configs = source.get("configs")
++    if type(configs) is not list:
++        raise PolicyContractError("source configs must be an array", path="source")
++    result = {}
++    for config in configs:
++        if type(config) is not dict or any(type(config.get(key)) is not str for key in ("source", "dataset")):
++            raise PolicyContractError("invalid source config identity", path="source")
++        result.setdefault((config["source"], config["dataset"]), []).append(config)
++    return result
++
++
++def _bind_context(selector, descriptors, sources, checked_sources, path):
++    entry = descriptors.get(selector["descriptor_id"])
++    if entry is None:
++        raise PolicyContractError("Context descriptor ENTRY identity is absent", path=path)
++    if (selector["context_kind"], selector["scope_key"]) != (entry["context_kind"], entry["scope_key"]):
++        raise PolicyContractError("Context kind or scope mismatch", path=path)
++    if (entry["security_scope"], entry["request_security"], entry["exchange_rule"]) != (
++            "security", "input_security", "security_exchange"):
++        raise PolicyContractError("policy requires input security and security_exchange for all exchanges", path=path)
++    if entry["bootstrap_calendar"]:
++        raise PolicyContractError("input security cannot request a bootstrap calendar", path=path)
++    whitelist = {"regulatory_state": "allowed_regulatory_flags", "event_calendar": "allowed_event_codes"}
++    if entry["context_kind"] in whitelist and selector["entry_id"] not in entry[whitelist[entry["context_kind"]]]:
++        raise PolicyContractError("Context flag/event ID is not authorized", path=path)
++    identity = selector["descriptor_id"]
++    if identity not in checked_sources:
++        configs = sources.get((entry["source"], entry["dataset"]), ())
++        for exchange in ("SH", "SZ", "BJ"):
++            # Existing resolver semantics: null plus exact is ambiguous, never a fallback.
++            matches = [c for c in configs if c.get("exchange_scope") in (None, exchange)]
++            if len(matches) != 1:
++                raise PolicyContractError(f"source selection requires exactly one config for {exchange}", path=path)
++            config = matches[0]
++            for field in ("source", "dataset", "parser_id", "parser_version", "mapping_version", "bootstrap_calendar"):
++                if type(config.get(field)) is not type(entry[field]) or config[field] != entry[field]:
++                    raise PolicyContractError(f"Context/source {field} mismatch for {exchange}", path=path)
++            if config.get("exchange_scope") != exchange:
++                raise PolicyContractError(f"source exchange_scope mismatch for {exchange}", path=path)
++            if "calendar_selector" not in config or _canonical(config["calendar_selector"]) != _canonical(entry["calendar_selector"]):
++                raise PolicyContractError(f"Context/source calendar_selector mismatch for {exchange}", path=path)
++        checked_sources.add(identity)
++    return dict(descriptor_id=identity, descriptor=entry)
++
++
++def _bind_selectors(rules, slots, descriptors, sources):
++    manifest, checked_sources = [], set()
++
++    def feature(selector, template, path):
++        slot = slots[template].get(selector["feature_key"])
++        if selector["template_id"] != template or slot is None:
++            raise PolicyContractError("feature is absent from this template", path=path)
++        if (selector["expected_unit"] != slot.unit or selector["formula_version"] != slot.formula_version
++                or selector["period_keys"] != _signed_periods(slot)):
++            raise PolicyContractError("feature unit, formula_version or AST period set mismatch", path=path)
++        return slot.to_dict()
++
++    for rule in rules:
++        base = f"{rule.role}.{rule.rule_id}"
++        for name, selector in sorted(rule.inputs.items()):
++            path = f"inputs.{name}"
++            if selector["kind"] == "annual_series":
++                slot_ids, fingerprints, units = set(), set(), set()
++                for index, observation in enumerate(selector["observations"]):
++                    item_path = f"{path}.observations[{index}].selector"
++                    slot = feature(observation["selector"], rule.template_id, f"{base}.{item_path}")
++                    fingerprint = _canonical({key: slot[key] for key in ("formula", "unit", "formula_version")})
++                    if slot["slot_id"] in slot_ids or fingerprint in fingerprints:
++                        raise PolicyContractError("annual series repeats a slot or complete formula", path=f"{base}.{path}")
++                    slot_ids.add(slot["slot_id"])
++                    fingerprints.add(fingerprint)
++                    units.add(slot["unit"])
++                    manifest.append(dict(role=rule.role, rule_id=rule.rule_id, input_path=item_path, slot=slot))
++                current = rule.inputs[name.replace("annual_", "current_")]
++                if units != {current["expected_unit"]}:
++                    raise PolicyContractError("annual/current units differ", path=f"{base}.{path}")
++            else:
++                definition = (dict(slot=feature(selector, rule.template_id, f"{base}.{path}"))
++                    if selector["kind"] == "feature" else
++                    _bind_context(selector, descriptors, sources, checked_sources, f"{base}.{path}"))
++                manifest.append(dict(role=rule.role, rule_id=rule.rule_id, input_path=path, **definition))
++    return manifest
++
++
++def _require_coverage(rules, scoring, children):
++    by_template = {template: {} for template in _TEMPLATES}
++    active = {(rule.role, rule.rule_id): rule for rule in rules}
++    for rule in rules:
++        by_template[rule.template_id][rule.semantic_id] = rule
++    security_fields = {"st": "is_st", "star_st": "is_star_st", "forced_delist_risk": "forced_delist_risk"}
++    regulatory_hard = ("governance_red", "audit_qualified", "audit_adverse", "audit_disclaimer")
++    independent = ("governance_orange", "crowding", "major_unlock_window", "major_reduction_window", "major_event")
++    required = (*security_fields, "delisting_arrangement", *regulatory_hard,
++        "nonpositive_equity", "no_effective_trade_20d", *independent, "cyclic_top")
++    for template, semantic_rules in by_template.items():
++        flag_bindings = {}
++        for candidate in semantic_rules.values():
++            for selector in candidate.inputs.values():
++                if selector.get("context_kind") == "regulatory_state":
++                    identity = (selector["descriptor_id"], selector["entry_id"])
++                    previous = flag_bindings.setdefault(identity, candidate.semantic_id)
++                    if previous != candidate.semantic_id:
++                        raise PolicyContractError("regulatory semantics reuse the same flag binding",
++                            path=f"coverage.{template}.{candidate.semantic_id}")
++        for semantic in required:
++            path = f"coverage.{template}.{semantic}"
++            rule = semantic_rules.get(semantic)
++            if rule is None:
++                raise PolicyContractError("missing mandatory semantic", path=path)
++            if semantic in security_fields or semantic in regulatory_hard or semantic in independent:
++                if rule.kind != "boolean_state" or rule.parameters["expected"] is not True:
++                    raise PolicyContractError("mandatory state must match expected=true", path=path)
++                selector = rule.inputs["value"]
++                expected = (("security_state", security_fields[semantic]) if semantic in security_fields
++                    else ("regulatory_state", "active"))
++                if (selector["context_kind"], selector["field"]) != expected:
++                    raise PolicyContractError("mandatory semantic has the wrong Context field", path=path)
++            elif semantic == "delisting_arrangement":
++                if (rule.kind != "enum_state" or rule.parameters["values"] != ("delisting_arrangement",)
++                        or (rule.inputs["value"]["context_kind"], rule.inputs["value"]["field"]) != ("security_state", "listing_status")):
++                    raise PolicyContractError("delisting_arrangement must match exactly its approved listing state", path=path)
++            elif semantic == "nonpositive_equity":
++                if (rule.kind != "numeric_redline" or rule.parameters["comparator"] != "lte"
++                        or Decimal(rule.parameters["threshold"]) != 0):
++                    raise PolicyContractError("nonpositive_equity requires lte zero", path=path)
++            else:
++                kind = "cyclic_protection" if semantic == "cyclic_top" else "market_liquidity"
++                if rule.kind != kind:
++                    raise PolicyContractError(f"mandatory semantic requires {kind}", path=path)
++            effects = rule.outcomes["on_match"]
++            pools = {effect["pool"] for effect in effects if effect["kind"] == "pool_prohibition"}
++            if semantic in independent or semantic == "cyclic_top":
++                if not pools or not any(effect["kind"] == "independent_status"
++                        and effect["status_code"] == semantic for effect in effects):
++                    raise PolicyContractError("independent semantic needs its status and explicit pool restriction", path=path)
++            elif "both" not in pools:
++                raise PolicyContractError("mandatory hard veto must prohibit both pools", path=path)
++
++        cyclic = semantic_rules["cyclic_top"]
++        expected_metrics = {"V." + metric.metric_id for metric in scoring.templates[template].metrics["V"]}
++        actual_metrics = {dependency["metric_id"] for dependency in cyclic.parameters["valuation_dependencies"]}
++        if actual_metrics != expected_metrics:
++            raise PolicyContractError("valuation dependencies must cover exactly this template's V metrics",
++                path=f"coverage.{template}.valuation_dependencies")
++
++    classification = (scoring.cyclic_rule.policy_role, scoring.cyclic_rule.rule_id)
++    classification_wire = children[classification[0]]["rules"][classification[1]]
++    if (set(classification_wire) != {"secondary_industries"}
++            or set(classification_wire["secondary_industries"]) != set(scoring.cyclic_secondary_industries)):
++        raise PolicyContractError("cyclic classification differs from signed scoring", path="classification")
++
++    def reference(role, rule_id, path, template=None, allow_classification=False):
++        if allow_classification and (role, rule_id) == classification:
++            return
++        rule = active.get((role, rule_id))
++        if rule is None:
++            raise PolicyContractError("scoring reference does not name an active rule", path=path)
++        if template is not None and rule.template_id != template:
++            raise PolicyContractError("metric policy reference belongs to another template", path=path)
++        return rule
++
++    for name in ("redlines", "status_rules"):
++        for item in getattr(scoring, name):
++            reference(item.policy_role, item.rule_id, name)
++    market = scoring.market_liquidity_rule
++    if reference(market.policy_role, market.rule_id, "market_liquidity_rule").kind != "market_liquidity":
++        raise PolicyContractError("market_liquidity_rule must name an active market rule", path="market_liquidity_rule")
++    for template, definition in scoring.templates.items():
++        for dimension, metrics in definition.metrics.items():
++            for metric in metrics:
++                for item in metric.policy_refs:
++                    reference(item["policy_role"], item["rule_id"], f"{template}.{dimension}.{metric.metric_id}.policy_refs",
++                        template=template, allow_classification=True)
++
++
++def _install_binder():
++    # Call the authentic class implementations, even if callers shadow methods.
++    bundle_type, scoring_type, feature_type = VerifiedRegistryBundle, FormalScoringRegistry, SignedFormalFeatureRegistry
++    require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
++    require_scoring = scoring_type.require_official
++    require_feature = feature_type.require_release_eligible
++    slots_for_template = feature_type.slots_for_template
++
++    def bind(bundle: VerifiedRegistryBundle, *, scoring_registry: FormalScoringRegistry,
++            feature_registry: SignedFormalFeatureRegistry) -> bytes:
++        """Reparse verified children and return auditable definitions, never runtime evidence."""
++        if (type(bundle) is not bundle_type or type(scoring_registry) is not scoring_type
++                or type(feature_registry) is not feature_type):
++            raise PolicyContractError("exact verified bundle, scoring and feature types required", path="graph")
++        require_bundle(bundle)
++        require_scoring(scoring_registry, bundle)
++        require_feature(feature_registry)
++        blobs = {role: blob_for(bundle, role) for role in _ROLES}
++        hashes = {role: hashlib.sha256(blob.canonical_json).hexdigest() for role, blob in blobs.items()}
++        if (hashlib.sha256(bundle.manifest.canonical_json).hexdigest() != bundle.manifest.manifest_hash
++                or any(hashes[role] != blobs[role].registry_hash
++                    or hashes[role] != getattr(bundle.manifest, role + "_registry_hash") for role in _ROLES)):
++            raise PolicyContractError("actual root or child hash mismatch", path="graph")
++        if (feature_registry.canonical_json != blobs["feature"].canonical_json
++                or feature_registry.registry_hash != hashes["feature"]
++                or feature_registry.source_registry_hash != hashes["source"]
++                or feature_registry.mapping_registry_hash != hashes["mapping"]):
++            raise PolicyContractError("feature content differs from current root", path="graph.feature")
++        parsed = parse_policy_contract({role: blobs[role].canonical_json for role in _POLICY_ROLES})
++        children = {role: json.loads(blobs[role].canonical_json) for role in _POLICY_ROLES}
++        for role, child in children.items():
++            declared = scoring_registry.policy_contracts[role]
++            if (child["purpose"] != "official" or declared["registry_hash"] != hashes[role]
++                    or child["registry_version"] != declared["registry_version"]
++                    or tuple(child["source_evidence_categories"]) != declared["source_evidence_categories"]):
++                raise PolicyContractError("policy purpose, version or categories mismatch", path=role)
++        rules = [dict(children[rule.role]["rules"][rule.rule_id], role=rule.role, rule_id=rule.rule_id)
++            for rule in parsed.rules]
++        slots = MappingProxyType({template: MappingProxyType({slot.slot_id: slot
++            for slot in slots_for_template(feature_registry, template)}) for template in _TEMPLATES})
++        wrapper = json.loads(blobs["scoring"].canonical_json)
++        binding_manifest = _bind_selectors(parsed.rules, slots, _context_index(wrapper),
++            _source_index(json.loads(blobs["source"].canonical_json)))
++        _require_coverage(parsed.rules, scoring_registry, children)
++        return _canonical(dict(schema_version="formal-policy-bound-definition-v1",
++            contract_version="formal-policy-execution-contract-v1",
++            registry_manifest_hash=bundle.manifest.manifest_hash, role_hashes=hashes,
++            role_versions=dict(parsed.role_versions),
++            source_evidence_categories={role: list(values) for role, values in parsed.evidence_categories.items()},
++            rules=rules, valuation_dependencies={rule.template_id:
++                children[rule.role]["rules"][rule.rule_id]["parameters"]["valuation_dependencies"]
++                for rule in parsed.rules if rule.kind == "cyclic_protection"},
++            cyclic_secondary_industries=sorted(scoring_registry.cyclic_secondary_industries),
++            binding_manifest=binding_manifest))
++
++    return bind
++
++
++_bind_policy_contract = _install_binder()
++del _install_binder
+diff --git a/tests/formal_policy_fixtures.py b/tests/formal_policy_fixtures.py
+index c6898ee..ecd4ec8 100644
+--- a/tests/formal_policy_fixtures.py
++++ b/tests/formal_policy_fixtures.py
+@@ -1,11 +1,13 @@
+-"""Synthetic policy rule declarations for pure grammar tests."""
++"""Synthetic policy declarations and byte-sensitive signed graphs, never production mappings."""
++
++import hashlib
+ 
+ from tests.test_formal_scoring_registry import canonical
+ 
+ 
+ FY_ENDS = [f"{year}-12-31" for year in range(2021, 2026)]
+ 
+ 
+ def feature_selector(template_id, name, period_key, unit):
+     return dict(
+         kind="feature",
+@@ -200,10 +202,146 @@ def policy_wrapper(role, rules, active_ids=None):
+ 
+ 
+ def policy_children():
+     wrappers = {
+         "cyclic": policy_wrapper("cyclic", {"bank_cyclic": cyclic_rule()}),
+         "redline": policy_wrapper("redline", {"bank_equity": numeric_rule()}),
+         "status": policy_wrapper("status", {"bank_market": market_rule()}),
+         "event": policy_wrapper("event", {"bank_st": boolean_rule()}),
+     }
+     return {role: canonical(wrapper) for role, wrapper in wrappers.items()}
++
++
++REGULATORY_SEMANTICS = (
++    "audit_adverse", "audit_disclaimer", "audit_qualified", "crowding",
++    "governance_orange", "governance_red", "major_event",
++    "major_reduction_window", "major_unlock_window",
++)
++INDEPENDENT_SEMANTICS = (
++    "governance_orange", "crowding", "major_unlock_window",
++    "major_reduction_window", "major_event",
++)
++
++
++def rehash_documents(documents):
++    feature = documents["feature"]
++    for role in ("source", "mapping"):
++        feature[f"{role}_registry_hash"] = hashlib.sha256(canonical(documents[role])).hexdigest()
++    scoring = documents["scoring"]["scoring"]
++    for role in ("cyclic", "redline", "status", "event"):
++        child = documents[role]
++        scoring["policy_contracts"][role] = dict(
++            registry_hash=hashlib.sha256(canonical(child)).hexdigest(),
++            registry_version=child["registry_version"],
++            source_evidence_categories=child["source_evidence_categories"],
++        )
++
++
++def add_policy_documents(documents):
++    """Add static fixture contracts before signing, preserving original declarations."""
++    from tests.test_formal_context_repository import descriptor
++    from tests.test_formal_sources import config
++    from tests.test_formal_scoring_registry import TEMPLATES
++
++    configs = documents["source"]["configs"]
++    identities = {(c["source"], c["dataset"], c["exchange_scope"]) for c in configs}
++    for exchange in ("SH", "SZ", "BJ"):
++        added = config(dataset="fixture-state", exchange_scope=exchange)
++        if (added["source"], added["dataset"], exchange) not in identities:
++            configs.append(added)
++    wrapper = documents["scoring"]
++    descriptors = {"security_state": next(d for d in wrapper["descriptors"]
++        if d["context_kind"] == "security_state")}
++    for kind in ("regulatory_state", "event_calendar", "market_close", "trading_calendar"):
++        entry = descriptor(kind, scope_key=f"fixture-policy-{kind}")
++        if kind == "regulatory_state":
++            entry["allowed_regulatory_flags"] = list(REGULATORY_SEMANTICS)
++        if kind == "event_calendar":
++            entry["allowed_event_codes"] = ["fixture_quantified_event"]
++        wrapper["descriptors"].append(entry)
++        descriptors[kind] = entry
++
++    def bind_context(selector):
++        entry = descriptors[selector["context_kind"]]
++        selector.update(descriptor_id=hashlib.sha256(canonical(entry)).hexdigest(),
++            scope_key=entry["scope_key"])
++
++    active = {role: [] for role in ("cyclic", "redline", "status", "event")}
++    scoring = wrapper["scoring"]
++    for template in TEMPLATES:
++        for name, unit, dimension in (("equity", "CNY", "FS"), ("roe", "ratio", "M"),
++                ("margin", "ratio", "M"), ("profit", "CNY", "V")):
++            for year in ([None] if name == "equity" else [None, *range(2021, 2026)]):
++                suffix = name if year is None else f"{name}_{year}"
++                documents["feature"]["slots"].append(dict(
++                    slot_id=f"{template}.policy.{suffix}", template_id=template,
++                    dimension=dimension, required=False, unit=unit,
++                    formula_version="fixture-policy-v1",
++                    formula=dict(op="fact", fact_key=f"fixture.policy.{name}",
++                        period_key="FY0" if year is None else f"FY{year}")))
++        rules = [numeric_rule(template), cyclic_rule(template), market_rule(template), enum_rule(template)]
++        for semantic, field in (("st", "is_st"), ("star_st", "is_star_st"),
++                ("forced_delist_risk", "forced_delist_risk")):
++            rule = boolean_rule(template)
++            rule["semantic_id"] = semantic
++            rule["inputs"]["value"]["field"] = field
++            rules.append(rule)
++        for semantic in REGULATORY_SEMANTICS:
++            rule = boolean_rule(template)
++            rule["semantic_id"] = semantic
++            rule["inputs"]["value"] = context_selector("regulatory_state", "active", "bool", entry_id=semantic)
++            if semantic in INDEPENDENT_SEMANTICS:
++                rule["outcomes"]["on_match"] = sorted([
++                    dict(kind="independent_status", status_code=semantic),
++                    dict(kind="pool_prohibition", pool="strong")], key=canonical)
++            rules.append(rule)
++        for rule in rules:
++            semantic = rule["semantic_id"]
++            role = ("cyclic" if semantic == "cyclic_top" else "redline" if semantic == "nonpositive_equity"
++                else "event" if semantic == "major_event" else "status")
++            if role == "cyclic":
++                metric_ids = sorted("V." + m["metric_id"] for m in scoring["templates"][template]["metrics"]["V"])
++                rule["parameters"]["valuation_dependencies"] = [dict(
++                    metric_id=metric_id, policy_dependency="affected" if index == 0 else "unaffected",
++                    profit_semantic_id="cyclic_top" if index == 0 else None,
++                    adapter_id="fixture_profit_adapter" if index == 0 else None,
++                    adapter_version="fixture-v1" if index == 0 else None,
++                    definition_basis="fixture-only declared definition; no economic equivalence asserted")
++                    for index, metric_id in enumerate(metric_ids)]
++            for selector in rule["inputs"].values():
++                if selector["kind"] == "context":
++                    bind_context(selector)
++            rule_id = f"{template}_{semantic}"
++            documents[role]["rules"][rule_id] = rule
++            active[role].append(rule_id)
++        for metrics in scoring["templates"][template]["metrics"].values():
++            for metric in metrics:
++                metric["policy_refs"] = [dict(policy_role="redline", rule_id=f"{template}_nonpositive_equity")]
++    documents["feature"]["slots"].sort(key=lambda slot: slot["slot_id"])
++    for role, ids in active.items():
++        documents[role]["rules"]["execution_contract"] = dict(
++            schema_version="formal-policy-execution-contract-v1", role=role, rule_ids=sorted(ids))
++    scoring["redlines"] = [dict(policy_role="redline", rule_id=key) for key in sorted(active["redline"])]
++    scoring["status_rules"] = [dict(policy_role=role, rule_id=key)
++        for role in ("status", "event") for key in sorted(active[role])]
++    scoring["market_liquidity_rule"] = dict(policy_role="status", rule_id="general_nonfinancial_no_effective_trade_20d")
++
++
++def policy_graph(*, version="v1", mutate=None):
++    from ashare_pipeline.formal_scoring_registry import RegistryApproval, load_formal_registry
++    from tests.test_formal_scoring_registry import signed_graph
++    from tests.test_formal_scoring_consensus_registry import v2_graph
++
++    if version not in ("v1", "v2"):
++        raise ValueError("unknown fixture wrapper version")
++
++    def prepare(documents):
++        add_policy_documents(documents)
++        if mutate is not None:
++            mutate(documents)
++        rehash_documents(documents)
++
++    values = (signed_graph(context=True, mutate=prepare) if version == "v1" else v2_graph(mutate=prepare))
++    bundle, vocabulary, repository, verifier = values[:4]
++    approval = RegistryApproval("official", bundle.manifest.scoring_registry_hash, bundle.manifest.approval_id)
++    scoring = load_formal_registry(bundle, approval, feature_registry=vocabulary)
++    return bundle, vocabulary, scoring, repository, verifier
+diff --git a/tests/test_formal_policy_registry.py b/tests/test_formal_policy_registry.py
+new file mode 100644
+index 0000000..26586dd
+--- /dev/null
++++ b/tests/test_formal_policy_registry.py
+@@ -0,0 +1,391 @@
++"""Static policy binding tests against real, in-memory signed registry graphs."""
++
++import copy
++import hashlib
++import json
++import unittest
++from unittest.mock import patch
++
++from ashare_pipeline.formal_policy_contract import PolicyContractError
++from ashare_pipeline.formal_policy_registry import _bind_policy_contract
++from tests.formal_policy_fixtures import policy_graph
++from tests.test_formal_scoring_registry import canonical
++
++
++def bind_graph(**kwargs):
++    bundle, feature, scoring, _, _ = policy_graph(**kwargs)
++    return json.loads(_bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature))
++
++
++def rule_for(documents, semantic="cyclic_top", role="cyclic", template="bank"):
++    return documents[role]["rules"][f"{template}_{semantic}"]
++
++
++def change_descriptor(documents, kind, **changes):
++    entry = next(d for d in documents["scoring"]["descriptors"] if d["context_kind"] == kind)
++    old_hash = hashlib.sha256(canonical(entry)).hexdigest()
++    entry.update(changes)
++    new_hash = hashlib.sha256(canonical(entry)).hexdigest()
++    for role in ("cyclic", "redline", "status", "event"):
++        for rule in documents[role]["rules"].values():
++            for selector in rule.get("inputs", {}).values():
++                if selector.get("descriptor_id") == old_hash:
++                    selector["descriptor_id"] = new_hash
++
++
++class PolicySelectorBindingTests(unittest.TestCase):
++    def test_unknown_cross_template_unit_version_and_period_feature_fail(self):
++        for change in ({"feature_key": "unknown"}, {"feature_key": "broker.policy.roe"},
++                {"template_id": "broker"}, {"expected_unit": "CNY"},
++                {"formula_version": "other"}, {"period_keys": ["FY1"]}):
++            with self.subTest(change=change), self.assertRaises(PolicyContractError):
++                bind_graph(mutate=lambda d: rule_for(d)["inputs"]["current_roe"].update(change))
++
++    def test_annual_repeated_slot_fails_even_with_distinct_year_labels(self):
++        def mutate(d):
++            observations = rule_for(d)["inputs"]["annual_roe"]["observations"]
++            observations[1]["selector"] = copy.deepcopy(observations[0]["selector"])
++        with self.assertRaisesRegex(PolicyContractError, "annual|repeated"):
++            bind_graph(mutate=mutate)
++
++    def test_distinct_slots_with_identical_formula_cannot_fake_five_years(self):
++        def mutate(d):
++            slots = {s["slot_id"]: s for s in d["feature"]["slots"]}
++            slots["bank.policy.roe_2022"]["formula"] = copy.deepcopy(slots["bank.policy.roe_2021"]["formula"])
++            rule_for(d)["inputs"]["annual_roe"]["observations"][1]["selector"]["period_keys"] = ["FY2021"]
++        with self.assertRaisesRegex(PolicyContractError, "annual|repeated"):
++            bind_graph(mutate=mutate)
++
++    def test_annual_cross_year_balance_formula_binds_complete_period_set(self):
++        def mutate(d):
++            slot = next(s for s in d["feature"]["slots"] if s["slot_id"] == "bank.policy.roe_2021")
++            slot["formula"] = dict(op="divide", left=slot["formula"],
++                right=dict(op="fact", fact_key="fixture.opening_equity", period_key="FY2020"))
++            rule_for(d)["inputs"]["annual_roe"]["observations"][0]["selector"]["period_keys"] = ["FY2020", "FY2021"]
++        wire = bind_graph(mutate=mutate)
++        match = next(b for b in wire["binding_manifest"] if b["rule_id"] == "bank_cyclic_top"
++            and b["input_path"] == "inputs.annual_roe.observations[0].selector")
++        self.assertEqual(match["slot"]["formula"]["right"]["period_key"], "FY2020")
++        self.assertIs(match["slot"]["required"], False)
++
++    def test_series_units_must_match_current_even_when_each_slot_matches(self):
++        def mutate(d):
++            for slot in d["feature"]["slots"]:
++                if slot["slot_id"].startswith("bank.policy.roe_"):
++                    slot["unit"] = "CNY"
++            for item in rule_for(d)["inputs"]["annual_roe"]["observations"]:
++                item["selector"]["expected_unit"] = "CNY"
++        with self.assertRaisesRegex(PolicyContractError, "unit"):
++            bind_graph(mutate=mutate)
++
++    def test_wrapper_hash_cannot_impersonate_descriptor_entry(self):
++        def mutate(d):
++            rule_for(d, "st", "status")["inputs"]["value"]["descriptor_id"] = hashlib.sha256(canonical(d["scoring"])).hexdigest()
++        with self.assertRaisesRegex(PolicyContractError, "descriptor"):
++            bind_graph(mutate=mutate)
++
++    def test_context_scope_kind_and_field_type_must_match(self):
++        for change in ({"scope_key": "other"}, {"context_kind": "regulatory_state"}, {"expected_type": "enum"}):
++            with self.subTest(change=change), self.assertRaises(PolicyContractError):
++                bind_graph(mutate=lambda d: rule_for(d, "st", "status")["inputs"]["value"].update(change))
++
++    def test_security_market_and_calendar_require_input_security_exchange(self):
++        for kind in ("security_state", "regulatory_state", "market_close", "trading_calendar"):
++            for changes in (dict(security_scope="none", request_security="none", exchange_rule="none"),
++                    dict(exchange_rule="fixed_exchange", fixed_exchange="SZ")):
++                with self.subTest(kind=kind, changes=changes), self.assertRaisesRegex(PolicyContractError, "security|exchange"):
++                    bind_graph(mutate=lambda d: change_descriptor(d, kind, **changes))
++
++    def test_context_flag_must_be_authorized(self):
++        with self.assertRaisesRegex(PolicyContractError, "flag|authorized"):
++            bind_graph(mutate=lambda d: rule_for(d, "audit_adverse", "status")["inputs"]["value"].update(entry_id="unapproved"))
++
++    def test_missing_exchange_and_null_plus_exact_source_are_rejected(self):
++        def missing(d):
++            d["source"]["configs"][:] = [c for c in d["source"]["configs"] if c["exchange_scope"] != "BJ"]
++        def ambiguous(d):
++            added = copy.deepcopy(d["source"]["configs"][0])
++            added["exchange_scope"] = None
++            d["source"]["configs"].append(added)
++        for mutate in (missing, ambiguous):
++            with self.subTest(mutate=mutate), self.assertRaisesRegex(PolicyContractError, "source"):
++                bind_graph(mutate=mutate)
++
++    def test_descriptor_source_identity_fields_and_calendar_must_match(self):
++        for field, value in (("source", "other"), ("dataset", "other"), ("parser_id", "other"),
++                ("parser_version", "other"), ("mapping_version", "other"),
++                ("calendar_selector", dict(context_kind="trading_calendar", scope_key="signed-calendar", exchange="SZ", as_of_rule="visible_at_freeze"))):
++            with self.subTest(field=field), self.assertRaises(PolicyContractError):
++                bind_graph(mutate=lambda d: change_descriptor(d, "security_state", **{field: value}))
++
++    def test_matching_calendar_text_cannot_bind_sz_calendar_for_sh_and_bj(self):
++        def mutate(d):
++            selector = dict(context_kind="trading_calendar", scope_key="signed-calendar", exchange="SZ", as_of_rule="visible_at_freeze")
++            for entry in d["scoring"]["descriptors"]:
++                change_descriptor(d, entry["context_kind"], calendar_selector=copy.deepcopy(selector))
++            for config in d["source"]["configs"]:
++                config["calendar_selector"] = copy.deepcopy(selector)
++        # The verified bundle loader validates SourceAdapterConfig before A2 runs.
++        with self.assertRaisesRegex(ValueError, "calendar selector exchange must match exchange_scope"):
++            bind_graph(mutate=mutate)
++
++    def test_source_identity_mismatch_on_only_bj_is_rejected(self):
++        def mutate(d):
++            next(c for c in d["source"]["configs"] if c["exchange_scope"] == "BJ")["parser_version"] = "other"
++        with self.assertRaisesRegex(PolicyContractError, "parser_version"):
++            bind_graph(mutate=mutate)
++
++    def test_input_security_bootstrap_calendar_is_rejected(self):
++        with self.assertRaisesRegex(PolicyContractError, "bootstrap"):
++            bind_graph(mutate=lambda d: change_descriptor(d, "trading_calendar", bootstrap_calendar=True))
++
++    def test_duplicate_context_descriptor_is_rejected_in_v1(self):
++        with self.assertRaisesRegex(PolicyContractError, "duplicate"):
++            bind_graph(mutate=lambda d: d["scoring"]["descriptors"].append(copy.deepcopy(d["scoring"]["descriptors"][0])))
++
++    def test_manifest_preserves_full_signed_context_entry_and_identity(self):
++        bundle, feature, scoring, _, _ = policy_graph()
++        wire = json.loads(_bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature))
++        entry = json.loads(bundle.blob("scoring").canonical_json)["descriptors"][0]
++        match = next(b for b in wire["binding_manifest"] if b["rule_id"] == "bank_st")
++        self.assertEqual(match["descriptor"], entry)
++        self.assertEqual(match["descriptor_id"], hashlib.sha256(canonical(entry)).hexdigest())
++
++
++class PolicyBindingTests(unittest.TestCase):
++    def test_complete_signed_graph_binds_without_runtime_evidence(self):
++        # Loading the existing official registries succeeds before the new API is exercised.
++        bundle, feature, scoring, _, _ = policy_graph()
++        from ashare_pipeline.formal_policy_registry import _bind_policy_contract
++        raw = _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature)
++        wire = json.loads(raw)
++        self.assertEqual(wire["registry_manifest_hash"], bundle.manifest.manifest_hash)
++        self.assertEqual(set(wire["role_hashes"]), set(scoring.role_hashes))
++        self.assertEqual(wire["contract_version"], "formal-policy-execution-contract-v1")
++        self.assertEqual(len(wire["rules"]), 80)
++        self.assertEqual(len(wire["binding_manifest"]), 170)
++        self.assertEqual(set(wire), {"schema_version", "contract_version", "registry_manifest_hash",
++            "role_hashes", "role_versions", "source_evidence_categories", "rules",
++            "valuation_dependencies", "cyclic_secondary_industries", "binding_manifest"})
++        self.assertNotIn("security_id", wire)
++        self.assertNotIn("pool_eligible", wire)
++
++
++class PolicyCoverageTests(unittest.TestCase):
++    def test_every_mandatory_semantic_is_required_after_valid_signing(self):
++        semantics = ("st", "star_st", "delisting_arrangement", "forced_delist_risk",
++            "governance_red", "audit_qualified", "audit_adverse", "audit_disclaimer",
++            "nonpositive_equity", "no_effective_trade_20d", "governance_orange", "crowding",
++            "major_unlock_window", "major_reduction_window", "major_event", "cyclic_top")
++        for semantic in semantics:
++            def mutate(d):
++                role = "cyclic" if semantic == "cyclic_top" else "redline" if semantic == "nonpositive_equity" else "event" if semantic == "major_event" else "status"
++                key = f"bank_{semantic}"
++                d[role]["rules"]["execution_contract"]["rule_ids"].remove(key)
++                for name in ("redlines", "status_rules"):
++                    d["scoring"]["scoring"][name][:] = [r for r in d["scoring"]["scoring"][name] if r["rule_id"] != key]
++            with self.subTest(semantic=semantic), self.assertRaisesRegex(PolicyContractError, semantic):
++                bind_graph(mutate=mutate)
++
++    def test_hard_veto_cannot_be_reduced_to_one_pool(self):
++        with self.assertRaisesRegex(PolicyContractError, "both|st"):
++            bind_graph(mutate=lambda d: rule_for(d, "st", "status")["outcomes"]["on_match"][0].update(pool="strong"))
++
++    def test_nonpositive_equity_requires_lte_zero(self):
++        for change in ({"threshold": "1"}, {"comparator": "lt"}):
++            with self.subTest(change=change), self.assertRaisesRegex(PolicyContractError, "nonpositive_equity"):
++                bind_graph(mutate=lambda d: rule_for(d, "nonpositive_equity", "redline")["parameters"].update(change))
++
++    def test_st_and_regulatory_rules_cannot_match_false(self):
++        for semantic in ("st", "audit_adverse", "governance_orange"):
++            with self.subTest(semantic=semantic), self.assertRaisesRegex(PolicyContractError, semantic):
++                bind_graph(mutate=lambda d: rule_for(d, semantic, "status")["parameters"].update(expected=False))
++
++    def test_mandatory_security_semantics_cannot_use_another_field(self):
++        with self.assertRaisesRegex(PolicyContractError, "st"):
++            bind_graph(mutate=lambda d: rule_for(d, "st", "status")["inputs"]["value"].update(field="suspended"))
++
++    def test_delisting_enum_cannot_veto_listed_securities(self):
++        with self.assertRaisesRegex(PolicyContractError, "delisting_arrangement"):
++            bind_graph(mutate=lambda d: rule_for(d, "delisting_arrangement", "status")["parameters"].update(values=["delisting_arrangement", "listed"]))
++
++    def test_regulatory_semantics_cannot_share_one_generic_flag(self):
++        with self.assertRaisesRegex(PolicyContractError, "flag|regulatory"):
++            bind_graph(mutate=lambda d: rule_for(d, "audit_adverse", "status")["inputs"]["value"].update(entry_id="governance_red"))
++
++    def test_independent_status_needs_status_and_explicit_pool(self):
++        for kept_kind in ("independent_status", "pool_prohibition"):
++            def mutate(d):
++                outcomes = rule_for(d, "crowding", "status")["outcomes"]
++                outcomes["on_match"] = [e for e in outcomes["on_match"] if e["kind"] == kept_kind]
++            with self.subTest(kept_kind=kept_kind), self.assertRaisesRegex(PolicyContractError, "crowding"):
++                bind_graph(mutate=mutate)
++
++    def test_duplicate_semantic_across_roles_is_rejected(self):
++        def mutate(d):
++            rule = copy.deepcopy(rule_for(d, "st", "status"))
++            d["event"]["rules"]["bank_duplicate_st"] = rule
++            d["event"]["rules"]["execution_contract"]["rule_ids"].append("bank_duplicate_st")
++            d["event"]["rules"]["execution_contract"]["rule_ids"].sort()
++        with self.assertRaisesRegex(PolicyContractError, "semantic"):
++            bind_graph(mutate=mutate)
++
++    def test_every_scoring_reference_requires_an_active_rule(self):
++        for target in ("redlines", "status_rules", "market_liquidity_rule", "metric"):
++            def mutate(d):
++                role = "redline" if target in ("redlines", "metric") else "status"
++                semantic = "nonpositive_equity" if role == "redline" else "no_effective_trade_20d"
++                d[role]["rules"]["inactive_extra"] = copy.deepcopy(rule_for(d, semantic, role))
++                ref = dict(policy_role=role, rule_id="inactive_extra")
++                scoring = d["scoring"]["scoring"]
++                if target == "metric":
++                    scoring["templates"]["bank"]["metrics"]["V"][0]["policy_refs"] = [ref]
++                elif target == "market_liquidity_rule":
++                    scoring[target] = ref
++                else:
++                    scoring[target].append(ref)
++            with self.subTest(target=target), self.assertRaisesRegex(PolicyContractError, "active"):
++                bind_graph(mutate=mutate)
++
++    def test_metric_policy_reference_must_belong_to_its_template(self):
++        def mutate(d):
++            d["scoring"]["scoring"]["templates"]["bank"]["metrics"]["V"][0]["policy_refs"][0]["rule_id"] = "broker_nonpositive_equity"
++        with self.assertRaisesRegex(PolicyContractError, "template"):
++            bind_graph(mutate=mutate)
++
++    def test_valuation_dependencies_cover_exact_current_template_v_metrics(self):
++        for mutation in (lambda deps: deps.pop(),
++                lambda deps: deps[0].update(metric_id="V.unknown"),
++                lambda deps: deps[0].update(metric_id="V.broker.normalized_earnings_yield")):
++            def mutate(d):
++                deps = rule_for(d)["parameters"]["valuation_dependencies"]
++                mutation(deps)
++                deps.sort(key=lambda item: item["metric_id"])
++            with self.subTest(mutation=mutation), self.assertRaisesRegex(PolicyContractError, "valuation"):
++                bind_graph(mutate=mutate)
++
++    def test_invalid_v_dependency_declarations_fail_with_signed_graph(self):
++        for mutation in (lambda deps: deps.append(copy.deepcopy(deps[-1])),
++                lambda deps: deps[0].update(metric_id="G.operating_revenue_yoy"),
++                lambda deps: deps[0].update(adapter_version=None),
++                lambda deps: deps[0].update(profit_semantic_id="other_rule"),
++                lambda deps: deps[1].update(adapter_id="not_null")):
++            with self.subTest(mutation=mutation), self.assertRaises(PolicyContractError):
++                bind_graph(mutate=lambda d: mutation(rule_for(d)["parameters"]["valuation_dependencies"]))
++
++
++class PolicyCompatibilityTests(unittest.TestCase):
++    def test_v1_v2_preserve_original_context_entries_and_consensus_links(self):
++        from tests.test_formal_context_repository import descriptor
++        from tests.test_formal_scoring_consensus_registry import consensus_descriptor
++        for version in ("v1", "v2"):
++            with self.subTest(version=version):
++                bundle, feature, scoring, _, _ = policy_graph(version=version)
++                wrapper = json.loads(bundle.blob("scoring").canonical_json)
++                wire = json.loads(_bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature))
++                self.assertIn(descriptor(), wrapper["descriptors"])
++                self.assertEqual(wire["registry_manifest_hash"], bundle.manifest.manifest_hash)
++                self.assertEqual(wire["cyclic_secondary_industries"], ["fixture-cyclic"])
++                if version == "v2":
++                    original = consensus_descriptor()
++                    self.assertIn(original, wrapper["descriptors"])
++                    self.assertEqual(scoring.consensus_no_coverage_links["bank"]["descriptor_id"], hashlib.sha256(canonical(original)).hexdigest())
++                    self.assertEqual(wrapper["input_alternatives"][0]["metric_id"], "T.expectation_change")
++                else:
++                    self.assertEqual(scoring.consensus_no_coverage_links, {})
++
++    def test_old_signed_graph_remains_loadable_but_has_no_execution_contract(self):
++        from ashare_pipeline.formal_scoring_registry import RegistryApproval, load_formal_registry
++        from tests.test_formal_scoring_registry import signed_graph
++        bundle, feature, _, _ = signed_graph(context=True)
++        scoring = load_formal_registry(bundle, RegistryApproval("official", bundle.manifest.scoring_registry_hash,
++            bundle.manifest.approval_id), feature_registry=feature)
++        scoring.require_official(bundle)
++        with self.assertRaisesRegex(PolicyContractError, "execution_contract"):
++            _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature)
++
++    def test_changed_signed_definition_changes_root_bytes_and_rejects_old_scoring(self):
++        bundle, feature, scoring, _, _ = policy_graph()
++        def mutate(d):
++            rule_for(d)["parameters"]["valuation_dependencies"][0]["definition_basis"] = "revised fixture-only basis"
++        changed, changed_feature, changed_scoring, _, _ = policy_graph(mutate=mutate)
++        first = _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature)
++        second = _bind_policy_contract(changed, scoring_registry=changed_scoring, feature_registry=changed_feature)
++        self.assertNotEqual(bundle.manifest.manifest_hash, changed.manifest.manifest_hash)
++        self.assertNotEqual(first, second)
++        self.assertEqual(second, _bind_policy_contract(changed, scoring_registry=changed_scoring, feature_registry=changed_feature))
++        with self.assertRaisesRegex(ValueError, "manifest"):
++            _bind_policy_contract(changed, scoring_registry=scoring, feature_registry=changed_feature)
++        # The old feature's genuine bytes still belong to the second graph.
++        self.assertEqual(feature.canonical_json, changed_feature.canonical_json)
++        self.assertEqual(second, _bind_policy_contract(changed, scoring_registry=changed_scoring, feature_registry=feature))
++
++    def test_old_feature_content_cannot_be_mixed_into_changed_feature_graph(self):
++        _, old_feature, _, _, _ = policy_graph()
++        def mutate(d):
++            next(s for s in d["feature"]["slots"] if s["slot_id"] == "bank.policy.equity")["formula"]["fact_key"] = "fixture.revised_equity"
++        bundle, feature, scoring, _, _ = policy_graph(mutate=mutate)
++        _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature)
++        with self.assertRaisesRegex(PolicyContractError, "feature"):
++            _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=old_feature)
++
++    def test_exact_objects_and_copies_cannot_replace_verified_inputs(self):
++        bundle, feature, scoring, _, _ = policy_graph()
++        for which, original in (("bundle", bundle), ("feature", feature), ("scoring", scoring)):
++            for value in (object(), copy.copy(original)):
++                args = dict(bundle=bundle, scoring_registry=scoring, feature_registry=feature)
++                args[{"bundle": "bundle", "feature": "feature_registry", "scoring": "scoring_registry"}[which]] = value
++                with self.subTest(which=which, value=type(value)), self.assertRaises(ValueError):
++                    _bind_policy_contract(**args)
++
++    def test_original_verifiers_cannot_be_shadowed_to_accept_copies(self):
++        bundle, feature, scoring, _, _ = policy_graph()
++        for original, method, argument in ((bundle, "require_official", "bundle"),
++                (feature, "require_release_eligible", "feature_registry"),
++                (scoring, "require_official", "scoring_registry")):
++            copied = copy.copy(original)
++            with self.subTest(argument=argument), patch.object(type(original), method, lambda *args: None):
++                args = dict(bundle=bundle, scoring_registry=scoring, feature_registry=feature)
++                args[argument] = copied
++                with self.assertRaises(ValueError):
++                    _bind_policy_contract(**args)
++
++    def test_mutated_verified_child_bytes_are_rejected(self):
++        bundle, feature, scoring, _, _ = policy_graph()
++        object.__setattr__(bundle.blob("event"), "canonical_json", b"{}")
++        with self.assertRaises(ValueError):
++            _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature)
++
++    def test_legacy_policy_metadata_mismatch_errors_are_preserved(self):
++        from ashare_pipeline.formal_scoring_registry import RegistryApproval, load_formal_registry, RegistryValidationError
++        from tests.formal_policy_fixtures import add_policy_documents, rehash_documents
++        from tests.test_formal_scoring_registry import signed_graph
++        for field, value in (("registry_version", "wrong"), ("source_evidence_categories", ["wrong"]), ("registry_hash", "0" * 64)):
++            def mutate(d):
++                add_policy_documents(d)
++                rehash_documents(d)
++                d["scoring"]["scoring"]["policy_contracts"]["event"][field] = value
++            bundle, feature, _, _ = signed_graph(context=True, mutate=mutate)
++            with self.subTest(field=field), self.assertRaises(RegistryValidationError):
++                load_formal_registry(bundle, RegistryApproval("official", bundle.manifest.scoring_registry_hash,
++                    bundle.manifest.approval_id), feature_registry=feature)
++
++    def test_classification_metric_reference_remains_the_only_inactive_exception(self):
++        def mutate(d):
++            scoring = d["scoring"]["scoring"]
++            scoring["templates"]["bank"]["metrics"]["V"][0]["policy_refs"].append(copy.deepcopy(scoring["cyclic_rule"]))
++        self.assertEqual(len(bind_graph(mutate=mutate)["rules"]), 80)
++
++    def test_additional_signed_regulatory_semantic_cannot_alias_required_flag(self):
++        def mutate(d):
++            rule = copy.deepcopy(rule_for(d, "governance_red", "status"))
++            rule["semantic_id"] = "additional_governance_status"
++            d["status"]["rules"]["bank_additional_governance"] = rule
++            d["status"]["rules"]["execution_contract"]["rule_ids"].append("bank_additional_governance")
++            d["status"]["rules"]["execution_contract"]["rule_ids"].sort()
++        with self.assertRaisesRegex(PolicyContractError, "regulatory|flag"):
++            bind_graph(mutate=mutate)
++
++
++if __name__ == "__main__":
++    unittest.main()
+

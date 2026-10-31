@@ -1,0 +1,852 @@
+# Review package: 1af0e2bae2cf9819e963532cfdbcb1e34b693cfe..bf0f694
+
+## Commits
+bf0f694 Bound policy range reads to owner operations
+
+## Files changed
+ ashare_pipeline/formal_policy_market.py          |  88 +++++++---
+ ashare_pipeline/formal_range_contract.py         | 194 +++++++++++++++++++-
+ ashare_pipeline/formal_range_store.py            |  17 +-
+ tests/test_formal_policy_market_binding_lease.py | 215 +++++++++++++++++++++++
+ 4 files changed, 476 insertions(+), 38 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_policy_market.py b/ashare_pipeline/formal_policy_market.py
+index d45901b..357218e 100644
+--- a/ashare_pipeline/formal_policy_market.py
++++ b/ashare_pipeline/formal_policy_market.py
+@@ -7,29 +7,32 @@ from contextvars import ContextVar
+ from dataclasses import dataclass
+ from datetime import date, datetime, timedelta, timezone
+ from decimal import Decimal, InvalidOperation
+ import hashlib
+ import json
+ import re
+ from types import MappingProxyType
+ import weakref
+ 
+ from .formal_policy_values import canonical_bytes
+-from .formal_range_contract import _range_binding_planning_authority
++from .formal_range_contract import (
++    _range_binding_planning_authority, _range_binding_read_lease_authority,
++)
+ from .formal_range_format import RangeConfig, _range_config_to_dict
+ from .formal_time import FORMAL_FREEZE_AT_CN
+ 
+ 
+ _FREEZE_UTC = datetime.fromisoformat(FORMAL_FREEZE_AT_CN).astimezone(timezone.utc).isoformat()
+ _FREEZE_DATE = datetime.fromisoformat(_FREEZE_UTC).date()
+ _SECURITY = re.compile(r"^(?:SH|SZ|BJ)[0-9]{6}$")
+ _binding_type, _read_binding = _range_binding_planning_authority()
++_open_binding_read_lease, _close_binding_read_lease = _range_binding_read_lease_authority()
+ 
+ 
+ def _detached(value):
+     return json.loads(canonical_bytes(value))
+ 
+ 
+ def _iso_date(value, label):
+     if type(value) is not str:
+         raise ValueError(f"{label} must be a canonical ISO date")
+     try:
+@@ -230,20 +233,22 @@ def _build_proof_types():
+             raise RuntimeError("market repository dependencies are invalid")
+         (store_type, resolve_binding, select_current, first_calendar_request,
+          next_page, previous_calendar_request, market_requests, observation_to_dict,
+          observation_require_current, implementation_page_group, implementation_select_calendar,
+          implementation_select_market, selection_types) = dependencies
+         calendar_selection_type, market_selection_type = selection_types
+         batch_capture = ContextVar("policy_market_batch_capture", default=None)
+         selection_records = {}
+         anchored_binding_identity = _binding_identity
+         anchored_read_binding = _read_binding
++        anchored_open_binding_read_lease = _open_binding_read_lease
++        anchored_close_binding_read_lease = _close_binding_read_lease
+         anchored_canonical = canonical_bytes
+         selection_fields = {
+             calendar_selection_type: ("coverage", "pending", "lineage", "selection_hash", "_check"),
+             market_selection_type: ("window", "pending", "lineage", "selection_hash", "_check"),
+         }
+         selection_interfaces = {
+             cls: (cls.__new__, cls.__init__, cls.__getattribute__, cls.__setattr__,
+                   cls.__dataclass_fields__, tuple((name, cls.__dataclass_fields__[name],
+                       cls.__dataclass_fields__[name].name,
+                       cls.__dataclass_fields__[name].type,
+@@ -309,20 +314,22 @@ def _build_proof_types():
+             def __setattr__(self, name, value):
+                 raise TypeError("market repository type is immutable")
+ 
+             def __delattr__(self, name):
+                 raise TypeError("market repository type is immutable")
+ 
+         def repository_record(value):
+             selection_interface()
+             if (_binding_identity is not anchored_binding_identity
+                     or _read_binding is not anchored_read_binding
++                    or _open_binding_read_lease is not anchored_open_binding_read_lease
++                    or _close_binding_read_lease is not anchored_close_binding_read_lease
+                     or canonical_bytes is not anchored_canonical):
+                 raise ValueError("market ticket binding interface changed")
+             sealed = repository_records.get(id(value))
+             if (type(value) is not FormalPolicyMarketRepository or sealed is None
+                     or sealed.reference() is not value):
+                 raise ValueError("market repository is forged, copied, or unregistered")
+             if type(sealed.range_store) is not store_type:
+                 raise ValueError("market repository Store identity changed")
+             return sealed
+ 
+@@ -501,48 +508,83 @@ def _build_proof_types():
+                 return assemble_market(repository_record(self), security_id, as_of_utc,
+                                        binding=binding)
+ 
+             def _batch_journal_identity(self):
+                 sealed = repository_record(self)
+                 return sealed.range_store._batch_journal_identity()[0], sealed.range_store
+ 
+             def select_calendar_batch_ticket(self, journal, binding, as_of_utc):
+                 from .formal_batch_read_journal import _require_current_scope
+                 sealed = repository_record(self)
+-                identity = _binding_identity(binding)
+-                _require_current_scope(journal, self,
+-                    root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
+-                    population=(identity["exchange"],))
+-                capture = {"journal": journal, "owner": self, "tickets": []}
+-                reset = batch_capture.set(capture)
++                lease = None
+                 try:
+-                    selected = assemble_calendar(sealed, binding, as_of_utc)
+-                finally:
+-                    batch_capture.reset(reset)
+-                return ticket_evidence(self, journal, "calendar", selected, binding,
+-                                       as_of_utc, identity["exchange"], capture)
++                    lease = _open_binding_read_lease(
++                        binding, journal, ("calendar", as_of_utc))
++                    identity = _binding_identity(binding)
++                    _require_current_scope(journal, self,
++                        root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
++                        population=(identity["exchange"],))
++                    capture = {"journal": journal, "owner": self, "tickets": []}
++                    reset = batch_capture.set(capture)
++                    try:
++                        selected = assemble_calendar(sealed, binding, as_of_utc)
++                    finally:
++                        batch_capture.reset(reset)
++                    ticket = ticket_evidence(self, journal, "calendar", selected, binding,
++                                             as_of_utc, identity["exchange"], capture)
++                    _close_binding_read_lease(lease)
++                    return ticket
++                except BaseException:
++                    if lease is not None:
++                        try:
++                            _close_binding_read_lease(lease)
++                        except ValueError:
++                            pass
++                    try:
++                        journal.close()
++                    except ValueError:
++                        pass
++                    raise
+ 
+             def select_current_batch_ticket(self, journal, security_id, as_of_utc, *, binding):
+                 from .formal_batch_read_journal import _require_current_scope
+                 sealed = repository_record(self)
+-                identity = _binding_identity(binding)
+-                _require_current_scope(journal, self,
+-                    root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
+-                    population=(security_id,))
+-                capture = {"journal": journal, "owner": self, "tickets": []}
+-                reset = batch_capture.set(capture)
++                lease = None
+                 try:
+-                    selected = assemble_market(sealed, security_id, as_of_utc, binding=binding)
+-                finally:
+-                    batch_capture.reset(reset)
+-                return ticket_evidence(self, journal, "market", selected, binding,
+-                                       as_of_utc, security_id, capture)
++                    lease = _open_binding_read_lease(
++                        binding, journal, ("market", security_id, as_of_utc))
++                    identity = _binding_identity(binding)
++                    _require_current_scope(journal, self,
++                        root=identity["registry_manifest_hash"], as_of_utc=as_of_utc,
++                        population=(security_id,))
++                    capture = {"journal": journal, "owner": self, "tickets": []}
++                    reset = batch_capture.set(capture)
++                    try:
++                        selected = assemble_market(
++                            sealed, security_id, as_of_utc, binding=binding)
++                    finally:
++                        batch_capture.reset(reset)
++                    ticket = ticket_evidence(self, journal, "market", selected, binding,
++                                             as_of_utc, security_id, capture)
++                    _close_binding_read_lease(lease)
++                    return ticket
++                except BaseException:
++                    if lease is not None:
++                        try:
++                            _close_binding_read_lease(lease)
++                        except ValueError:
++                            pass
++                    try:
++                        journal.close()
++                    except ValueError:
++                        pass
++                    raise
+ 
+             def _batch_recheck_ticket(self, evidence):
+                 from .formal_batch_read_journal import _require_current_ticket
+                 (kind, selected, fields, proof_bytes, proof, binding, binding_bytes,
+                  range_store, journal, lower, calendar_ticket, calendar_selected,
+                  request) = evidence
+                 sealed = repository_record(self)
+                 if (range_store is not sealed.range_store
+                         or selection_record(self, selected, kind)[3] != fields
+                         or canonical_bytes(_binding_identity(binding)) != binding_bytes
+diff --git a/ashare_pipeline/formal_range_contract.py b/ashare_pipeline/formal_range_contract.py
+index 1375452..e9612b2 100644
+--- a/ashare_pipeline/formal_range_contract.py
++++ b/ashare_pipeline/formal_range_contract.py
+@@ -1,18 +1,20 @@
+ """Same-root active-policy range bindings; no date coverage or execution authority."""
+ 
+ from __future__ import annotations
+ 
+ from collections.abc import Mapping
++from contextvars import ContextVar
+ from dataclasses import dataclass
+ import hashlib
+ import json
++import threading
+ from types import MappingProxyType
+ import weakref
+ 
+ from .formal_range_format import (
+     RangeConfig, parse_range_entry, _canonical, _exchange, _freeze, _text,
+ )
+ 
+ _LEGACY_CONFIG_FIELDS = frozenset(
+     {
+         "source",
+@@ -80,21 +82,22 @@ def _build_range_bindings_contract():
+     module_globals = globals()
+     # _range_catalog_from_source reads _load_canonical_object and the immutable
+     # _LEGACY_CONFIG_FIELDS global; its parser/type/serializer are captured
+     # closure references. parse_range_entry -> _bridge/_context_selector,
+     # _request_template and its text/tree helpers, numeric validators and
+     # _freeze. The serializer used by
+     # current checks -> _thaw (recursive). Inventory every non-builtin global
+     # reached by those call chains, including the module aliases they use.
+     dependencies = tuple((module_globals, name, module_globals[name]) for name in (
+         "_load_canonical_object", "_LEGACY_CONFIG_FIELDS", "_canonical", "_freeze", "_text", "_exchange",
+-        "RangeConfig", "parse_range_entry", "MappingProxyType", "json", "hashlib", "weakref",
++        "RangeConfig", "parse_range_entry", "MappingProxyType", "ContextVar", "json", "hashlib",
++        "threading", "weakref",
+     )) + tuple((vars(format_module), name, vars(format_module)[name]) for name in (
+         "RangeConfig", "parse_range_entry", "_range_config_to_dict", "_canonical",
+         "_text", "_hash", "_exchange", "_positive_number", "_positive_integer",
+         "_https_url", "_placeholder_text", "_template_tree", "_request_template",
+         "_walk_strings", "_context_selector", "_bridge", "_freeze", "_thaw",
+         "Mapping", "MappingProxyType", "json", "hashlib", "math", "re",
+         "_SOURCES", "_EXCHANGES", "_IDENTIFIER", "_VERSION_IDENTIFIER", "_SHA256",
+         "_PLACEHOLDER", "_PLACEHOLDERS", "_RANGE_FIELDS", "_RANGE_FIELD_SET",
+         "_CONTEXT_SELECTOR_FIELDS",
+     )) + ((vars(context_module), "_descriptor", validate_descriptor),
+@@ -364,37 +367,76 @@ def _build_range_bindings_contract():
+ 
+ 
+     @dataclass(frozen=True)
+     class _BindingsRecord:
+         reference: weakref.ReferenceType[object]
+         bundle: object
+         scoring_registry: object
+         policy_registry: object
+         snapshot: _GraphSnapshot
+         bindings: dict[tuple[str, str], object]
++        manifest: object
++        blobs: object
++        role_objects: tuple[tuple[str, object], ...]
+ 
+ 
+     @dataclass(frozen=True)
+     class _BindingRecord:
+         reference: weakref.ReferenceType[object]
+         parent: weakref.ReferenceType[object]
+         key: tuple[str, str]
+         market_config: RangeConfig
+         calendar_config: RangeConfig
+         selector: Mapping[str, object]
+         binding_hash: str
+         market_bytes: bytes
+         calendar_bytes: bytes
+ 
+ 
+     _bindings_records: dict[int, _BindingsRecord] = {}
+     _binding_records: dict[int, _BindingRecord] = {}
++    _binding_read_lease = ContextVar("formal_range_current_binding_read_lease", default=None)
++    _lease_records = {}
++
++
++    def _lightweight_current(record: _BindingsRecord) -> None:
++        """Recheck mutable current fields without repeating signed graph parsing."""
++        _check_dependencies()
++        if (type(record.bundle) is not bundle_type
++                or type(record.scoring_registry) is not scoring_type
++                or type(record.policy_registry) is not policy_type):
++            raise ValueError("range binding lease source identity changed")
++        manifest = object.__getattribute__(record.bundle, "manifest")
++        blobs = object.__getattribute__(record.bundle, "blobs")
++        if manifest is not record.manifest or blobs is not record.blobs:
++            raise ValueError("range binding lease graph object changed")
++        manifest_bytes = object.__getattribute__(manifest, "canonical_json")
++        if (type(manifest_bytes) is not bytes
++                or manifest_bytes != record.snapshot.manifest_bytes
++                or hashlib.sha256(manifest_bytes).hexdigest() != record.snapshot.root_hash
++                or object.__getattribute__(manifest, "manifest_hash") != record.snapshot.root_hash):
++            raise ValueError("range binding lease manifest changed")
++        expected = {role: (raw, digest) for role, raw, digest in record.snapshot.roles}
++        if tuple(role for role, _ in record.role_objects) != tuple(expected):
++            raise ValueError("range binding lease roles changed")
++        for role, sealed_blob in record.role_objects:
++            blob = blobs.get(role)
++            raw, digest = expected[role]
++            if blob is not sealed_blob or type(raw) is not bytes:
++                raise ValueError("range binding lease child object changed")
++            current_raw = object.__getattribute__(blob, "canonical_json")
++            if (type(current_raw) is not bytes or current_raw != raw
++                    or hashlib.sha256(current_raw).hexdigest() != digest
++                    or object.__getattribute__(blob, "registry_hash") != digest
++                    or object.__getattribute__(blob, "registry_role") != role
++                    or object.__getattribute__(manifest, role + "_registry_hash") != digest):
++                raise ValueError("range binding lease child bytes changed")
+ 
+ 
+     def _bindings_record(value: object, *, current: bool = False) -> _BindingsRecord:
+         record = _bindings_records.get(id(value))
+         if type(value) is not RangeBindings or record is None or record.reference() is not value:
+             raise ValueError("range bindings are forged, copied, or unregistered")
+         children = object.__getattribute__(value, "_RangeBindings__bindings")
+         if (
+             type(children) is not MappingProxyType
+             or children.keys() != record.bindings.keys()
+@@ -410,34 +452,124 @@ def _build_range_bindings_contract():
+         return record
+ 
+ 
+     def _binding_record(value: object, *, current: bool = False) -> _BindingRecord:
+         record = _binding_records.get(id(value))
+         if type(value) is not RangeBinding or record is None or record.reference() is not value:
+             raise ValueError("range binding is forged, copied, or unregistered")
+         parent = record.parent()
+         if parent is None or object.__getattribute__(value, "_RangeBinding__parent") is not parent:
+             raise ValueError("range binding parent changed")
+-        parent_record = _bindings_record(parent, current=current)
++        lease = _binding_read_lease.get() if current else None
++        if lease is not None:
++            parent_record = _bindings_record(parent)
++            identity = (parent_record.snapshot.root_hash, record.binding_hash, record.key)
++            if (threading.get_ident() != lease[0] or identity != lease[2]
++                    or parent_record.snapshot != lease[5]):
++                raise ValueError("range binding lease is cross-thread, cross-binding, or stale")
++            _lightweight_current(parent_record)
++        else:
++            parent_record = _bindings_record(parent, current=current)
+         child_reference = parent_record.bindings.get(record.key)
+         if child_reference is None or child_reference() is not value:
+             raise ValueError("range binding no longer belongs to its binding set")
+         if (
+             type(record.market_config) is not RangeConfig
+             or type(record.calendar_config) is not RangeConfig
+             or _canonical(_range_config_to_dict(record.market_config)) != record.market_bytes
+             or _canonical(_range_config_to_dict(record.calendar_config)) != record.calendar_bytes
+         ):
+             raise ValueError("range binding configuration changed")
+         return record
+ 
+ 
++    class _BindingReadLease:
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *_args, **_kwargs):
++            raise TypeError("range binding read leases require their sealed owner")
++
++        def __copy__(self):
++            raise TypeError("range binding read leases cannot be copied")
++
++        def __deepcopy__(self, _memo):
++            raise TypeError("range binding read leases cannot be copied")
++
++        def __reduce__(self):
++            raise TypeError("range binding read leases cannot be exported")
++
++        def __reduce_ex__(self, _protocol):
++            raise TypeError("range binding read leases cannot be exported")
++
++
++    def open_current_binding_read_lease(value, owner_scope, operation_key):
++        """Open one bounded owner operation; the returned token has no public behavior."""
++        if (type(operation_key) is not tuple or not operation_key
++                or any(type(item) is not str or not item for item in operation_key)):
++            raise ValueError("range binding lease cannot be nested, copied, or unbound")
++        active = _binding_read_lease.get()
++        if active is not None:
++            _binding_record(value, current=True)
++            nested = (active[1] is owner_scope and active[3][0] == "market"
++                      and operation_key == ("calendar", active[3][-1]))
++            if not nested:
++                raise ValueError("range binding lease cannot be nested, copied, or unbound")
++            state, token = active, None
++        else:
++            child = _binding_record(value)
++            parent = child.parent()
++            parent_record = _bindings_record(parent)
++            entry = _capture_graph_snapshot(
++                parent_record.bundle, parent_record.scoring_registry,
++                parent_record.policy_registry
++            )
++            if entry != parent_record.snapshot:
++                raise ValueError("range binding sources changed before owner operation")
++            _lightweight_current(parent_record)
++            identity = (parent_record.snapshot.root_hash, child.binding_hash, child.key)
++            state = (threading.get_ident(), owner_scope, identity, operation_key,
++                     parent_record, entry)
++            token = _binding_read_lease.set(state)
++            nested = False
++        lease = object.__new__(_BindingReadLease)
++        identity = id(lease)
++        reference = weakref.ref(lease, lambda ref, key=identity:
++            _lease_records.pop(key, None)
++            if _lease_records.get(key) is not None
++            and _lease_records[key][0] is ref else None)
++        _lease_records[identity] = [reference, state, token, nested, True]
++        return lease
++
++
++    def close_current_binding_read_lease(lease):
++        saved = _lease_records.get(id(lease))
++        if (type(lease) is not _BindingReadLease or saved is None
++                or saved[0]() is not lease or saved[4] is not True):
++            raise ValueError("range binding read lease is forged, copied, or closed")
++        state, token, nested = saved[1:4]
++        saved[4] = False
++        if threading.get_ident() != state[0] or _binding_read_lease.get() is not state:
++            raise ValueError("range binding read lease is cross-thread or out of order")
++        if nested:
++            return
++        parent_record, entry = state[4:6]
++        try:
++            exit_snapshot = _capture_graph_snapshot(
++                parent_record.bundle, parent_record.scoring_registry,
++                parent_record.policy_registry
++            )
++            if exit_snapshot != entry or exit_snapshot != parent_record.snapshot:
++                raise ValueError("range binding sources changed during owner operation")
++        finally:
++            _binding_read_lease.reset(token)
++
++
+     class RangeBinding:
+         """A current, same-root M/C/Bx configuration authorization."""
+ 
+         __slots__ = ("__parent", "__weakref__")
+ 
+         def __init__(self, *_args: object, **_kwargs: object) -> None:
+             raise ValueError("RangeBinding must be loaded from a verified graph")
+ 
+         @property
+         def market_config(self) -> RangeConfig:
+@@ -546,42 +678,68 @@ def _build_range_bindings_contract():
+         if _capture_graph_snapshot(bundle, scoring_registry, policy_registry) != snapshot:
+             raise ValueError("range binding sources changed during loading")
+         reference = weakref.ref(result, forget_bindings)
+         _bindings_records[identity] = _BindingsRecord(
+             reference,
+             bundle,
+             scoring_registry,
+             policy_registry,
+             snapshot,
+             {key: weakref.ref(binding) for key, binding in binding_objects.items()},
++            object.__getattribute__(bundle, "manifest"),
++            object.__getattribute__(bundle, "blobs"),
++            tuple((role, blob_for(bundle, role)) for role, _, _ in snapshot.roles),
+         )
+         return result
+ 
+     def read_planning_binding(value: object) -> Mapping[str, object]:
+         """Read a current binding through the original owner's sealed records."""
+         child = _binding_record(value, current=True)
+         parent = _bindings_record(child.parent())
+         return MappingProxyType({
+             "market_config": child.market_config,
+             "calendar_config": child.calendar_config,
+             "registry_manifest_hash": parent.snapshot.root_hash,
+             "source_registry_hash": dict((role, digest) for role, _, digest in parent.snapshot.roles)["source"],
+             "binding_hash": child.binding_hash,
+             "rule_id": child.key[0],
+             "exchange": child.key[1],
+         })
+ 
+-    return RangeBinding, RangeBindings, load_policy_range_bindings, read_planning_binding
++    def lookup_planning_binding(bindings, binding_hash, exchange):
++        """Select one sealed binding without probing unrelated child bindings."""
++        parent = _bindings_record(bindings)
++        _text(binding_hash, "range binding hash")
++        if len(binding_hash) != 64 or any(c not in "0123456789abcdef" for c in binding_hash):
++            raise ValueError("range binding hash must be canonical sha256")
++        _exchange(exchange, "range binding exchange")
++        matches = []
++        for key, reference in parent.bindings.items():
++            child = reference()
++            record = None if child is None else _binding_records.get(id(child))
++            if (record is not None and record.reference() is child and key[1] == exchange
++                    and record.binding_hash == binding_hash):
++                matches.append(child)
++        if len(matches) != 1:
++            raise ValueError("range task binding absent or ambiguous")
++        _binding_record(matches[0], current=True)
++        return matches[0]
++
++    return (RangeBinding, RangeBindings, load_policy_range_bindings, read_planning_binding,
++            lookup_planning_binding, open_current_binding_read_lease,
++            close_current_binding_read_lease)
+ 
+ 
+ (RangeBinding, RangeBindings, load_policy_range_bindings,
+- _read_range_binding_planning) = _build_range_bindings_contract()
++ _read_range_binding_planning, _lookup_range_binding_planning,
++ _open_current_binding_read_lease,
++ _close_current_binding_read_lease) = _build_range_bindings_contract()
+ del _build_range_bindings_contract
+ 
+ 
+ def _make_range_binding_authority():
+     """Expose immutable genuine anchors to the range source during module init."""
+ 
+     binding_type = RangeBinding
+     require_current = RangeBinding.require_current
+     calendar_config_get = RangeBinding.calendar_config.fget
+     manifest_hash_get = RangeBinding.registry_manifest_hash.fget
+@@ -613,17 +771,45 @@ def _make_range_binding_planning_authority():
+     def authority():
+         return binding_type, read
+ 
+     return authority
+ 
+ 
+ _range_binding_planning_authority = _make_range_binding_planning_authority()
+ del _make_range_binding_planning_authority, _read_range_binding_planning
+ 
+ 
++def _make_range_binding_lookup_authority():
++    lookup = _lookup_range_binding_planning
++
++    def authority():
++        return lookup
++
++    return authority
++
++
++_range_binding_lookup_authority = _make_range_binding_lookup_authority()
++del _make_range_binding_lookup_authority, _lookup_range_binding_planning
++
++
++def _make_range_binding_read_lease_authority():
++    open_lease = _open_current_binding_read_lease
++    close_lease = _close_current_binding_read_lease
++
++    def authority():
++        return open_lease, close_lease
++
++    return authority
++
++
++_range_binding_read_lease_authority = _make_range_binding_read_lease_authority()
++del (_make_range_binding_read_lease_authority, _open_current_binding_read_lease,
++     _close_current_binding_read_lease)
++
++
+ __all__ = [
+     "RangeBinding",
+     "RangeBindings",
+     "RangeConfig",
+     "load_policy_range_bindings",
+     "parse_range_entry",
+ ]
+diff --git a/ashare_pipeline/formal_range_store.py b/ashare_pipeline/formal_range_store.py
+index a502523..e2f3c0c 100644
+--- a/ashare_pipeline/formal_range_store.py
++++ b/ashare_pipeline/formal_range_store.py
+@@ -109,48 +109,43 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
+             raise ValueError("range store is forged or copied")
+         _, state, path, root, verifier, verify_anchor, factory, cache = value
+         _require_repository_initialization(state)
+         if (type(state) is not StateStore or state.db_path.resolve() != path
+                 or getattr(state._connect, "__func__", None) is not connect):
+             raise ValueError("range StateStore identity changed")
+         if getattr(verifier, "verify") != verify_anchor:
+             raise ValueError("range signature verifier changed")
+         return state, root, verifier, factory, cache
+ 
++    from .formal_range_contract import _range_binding_lookup_authority
+     planning_binding_type, read_planning_binding = _range_binding_planning_authority()
++    lookup_planning_binding = _range_binding_lookup_authority()
+ 
+     def load_binding_identity(store, *, registry_manifest_hash, binding_hash, exchange):
+         state, _, verifier, factory, cache = record(store)
+         root_hash = registry_manifest_hash
+         bundle = FormalRegistryBundleLoader(state, verifier).load(root_hash)
+         key = root_hash, binding_hash, exchange
+         if key not in cache:
+             blob = bundle.blob("feature")
+             vocabulary = load_signed_feature_registry(blob.canonical_json, blob.signature, blob.key_id,
+                 verifier, registry_manifest=bundle.manifest)
+             scoring = load_formal_registry(bundle, RegistryApproval("official", bundle.manifest.scoring_registry_hash,
+                 bundle.manifest.approval_id), feature_registry=vocabulary)
+             policy = load_formal_policy_registry(bundle, scoring_registry=scoring, feature_registry=vocabulary)
+             bindings = load_policy_range_bindings(bundle, scoring_registry=scoring, policy_registry=policy)
+-            matches = []
+-            for rule in policy.to_dict()["rules"]:
+-                if rule["kind"] == "market_liquidity":
+-                    binding = bindings.for_rule(rule["rule_id"], exchange)
+-                    if read_planning_binding(binding)["binding_hash"] == binding_hash:
+-                        matches.append(binding)
+-            if len(matches) != 1:
+-                raise ValueError("range task binding absent or ambiguous")
+-            source = factory(matches[0])
+-            if type(source) is not source_type or source_binding(source) is not matches[0]:
++            binding = lookup_planning_binding(bindings, binding_hash, exchange)
++            source = factory(binding)
++            if type(source) is not source_type or source_binding(source) is not binding:
+                 raise ValueError("range source factory returned a different binding")
+             bind_source_store(source, store)
+-            cache[key] = (matches[0], source)
++            cache[key] = (binding, source)
+         binding, source = cache[key]
+         binding.require_current()
+         source_binding(source)
+         bind_source_store(source, store)
+         return binding, source
+ 
+     def load_binding(store, payload):
+         request = payload["request"]
+         return load_binding_identity(
+             store,
+diff --git a/tests/test_formal_policy_market_binding_lease.py b/tests/test_formal_policy_market_binding_lease.py
+new file mode 100644
+index 0000000..7798902
+--- /dev/null
++++ b/tests/test_formal_policy_market_binding_lease.py
+@@ -0,0 +1,215 @@
++"""Operation-scoped current-binding lease regressions for market tickets."""
++
++from __future__ import annotations
++
++from datetime import date, timedelta
++from pathlib import Path
++from types import FunctionType
++import sqlite3
++import sys
++import unittest
++
++from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
++from ashare_pipeline import formal_policy_market as market_module
++from tests.formal_range_fixtures import RangeStoreFixture
++from tests.test_formal_policy_market import FREEZE, quiet_row
++
++
++def _trading_days(count: int) -> tuple[str, ...]:
++    end = date(2026, 8, 31)
++    return tuple((end - timedelta(days=count - 1 - offset)).isoformat()
++                 for offset in range(count))
++
++
++def _closure_function(root: FunctionType, name: str) -> FunctionType:
++    """Locate a captured production function without adding a test hook."""
++    pending = [root]
++    seen = set()
++    while pending:
++        function = pending.pop()
++        if id(function) in seen:
++            continue
++        seen.add(id(function))
++        if function.__code__.co_name == name:
++            return function
++        for cell in function.__closure__ or ():
++            try:
++                captured = cell.cell_contents
++            except ValueError:
++                continue
++            if type(captured) is FunctionType:
++                pending.append(captured)
++    raise AssertionError(f"production closure {name!r} is absent")
++
++
++class MarketBindingLeaseTests(unittest.TestCase):
++    def _fixture(self, **kwargs):
++        fixture = RangeStoreFixture(**kwargs)
++        self.addCleanup(fixture.close)
++        return fixture
++
++    def _ticket_capture_count(self, fixture, days):
++        fixture.put_window("SH600000", trading_days=days,
++                           rows={day: quiet_row() for day in days})
++        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
++        journal = FormalBatchReadJournal.open(repository,
++            registry_manifest_hash=fixture.graph.manifest.manifest_hash,
++            as_of_utc=FREEZE, population=("SH600000",),
++            required_keys=(("SH600000",),))
++        capture = _closure_function(market_module._read_binding,
++                                    "_capture_graph_snapshot")
++        calls = 0
++        tool_id = next(identifier for identifier in range(6)
++                       if sys.monitoring.get_tool(identifier) is None)
++        sys.monitoring.use_tool_id(tool_id, "market-binding-lease-test")
++
++        def monitor(code, instruction_offset):
++            nonlocal calls
++            self.assertIs(code, capture.__code__)
++            calls += 1
++
++        sys.monitoring.register_callback(tool_id, sys.monitoring.events.PY_START, monitor)
++        sys.monitoring.set_local_events(tool_id, capture.__code__,
++                                        sys.monitoring.events.PY_START)
++        try:
++            ticket = repository.select_current_batch_ticket(
++                journal, "SH600000", FREEZE, binding=fixture.binding)
++        finally:
++            sys.monitoring.set_local_events(tool_id, capture.__code__, 0)
++            sys.monitoring.free_tool_id(tool_id)
++        self.assertIsNotNone(ticket.selected().window)
++        journal.close()
++        return calls
++
++    def _journal(self, fixture, repository):
++        return FormalBatchReadJournal.open(repository,
++            registry_manifest_hash=fixture.graph.manifest.manifest_hash,
++            as_of_utc=FREEZE, population=("SH600000",),
++            required_keys=(("SH600000",),))
++
++    def test_owner_ticket_capture_fallback_is_two_and_does_not_scale_with_more_requests(self):
++        short_days = _trading_days(20)
++        short_count = self._ticket_capture_count(self._fixture(), short_days)
++
++        def split_requests(documents):
++            for config in documents["source"]["range_configs"]:
++                config["max_calendar_days_per_request"] = 30
++
++        long_days = _trading_days(40)
++        long_count = self._ticket_capture_count(
++            self._fixture(mutate=split_requests), long_days)
++
++        self.assertEqual((short_count, long_count), (2, 2))
++
++    def test_owner_lease_detects_in_place_source_bytes_before_next_read_and_consumes_scope(self):
++        fixture = self._fixture()
++        days = _trading_days(20)
++        fixture.put_window("SH600000", trading_days=days,
++                           rows={day: quiet_row() for day in days})
++        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
++        journal = self._journal(fixture, repository)
++        source = fixture.bundle.blob("source")
++        original = source.canonical_json
++        reader_code = market_module._read_binding.__code__
++        issue_code = __import__(
++            "ashare_pipeline.formal_batch_read_journal", fromlist=["_issue_current_ticket"]
++        )._issue_current_ticket.__code__
++        changed = []
++        market_issues = []
++        connection = sqlite3.connect(Path(fixture.store.db_path))
++        try:
++            before_version = connection.execute("PRAGMA data_version").fetchone()[0]
++
++            def inject(frame, event, arg):
++                if event == "return" and frame.f_code is reader_code and not changed:
++                    object.__setattr__(source, "canonical_json", original + b" ")
++                    changed.append(True)
++                elif (event == "call" and frame.f_code is issue_code
++                      and frame.f_locals.get("kind") == "market"):
++                    market_issues.append(True)
++
++            sys.setprofile(inject)
++            try:
++                with self.assertRaises(ValueError):
++                    repository.select_current_batch_ticket(
++                        journal, "SH600000", FREEZE, binding=fixture.binding)
++            finally:
++                sys.setprofile(None)
++                object.__setattr__(source, "canonical_json", original)
++            after_version = connection.execute("PRAGMA data_version").fetchone()[0]
++        finally:
++            connection.close()
++
++        self.assertEqual(changed, [True])
++        self.assertEqual(market_issues, [])
++        self.assertEqual(after_version, before_version)
++        with self.assertRaisesRegex(ValueError, "closed"):
++            repository.select_current_batch_ticket(
++                journal, "SH600000", FREEZE, binding=fixture.binding)
++
++        fresh = self._journal(fixture, repository)
++        ticket = repository.select_current_batch_ticket(
++            fresh, "SH600000", FREEZE, binding=fixture.binding)
++        self.assertIsNotNone(ticket.selected().window)
++        fresh.close()
++
++    def test_next_journal_phase_performs_a_new_entry_and_exit_full_capture(self):
++        fixture = self._fixture()
++        days = _trading_days(20)
++        fixture.put_window("SH600000", trading_days=days,
++                           rows={day: quiet_row() for day in days})
++        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
++        journal = self._journal(fixture, repository)
++        capture = _closure_function(market_module._read_binding,
++                                    "_capture_graph_snapshot")
++        counts = [0, 0]
++        phase = 0
++        tracking_owner_operation = True
++        tool_id = next(identifier for identifier in range(6)
++                       if sys.monitoring.get_tool(identifier) is None)
++        sys.monitoring.use_tool_id(tool_id, "market-binding-phase-test")
++
++        def monitor(code, instruction_offset):
++            self.assertIs(code, capture.__code__)
++            if tracking_owner_operation:
++                counts[phase] += 1
++
++        sys.monitoring.register_callback(tool_id, sys.monitoring.events.PY_START, monitor)
++        sys.monitoring.set_local_events(tool_id, capture.__code__,
++                                        sys.monitoring.events.PY_START)
++        try:
++            repository.select_current_batch_ticket(
++                journal, "SH600000", FREEZE, binding=fixture.binding)
++            tracking_owner_operation = False
++            journal.checkpoint()
++            journal.next_phase()
++            phase = 1
++            tracking_owner_operation = True
++            repository.select_current_batch_ticket(
++                journal, "SH600000", FREEZE, binding=fixture.binding)
++        finally:
++            sys.monitoring.set_local_events(tool_id, capture.__code__, 0)
++            sys.monitoring.free_tool_id(tool_id)
++        journal.close()
++        self.assertEqual(counts, [2, 2])
++
++    def test_owner_lease_entry_failure_consumes_scope_before_any_ticket(self):
++        fixture = self._fixture()
++        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
++        journal = self._journal(fixture, repository)
++        source = fixture.bundle.blob("source")
++        original = source.canonical_json
++        try:
++            object.__setattr__(source, "canonical_json", original + b" ")
++            with self.assertRaises(ValueError):
++                repository.select_current_batch_ticket(
++                    journal, "SH600000", FREEZE, binding=fixture.binding)
++        finally:
++            object.__setattr__(source, "canonical_json", original)
++        with self.assertRaisesRegex(ValueError, "closed"):
++            repository.select_current_batch_ticket(
++                journal, "SH600000", FREEZE, binding=fixture.binding)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,1555 @@
+# Task R2 review package
+
+Base: f4ed417fe6e64e324e9c725c3b185f7a10c52221
+Head: 38644671691e244164c267b07732d9756a06142e
+Paths: ashare_pipeline/formal_range_request.py ashare_pipeline/formal_range_source.py ashare_pipeline/formal_range_contract.py ashare_pipeline/formal_sources.py tests/formal_range_fixtures.py tests/test_formal_range_source.py
+
+3864467 feat: authenticate bounded calendar range requests
+ ashare_pipeline/formal_range_contract.py |   4 +
+ ashare_pipeline/formal_range_request.py  | 137 ++++++
+ ashare_pipeline/formal_range_source.py   | 698 +++++++++++++++++++++++++++++++
+ ashare_pipeline/formal_sources.py        |  34 +-
+ tests/formal_range_fixtures.py           |  90 ++++
+ tests/test_formal_range_source.py        | 437 +++++++++++++++++++
+ 6 files changed, 1399 insertions(+), 1 deletion(-)
+diff --git a/ashare_pipeline/formal_range_contract.py b/ashare_pipeline/formal_range_contract.py
+index 6a90241..bf4c9bc 100644
+--- a/ashare_pipeline/formal_range_contract.py
++++ b/ashare_pipeline/formal_range_contract.py
+@@ -398,20 +398,24 @@ def _build_range_bindings_contract():
+             return _binding_record(self).calendar_config
+ 
+         @property
+         def policy_calendar_selector(self) -> Mapping[str, object]:
+             return _binding_record(self).selector
+ 
+         @property
+         def registry_manifest_hash(self) -> str:
+             return _bindings_record(_binding_record(self).parent()).root_hash
+ 
++        @property
++        def source_registry_hash(self) -> str:
++            return _bindings_record(_binding_record(self).parent()).role_hashes["source"]
++
+         @property
+         def binding_hash(self) -> str:
+             return _binding_record(self).binding_hash
+ 
+         def require_current(self) -> None:
+             _binding_record(self, current=True)
+ 
+         def __copy__(self):
+             raise TypeError("range bindings cannot be copied")
+ 
+diff --git a/ashare_pipeline/formal_range_request.py b/ashare_pipeline/formal_range_request.py
+new file mode 100644
+index 0000000..d5984ea
+--- /dev/null
++++ b/ashare_pipeline/formal_range_request.py
+@@ -0,0 +1,137 @@
++"""Pure sealed identity for Formal V3 range requests.
++
++This module depends only on the pure range format and the standard library so
++source and contract modules can both capture its authority without import cycles.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import hashlib
++import re
++import weakref
++
++from .formal_range_format import _canonical
++
++
++_HASH = re.compile(r"^[0-9a-f]{64}$")
++_FIELDS = (
++    "schema_version", "kind", "source", "dataset", "security_id", "exchange",
++    "as_of_utc", "start_date", "end_date", "anchor_descriptor_id",
++    "calendar_descriptor_id", "range_config_id", "registry_manifest_hash",
++    "page_index", "calendar_coverage_hash",
++)
++
++
++def _build_authority():
++    @dataclass(frozen=True)
++    class _Record:
++        reference: weakref.ReferenceType[object]
++        wire: dict[str, object]
++        fingerprint: str
++        config_wire: dict[str, object]
++        source_registry_hash: str
++        root_guard: object
++
++    records: dict[int, _Record] = {}
++
++    @dataclass(frozen=True, init=False)
++    class FormalRangeRequestV1:
++        schema_version: str
++        kind: str
++        source: str
++        dataset: str
++        security_id: str | None
++        exchange: str
++        as_of_utc: str
++        start_date: str
++        end_date: str
++        anchor_descriptor_id: str
++        calendar_descriptor_id: str
++        range_config_id: str
++        registry_manifest_hash: str
++        page_index: int
++        calendar_coverage_hash: str | None
++
++        def __init__(self, *_args: object, **_kwargs: object) -> None:
++            raise ValueError("FormalRangeRequestV1 cannot be externally constructed")
++
++        def to_dict(self) -> dict[str, object]:
++            return dict(_record(self).wire)
++
++        @property
++        def request_fingerprint(self) -> str:
++            return _record(self).fingerprint
++
++        def __copy__(self):
++            raise TypeError("formal range requests cannot be copied")
++
++        def __deepcopy__(self, _memo):
++            raise TypeError("formal range requests cannot be copied")
++
++    def _record(request: object) -> _Record:
++        record = records.get(id(request))
++        if type(request) is not FormalRangeRequestV1 or record is None or record.reference() is not request:
++            raise ValueError("formal range request is forged, copied, or unregistered")
++        current = {field: object.__getattribute__(request, field) for field in _FIELDS}
++        if current != record.wire or hashlib.sha256(_canonical(current)).hexdigest() != record.fingerprint:
++            raise ValueError("formal range request fields changed")
++        guard = record.root_guard
++        if not callable(guard) or guard() is not True:
++            raise ValueError("formal range request root is no longer current")
++        return record
++
++    def mint(wire: dict[str, object], config_wire: dict[str, object], *,
++             source_registry_hash: str, root_guard):
++        if type(wire) is not dict or set(wire) != set(_FIELDS):
++            raise ValueError("range request has unknown or missing fields")
++        if wire["schema_version"] != "formal-range-request-v1":
++            raise ValueError("range request schema_version is invalid")
++        if wire["kind"] != "calendar_range" or wire["security_id"] is not None:
++            raise ValueError("R2 can mint only calendar range requests")
++        if wire["calendar_coverage_hash"] is not None or wire["page_index"] != 1:
++            raise ValueError("first calendar request identity is invalid")
++        for field in ("anchor_descriptor_id", "calendar_descriptor_id", "range_config_id",
++                      "registry_manifest_hash"):
++            if type(wire[field]) is not str or _HASH.fullmatch(wire[field]) is None:
++                raise ValueError(f"range request {field} is invalid")
++        if type(source_registry_hash) is not str or _HASH.fullmatch(source_registry_hash) is None:
++            raise ValueError("range request private source_registry_hash is invalid")
++        expected = {
++            "kind": config_wire.get("kind"), "source": config_wire.get("source"),
++            "dataset": config_wire.get("dataset"), "exchange": config_wire.get("exchange_scope"),
++            "anchor_descriptor_id": config_wire.get("anchor_descriptor_id"),
++            "calendar_descriptor_id": config_wire.get("calendar_descriptor_id"),
++        }
++        if any(type(wire[key]) is not type(value) or wire[key] != value
++               for key, value in expected.items()):
++            raise ValueError("range request differs from its sealed config")
++        if not callable(root_guard) or root_guard() is not True:
++            raise ValueError("range request requires a current root guard")
++        request = object.__new__(FormalRangeRequestV1)
++        for field in _FIELDS:
++            object.__setattr__(request, field, wire[field])
++        identity = id(request)
++        def forget(reference, *, identity=identity):
++            existing = records.get(identity)
++            if existing is not None and existing.reference is reference:
++                records.pop(identity, None)
++        fingerprint = hashlib.sha256(_canonical(wire)).hexdigest()
++        records[identity] = _Record(
++            weakref.ref(request, forget), dict(wire), fingerprint, dict(config_wire),
++            source_registry_hash, root_guard
++        )
++        return request
++
++    def snapshot(request: object) -> tuple[dict[str, object], dict[str, object], str]:
++        record = _record(request)
++        return dict(record.wire), dict(record.config_wire), record.source_registry_hash
++
++    return FormalRangeRequestV1, mint, snapshot
++
++
++FormalRangeRequestV1, _mint_range_request, _trusted_range_request_snapshot = _build_authority()
++del _build_authority
++
++
++__all__ = ["FormalRangeRequestV1"]
+diff --git a/ashare_pipeline/formal_range_source.py b/ashare_pipeline/formal_range_source.py
+new file mode 100644
+index 0000000..daec254
+--- /dev/null
++++ b/ashare_pipeline/formal_range_source.py
+@@ -0,0 +1,698 @@
++"""Authenticated bounded range requests, transport observations, and replay parsing."""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import dataclass
++from datetime import date, datetime, timedelta, timezone
++import hashlib
++import json
++import math
++import re
++from types import MappingProxyType, MethodType
++import weakref
++
++from .formal_range_format import RangeConfig, _canonical, _range_config_to_dict
++from .formal_range_request import (
++    FormalRangeRequestV1,
++    _mint_range_request,
++    _trusted_range_request_snapshot,
++)
++from .formal_time import FORMAL_FREEZE_AT_CN
++
++
++_HASH = re.compile(r"^[0-9a-f]{64}$")
++_SECURITY = re.compile(r"^(?:SH|SZ|BJ)[0-9]{6}$")
++_REQUEST_FIELDS = (
++    "schema_version", "kind", "source", "dataset", "security_id", "exchange",
++    "as_of_utc", "start_date", "end_date", "anchor_descriptor_id",
++    "calendar_descriptor_id", "range_config_id", "registry_manifest_hash",
++    "page_index", "calendar_coverage_hash",
++)
++_DOCUMENT_FIELDS = frozenset({
++    "schema_version", "request_fingerprint", "source", "dataset", "security_id",
++    "exchange", "start_date", "end_date", "parser_id", "parser_version",
++    "mapping_version", "normalizer_version", "request_version", "page_index",
++    "page_count", "record_count", "page_record_count", "coverage", "rows",
++    "published_at_utc", "published_precision", "source_updated_at_utc",
++    "effective_at_utc", "effective_time_evidence_hash", "captured_at_utc",
++    "upstream_generation", "pagination_evidence",
++})
++_ROW_TIME_FIELDS = frozenset({
++    "published_at_utc", "published_precision", "effective_at_utc",
++    "effective_time_evidence_hash", "captured_at_utc",
++})
++_FORBIDDEN_POLICY_FIELDS = frozenset({
++    "effective_trade", "stale_days", "pool_veto", "confirmed_no_price",
++})
++_FREEZE_UTC = datetime.fromisoformat(FORMAL_FREEZE_AT_CN).astimezone(timezone.utc).isoformat()
++
++
++def _aware(value: object, label: str) -> datetime:
++    if type(value) is not str or not value or value != value.strip():
++        raise ValueError(f"{label} must be an aware ISO timestamp")
++    try:
++        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
++    except ValueError as error:
++        raise ValueError(f"{label} must be an aware ISO timestamp") from error
++    if parsed.tzinfo is None or parsed.utcoffset() is None:
++        raise ValueError(f"{label} must be an aware ISO timestamp")
++    return parsed
++
++
++def _date(value: object, label: str) -> date:
++    if type(value) is not str:
++        raise ValueError(f"{label} must be an ISO date")
++    try:
++        parsed = date.fromisoformat(value)
++    except ValueError as error:
++        raise ValueError(f"{label} must be an ISO date") from error
++    if parsed.isoformat() != value:
++        raise ValueError(f"{label} must be a canonical ISO date")
++    return parsed
++
++
++def _hash(value: object, label: str) -> str:
++    if type(value) is not str or _HASH.fullmatch(value) is None:
++        raise ValueError(f"{label} must be a lowercase SHA-256")
++    return value
++
++
++def _text(value: object, label: str) -> str:
++    if type(value) is not str or not value or value != value.strip():
++        raise ValueError(f"{label} must be an already-trimmed nonempty string")
++    return value
++
++
++def backward_interval(end_text, limit):
++    """Return an inclusive natural-calendar interval without underflow."""
++    if type(limit) is not int or limit <= 0:
++        raise ValueError("range limit must be a positive exact integer")
++    end = date.fromisoformat(end_text)
++    distance = min(limit - 1, (end - date.min).days)
++    return (end - timedelta(days=distance)).isoformat(), end.isoformat()
++
++
++def page_successor(document, max_pages):
++    """Read a source-backed page declaration; this function mints no request."""
++    if type(max_pages) is not int or max_pages <= 0:
++        raise ValueError("max_pages must be a positive exact integer")
++    if not isinstance(document, Mapping):
++        raise ValueError("page document must be a mapping")
++    try:
++        page, count = document["page_index"], document["page_count"]
++    except KeyError as error:
++        raise ValueError("page identity is absent") from error
++    if type(page) is not int or type(count) is not int:
++        raise ValueError("page identity must use exact integers")
++    if not 1 <= page <= count or count > max_pages:
++        raise ValueError("unverified or out-of-budget pagination")
++    return page + 1 if page < count else None
++
++
++def _thaw(value: object) -> object:
++    if isinstance(value, Mapping):
++        return {key: _thaw(item) for key, item in value.items()}
++    if type(value) in (tuple, list):
++        return [_thaw(item) for item in value]
++    return value
++
++
++def _freeze_json(value: object, *, label: str = "JSON value") -> object:
++    if isinstance(value, Mapping):
++        result = {}
++        for key, item in value.items():
++            if type(key) is not str or key in result:
++                raise ValueError(f"{label} keys must be unique exact strings")
++            result[key] = _freeze_json(item, label=label)
++        return MappingProxyType(result)
++    if type(value) in (list, tuple):
++        return tuple(_freeze_json(item, label=label) for item in value)
++    if value is None or type(value) in (bool, int, str):
++        return value
++    if type(value) is float and math.isfinite(value):
++        return value
++    raise ValueError(f"{label} is not canonical JSON data")
++
++
++from .formal_sources import (
++    FormalOfficialSourceAdapter,
++    FormalRetryableSourceError,
++    FormalSourceBlocked,
++    FormalTerminalSourceError,
++    TransportRequest,
++    TransportResponse,
++    _https_host,
++)
++from .formal_range_contract import RangeBinding
++
++
++_snapshot_transport_response = FormalOfficialSourceAdapter._snapshot_response
++_classify_transport_response = FormalOfficialSourceAdapter._classify_response
++
++
++def _callable_anchor(owner: object, name: str) -> tuple[object, object | None]:
++    value = getattr(owner, name, None)
++    if not callable(value):
++        raise ValueError(f"range implementation {name} method is absent")
++    if isinstance(value, MethodType):
++        return value.__self__, value.__func__
++    return value, None
++
++
++def _render_text(value: str, substitutions: Mapping[str, str | None], *, quote: bool) -> str:
++    from urllib.parse import quote_from_bytes
++
++    result = value
++    for name in ("security_id", "exchange", "start_date", "end_date", "page_index"):
++        marker = "{" + name + "}"
++        if marker not in result:
++            continue
++        replacement = substitutions[name]
++        if replacement is None:
++            raise FormalTerminalSourceError(f"range placeholder {name} has a null value")
++        if quote:
++            replacement = quote_from_bytes(replacement.encode("utf-8"), safe="-._~")
++        result = result.replace(marker, replacement)
++    return result
++
++
++def _render_tree(value: object, substitutions: Mapping[str, str | None]) -> object:
++    if value is None:
++        return None
++    if type(value) is str:
++        return _render_text(value, substitutions, quote=False)
++    if isinstance(value, Mapping):
++        return {_render_text(key, substitutions, quote=False): _render_tree(item, substitutions)
++                for key, item in value.items()}
++    if type(value) in (list, tuple):
++        return [_render_tree(item, substitutions) for item in value]
++    raise FormalTerminalSourceError("range request template contains invalid data")
++
++
++def _transport_request(config: RangeConfig, request_wire: Mapping[str, object]) -> TransportRequest:
++    values = {
++        "security_id": request_wire["security_id"],
++        "exchange": request_wire["exchange"],
++        "start_date": request_wire["start_date"],
++        "end_date": request_wire["end_date"],
++        "page_index": str(request_wire["page_index"]),
++    }
++    query = config.request_template["query"]
++    headers = config.request_template["headers"]
++    pairs = [
++        f"{_render_text(key, values, quote=True)}={_render_text(value, values, quote=True)}"
++        for key, value in sorted(query.items())
++    ]
++    if pairs:
++        prefix = "?" if "?" not in config.endpoint_url else "" if config.endpoint_url.endswith(("?", "&")) else "&"
++        url = config.endpoint_url + prefix + "&".join(pairs)
++    else:
++        url = config.endpoint_url
++    _https_host(url, "constructed range URL")
++    sent_headers = MappingProxyType({
++        key: _render_text(value, values, quote=False) for key, value in headers.items()
++    })
++    body_value = _render_tree(config.request_template["body"], values)
++    body = None if body_value is None else _canonical(body_value)
++    return TransportRequest(config.http_method, url, sent_headers, body, float(config.timeout_seconds))
++
++
++def _validate_document_wire(wire: object) -> dict[str, object]:
++    if type(wire) is not dict or set(wire) != _DOCUMENT_FIELDS:
++        raise ValueError("parsed range document has unknown or missing keys")
++    if wire["schema_version"] != "formal-parsed-range-document-v1":
++        raise ValueError("parsed range document schema_version is invalid")
++    for field in ("request_fingerprint",):
++        _hash(wire[field], f"document {field}")
++    for field in (
++        "source", "dataset", "exchange", "start_date", "end_date", "parser_id",
++        "parser_version", "mapping_version", "normalizer_version", "request_version",
++    ):
++        _text(wire[field], f"document {field}")
++    if wire["security_id"] is not None and (
++        type(wire["security_id"]) is not str or _SECURITY.fullmatch(wire["security_id"]) is None
++    ):
++        raise ValueError("document security_id is invalid")
++    start = _date(wire["start_date"], "document start_date")
++    end = _date(wire["end_date"], "document end_date")
++    if start > end:
++        raise ValueError("document date interval is reversed")
++    for field in ("page_index", "page_count", "record_count", "page_record_count"):
++        if type(wire[field]) is not int or wire[field] < (0 if field in {"record_count", "page_record_count"} else 1):
++            raise ValueError(f"document {field} must be an exact nonnegative integer")
++    if wire["page_index"] > wire["page_count"]:
++        raise ValueError("document page identity is inconsistent")
++    coverage = wire["coverage"]
++    if type(coverage) is not dict or set(coverage) != {"start_date", "end_date", "complete"}:
++        raise ValueError("document coverage declaration is invalid")
++    if type(coverage["complete"]) is not bool:
++        raise ValueError("document coverage complete must be an exact boolean")
++    coverage_start = _date(coverage["start_date"], "coverage start_date")
++    coverage_end = _date(coverage["end_date"], "coverage end_date")
++    if coverage_start > coverage_end or coverage_start < start or coverage_end > end:
++        raise ValueError("document coverage is outside its request interval")
++    rows = wire["rows"]
++    if type(rows) is not list or wire["page_record_count"] != len(rows):
++        raise ValueError("document page_record_count does not match rows")
++    if wire["record_count"] < wire["page_record_count"]:
++        raise ValueError("document total record_count is smaller than this page")
++    if not rows and coverage["complete"] is True:
++        raise ValueError("empty response cannot claim complete coverage")
++    _text(wire["upstream_generation"], "document upstream_generation")
++    if wire["pagination_evidence"] not in {
++        "signed_single_response_v1", "source_declared_numbered_pages_v1",
++    } or type(wire["pagination_evidence"]) is not str:
++        raise ValueError("document pagination_evidence is invalid")
++
++    def validate_times(container, label):
++        precision = container["published_precision"]
++        if precision not in {"timestamp", "date_only"} or type(precision) is not str:
++            raise ValueError(f"{label} published_precision is invalid")
++        _aware(container["published_at_utc"], f"{label} published_at_utc")
++        _aware(container["captured_at_utc"], f"{label} captured_at_utc")
++        effective = container["effective_at_utc"]
++        evidence = container["effective_time_evidence_hash"]
++        if precision == "timestamp":
++            _aware(effective, f"{label} effective_at_utc")
++            if evidence is not None:
++                raise ValueError(f"timestamp {label} cannot carry calendar evidence")
++        elif effective is None and evidence is None:
++            pass
++        elif effective is not None and evidence is not None:
++            _aware(effective, f"{label} effective_at_utc")
++            _hash(evidence, f"{label} effective_time_evidence_hash")
++        else:
++            raise ValueError(f"date_only {label} effective-time proof is incomplete")
++
++    validate_times(wire, "document")
++    if wire["source_updated_at_utc"] is not None:
++        _aware(wire["source_updated_at_utc"], "document source_updated_at_utc")
++    for row in rows:
++        if type(row) is not dict or not _ROW_TIME_FIELDS <= set(row):
++            raise ValueError("range row lacks required visibility fields")
++        if _FORBIDDEN_POLICY_FIELDS & set(row):
++            raise ValueError("range row contains a forbidden policy conclusion")
++        validate_times(row, "row")
++    _freeze_json(wire, label="parsed range document")
++    return wire
++
++
++class ParsedRangeDocumentV1:
++    """Unprivileged detached range parser DTO; authority lives in source receipts."""
++
++    __slots__ = ("__wire",)
++
++    def __init__(self, *_args: object, **_kwargs: object) -> None:
++        raise ValueError("use ParsedRangeDocumentV1.from_dict")
++
++    @classmethod
++    def from_dict(cls, wire):
++        if cls is not ParsedRangeDocumentV1:
++            raise ValueError("ParsedRangeDocumentV1 requires exact type")
++        validated = _validate_document_wire(wire)
++        result = object.__new__(ParsedRangeDocumentV1)
++        object.__setattr__(result, "_ParsedRangeDocumentV1__wire", _freeze_json(validated))
++        return result
++
++    def to_dict(self) -> dict[str, object]:
++        if type(self) is not ParsedRangeDocumentV1:
++            raise ValueError("ParsedRangeDocumentV1 requires exact type")
++        value = _thaw(object.__getattribute__(self, "_ParsedRangeDocumentV1__wire"))
++        assert type(value) is dict
++        return value
++
++
++def _build_fetch_type():
++    @dataclass(frozen=True)
++    class _FetchRecord:
++        reference: weakref.ReferenceType[object]
++        fields: tuple[object, ...]
++
++    records: dict[int, _FetchRecord] = {}
++
++    class RangeFetch:
++        __slots__ = (
++            "request_fingerprint", "range_config_id", "registry_manifest_hash",
++            "source", "dataset", "original_url", "headers", "raw_bytes",
++            "content_sha256", "captured_at_utc", "parser_id", "parser_version",
++            "mapping_version", "normalizer_version", "request_version",
++            "published_at_utc", "published_precision", "source_updated_at_utc",
++            "effective_at_utc", "effective_time_evidence_hash", "upstream_generation",
++            "pagination_evidence", "record_count", "page_record_count", "page_count",
++            "__weakref__",
++        )
++
++        def __init__(self, *_args: object, **_kwargs: object) -> None:
++            raise ValueError("RangeFetch cannot be externally constructed")
++
++        def _require(self):
++            record = records.get(id(self))
++            current = tuple(object.__getattribute__(self, field) for field in self.__slots__[:-1])
++            if record is None or record.reference() is not self or current != record.fields:
++                raise ValueError("range fetch is forged or changed")
++            return record
++
++        def to_manifest(self) -> dict[str, object]:
++            self._require()
++            return {
++                "schema_version": "formal-range-fetch-manifest-v1",
++                "request_fingerprint": self.request_fingerprint,
++                "range_config_id": self.range_config_id,
++                "registry_manifest_hash": self.registry_manifest_hash,
++                "source": self.source,
++                "dataset": self.dataset,
++                "original_url": self.original_url,
++                "content_sha256": self.content_sha256,
++                "captured_at_utc": self.captured_at_utc,
++                "parser_id": self.parser_id,
++                "parser_version": self.parser_version,
++                "mapping_version": self.mapping_version,
++                "normalizer_version": self.normalizer_version,
++                "request_version": self.request_version,
++                "published_at_utc": self.published_at_utc,
++                "published_precision": self.published_precision,
++                "source_updated_at_utc": self.source_updated_at_utc,
++                "effective_at_utc": self.effective_at_utc,
++                "effective_time_evidence_hash": self.effective_time_evidence_hash,
++                "upstream_generation": self.upstream_generation,
++                "pagination_evidence": self.pagination_evidence,
++                "record_count": self.record_count,
++                "page_record_count": self.page_record_count,
++                "page_count": self.page_count,
++            }
++
++    def mint(request_wire, config, response, document):
++        document_wire = document.to_dict()
++        values = (
++            hashlib.sha256(_canonical(dict(request_wire))).hexdigest(), config.entry_id,
++            request_wire["registry_manifest_hash"], config.source, config.dataset,
++            response.original_url, MappingProxyType(dict(response.headers)), response.raw_bytes,
++            hashlib.sha256(response.raw_bytes).hexdigest(), response.captured_at_utc,
++            config.parser_id, config.parser_version, config.mapping_version,
++            config.normalizer_version, config.request_version,
++            document_wire["published_at_utc"], document_wire["published_precision"],
++            document_wire["source_updated_at_utc"], document_wire["effective_at_utc"],
++            document_wire["effective_time_evidence_hash"], document_wire["upstream_generation"],
++            document_wire["pagination_evidence"], document_wire["record_count"],
++            document_wire["page_record_count"], document_wire["page_count"],
++        )
++        result = object.__new__(RangeFetch)
++        for field, value in zip(RangeFetch.__slots__[:-1], values):
++            object.__setattr__(result, field, value)
++        identity = id(result)
++        def forget(reference, *, identity=identity):
++            if records.get(identity) is not None and records[identity].reference is reference:
++                records.pop(identity, None)
++        records[identity] = _FetchRecord(weakref.ref(result, forget), values)
++        return result
++
++    return RangeFetch, mint
++
++
++RangeFetch, _mint_fetch = _build_fetch_type()
++del _build_fetch_type
++
++
++def _build_source_type():
++    require_binding = RangeBinding.require_current
++    calendar_config_get = RangeBinding.calendar_config.fget
++    source_hash_get = RangeBinding.source_registry_hash.fget
++    manifest_hash_get = RangeBinding.registry_manifest_hash.fget
++    assert calendar_config_get is not None and source_hash_get is not None
++    assert manifest_hash_get is not None
++
++    @dataclass(frozen=True)
++    class _ImplementationRecord:
++        parser: object
++        normalizer: object
++        parser_anchor: tuple[object, object | None]
++        normalizer_anchor: tuple[object, object | None]
++
++    @dataclass(frozen=True)
++    class _SourceRecord:
++        reference: weakref.ReferenceType[object]
++        binding: RangeBinding
++        transport: object
++        transport_anchor: tuple[object, object | None]
++        implementations: dict
++        implementation_items: tuple[tuple[tuple[str, ...], tuple[object, object]], ...]
++        selected: _ImplementationRecord
++        config_wire: dict[str, object]
++
++    records: dict[int, _SourceRecord] = {}
++
++    def source_record(source: object) -> _SourceRecord:
++        record = records.get(id(source))
++        if type(source) is not FormalRangeSource or record is None or record.reference() is not source:
++            raise FormalTerminalSourceError("formal range source is forged or unregistered")
++        try:
++            current_items = tuple(record.implementations.items())
++            items_unchanged = (
++                len(current_items) == len(record.implementation_items)
++                and all(
++                    current_key == sealed_key and current_value is sealed_value
++                    for (current_key, current_value), (sealed_key, sealed_value)
++                    in zip(current_items, record.implementation_items)
++                )
++            )
++            config = calendar_config_get(record.binding)
++            require_binding(record.binding)
++            unchanged = (
++                source._binding is record.binding
++                and source._transport is record.transport
++                and source._implementations is record.implementations
++                and items_unchanged
++                and _callable_anchor(record.transport, "send") == record.transport_anchor
++                and _callable_anchor(record.selected.parser, "parse") == record.selected.parser_anchor
++                and _callable_anchor(record.selected.normalizer, "normalize") == record.selected.normalizer_anchor
++                and type(config) is RangeConfig
++                and _range_config_to_dict(config) == record.config_wire
++            )
++        except (AttributeError, TypeError, ValueError):
++            unchanged = False
++        if not unchanged:
++            raise FormalTerminalSourceError("formal range source dependencies changed")
++        return record
++
++    class FormalRangeSource:
++        """One binding's sealed transport and exact range implementation registry."""
++
++        def __init__(self, binding, *, transport, implementations):
++            if type(binding) is not RangeBinding:
++                raise ValueError("range source requires an exact genuine RangeBinding")
++            require_binding(binding)
++            config = calendar_config_get(binding)
++            if type(config) is not RangeConfig:
++                raise ValueError("range binding calendar config is invalid")
++            if type(implementations) is not dict:
++                raise ValueError("range implementations must be an exact dict")
++            transport_anchor = _callable_anchor(transport, "send")
++            items = tuple(implementations.items())
++            sealed = {}
++            for key, value in items:
++                if (type(key) is not tuple or len(key) != 5
++                        or any(type(part) is not str or not part for part in key)):
++                    raise ValueError("range implementation key must contain five exact versions")
++                if type(value) is not tuple or len(value) != 2:
++                    raise ValueError("range implementation value must be a (parser, normalizer) tuple")
++                parser, normalizer = value
++                sealed[key] = _ImplementationRecord(
++                    parser, normalizer, _callable_anchor(parser, "parse"),
++                    _callable_anchor(normalizer, "normalize"),
++                )
++            key = (config.parser_id, config.parser_version, config.mapping_version,
++                   config.normalizer_version, config.request_version)
++            selected = sealed.get(key)
++            if selected is None:
++                raise ValueError("signed range implementation is not registered")
++            self._binding = binding
++            self._transport = transport
++            self._implementations = implementations
++            identity = id(self)
++            def forget(reference, *, identity=identity):
++                if records.get(identity) is not None and records[identity].reference is reference:
++                    records.pop(identity, None)
++            records[identity] = _SourceRecord(
++                weakref.ref(self, forget), binding, transport, transport_anchor,
++                implementations, items, selected, _range_config_to_dict(config),
++            )
++            source_record(self)
++
++        def first_calendar_request(self, as_of_utc: str) -> FormalRangeRequestV1:
++            record = source_record(self)
++            parsed = _aware(as_of_utc, "as_of_utc")
++            if as_of_utc != _FREEZE_UTC or parsed != datetime.fromisoformat(_FREEZE_UTC):
++                raise ValueError("calendar request as_of_utc must equal the formal freeze in UTC")
++            config = calendar_config_get(record.binding)
++            start, end = backward_interval(parsed.date().isoformat(), config.max_calendar_days_per_request)
++            config = calendar_config_get(record.binding)
++            wire = {
++                "schema_version": "formal-range-request-v1", "kind": "calendar_range",
++                "source": config.source, "dataset": config.dataset, "security_id": None,
++                "exchange": config.exchange_scope, "as_of_utc": as_of_utc,
++                "start_date": start, "end_date": end,
++                "anchor_descriptor_id": config.anchor_descriptor_id,
++                "calendar_descriptor_id": config.calendar_descriptor_id,
++                "range_config_id": config.entry_id,
++                "registry_manifest_hash": manifest_hash_get(record.binding),
++                "page_index": 1, "calendar_coverage_hash": None,
++            }
++            def root_guard():
++                current = source_record(self)
++                current_config = calendar_config_get(current.binding)
++                return (
++                    _range_config_to_dict(current_config) == current.config_wire
++                    and source_hash_get(current.binding) == source_hash_get(record.binding)
++                    and manifest_hash_get(current.binding) == wire["registry_manifest_hash"]
++                )
++            return _mint_range_request(
++                wire, _range_config_to_dict(config),
++                source_registry_hash=source_hash_get(record.binding), root_guard=root_guard
++            )
++
++        @staticmethod
++        def _parse(record, request_wire, config, raw_bytes):
++            if type(raw_bytes) is not bytes:
++                raise FormalTerminalSourceError("range raw_bytes must be exact bytes")
++            parser_request = dict(request_wire)
++            parser_config = _range_config_to_dict(config)
++            try:
++                parsed = record.selected.parser.parse(
++                    raw_bytes, request=parser_request, config=dict(parser_config)
++                )
++                source_record_from = record.reference()
++                if source_record_from is None:
++                    raise FormalTerminalSourceError("formal range source expired during parsing")
++                source_record(source_record_from)
++                normalized = record.selected.normalizer.normalize(
++                    parsed, request=dict(request_wire), config=dict(parser_config)
++                )
++                source_record(source_record_from)
++                document = ParsedRangeDocumentV1.from_dict(normalized)
++            except FormalTerminalSourceError:
++                raise
++            except Exception as error:
++                raise FormalTerminalSourceError("registered range parser or normalizer failed") from error
++            wire = document.to_dict()
++            expected = {
++                "request_fingerprint": hashlib.sha256(_canonical(dict(request_wire))).hexdigest(),
++                "source": request_wire["source"], "dataset": request_wire["dataset"],
++                "security_id": request_wire["security_id"], "exchange": request_wire["exchange"],
++                "start_date": request_wire["start_date"], "end_date": request_wire["end_date"],
++                "parser_id": config.parser_id, "parser_version": config.parser_version,
++                "mapping_version": config.mapping_version,
++                "normalizer_version": config.normalizer_version,
++                "request_version": config.request_version, "page_index": request_wire["page_index"],
++            }
++            if any(type(wire[key]) is not type(value) or wire[key] != value for key, value in expected.items()):
++                raise FormalTerminalSourceError("parsed range document identity differs from request or config")
++            if config.pagination == "single_response_v1":
++                if wire["page_index"] != 1 or wire["page_count"] != 1:
++                    raise FormalTerminalSourceError("single-response range document claims pagination")
++                if wire["pagination_evidence"] != "signed_single_response_v1":
++                    raise FormalTerminalSourceError("single-response pagination evidence is invalid")
++                if wire["record_count"] != wire["page_record_count"]:
++                    raise FormalTerminalSourceError("single-response total differs from page rows")
++            elif wire["page_count"] > config.max_pages:
++                raise FormalTerminalSourceError("range document pagination exceeds signed budget")
++            elif wire["pagination_evidence"] != "source_declared_numbered_pages_v1":
++                raise FormalTerminalSourceError("numbered pagination lacks source declaration")
++            return document
++
++        def fetch_verified(self, request: FormalRangeRequestV1) -> RangeFetch:
++            record = source_record(self)
++            try:
++                request_wire, request_config, _ = _trusted_range_request_snapshot(request)
++            except ValueError as error:
++                raise FormalTerminalSourceError(str(error)) from error
++            config = calendar_config_get(record.binding)
++            if request_config != record.config_wire or request_config != _range_config_to_dict(config):
++                raise FormalTerminalSourceError("range request config differs from sealed source")
++            sent = _transport_request(config, request_wire)
++            try:
++                response = record.transport.send(sent)
++            except (FormalRetryableSourceError, FormalSourceBlocked):
++                raise
++            except Exception as error:
++                raise FormalRetryableSourceError("range transport failed") from error
++            source_record(self)
++            response = _snapshot_transport_response(response)
++            _classify_transport_response(response)
++            if _https_host(response.original_url, "range response original_url") != _https_host(
++                config.endpoint_url, "signed range endpoint_url"
++            ):
++                raise FormalTerminalSourceError("range response redirected outside the signed host")
++            document = self._parse(record, request_wire, config, response.raw_bytes)
++            if document.to_dict()["captured_at_utc"] != response.captured_at_utc:
++                raise FormalTerminalSourceError("document capture time differs from transport")
++            source_record(self)
++            return _mint_fetch(request_wire, config, response, document)
++
++        def parse_verified_snapshot(self, request: FormalRangeRequestV1, *, raw_bytes: bytes,
++                                    manifest: dict) -> ParsedRangeDocumentV1:
++            record = source_record(self)
++            try:
++                request_wire, request_config, _ = _trusted_range_request_snapshot(request)
++            except ValueError as error:
++                raise FormalTerminalSourceError(str(error)) from error
++            config = calendar_config_get(record.binding)
++            if request_config != record.config_wire or request_config != _range_config_to_dict(config):
++                raise FormalTerminalSourceError("range request config differs from sealed source")
++            expected_keys = frozenset({
++                "schema_version", "request_fingerprint", "range_config_id",
++                "registry_manifest_hash", "source", "dataset", "original_url",
++                "content_sha256", "captured_at_utc", "parser_id", "parser_version",
++                "mapping_version", "normalizer_version", "request_version",
++                "published_at_utc", "published_precision", "source_updated_at_utc",
++                "effective_at_utc", "effective_time_evidence_hash", "upstream_generation",
++                "pagination_evidence", "record_count", "page_record_count", "page_count",
++            })
++            if type(manifest) is not dict or set(manifest) != expected_keys:
++                raise FormalTerminalSourceError("range manifest has unknown or missing keys")
++            expected = {
++                "schema_version": "formal-range-fetch-manifest-v1",
++                "request_fingerprint": hashlib.sha256(_canonical(request_wire)).hexdigest(),
++                "range_config_id": config.entry_id,
++                "registry_manifest_hash": request_wire["registry_manifest_hash"],
++                "source": config.source, "dataset": config.dataset,
++                "content_sha256": hashlib.sha256(raw_bytes).hexdigest() if type(raw_bytes) is bytes else None,
++                "parser_id": config.parser_id, "parser_version": config.parser_version,
++                "mapping_version": config.mapping_version,
++                "normalizer_version": config.normalizer_version,
++                "request_version": config.request_version,
++            }
++            if any(type(manifest.get(key)) is not type(value) or manifest.get(key) != value
++                   for key, value in expected.items()):
++                raise FormalTerminalSourceError("range manifest identity or content hash is invalid")
++            try:
++                if _https_host(manifest["original_url"], "range manifest original_url") != _https_host(
++                    config.endpoint_url, "signed range endpoint_url"
++                ):
++                    raise FormalTerminalSourceError("range manifest URL host is invalid")
++                _aware(manifest["captured_at_utc"], "range manifest captured_at_utc")
++            except ValueError as error:
++                raise FormalTerminalSourceError(str(error)) from error
++            document = self._parse(record, request_wire, config, raw_bytes)
++            document_wire = document.to_dict()
++            for key in (
++                "published_at_utc", "published_precision", "source_updated_at_utc",
++                "effective_at_utc", "effective_time_evidence_hash", "upstream_generation",
++                "pagination_evidence", "record_count", "page_record_count", "page_count",
++                "captured_at_utc",
++            ):
++                if type(manifest[key]) is not type(document_wire[key]) or manifest[key] != document_wire[key]:
++                    raise FormalTerminalSourceError("range manifest source version differs from parser")
++            return document
++
++    return FormalRangeSource
++
++
++FormalRangeSource = _build_source_type()
++del _build_source_type
++
++
++__all__ = [
++    "FormalRangeRequestV1", "FormalRangeSource", "ParsedRangeDocumentV1", "RangeFetch",
++    "backward_interval", "page_successor",
++]
+diff --git a/ashare_pipeline/formal_sources.py b/ashare_pipeline/formal_sources.py
+index b3b2523..cc9b6a3 100644
+--- a/ashare_pipeline/formal_sources.py
++++ b/ashare_pipeline/formal_sources.py
+@@ -12,21 +12,25 @@ from dataclasses import dataclass
+ from datetime import datetime
+ import hashlib
+ import json
+ import math
+ import re
+ from types import MappingProxyType
+ from typing import Literal, Protocol
+ import uuid
+ import weakref
+ 
+-from .formal_range_format import RangeConfig, parse_range_entry
++from .formal_range_format import RangeConfig, parse_range_entry, _range_config_to_dict
++from .formal_range_request import (
++    FormalRangeRequestV1 as _FormalRangeRequestV1,
++    _trusted_range_request_snapshot as _range_request_snapshot,
++)
+ from .formal_evidence import (
+     EvidenceVerification,
+     OfficialFetch,
+     OfficialRequest,
+     OfficialSnapshotRef,
+     SourcePolicy,
+     VerifiedCalendarBinding,
+     verify_official_fetch,
+ )
+ from .formal_time import FORMAL_FREEZE_AT_CN, resolve_effective_at
+@@ -597,20 +601,23 @@ def _make_signed_source_registry_type() -> type[object]:
+         "retry_base_seconds",
+         "retry_max_attempts",
+         "challenge_cooldown_seconds",
+         "registry_hash",
+         "exchange_scope",
+         "calendar_selector",
+         "bootstrap_calendar",
+     )
+     range_config_type = RangeConfig
+     parse_range_config = parse_range_entry
++    range_request_type = _FormalRangeRequestV1
++    range_request_snapshot = _range_request_snapshot
++    range_config_to_dict = _range_config_to_dict
+     range_config_fields = (
+         "schema_version",
+         "capability",
+         "kind",
+         "anchor_descriptor_id",
+         "calendar_descriptor_id",
+         "source",
+         "dataset",
+         "endpoint_url",
+         "http_method",
+@@ -901,20 +908,45 @@ def _make_signed_source_registry_type() -> type[object]:
+             object.__setattr__(registry, "signature", signature_text)
+             object.__setattr__(registry, "key_id", key_text)
+             object.__setattr__(registry, "configs", configs)
+             object.__setattr__(registry, "range_configs", range_configs)
+             remember_verified(registry)
+             return registry
+ 
+         def select(self, request: OfficialRequest) -> SourceAdapterConfig:
+             return trusted_config_snapshot(self, request)
+ 
++        def select_range(self, request) -> RangeConfig:
++            try:
++                if type(request) is not range_request_type:
++                    raise ValueError("range request must have exact genuine type")
++                wire, sealed_config, source_registry_hash = range_request_snapshot(request)
++                if source_registry_hash != verified_record(self).registry_hash:
++                    raise ValueError("range request source registry differs from this registry")
++                matches = [
++                    config for config in trusted_range_config_snapshots(self)
++                    if config.kind == wire["kind"]
++                    and config.source == wire["source"]
++                    and config.dataset == wire["dataset"]
++                    and config.exchange_scope == wire["exchange"]
++                    and config.entry_id == wire["range_config_id"]
++                    and config.anchor_descriptor_id == wire["anchor_descriptor_id"]
++                    and config.calendar_descriptor_id == wire["calendar_descriptor_id"]
++                ]
++                if len(matches) != 1 or range_config_to_dict(matches[0]) != sealed_config:
++                    raise ValueError("signed range config is absent, ambiguous, or differs from request")
++                return matches[0]
++            except FormalTerminalSourceError:
++                raise
++            except ValueError as error:
++                raise FormalTerminalSourceError(str(error)) from error
++
+     return SignedSourceRegistry
+ 
+ 
+ SignedSourceRegistry = _make_signed_source_registry_type()
+ del _make_signed_source_registry_type
+ 
+ 
+ def _validate_request(request: object) -> tuple[OfficialRequest, str | None]:
+     if type(request) is not OfficialRequest:
+         raise FormalTerminalSourceError("request must have exact type OfficialRequest")
+diff --git a/tests/formal_range_fixtures.py b/tests/formal_range_fixtures.py
+index b79f823..df524a3 100644
+--- a/tests/formal_range_fixtures.py
++++ b/tests/formal_range_fixtures.py
+@@ -1,14 +1,19 @@
+ """Byte-sensitive signed range-catalog fixtures; never production mappings."""
+ 
+ import hashlib
++import json
+ 
++from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
++from ashare_pipeline.formal_range_contract import load_policy_range_bindings
++from ashare_pipeline.formal_range_source import FormalRangeSource
++from ashare_pipeline.formal_sources import SignedSourceRegistry, TransportResponse
+ from tests.formal_policy_fixtures import policy_graph, rehash_documents
+ from tests.test_formal_context_repository import descriptor
+ from tests.test_formal_scoring_registry import canonical
+ from tests.test_formal_sources import config
+ 
+ 
+ def range_entry(**changes):
+     entry = dict(
+         schema_version="formal-range-source-config-v1",
+         capability="verified_market_window_v1",
+@@ -153,10 +158,95 @@ def add_range_documents(documents):
+ 
+ 
+ def range_graph(*, mutate=None):
+     def prepare(documents):
+         add_range_documents(documents)
+         if mutate is not None:
+             mutate(documents)
+         rehash_documents(documents)
+ 
+     return policy_graph(mutate=prepare)
++
++
++class _CapturingRangeTransport:
++    def __init__(self):
++        self.requests = []
++        self.response = None
++
++    def send(self, request):
++        self.requests.append(request)
++        if self.response is None:
++            raise RuntimeError("fixture transport has no reply")
++        return self.response
++
++
++class _JsonRangeParser:
++    def __init__(self):
++        self.calls = []
++
++    def parse(self, raw_bytes, *, request, config):
++        self.calls.append((raw_bytes, request, config))
++        return json.loads(raw_bytes.decode("utf-8"))
++
++
++class _IdentityRangeNormalizer:
++    def __init__(self):
++        self.calls = []
++
++    def normalize(self, wire, *, request, config):
++        self.calls.append((wire, request, config))
++        return wire
++
++
++class RangeSourceFixture:
++    """A genuine signed binding with only in-memory range bytes and transport."""
++
++    def __init__(self, *, mutate=None, implementations=None):
++        bundle, vocabulary, scoring, _, verifier = range_graph(mutate=mutate)
++        policy = load_formal_policy_registry(
++            bundle, scoring_registry=scoring, feature_registry=vocabulary
++        )
++        bindings = load_policy_range_bindings(
++            bundle, scoring_registry=scoring, policy_registry=policy
++        )
++        self.binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
++        source_blob = bundle.blob("source")
++        self.registry = SignedSourceRegistry.from_signed_bytes(
++            source_blob.canonical_json,
++            source_blob.signature,
++            source_blob.key_id,
++            verifier,
++        )
++        self.transport = _CapturingRangeTransport()
++        self.parser = _JsonRangeParser()
++        self.normalizer = _IdentityRangeNormalizer()
++        config = self.binding.calendar_config
++        key = (
++            config.parser_id,
++            config.parser_version,
++            config.mapping_version,
++            config.normalizer_version,
++            config.request_version,
++        )
++        registry = {key: (self.parser, self.normalizer)}
++        if implementations is not None:
++            registry = implementations
++        self.implementations = registry
++        self.source = FormalRangeSource(
++            self.binding,
++            transport=self.transport,
++            implementations=registry,
++        )
++
++    def reply(self, wire, *, status_code=200,
++              original_url="https://www.cninfo.com.cn/fixture/range-calendar.json",
++              headers=None, captured_at_utc="2026-08-31T06:59:00+00:00"):
++        self.transport.response = TransportResponse(
++            status_code=status_code,
++            original_url=original_url,
++            headers={} if headers is None else headers,
++            raw_bytes=canonical(wire),
++            captured_at_utc=captured_at_utc,
++        )
++
++    def close(self):
++        pass
+diff --git a/tests/test_formal_range_source.py b/tests/test_formal_range_source.py
+new file mode 100644
+index 0000000..da8b313
+--- /dev/null
++++ b/tests/test_formal_range_source.py
+@@ -0,0 +1,437 @@
++"""Authenticated bounded calendar range request, transport, and parser tests."""
++
++import copy
++import hashlib
++import subprocess
++import sys
++import textwrap
++import unittest
++
++from ashare_pipeline.formal_sources import (
++    FormalRetryableSourceError,
++    FormalSourceBlocked,
++    FormalTerminalSourceError,
++    SignedSourceRegistry,
++    TransportResponse,
++)
++from tests.formal_range_fixtures import RangeSourceFixture, range_entry
++
++
++FREEZE = "2026-08-31T07:00:00+00:00"
++
++
++def document_wire(request, **changes):
++    request_wire = request.to_dict()
++    row = {
++        "date": "2026-08-29",
++        "is_open": False,
++        "published_at_utc": "2026-08-29T08:00:00+00:00",
++        "published_precision": "timestamp",
++        "effective_at_utc": "2026-08-29T08:00:00+00:00",
++        "effective_time_evidence_hash": None,
++        "captured_at_utc": "2026-08-31T06:59:00+00:00",
++    }
++    wire = {
++        "schema_version": "formal-parsed-range-document-v1",
++        "request_fingerprint": request.request_fingerprint,
++        "source": request_wire["source"],
++        "dataset": request_wire["dataset"],
++        "security_id": request_wire["security_id"],
++        "exchange": request_wire["exchange"],
++        "start_date": request_wire["start_date"],
++        "end_date": request_wire["end_date"],
++        "parser_id": "fixture-range-parser",
++        "parser_version": "fixture-range-v1",
++        "mapping_version": "fixture-range-map-v1",
++        "normalizer_version": "fixture-range-normalizer-v1",
++        "request_version": "formal-range-request-v1",
++        "published_at_utc": "2026-08-29T08:00:00+00:00",
++        "published_precision": "timestamp",
++        "source_updated_at_utc": "2026-08-30T08:00:00+00:00",
++        "effective_at_utc": "2026-08-29T08:00:00+00:00",
++        "effective_time_evidence_hash": None,
++        "captured_at_utc": "2026-08-31T06:59:00+00:00",
++        "upstream_generation": "fixture-calendar-release-2026-08-30",
++        "pagination_evidence": "signed_single_response_v1",
++        "page_index": 1,
++        "page_count": 1,
++        "record_count": 1,
++        "page_record_count": 1,
++        "coverage": {
++            "start_date": request_wire["start_date"],
++            "end_date": request_wire["end_date"],
++            "complete": True,
++        },
++        "rows": [row],
++    }
++    wire.update(changes)
++    return wire
++
++
++class FormalRangeSourceTests(unittest.TestCase):
++    def fixture(self, **kwargs):
++        fixture = RangeSourceFixture(**kwargs)
++        self.addCleanup(fixture.close)
++        return fixture
++
++    def test_first_calendar_request_needs_no_existing_calendar(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        wire = request.to_dict()
++        self.assertEqual(wire["end_date"], "2026-08-31")
++        self.assertEqual(wire["start_date"], "2025-07-28")
++        self.assertEqual(wire["page_index"], 1)
++        self.assertIsNone(wire["security_id"])
++        self.assertIsNone(wire["calendar_coverage_hash"])
++        self.assertEqual(len(request.request_fingerprint), 64)
++
++    def test_backward_interval_is_inclusive_and_stops_at_iso_floor(self):
++        from ashare_pipeline.formal_range_source import backward_interval
++
++        self.assertEqual(backward_interval("2026-08-31", 400), ("2025-07-28", "2026-08-31"))
++        self.assertEqual(backward_interval("0001-01-03", 10), ("0001-01-01", "0001-01-03"))
++        for bad in (True, 1.0, 0, -1):
++            with self.subTest(limit=bad), self.assertRaises(ValueError):
++                backward_interval("2026-08-31", bad)
++        for bad in (None, "2026-8-31", "2026-02-30"):
++            with self.subTest(end=bad), self.assertRaises((TypeError, ValueError)):
++                backward_interval(bad, 1)
++
++    def test_page_successor_requires_source_backed_exact_page_identity(self):
++        from ashare_pipeline.formal_range_source import page_successor
++
++        self.assertEqual(page_successor({"page_index": 1, "page_count": 2}, 2), 2)
++        self.assertIsNone(page_successor({"page_index": 2, "page_count": 2}, 2))
++        for document, maximum in (
++            ({"page_index": True, "page_count": 1}, 1),
++            ({"page_index": 0, "page_count": 1}, 1),
++            ({"page_index": 2, "page_count": 1}, 2),
++            ({"page_index": 1, "page_count": 3}, 2),
++            ({"page_index": 1, "page_count": 1}, True),
++        ):
++            with self.subTest(document=document, maximum=maximum), self.assertRaises(ValueError):
++                page_successor(document, maximum)
++
++    def test_request_dates_and_freeze_are_closed(self):
++        fixture = self.fixture()
++        for bad in (
++            "2026-08-31",
++            "2026-08-31T07:00:01+00:00",
++            "2026-08-31T15:00:00+07:00",
++            True,
++        ):
++            with self.subTest(as_of=bad), self.assertRaises(ValueError):
++                fixture.source.first_calendar_request(bad)
++
++    def test_request_cannot_be_constructed_copied_or_mutated_into_authority(self):
++        from ashare_pipeline.formal_range_source import FormalRangeRequestV1
++
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        with self.assertRaises(ValueError):
++            FormalRangeRequestV1(**request.to_dict())
++        forged = object.__new__(FormalRangeRequestV1)
++        for key, value in request.to_dict().items():
++            object.__setattr__(forged, key, value)
++        with self.assertRaises(FormalTerminalSourceError):
++            fixture.source.fetch_verified(forged)
++        with self.assertRaises(TypeError):
++            copy.copy(request)
++        object.__setattr__(request, "page_index", 2)
++        with self.assertRaises(FormalTerminalSourceError):
++            fixture.source.fetch_verified(request)
++
++    def test_select_range_accepts_only_matching_genuine_request(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        selected = fixture.registry.select_range(request)
++        self.assertEqual(selected.entry_id, request.to_dict()["range_config_id"])
++        self.assertEqual(selected.anchor_descriptor_id, request.to_dict()["anchor_descriptor_id"])
++        with self.assertRaises(FormalTerminalSourceError):
++            fixture.registry.select_range(object())
++
++    def test_select_range_rejects_different_config_and_root_identity(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++
++        def changed(documents):
++            entry = next(item for item in documents["source"]["range_configs"]
++                         if item["kind"] == "calendar_range" and item["exchange_scope"] == "SH")
++            entry["endpoint_url"] = "https://www.cninfo.com.cn/fixture/other-range.json"
++
++        other = self.fixture(mutate=changed)
++        with self.assertRaises(FormalTerminalSourceError):
++            other.registry.select_range(request)
++
++    def test_select_range_rejects_changed_source_blob_even_when_entry_is_identical(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++
++        def changed_unrelated_entry(documents):
++            entry = next(item for item in documents["source"]["range_configs"]
++                         if item["kind"] == "calendar_range" and item["exchange_scope"] == "SZ")
++            entry["endpoint_url"] = "https://www.cninfo.com.cn/fixture/changed-sz.json"
++
++        other = self.fixture(mutate=changed_unrelated_entry)
++        self.assertEqual(
++            other.binding.calendar_config.entry_id,
++            fixture.binding.calendar_config.entry_id,
++        )
++        with self.assertRaises(FormalTerminalSourceError):
++            other.registry.select_range(request)
++
++    def test_identical_source_blob_can_be_reused_by_a_different_manifest_root(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++
++        def changed_other_role(documents):
++            documents["event"]["rules"]["event"]["evidence_kind"] = "fixture-event-v2"
++
++        other = self.fixture(mutate=changed_other_role)
++        self.assertNotEqual(
++            other.binding.registry_manifest_hash, fixture.binding.registry_manifest_hash
++        )
++        self.assertEqual(other.registry.registry_hash, fixture.registry.registry_hash)
++        selected = other.registry.select_range(request)
++        self.assertEqual(selected.entry_id, fixture.binding.calendar_config.entry_id)
++
++    def test_import_orders_have_no_registration_hook_or_partial_cycle(self):
++        modules = (
++            "ashare_pipeline.formal_sources",
++            "ashare_pipeline.formal_range_source",
++            "ashare_pipeline.formal_range_contract",
++            "ashare_pipeline.formal_context_schema",
++            "ashare_pipeline.formal_registry_manifest",
++        )
++        for module in modules:
++            code = textwrap.dedent(f"""
++                import {module}
++                import ashare_pipeline.formal_sources as sources
++                import ashare_pipeline.formal_range_source as ranges
++                assert not hasattr(sources, '_register_range_request')
++                forged = object.__new__(ranges.FormalRangeRequestV1)
++                try:
++                    sources.SignedSourceRegistry.select_range(object(), forged)
++                except Exception:
++                    pass
++                else:
++                    raise AssertionError('forged request accepted')
++            """)
++            result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
++            with self.subTest(first=module):
++                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++    def test_transport_request_uses_only_new_placeholders_and_signed_bounds(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        fixture.reply(document_wire(request))
++        fetch = fixture.source.fetch_verified(request)
++        sent = fixture.transport.requests[0]
++        self.assertEqual(
++            sent.url,
++            "https://www.cninfo.com.cn/fixture/range-calendar.json?end=2026-08-31&exchange=SH&page=1&start=2025-07-28",
++        )
++        self.assertEqual(sent.method, "GET")
++        self.assertIsNone(sent.body)
++        self.assertEqual(fetch.request_fingerprint, request.request_fingerprint)
++        self.assertEqual(fetch.raw_bytes, fixture.transport.response.raw_bytes)
++
++    def test_old_and_new_request_placeholders_cannot_cross(self):
++        from ashare_pipeline.formal_range_contract import parse_range_entry
++
++        with self.assertRaises(ValueError):
++            parse_range_entry(range_entry(request_template={
++                "query": {"date": "{period_or_date}"}, "headers": {}, "body": None
++            }))
++
++    def test_redirect_challenge_and_blocking_statuses_are_not_evidence(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        for status, url, headers, error in (
++            (200, "https://evil.example.invalid/range.json", {}, FormalTerminalSourceError),
++            (403, "https://www.cninfo.com.cn/fixture/range-calendar.json", {}, FormalSourceBlocked),
++            (429, "https://www.cninfo.com.cn/fixture/range-calendar.json", {}, FormalSourceBlocked),
++            (200, "https://www.cninfo.com.cn/fixture/range-calendar.json", {"x-page": "captcha"}, FormalSourceBlocked),
++            (503, "https://www.cninfo.com.cn/fixture/range-calendar.json", {}, FormalRetryableSourceError),
++        ):
++            fixture.reply(document_wire(request), status_code=status, original_url=url, headers=headers)
++            with self.subTest(status=status, url=url, headers=headers), self.assertRaises(error):
++                fixture.source.fetch_verified(request)
++
++    def test_fetch_and_snapshot_parse_bind_content_and_manifest(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        fixture.reply(document_wire(request))
++        fetch = fixture.source.fetch_verified(request)
++        parsed = fixture.source.parse_verified_snapshot(
++            request, raw_bytes=fetch.raw_bytes, manifest=fetch.to_manifest()
++        )
++        self.assertEqual(parsed.to_dict(), document_wire(request))
++        detached = parsed.to_dict()
++        detached["rows"][0]["is_open"] = True
++        self.assertFalse(parsed.to_dict()["rows"][0]["is_open"])
++        bad = fetch.to_manifest()
++        bad["content_sha256"] = "0" * 64
++        with self.assertRaises(FormalTerminalSourceError):
++            fixture.source.parse_verified_snapshot(request, raw_bytes=fetch.raw_bytes, manifest=bad)
++
++    def test_parser_output_identity_page_and_counts_must_match(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        cases = (
++            {"request_fingerprint": "0" * 64},
++            {"source": "sse"},
++            {"dataset": "other"},
++            {"security_id": "SH600000"},
++            {"exchange": "SZ"},
++            {"start_date": "2025-07-29"},
++            {"end_date": "2026-08-30"},
++            {"parser_version": "other-v1"},
++            {"page_index": 2},
++            {"page_count": 2},
++            {"record_count": 0},
++            {"page_record_count": 0},
++            {"pagination_evidence": "source_declared_numbered_pages_v1"},
++        )
++        for changes in cases:
++            fixture.reply(document_wire(request, **changes))
++            with self.subTest(changes=changes), self.assertRaises(FormalTerminalSourceError):
++                fixture.source.fetch_verified(request)
++
++    def test_empty_response_does_not_claim_complete_coverage(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        fixture.reply(document_wire(request, record_count=0, page_record_count=0, rows=[]))
++        with self.assertRaises(FormalTerminalSourceError):
++            fixture.source.fetch_verified(request)
++
++    def test_late_capture_and_late_publication_are_preserved_as_observations(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        late = "2026-09-01T01:00:00+00:00"
++        wire = document_wire(
++            request,
++            published_at_utc=late,
++            source_updated_at_utc=late,
++            effective_at_utc=late,
++            captured_at_utc=late,
++        )
++        wire["rows"][0].update(
++            published_at_utc=late, effective_at_utc=late, captured_at_utc=late
++        )
++        fixture.reply(wire, captured_at_utc=late)
++        fetch = fixture.source.fetch_verified(request)
++        self.assertEqual(fetch.captured_at_utc, late)
++        self.assertEqual(fetch.to_manifest()["published_at_utc"], late)
++        self.assertEqual(
++            fixture.source.parse_verified_snapshot(
++                request, raw_bytes=fetch.raw_bytes, manifest=fetch.to_manifest()
++            ).to_dict()["published_at_utc"],
++            late,
++        )
++
++    def test_unproven_date_only_effective_time_stays_explicitly_unresolved(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        wire = document_wire(
++            request,
++            published_at_utc="2026-08-29T00:00:00+00:00",
++            published_precision="date_only",
++            effective_at_utc=None,
++            effective_time_evidence_hash=None,
++        )
++        wire["rows"][0].update(
++            published_at_utc="2026-08-29T00:00:00+00:00",
++            published_precision="date_only",
++            effective_at_utc=None,
++            effective_time_evidence_hash=None,
++        )
++        fixture.reply(wire)
++        fetch = fixture.source.fetch_verified(request)
++        parsed = fixture.source.parse_verified_snapshot(
++            request, raw_bytes=fetch.raw_bytes, manifest=fetch.to_manifest()
++        )
++        self.assertIsNone(parsed.to_dict()["effective_at_utc"])
++        self.assertIsNone(parsed.to_dict()["rows"][0]["effective_at_utc"])
++
++    def test_rows_require_visibility_fields_and_forbid_policy_conclusions(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        for mutation in ("missing_time", "effective_trade", "stale_days", "pool_veto"):
++            wire = document_wire(request)
++            if mutation == "missing_time":
++                del wire["rows"][0]["published_at_utc"]
++            else:
++                wire["rows"][0][mutation] = False if mutation == "pool_veto" else 0
++            fixture.reply(wire)
++            with self.subTest(mutation=mutation), self.assertRaises(FormalTerminalSourceError):
++                fixture.source.fetch_verified(request)
++
++    def test_implementation_key_and_method_identities_are_sealed(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        fixture.reply(document_wire(request))
++        key = next(iter(fixture.implementations))
++        fixture.implementations[key] = (object(), object())
++        with self.assertRaises(FormalTerminalSourceError):
++            fixture.source.fetch_verified(request)
++
++        second = self.fixture()
++        request = second.source.first_calendar_request(FREEZE)
++        second.reply(document_wire(request))
++        second.normalizer.normalize = lambda wire, **kwargs: wire
++        with self.assertRaises(FormalTerminalSourceError):
++            second.source.fetch_verified(request)
++
++        third = self.fixture()
++        request = third.source.first_calendar_request(FREEZE)
++        third.reply(document_wire(request))
++        key = next(iter(third.implementations))
++        third.implementations[key] = (third.parser, third.normalizer)
++        with self.assertRaises(FormalTerminalSourceError):
++            third.source.fetch_verified(request)
++
++    def test_unregistered_or_self_reported_implementation_is_rejected(self):
++        fixture = RangeSourceFixture.__new__(RangeSourceFixture)
++        with self.assertRaises(ValueError):
++            RangeSourceFixture(implementations={})
++
++        class ClaimsVersions:
++            parser_id = "fixture-range-parser"
++            parser_version = "fixture-range-v1"
++            mapping_version = "fixture-range-map-v1"
++            normalizer_version = "fixture-range-normalizer-v1"
++            request_version = "formal-range-request-v1"
++
++            def parse(self, raw_bytes, **kwargs):
++                return {}
++
++            def normalize(self, wire, **kwargs):
++                return wire
++
++        with self.assertRaises(ValueError):
++            RangeSourceFixture(implementations={"fixture-range-parser": ClaimsVersions()})
++
++    def test_parser_cannot_mutate_config_or_request_during_execution(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        fixture.reply(document_wire(request))
++        original_parse = fixture.parser.parse
++
++        def mutating_parse(raw_bytes, *, request, config):
++            config["mapping_version"] = "unsigned-map"
++            return original_parse(raw_bytes, request=request, config=config)
++
++        fixture.parser.parse = mutating_parse
++        with self.assertRaises(FormalTerminalSourceError):
++            fixture.source.fetch_verified(request)
++
++    def test_range_fetch_cannot_be_externally_minted(self):
++        from ashare_pipeline.formal_range_source import RangeFetch
++
++        with self.assertRaises(ValueError):
++            RangeFetch()
++
++
++if __name__ == "__main__":
++    unittest.main()
+

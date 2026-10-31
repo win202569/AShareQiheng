@@ -1,0 +1,137 @@
+{
+  "captured_at_utc": "2026-10-31T17:10:03.871017+00:00",
+  "source_checkpoint": "756fdfc38c27df4a9ea5ee01f15117ce7e9f3b00",
+  "recovery_branch": "codex/recovery-2026-10-31",
+  "worktrees": [
+    {
+      "path": "D:\\Projects\\AShareQiheng",
+      "label": "00-main",
+      "branch": "main",
+      "head": "a621895d30c331b32f23f0e301747451b9f7e37c",
+      "status": [
+        " M data/status/pipeline_status.json",
+        "?? .tmp_git_safe_config",
+        "?? AShareQiheng-backup-20260906.bundle",
+        "?? AShareQiheng-backup-20260906.git/",
+        "?? data/backups/state_before_path_move_20260829T061619Z.sqlite3-shm",
+        "?? data/backups/state_before_path_move_20260829T061619Z.sqlite3-wal",
+        "?? data/backups/state_before_qiheng_rename_20260829T062259Z.sqlite3-shm",
+        "?? data/backups/state_before_qiheng_rename_20260829T062259Z.sqlite3-wal",
+        "?? tmp_push_mirror_20260906/",
+        "?? 恢复进度文档-另一台电脑.md",
+        ""
+      ]
+    },
+    {
+      "path": "C:\\Users\\Lenovo\\.codex\\worktrees\\formal-final-stage-d\\AShareQiheng",
+      "label": "01-formal-final-stage-d",
+      "branch": "codex/formal-final-stage-d",
+      "head": "756fdfc38c27df4a9ea5ee01f15117ce7e9f3b00",
+      "status": [
+        " M .superpowers/sdd/.gitignore",
+        " M docs/superpowers/plans/2026-09-28-formal-final-scoring-stage-d.md",
+        "?? data/backups/state_before_path_move_20260829T061619Z.sqlite3-shm",
+        "?? data/backups/state_before_path_move_20260829T061619Z.sqlite3-wal",
+        "?? data/backups/state_before_qiheng_rename_20260829T062259Z.sqlite3-shm",
+        "?? data/backups/state_before_qiheng_rename_20260829T062259Z.sqlite3-wal",
+        ""
+      ]
+    },
+    {
+      "path": "D:\\Projects\\AShareQiheng\\.worktrees\\industry-registry-v2",
+      "label": "02-industry-registry-v2",
+      "branch": "codex/industry-registry-v2",
+      "head": "69727f645e42d55781cbf39d36cb2b3f91350dbc",
+      "status": [
+        ""
+      ]
+    },
+    {
+      "path": "D:\\Projects\\AShareQiheng\\.worktrees\\malformed-reconciliation-store",
+      "label": "03-malformed-reconciliation-store",
+      "branch": "codex/malformed-reconciliation-store",
+      "head": "10447770988b5d9966529a6bbae6609003990ce2",
+      "status": [
+        ""
+      ]
+    },
+    {
+      "path": "D:\\Projects\\AShareQiheng\\.worktrees\\midnight-refresh-tolerance",
+      "label": "04-midnight-refresh-tolerance",
+      "branch": "codex/midnight-refresh-tolerance",
+      "head": "63485e8c99f5bb96da2f86ab5d4544d135249854",
+      "status": [
+        ""
+      ]
+    },
+    {
+      "path": "D:\\Projects\\AShareQiheng\\.worktrees\\report-date-repair",
+      "label": "05-report-date-repair",
+      "branch": "codex/report-date-repair",
+      "head": "3418de95fff3c5818fa0007062c29f69dbffe781",
+      "status": [
+        "?? .tmp-controller/",
+        "?? data/state.sqlite3-shm",
+        "?? data/state.sqlite3-wal",
+        ""
+      ]
+    },
+    {
+      "path": "D:\\Projects\\AShareQiheng\\.worktrees\\seven-dimension-foundation",
+      "label": "06-seven-dimension-foundation",
+      "branch": "feature/seven-dimension-foundation",
+      "head": "29bac16fc1ee0f690a4ca8eeec6ff213c69bda69",
+      "status": [
+        "?? .controller-final-29bac16/",
+        "?? .final-controller-unittest-v5/",
+        "?? .final-derived-mirror-temp/",
+        "?? .final-derived-temp/",
+        "?? .final-pit-temp/",
+        "?? .final-trust-boundary-temp/",
+        "?? .ftb2/",
+        "?? .fv6/",
+        "?? .m6/",
+        "?? .merge-preflight-29bac16/",
+        "?? .r0/",
+        "?? .review-v5-tests-20260901/",
+        "?? .test-tmp/",
+        "?? .tmp-root-check/",
+        "?? .tmp-tests/",
+        ""
+      ]
+    }
+  ],
+  "journals": {
+    "grouped-checkpoint-756fdfc": {
+      "passed_groups": 51,
+      "nonzero_groups": 0
+    },
+    "grouped-checkpoint-b1b49c7": {
+      "passed_groups": 70,
+      "nonzero_groups": 1
+    },
+    "grouped-checkpoint-caff956": {
+      "passed_groups": 80,
+      "nonzero_groups": 1
+    },
+    "grouped-checkpoint-cdad2c4": {
+      "passed_groups": 57,
+      "nonzero_groups": 1
+    }
+  },
+  "databases": "SQLite online backup; integrity_check=ok",
+  "verification_observation": {
+    "state": "interrupted; not running at 2026-10-31 inspection",
+    "scheduler_result": 1073807364,
+    "last_heartbeat": "2026-10-19T13:16:26.337045+00:00",
+    "full_suite_passed": false,
+    "interruption_cause": "not established"
+  },
+  "exclusions": [
+    "credentials/env files",
+    "virtualenv/cache",
+    "obsolete nested Git mirrors/bundles",
+    "disposable synthetic test databases",
+    "OS task registrations and locks"
+  ]
+}

@@ -1,0 +1,701 @@
+# Review package: 750e091..c89f9da
+
+## Commits
+c89f9da Add composite policy batch read journal
+
+## Files changed
+ ashare_pipeline/formal_batch_read_journal.py |  37 ++++++++-
+ ashare_pipeline/formal_policy_repository.py  | 110 +++++++++++++++++++++++++--
+ tests/test_formal_policy_batch_guards.py     |  78 +++++++++++++++++++
+ tests/test_formal_policy_repository.py       |  91 ++++++++++++++++++++++
+ 4 files changed, 305 insertions(+), 11 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_batch_read_journal.py b/ashare_pipeline/formal_batch_read_journal.py
+index 6a82c9c..0ababa4 100644
+--- a/ashare_pipeline/formal_batch_read_journal.py
++++ b/ashare_pipeline/formal_batch_read_journal.py
+@@ -30,30 +30,45 @@ def _install_journal():
+             _require_authentic_context_repository(owner)
+             return "context", owner._state_store, (owner._snapshots, owner._verifier)
+         if type(owner) is FormalFeatureRepository:
+             _require_authentic_metric_feature_repository(owner)
+             return "feature", owner._store, (owner._bundle_store, owner._verifier, owner._current_input_provider)
+         if type(owner) is FormalRangeStore:
+             return "range", *_require_range_batch_journal_owner(owner)
+         from .formal_policy_state import FormalPolicyStateRepository
+         from .formal_policy_financial import FormalPolicyFinancialRepository
+         from .formal_policy_market import FormalPolicyMarketRepository
++        from .formal_policy_repository import FormalPolicyRepository
++        if type(owner) is FormalPolicyRepository:
++            state, children = owner._batch_journal_identity()
++            return "policy", state, children
+         for owner_type, kind in ((FormalPolicyStateRepository, "state"),
+                                  (FormalPolicyFinancialRepository, "financial"),
+                                  (FormalPolicyMarketRepository, "market")):
+             if type(owner) is owner_type:
+                 state, child = owner._batch_journal_identity()
+                 return kind, state, (child,)
+         raise ValueError("batch journal requires a fixed genuine owner type")
+ 
+     def _chain(owner):
+         kind, state, refs = _owner_state(owner)
++        if kind == "policy":
++            allowed = {kind: owner}
++            expanded = []
++            for child in refs:
++                child_kind, child_state, child_refs, child_allowed = _chain(child)
++                if child_state is not state:
++                    raise ValueError("policy batch scope children have different StateStores")
++                allowed.update(child_allowed)
++                expanded.extend((child, *child_refs))
++            unique = tuple(dict.fromkeys((*refs, *expanded)))
++            return kind, state, unique, allowed
+         children = tuple(item for item in refs if item is not None
+                          and type(item).__name__ in {
+                              "FormalContextRepository", "FormalFeatureRepository", "FormalRangeStore"})
+         expanded = tuple(reference for child in children
+                          for reference in _owner_state(child)[2])
+         allowed = {kind: owner, **{_owner_state(child)[0]: child for child in children}}
+         if kind == "financial" and "feature" in allowed:
+             allowed["policy_feature"] = allowed["feature"]
+         if kind == "market":
+             allowed["calendar"] = owner
+@@ -131,25 +146,27 @@ def _install_journal():
+                 raise ValueError("batch journal issuing authority changed")
+             if (type(registry_manifest_hash) is not str or len(registry_manifest_hash) != 64
+                     or any(c not in "0123456789abcdef" for c in registry_manifest_hash)):
+                 raise ValueError("batch scope requires canonical signed root hash")
+             if type(as_of_utc) is not str or not as_of_utc:
+                 raise ValueError("batch scope requires a frozen cutoff")
+             if (type(population) is not tuple or not population
+                     or any(type(x) is not str for x in population)
+                     or tuple(sorted(set(population))) != population):
+                 raise ValueError("batch scope requires sorted unique population")
+-            if (type(required_keys) is not tuple or not required_keys
++            if (type(required_keys) is not tuple
+                     or any(type(x) is not tuple or not x for x in required_keys)
+                     or len(set(required_keys)) != len(required_keys)):
+                 raise ValueError("batch scope requires exact mandatory coverage")
+             kind, state, refs, allowed = _chain(owner)
++            if not required_keys and kind != "policy":
++                raise ValueError("batch scope requires mandatory coverage")
+             signatures = tuple(item for instance in (owner, state, *refs) if instance is not None
+                                for item in _methods(instance))
+             result = object.__new__(FormalBatchReadJournal)
+             scope_id = id(result)
+             scopes[scope_id] = [weakref.ref(result, lambda _, key=scope_id: scopes.pop(key, None)),
+                 "active", threading.get_ident(), owner, kind, state, refs, signatures,
+                 str(state.db_path.resolve()), registry_manifest_hash, as_of_utc, population,
+                 frozenset(required_keys), {}, 0, {}, allowed]
+             return result
+ 
+@@ -167,20 +184,30 @@ def _install_journal():
+                     checker(ticket_record[4])
+                     record[15][id(ticket)] = phase
+             except Exception:
+                 record[1] = "consumed"
+                 raise
+ 
+         def next_phase(self):
+             record = _scope(self)
+             record[14] += 1
+ 
++        def close(self):
++            # Revocation must still work when the owner graph is no longer
++            # valid; ordinary scope reads intentionally reject that graph.
++            record = scopes.get(id(self))
++            if (type(self) is not FormalBatchReadJournal or record is None
++                    or record[0]() is not self or record[1] != "active"
++                    or threading.get_ident() != record[2]):
++                raise ValueError("batch scope is closed, forged, or cross-thread")
++            record[1] = "consumed"
++
+         def finalize(self):
+             record = _scope(self)
+             record[1] = "finalizing"
+             try:
+                 coverage = set()
+                 for ticket in record[13].values():
+                     coverage.update(_ticket(ticket, self)[5])
+                 if not record[12] <= coverage:
+                     raise ValueError("batch mandatory coverage is incomplete")
+                 record[1] = "active"
+@@ -199,36 +226,40 @@ def _install_journal():
+     def issue(scope, owner, kind, key, baseline, evidence, coverage, selection):
+         record = _scope(scope)
+         if record[16].get(kind) is not owner:
+             raise ValueError("current ticket owner mismatch")
+         issuer_name = {"context": "select_current_batch_ticket",
+                        "feature": "select_current_metric_batch_ticket",
+                        "policy_feature": "select_current_policy_batch_ticket",
+                        "range": "select_current_batch_ticket",
+                        "state": "select_current_batch_ticket",
+                        "financial": "select_current_batch_ticket",
++                       "policy": "_build_batch_in_owner_scope",
+                        "calendar": "select_calendar_batch_ticket",
+                        "market": "select_current_batch_ticket"}[kind]
+         caller = sys._getframe(1)
+         if caller.f_code is not vars(type(owner))[issuer_name].__code__:
+             if (kind not in {"calendar", "market"}
+                     or caller.f_code.co_name != "ticket_evidence"
+                     or sys._getframe(2).f_code is not vars(type(owner))[issuer_name].__code__):
+                 raise ValueError("current ticket must be issued by the fixed owner selector")
+         if type(key) is not tuple or type(baseline) is not bytes or type(coverage) is not tuple:
+             raise ValueError("current ticket evidence shape invalid")
+         member_index = 2 if kind == "context" else 0
+         expected_length = 3 if kind in {"context", "feature", "policy_feature"} else 1
+         if any(type(item) is not tuple or len(item) != expected_length
+                or type(item[member_index]) is not str
+                or (item[member_index] not in record[11]
+-                   and not (record[4] == "market" and kind == "range")) for item in coverage):
++                   and not (record[4] in {"market", "policy"}
++                            and (kind == "range" or
++                                 (kind == "calendar" and item[member_index] in {"SH", "SZ", "BJ"}))))
++               for item in coverage):
+             raise ValueError("current ticket coverage is outside frozen population")
+         identity = (id(owner), kind, key)
+         previous = record[13].get(identity)
+         if previous is not None:
+             prior = _ticket(previous, scope)
+             if prior[3] != baseline:
+                 raise ValueError("same current key has a different baseline")
+             return previous
+         ticket = object.__new__(CurrentReadTicket)
+         ticket_id = id(ticket)
+@@ -239,21 +270,21 @@ def _install_journal():
+ 
+     def require_scope(scope, owner, *, root, as_of_utc, population):
+         record = _scope(scope)
+         if (type(population) is not tuple or not population
+                 or any(type(item) is not str for item in population)
+                 or tuple(sorted(set(population))) != population):
+             raise ValueError("current read population must be a sorted nonempty subset")
+         if (record[16].get(_owner_state(owner)[0]) is not owner
+                 or root != record[9] or as_of_utc != record[10]
+                 or (not set(population) <= set(record[11])
+-                    and not (record[4] == "market" and (type(owner).__name__ == "FormalRangeStore"
++                    and not (record[4] in {"market", "policy"} and (type(owner).__name__ == "FormalRangeStore"
+                                                            or set(population) <= {"SH", "SZ", "BJ"})))):
+             raise ValueError("current read does not match owner build scope")
+ 
+     def require_ticket(scope, ticket, owner, kind):
+         record = _scope(scope)
+         saved = _ticket(ticket, scope)
+         if record[16].get(kind) is not owner or saved[2][0:2] != (id(owner), kind):
+             raise ValueError("current read ticket belongs to another owner")
+         return saved[6], saved[3], saved[4]
+ 
+diff --git a/ashare_pipeline/formal_policy_repository.py b/ashare_pipeline/formal_policy_repository.py
+index 118778c..3763099 100644
+--- a/ashare_pipeline/formal_policy_repository.py
++++ b/ashare_pipeline/formal_policy_repository.py
+@@ -19,24 +19,27 @@ from .formal_metric_context import FormalMetricContextRepository, _require_authe
+ from .formal_policy_financial import FormalPolicyFinancialRepository, PolicyFinancialSelection, _feature_dependencies
+ from .formal_policy_state import FormalPolicyStateRepository, PolicyStateSelection
+ from .formal_policy_market import (
+     FormalPolicyMarketRepository, MarketSelection, CalendarSelection,
+     VerifiedMarketWindowV1, VerifiedCalendarCoverageV1,
+ )
+ from .formal_policy_values import PolicyValue, canonical_bytes, digest, _policy_value_operations
+ from .formal_range_contract import load_policy_range_bindings
+ from .formal_registry_manifest import FormalRegistryBundleLoader
+ from .formal_scoring_registry import FormalScoringRegistry
++from .formal_batch_read_journal import (
++    FormalBatchReadJournal, _issue_current_ticket, _require_current_scope,
++)
+ 
+ 
+ def _install_repository():
+-    repositories, proofs = {}, {}
++    repositories, proofs, rechecks = {}, {}, {}
+     owner = globals()
+     encode, hash_payload = canonical_bytes, digest
+     parse_value, serialize_value, check_values = _policy_value_operations()
+     read_policy = registry_module._read_authenticated_policy_registry
+     range_identity = range_module._require_range_store_identity
+     feature_check = _feature_dependencies
+     context_check = _require_authentic_metric_context_repository
+     guard_factory = _metric_batch_guard
+     load_root = FormalRegistryBundleLoader.load
+     load_bindings = load_policy_range_bindings
+@@ -212,85 +215,148 @@ def _install_repository():
+             repositories[key] = (weakref.ref(self, lambda _: repositories.pop(key, None)),
+                 feature_repository, context_repository, range_store, registry_signature_verifier,
+                 companion, original, financial, states, market)
+ 
+         def __copy__(self):
+             raise TypeError("policy repositories cannot be copied")
+ 
+         def __deepcopy__(self, memo):
+             raise TypeError("policy repositories cannot be copied")
+ 
++        def recheck_current(self, batch):
++            """Recheck the published batch's original source selections in place."""
++            dependencies(self)
++            if type(batch) is not VerifiedPolicyResultBatch:
++                raise ValueError("policy current recheck needs an original result batch")
++            record(batch)
++            saved = rechecks.get(id(batch))
++            if (saved is None or saved[0]() is not batch or saved[1]() is not self):
++                raise ValueError("policy result batch has no original current-state recheck")
++            saved[2](batch)
++
+         def build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry):
++            return self._build_batch(frozen_input_hash, scoring_registry=scoring_registry,
++                                     policy_registry=policy_registry, owner_scope=None)[0]
++
++        def _build_batch_in_owner_scope(self, frozen_input_hash, *, scoring_registry,
++                                        policy_registry, owner_scope):
++            """Return a batch, coverage ticket, and revoker to an enclosing owner."""
++            batch, revoke, check_dependencies = self._build_batch(frozen_input_hash,
++                scoring_registry=scoring_registry, policy_registry=policy_registry,
++                owner_scope=owner_scope)
++            try:
++                wire = record(batch)[2]
++                ticket = _issue_current_ticket(owner_scope, self, "policy",
++                    (frozen_input_hash, batch.batch_hash), wire,
++                    (batch, wire, check_dependencies),
++                    tuple((sid,) for sid in batch.security_ids), batch)
++                return batch, ticket, revoke
++            except BaseException:
++                revoke(batch)
++                try:
++                    owner_scope.close()
++                except ValueError:
++                    pass
++                raise
++
++        def _batch_recheck_ticket(self, evidence):
++            batch, wire, check_dependencies = evidence
++            dependencies(self)
++            if record(batch)[2] != wire:
++                raise ValueError("policy result ticket publication changed")
++            check_dependencies()
++
++        def _batch_journal_identity(self):
++            saved = dependencies(self)
++            return saved[1]._store, (saved[7], saved[8], saved[9])
++
++        def _build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry,
++                         owner_scope):
+             saved = dependencies(self)
+             feature, _, ranges, verifier, context = saved[1:6]
+             financial, states, market = saved[7:]
+             if type(frozen_input_hash) is not str or type(scoring_registry) is not FormalScoringRegistry:
+                 raise ValueError("policy publication requires exact frozen and registry identities")
+             prepared = None
++            scope = None
+             selections = []
+             market_markers = []
+             publication = dict(published=False, parent_link=object(), batch_hash=None)
+ 
+             def registry_snapshot(root_hash):
+                 dependencies(self)
+                 bundle = load_root(FormalRegistryBundleLoader(feature._store, verifier), root_hash)
+                 scoring_registry.require_official(bundle)
+                 policy = read_policy(policy_registry)
+                 role_bytes = {role: bundle.blob(role).canonical_json for role in roles}
+                 if (policy["registry_manifest_hash"] != root_hash
+                         or any(policy["role_hashes"][role] != hash_payload(json.loads(raw))
+                                for role, raw in role_bytes.items())):
+                     raise ValueError("policy and scoring signature roots differ")
+                 return bundle, policy, role_bytes
+ 
+             def prepare():
+-                nonlocal universe, industry, policy_wire, source_bytes, root_hash
++                nonlocal universe, industry, policy_wire, source_bytes, root_hash, scope
+                 universe = context.load_universe(frozen_input_hash, scoring_registry=scoring_registry)
+                 if universe is None:
+                     raise ValueError("policy frozen universe is absent")
+                 root_hash = universe.registry_manifest_hash
+                 bundle, policy_wire, source_bytes = registry_snapshot(root_hash)
+                 bindings = load_bindings(bundle, scoring_registry=scoring_registry, policy_registry=policy_registry)
+                 industry = context.resolve_industries(universe)
++                required = tuple((sid,) for sid in universe.security_ids
++                                 if industry.entries[sid]["status"] == "assigned")
++                if owner_scope is None:
++                    scope = FormalBatchReadJournal.open(self, registry_manifest_hash=root_hash,
++                        as_of_utc=universe.as_of_utc, population=tuple(universe.security_ids),
++                        required_keys=required)
++                else:
++                    _require_current_scope(owner_scope, self, root=root_hash,
++                        as_of_utc=universe.as_of_utc, population=tuple(universe.security_ids))
++                    scope = owner_scope
+                 common = dict(registry_manifest_hash=root_hash, frozen_input_hash=frozen_input_hash,
+                     universe_hash=universe.universe_hash, as_of_utc=universe.as_of_utc,
+                     policy_contract_hash=policy_wire["contract_hash"], role_hashes=policy_wire["role_hashes"])
+                 evidence = dict(common, schema_version="formal-policy-evidence-batch-v1",
+                     universe=universe.to_dict(), industry=industry.to_dict(),
+                     source_specification=json.loads(source_bytes["source"]), selections={}, rule_inputs={})
+                 result_wires = []
+                 for sid in universe.security_ids:
+                     entry = industry.entries[sid]
+                     decisions, evidence_selections, inputs = [], {}, {}
+                     if entry["status"] == "assigned":
+                         template = entry["template_id"]
+                         args = dict(template_id=template, policy_registry=policy_registry)
+-                        fin = financial.select(sid, universe.as_of_utc, industry_batch=industry, **args)
+-                        state_selection = states.select(sid, universe.as_of_utc, **args)
++                        fin_ticket = financial.select_current_batch_ticket(scope, sid,
++                            universe.as_of_utc, industry_batch=industry, **args)
++                        state_ticket = states.select_current_batch_ticket(scope, sid,
++                            universe.as_of_utc, **args)
++                        fin, state_selection = fin_ticket.selected(), state_ticket.selected()
+                         selections.extend((fin, state_selection))
+                         values = dict(fin.values)
+                         values.update(dict(state_selection.values))
+                         annual = {key: tuple(dict(item) for item in series) for key, series in fin.annual.items()}
+                         evidence_selections.update(financial=dict(values=plain(fin.values), annual=plain(fin.annual),
+                             lineage=plain(fin.lineage), selection_hash=fin.selection_hash),
+                             state=dict(values=plain(state_selection.values), lineage=plain(state_selection.lineage),
+                                        selection_hash=state_selection.selection_hash))
+                         for rule in policy_wire["rules"]:
+                             if rule["template_id"] != template:
+                                 continue
+                             applicability = "applicable"
+                             if rule["kind"] == "cyclic_protection" and entry["secondary_industry"] not in policy_wire["cyclic_secondary_industries"]:
+                                 applicability = "not_applicable"
+                             market_wire = None
+                             if rule["kind"] == "market_liquidity":
+                                 binding = bindings.for_rule(rule["rule_id"], sid[:2])
+-                                selected = market.select(sid, universe.as_of_utc, binding=binding)
++                                selected = market.select_current_batch_ticket(scope, sid,
++                                    universe.as_of_utc, binding=binding).selected()
+                                 if type(selected) is not MarketSelection:
+                                     raise ValueError("market repository returned an unknown selection")
+                                 market_markers.append((selected, selected.window, selected.pending,
+                                     selected.lineage, selected.selection_hash, selected._check))
+                                 selections.append(selected)
+                                 market_wire = None if selected.window is None else selected.window.to_dict()
+                                 evidence_selections[rule["rule_id"]] = dict(window=market_wire,
+                                     pending=list(selected.pending), lineage=list(selected.lineage), selection_hash=selected.selection_hash)
+                                 if market_wire is not None and any(market_wire[key] != expected for key, expected in
+                                     (("security_id", sid), ("as_of_utc", universe.as_of_utc), ("registry_manifest_hash", root_hash),
+@@ -331,40 +397,68 @@ def _install_repository():
+                 context.recheck_batch(universe, industry)
+                 for selected, window, pending, lineage, selection_hash, check in market_markers:
+                     if (selected.window is not window or selected._check is not check
+                             or selected.pending != pending or selected.lineage != lineage
+                             or selected.selection_hash != selection_hash):
+                         raise ValueError("market selection identity changed")
+                 for selection in selections:
+                     selection.recheck()
+                 dependencies(self)
+ 
++            def checkpoint(*, final=False):
++                check_dependencies()
++                if final:
++                    scope.finalize()
++                else:
++                    scope.checkpoint()
++                check_dependencies()
++
++            def check_dependencies():
++                dependencies(self)
++                _, current_policy, current_bytes = registry_snapshot(root_hash)
++                if current_policy != policy_wire or current_bytes != source_bytes:
++                    raise ValueError("policy signed source configuration changed")
++                context.recheck_batch(universe, industry)
++                dependencies(self)
++
+             def mark_published(batch):
+                 publication["published"] = True
+ 
+             def revoke(batch):
+                 publication["published"] = False
+ 
+             universe = industry = policy_wire = source_bytes = root_hash = None
+             try:
+                 with guard_factory(feature._current_input_provider, feature._store) as guard:
+                     prepared = prepare()
+-                    read_and_recheck(prepared)
++                    key = id(prepared)
++                    rechecks[key] = (weakref.ref(prepared,
++                        lambda reference: rechecks.pop(key, None)), weakref.ref(self), read_and_recheck)
++                    checkpoint()
+                     def finalize():
+-                        read_and_recheck(prepared)
++                        if owner_scope is None:
++                            checkpoint(final=True)
++                        else:
++                            scope.next_phase()
++                            checkpoint()
+                         mark_published(prepared)
+                         return prepared
+                     result = guard.finalize(finalize)
+-                return result
++                return result, revoke, check_dependencies
+             except BaseException:
+                 # Also revoke children if prepare failed after its first mint.
+                 revoke(prepared)
++                if scope is not None:
++                    try:
++                        scope.close()
++                    except ValueError:
++                        pass
+                 raise
+ 
+     entries = tuple((cls.__name__, cls) for cls in (FormalPolicyRepository, *proof_types))
+     return FormalPolicyRepository, *proof_types
+ 
+ 
+ (FormalPolicyRepository, VerifiedPolicyEvidenceBatch, PolicyDecision, PolicyResult,
+  VerifiedPolicyResultBatch) = _install_repository()
+ del _install_repository
+ 
+diff --git a/tests/test_formal_policy_batch_guards.py b/tests/test_formal_policy_batch_guards.py
+index b76534b..80669f5 100644
+--- a/tests/test_formal_policy_batch_guards.py
++++ b/tests/test_formal_policy_batch_guards.py
+@@ -20,20 +20,70 @@ class PolicyBatchGuardTests(unittest.TestCase):
+         self.addCleanup(self.fixture.close)
+ 
+     def run_hook(self, hook):
+         previous = sys.getprofile()
+         try:
+             sys.setprofile(hook)
+             return self.fixture.build_policy_batch()
+         finally:
+             sys.setprofile(previous)
+ 
++    def test_policy_checks_ticketed_selections_in_two_phases_without_reselection(self):
++        for security_id in ("BJ430001", "SH600000", "SZ000001"):
++            self.fixture.put_industry(security_id)
++        from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
++        from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
++        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
++        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
++
++        selected = {
++            FormalPolicyFinancialRepository.select.__code__: 0,
++            FormalPolicyStateRepository.select.__code__: 0,
++            FormalPolicyMarketRepository.select.__code__: 0,
++        }
++        market_ticket_code = FormalPolicyMarketRepository.select_current_batch_ticket.__code__
++        market_tickets = []
++        market_assembled = []
++        checked = {
++            FormalPolicyFinancialRepository._batch_recheck_ticket.__code__: 0,
++            FormalPolicyStateRepository._batch_recheck_ticket.__code__: 0,
++            FormalPolicyMarketRepository._batch_recheck_ticket.__code__: 0,
++        }
++        checkpoints = []
++        checkpoint_code = FormalBatchReadJournal.checkpoint.__code__
++
++        def profile(frame, event, result):
++            if event != "call":
++                return
++            if frame.f_code in selected:
++                selected[frame.f_code] += 1
++            if frame.f_code is market_ticket_code:
++                market_tickets.append(1)
++            if (frame.f_code.co_name == "assemble_market"
++                    and frame.f_code.co_filename.endswith("formal_policy_market.py")):
++                market_assembled.append(1)
++            if frame.f_code in checked:
++                checked[frame.f_code] += 1
++            if frame.f_code is checkpoint_code:
++                checkpoints.append(frame.f_locals["self"])
++
++        batch = self.run_hook(profile)
++        batch.require_verified()
++        self.assertEqual(list(selected.values()), [3, 3, 0])
++        self.assertEqual(len(market_tickets), 3)
++        self.assertEqual(len(market_assembled), 3)
++        self.assertEqual(len(checkpoints), 2)
++        self.assertIs(checkpoints[0], checkpoints[1])
++        self.assertTrue(all(count >= 6 for count in checked.values()))
++        with self.assertRaises(ValueError):
++            checkpoints[0].checkpoint()
++
+     def test_after_first_security_read_second_security_provider_changes(self):
+         self.fixture.put_industry("BJ430001")
+         self.fixture.put_industry("SH600000")
+         touched = []
+         def hook(frame, event, result):
+             if (not touched and event == "return" and frame.f_code.co_name == "select"
+                     and frame.f_code.co_filename.endswith("formal_policy_financial.py")
+                     and frame.f_locals.get("security_id") == "BJ430001"):
+                 touched.append(True)
+                 self.fixture.set_generation("SH600000", "changed-mid-batch")
+@@ -76,20 +126,48 @@ class PolicyBatchGuardTests(unittest.TestCase):
+         touched = []
+         def hook(frame, event, result):
+             if not touched and event == "return" and frame.f_code.co_name == "prepare":
+                 touched.append(True)
+                 path = Path(ref.content_path)
+                 path.write_bytes(b"corrupt")
+         with self.assertRaises(ValueError):
+             self.run_hook(hook)
+         self.assertEqual(touched, [True])
+ 
++    def test_source_delete_after_first_checkpoint_revokes_final_phase(self):
++        _, ref = self.fixture.put_industry("SH600000")
++        touched = []
++        def hook(frame, event, result):
++            if (not touched and event == "return" and frame.f_code.co_name == "checkpoint"
++                    and frame.f_code.co_filename.endswith("formal_policy_repository.py")):
++                touched.append(True)
++                Path(ref.content_path).unlink()
++        with self.assertRaises(ValueError):
++            self.run_hook(hook)
++        self.assertEqual(touched, [True])
++
++    def test_source_delete_after_final_journal_checkpoint_revokes_publication(self):
++        _, ref = self.fixture.put_industry("SH600000")
++        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
++        checkpoint_code = FormalBatchReadJournal.checkpoint.__code__
++        checkpoints = []
++
++        def hook(frame, event, result):
++            if event == "return" and frame.f_code is checkpoint_code:
++                checkpoints.append(True)
++                if len(checkpoints) == 2:
++                    Path(ref.content_path).unlink()
++
++        with self.assertRaises(ValueError):
++            self.run_hook(hook)
++        self.assertEqual(checkpoints, [True, True])
++
+     def test_signed_source_configuration_replacement_revokes_prepared_children(self):
+         blob = self.fixture.bundle.blob("source")
+         original = blob.canonical_json
+         captured, touched = [], []
+         def hook(frame, event, result):
+             if (event == "return" and frame.f_code.co_name == "mint"
+                     and frame.f_code.co_filename.endswith("formal_policy_repository.py")):
+                 captured.append(result)
+             if not touched and event == "return" and frame.f_code.co_name == "prepare":
+                 touched.append(True)
+diff --git a/tests/test_formal_policy_repository.py b/tests/test_formal_policy_repository.py
+index dbe7855..0f4e676 100644
+--- a/tests/test_formal_policy_repository.py
++++ b/tests/test_formal_policy_repository.py
+@@ -1,14 +1,16 @@
+ """The policy authority publishes exactly one complete frozen population."""
+ 
+ import copy
+ import importlib
++import sys
++import threading
+ import unittest
+ from dataclasses import replace
+ from unittest.mock import patch
+ 
+ from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
+ 
+ 
+ class PolicyRepositoryTests(unittest.TestCase):
+     def setUp(self):
+         self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_policy_repository"),
+@@ -36,20 +38,109 @@ class PolicyRepositoryTests(unittest.TestCase):
+         batch = fixture.build_policy_batch()
+         self.assertEqual(len(batch.results), 3)
+         for item in batch.results:
+             item.require_verified()
+             self.assertEqual(item.evidence_state, "complete")
+             self.assertFalse(item.pending_requirements)
+             self.assertTrue(item.decisions)
+             self.assertEqual(item.batch_hash, batch.batch_hash)
+             self.assertTrue(all(decision.security_id == item.security_id for decision in item.decisions))
+ 
++    def test_public_recheck_independently_reselects_original_inputs(self):
++        fixture = self.fixture()
++        fixture.put_industry("SH600000")
++        batch = fixture.build_policy_batch()
++        from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
++        from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
++        calls = {FormalPolicyFinancialRepository.select.__code__: 0,
++                 FormalPolicyStateRepository.select.__code__: 0}
++
++        def profile(frame, event, result):
++            if event == "call" and frame.f_code in calls:
++                calls[frame.f_code] += 1
++
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            fixture.policy_repository.recheck_current(batch)
++        finally:
++            sys.setprofile(previous)
++        self.assertEqual(list(calls.values()), [1, 1])
++        foreign = self.fixture()
++        with self.assertRaises(ValueError):
++            foreign.policy_repository.recheck_current(batch)
++        with self.assertRaises(TypeError):
++            copy.copy(batch)
++
++    def test_private_owner_scope_stays_live_for_enclosing_batch_and_rejects_replay(self):
++        from ashare_pipeline.formal_batch_read_journal import (
++            FormalBatchReadJournal, _require_current_scope,
++        )
++        from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
++        from ashare_pipeline.formal_policy_repository import FormalPolicyRepository
++        fixture = self.fixture()
++        fixture.put_industry("SH600000")
++        universe = fixture.policy_context_repository.load_universe(
++            fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++        scope = FormalBatchReadJournal.open(fixture.policy_repository,
++            registry_manifest_hash=universe.registry_manifest_hash,
++            as_of_utc=universe.as_of_utc,
++            population=tuple(universe.security_ids),
++            required_keys=tuple((sid,) for sid in universe.security_ids))
++        scope_args = dict(root=universe.registry_manifest_hash,
++                          as_of_utc=universe.as_of_utc,
++                          population=tuple(universe.security_ids))
++        stale = FormalBatchReadJournal.open(fixture.policy_repository,
++            registry_manifest_hash=universe.registry_manifest_hash,
++            as_of_utc=universe.as_of_utc,
++            population=tuple(universe.security_ids),
++            required_keys=(("SH600000",),))
++        with patch.object(FormalPolicyFinancialRepository, "_batch_recheck_ticket", lambda *_: None):
++            stale.close()
++        with self.assertRaises(ValueError):
++            stale.checkpoint()
++        with self.assertRaises(TypeError):
++            copy.copy(scope)
++        with self.assertRaises(ValueError):
++            _require_current_scope(scope, fixture.policy_repository,
++                **dict(scope_args, root="0" * 64))
++        other = FormalPolicyRepository(fixture.feature_repository, fixture.context,
++            fixture.range_store, registry_signature_verifier=fixture.verifier)
++        with self.assertRaises(ValueError):
++            _require_current_scope(scope, other, **scope_args)
++        thread_errors = []
++        # Keep the exception on the worker thread so the test can assert it.
++        def cross_thread_read():
++            try:
++                _require_current_scope(scope, fixture.policy_repository, **scope_args)
++            except ValueError as error:
++                thread_errors.append(error)
++        thread = threading.Thread(target=cross_thread_read)
++        thread.start()
++        thread.join()
++        self.assertEqual(len(thread_errors), 1)
++        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
++        with self.assertRaises(ValueError):
++            fixture.policy_repository._build_batch_in_owner_scope(
++                fixture.frozen.frozen_input_hash, owner_scope=object(), **args)
++        batch, ticket, revoke = fixture.policy_repository._build_batch_in_owner_scope(
++            fixture.frozen.frozen_input_hash, owner_scope=scope, **args)
++        batch.require_verified()
++        self.assertIs(ticket.selected(), batch)
++        scope.finalize()
++        with self.assertRaises(ValueError):
++            fixture.policy_repository._build_batch_in_owner_scope(
++                fixture.frozen.frozen_input_hash, owner_scope=scope, **args)
++        revoke(batch)
++        with self.assertRaises(ValueError):
++            batch.require_verified()
++
+     def test_unknown_membership_never_fabricates_five_template_decisions(self):
+         fixture = self.fixture()
+         batch = fixture.build_policy_batch()
+         for item in batch.results:
+             self.assertEqual(item.decisions, ())
+             self.assertEqual(item.evidence_state, "pending_evidence")
+             self.assertEqual(dict(item.dimension_caps), {})
+             self.assertEqual(dict(item.pool_prohibitions), {})
+ 
+     def test_missing_universe_is_failure(self):

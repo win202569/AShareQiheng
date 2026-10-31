@@ -1,0 +1,91 @@
+# A3 fix round 1 review delta
+Fix base: original staged snapshot task-A3-review.diff (registry 035f40f8..., guards 3194aa29...). Index remains that original snapshot.
+Head: frozen working-file fix, registry 4dd60dd588e4f19deae5e9c7e378237c774610ac2c35cad158eaa67b4ec080b3, guards 67f8685add176becac44994bd02d870a83ff7e03bfb260dbe5ce5989f393e594.
+One finding: missing actual owner formal_sources._EXCHANGES dependency.
+Worker focused RED 1/1.227s -> GREEN 1/1.976s. Parent independently focused new test 1/1.931s OK. Full final suites pending and remain a separate precommit gate.
+
+warning: in the working copy of 'ashare_pipeline/formal_policy_registry.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_formal_policy_registry_guards.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/ashare_pipeline/formal_policy_registry.py b/ashare_pipeline/formal_policy_registry.py
+index b18d64b..f9189b4 100644
+--- a/ashare_pipeline/formal_policy_registry.py
++++ b/ashare_pipeline/formal_policy_registry.py
+@@ -328,21 +328,21 @@ def _install_policy_registry():
+             "RedlineDefinition StatusRule RegistryValidationError fields Decimal MappingProxyType hashlib _ROLES _TEMPLATES"),
+         (vars(feature_module), "SignedFormalFeatureRegistry FormalFeatureSlot FormulaNode _parse_registry_bytes "
+             "_load_canonical_object _canonical_json_bytes _unique_json_object _reject_json_constant _DuplicateJsonKey "
+             "_require_text _require_hash _require_exact_keys _snapshot_json _parse_formula _formula_to_dict "
+             "_slot_to_dict _SHA256 _IDENTIFIER _TEMPLATES _DIMENSIONS _UNITS _FORMULA_OPS _REGISTRY_KEYS "
+             "_SLOT_KEYS json hashlib math"),
+         (vars(manifest_module), "VerifiedRegistryBundle FormalRegistryManifest VerifiedRegistryBlob "
+             "_require_trimmed_text _VERSION_IDENTIFIER _ROLE_FIELDS Mapping"),
+         (vars(context_module), "_descriptor _canonical _json_tree _keys _text _exchange _ordered _selector "
+             "CalendarSelector CONTEXT_KINDS _DESCRIPTOR_FIELDS _ROLES json math re"),
+-        (vars(sources_module), "CalendarSelector _require_trimmed_text _require_exchange _VERSION_IDENTIFIER"),
++        (vars(sources_module), "CalendarSelector _require_trimmed_text _require_exchange _VERSION_IDENTIFIER _EXCHANGES"),
+         (vars(json), "loads dumps"), (vars(hashlib), "sha256"), (vars(weakref), "ref"),
+         (vars(feature_module.math), "isfinite"), (vars(context_module.re), "fullmatch"),
+     )
+     bindings = tuple((owner, name, owner[name]) for owner, names in binding_names for name in names.split())
+     source_interfaces = (
+         (bundle_type, "require_official blob"), (scoring_type, "require_official"),
+         (feature_type, "require_release_eligible slots_for_template"),
+         (manifest_module.FormalRegistryManifest, ""), (manifest_module.VerifiedRegistryBlob, ""),
+         (feature_module.FormalFeatureSlot, "__init__ __post_init__ from_dict to_dict"),
+         (feature_module.FormulaNode, "__init__ __post_init__ from_dict"),
+diff --git a/tests/test_formal_policy_registry_guards.py b/tests/test_formal_policy_registry_guards.py
+index 8861535..88f3772 100644
+--- a/tests/test_formal_policy_registry_guards.py
++++ b/tests/test_formal_policy_registry_guards.py
+@@ -9,20 +9,21 @@ import sys
+ import unittest
+ import weakref
+ from unittest.mock import patch
+ 
+ from ashare_pipeline import formal_context_schema as context_module
+ from ashare_pipeline import formal_feature_contract as feature_module
+ from ashare_pipeline import formal_policy_contract as contract_module
+ from ashare_pipeline import formal_policy_registry as policy_module
+ from ashare_pipeline import formal_registry_manifest as manifest_module
+ from ashare_pipeline import formal_scoring_registry as scoring_module
++from ashare_pipeline import formal_sources as sources_module
+ from ashare_pipeline.formal_policy_registry import (
+     FormalPolicyRegistry, load_formal_policy_registry,
+ )
+ from ashare_pipeline.formal_scoring import calculate_pre_policy_score
+ from tests.formal_policy_fixtures import policy_graph
+ 
+ 
+ class _PolicyGraphTestCase(unittest.TestCase):
+     @classmethod
+     def setUpClass(cls):
+@@ -170,20 +171,28 @@ class PolicyProofGuardTests(_PolicyGraphTestCase):
+         proof.require_verified()
+ 
+     def test_replaced_hash_json_freeze_and_weakref_dependencies_fail_closed(self):
+         proof = self.load()
+         for module, name in ((hashlib, "sha256"), (json, "loads"), (json, "dumps"),
+                 (weakref, "ref"), (policy_module, "MappingProxyType")):
+             with self.subTest(name=name), patch.object(module, name, lambda *a, **k: None):
+                 self.assert_rejected(proof)
+         proof.require_verified()
+ 
++    def test_replaced_exchange_enum_invalidates_reads_and_loads_until_restored(self):
++        proof = self.load()
++        proof.require_verified()
++        with patch.object(sources_module, "_EXCHANGES", frozenset({"SH", "SZ", "BJ", "FAKE"})):
++            self.assert_rejected(proof)
++        proof.require_verified()
++        self.load().require_verified()
++
+     def test_replaced_upstream_verifiers_and_slots_fail_closed(self):
+         proof = self.load()
+         for cls, method in ((type(self.bundle), "require_official"), (type(self.bundle), "blob"),
+                 (type(self.scoring), "require_official"), (type(self.feature), "require_release_eligible"),
+                 (type(self.feature), "slots_for_template"), (type(self.feature), "__getattribute__"),
+                 (feature_module.FormalFeatureSlot, "to_dict")):
+             with self.subTest(method=method), patch.object(cls, method, lambda *a: None):
+                 self.assert_rejected(proof)
+         proof.require_verified()
+ 
+

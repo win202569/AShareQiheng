@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_score_inputs.FinalScoreInputTypeSealTests.test_minted_entry_relabelled_as_batch_is_rejected
+test_minted_entry_relabelled_as_batch_is_rejected (test_formal_final_score_inputs.FinalScoreInputTypeSealTests.test_minted_entry_relabelled_as_batch_is_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 310.737s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_score_inputs.FinalScoreInputTypeSealTests.test_minted_entry_relabelled_as_batch_is_rejected"], "passed": ["test_formal_final_score_inputs.FinalScoreInputTypeSealTests.test_minted_entry_relabelled_as_batch_is_rejected"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

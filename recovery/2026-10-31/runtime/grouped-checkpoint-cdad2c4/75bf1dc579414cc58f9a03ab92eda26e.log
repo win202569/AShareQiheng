@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_fixture.FinalScoringVetoMarketProtocolTests.test_veto_reply_keeps_a_prior_positive_close_outside_twenty_quiet_days
+test_veto_reply_keeps_a_prior_positive_close_outside_twenty_quiet_days (test_formal_final_fixture.FinalScoringVetoMarketProtocolTests.test_veto_reply_keeps_a_prior_positive_close_outside_twenty_quiet_days) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_fixture.FinalScoringVetoMarketProtocolTests.test_veto_reply_keeps_a_prior_positive_close_outside_twenty_quiet_days"], "passed": ["test_formal_final_fixture.FinalScoringVetoMarketProtocolTests.test_veto_reply_keeps_a_prior_positive_close_outside_twenty_quiet_days"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

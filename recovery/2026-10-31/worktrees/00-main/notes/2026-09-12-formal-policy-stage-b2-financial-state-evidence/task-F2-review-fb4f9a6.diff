@@ -1,0 +1,1041 @@
+# Task F2 review package
+
+Base: f4ed417fe6e64e324e9c725c3b185f7a10c52221
+Head: fb4f9a681303dbe5ce53ef2007e69e0cb42ab0fe
+Paths: ashare_pipeline/formal_feature_repository.py ashare_pipeline/formal_policy_financial.py tests/formal_policy_runtime_fixtures.py tests/test_formal_policy_financial.py
+
+fb4f9a6 feat: authenticate independent policy financial and annual evidence
+ ashare_pipeline/formal_feature_repository.py | 182 ++++++++++++++
+ ashare_pipeline/formal_policy_financial.py   | 310 +++++++++++++++++++++++
+ tests/formal_policy_runtime_fixtures.py      |  57 +++--
+ tests/test_formal_policy_financial.py        | 363 +++++++++++++++++++++++++++
+ 4 files changed, 897 insertions(+), 15 deletions(-)
+diff --git a/ashare_pipeline/formal_feature_repository.py b/ashare_pipeline/formal_feature_repository.py
+index 16a2cd0..55efde5 100644
+--- a/ashare_pipeline/formal_feature_repository.py
++++ b/ashare_pipeline/formal_feature_repository.py
+@@ -580,11 +580,193 @@ def _install_metric_projection():
+     repository_type.select_current_verified_metric_feature_state = select_state
+     checked_methods += ((repository_type, "select_current_verified_metric_features", select),
+         (repository_type, "select_current_verified_metric_feature_state", select_state))
+     return VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence, dependencies
+ 
+ 
+ (VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence,
+  _require_authentic_metric_feature_repository) = _install_metric_projection()
+ del _install_metric_projection
+ 
++
++def _install_policy_projection(provider_module):
++    """Install only after the owned provider module has completed initialization.
++
++    Kept independent from the required-only metric entry point. Existing metric
++    registration authenticates repositories created before this installation.
++    """
++    from types import MappingProxyType
++    from .formal_policy_registry import FormalPolicyRegistry
++    from .formal_policy_values import PolicyIntegrityError, PolicyPreconditionError
++
++    repository_type = FormalFeatureRepository
++    provider_type = provider_module.FormalMetricCurrentInputProvider
++    resolve = provider_type.resolve_current_inputs
++    guard = provider_module._metric_batch_guard
++    authentic = _require_authentic_metric_feature_repository
++    read_registry = repository_type._registry
++    persisted = repository_type._persisted_facts
++    read_bundle = repository_type._read_authenticated_bundle
++    identity_of = repository_type._snapshot_identity
++    evaluator, builder = evaluate_selected_features, build_formal_feature_bundle
++    require_policy, policy_wire = FormalPolicyRegistry.require_verified, FormalPolicyRegistry.to_dict
++    records = {}
++
++    def freeze(value):
++        if type(value) is dict:
++            return MappingProxyType({k: freeze(v) for k, v in value.items()})
++        return tuple(map(freeze, value)) if type(value) is list else value
++
++    def dependencies(repository, provider=None):
++        authentic(repository)
++        actual = repository._current_input_provider
++        if (type(actual) is not provider_type or (provider is not None and actual is not provider)
++                or provider_module.FormalMetricCurrentInputProvider is not provider_type
++                or provider_type.resolve_current_inputs is not resolve
++                or provider_module._metric_batch_guard is not guard):
++            raise PolicyIntegrityError("policy provider dependency changed or is not owned")
++        if (repository_type.select_current_verified_policy_feature_state is not select
++                or "select_current_verified_policy_feature_state" in vars(repository)):
++            raise PolicyIntegrityError("policy repository selector was replaced")
++        return actual
++
++    def record(item):
++        saved = records.get(id(item))
++        if type(item) is not PolicyFeatureState or saved is None or saved[0]() is not item:
++            raise PolicyIntegrityError("policy feature state is forged or copied")
++        if (set(vars(PolicyFeatureState)) != {k for k, _ in methods}
++                or any(vars(PolicyFeatureState).get(k) is not v for k, v in methods)):
++            raise PolicyIntegrityError("policy feature state interface changed")
++        return saved
++
++    class StateMeta(type):
++        def __setattr__(cls, name, value):
++            if name in {"__getattribute__", "__bases__"}:
++                raise TypeError("policy feature lookup and inheritance are immutable")
++            return super().__setattr__(name, value)
++
++        def __delattr__(cls, name):
++            if name in {"__getattribute__", "__bases__"}:
++                raise TypeError("policy feature lookup and inheritance are immutable")
++            return super().__delattr__(name)
++
++    class PolicyFeatureState(metaclass=StateMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("policy feature states require an authenticated repository selection")
++
++        def __getattribute__(self, name):
++            record(self)
++            return object.__getattribute__(self, name)
++
++        def __getattr__(self, name):
++            payload = json.loads(record(self)[1])
++            if name not in payload:
++                raise AttributeError(name)
++            return freeze(payload[name])
++
++        def to_dict(self):
++            return json.loads(record(self)[1])
++
++        def recheck(self):
++            saved = record(self)
++            current = select(saved[2], **saved[3])
++            if record(current)[1] != saved[1]:
++                raise PolicyIntegrityError("policy feature selection is no longer current")
++
++        def __copy__(self):
++            raise TypeError("policy feature states cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("policy feature states cannot be copied")
++
++    methods = tuple(vars(PolicyFeatureState).items())
++
++    def select(self, security_id, as_of_utc, *, template_id, registry_manifest_hash,
++               policy_registry, rule_ids):
++        provider = dependencies(self)
++        request = _request(security_id, as_of_utc, template_id, registry_manifest_hash)
++        if as_of_utc != "2026-08-31T07:00:00+00:00":
++            raise PolicyPreconditionError("policy projection requires the fixed cutoff")
++        if type(policy_registry) is not FormalPolicyRegistry:
++            raise PolicyPreconditionError("genuine policy registry required")
++        require_policy(policy_registry)
++        policy = policy_wire(policy_registry)
++        if policy["registry_manifest_hash"] != registry_manifest_hash:
++            raise PolicyPreconditionError("policy projection root mismatch")
++        if (type(rule_ids) is not tuple or not rule_ids
++                or any(type(key) is not str for key in rule_ids)
++                or tuple(sorted(set(rule_ids))) != rule_ids):
++            raise PolicyPreconditionError("policy rule IDs must be distinct and ordered")
++        rules = [r for r in policy["rules"] if r["template_id"] == template_id and r["rule_id"] in rule_ids]
++        if len(rules) != len(rule_ids):
++            raise PolicyPreconditionError("policy rule is not active for the template")
++        selectors = []
++        for rule in rules:
++            for selector in rule["inputs"].values():
++                if selector["kind"] == "feature":
++                    selectors.append(selector)
++                elif selector["kind"] == "annual_series":
++                    selectors.extend(o["selector"] for o in selector["observations"])
++        graph, registry = read_registry(self, registry_manifest_hash)
++        index = {s.slot_id: s for s in registry.slots_for_template(template_id)}
++        keys = sorted({s["feature_key"] for s in selectors})
++        slots = tuple(index[key] for key in keys)
++        # The provider guard authenticates its closure-owned store registration;
++        # its epoch and database barrier also catch changes during this read.
++        with guard(provider, self._store) as barrier:
++            supplied = resolve(provider, **request)
++            identity = identity_of(supplied, request)
++            facts, fact_bytes = _fact_snapshot(supplied.facts, security_id)
++            issues, issue_bytes = _issue_snapshot(supplied.issues)
++
++            def current():
++                dependencies(self, provider)
++                latest = resolve(provider, **request)
++                if (identity_of(latest, request) != identity
++                        or _fact_snapshot(latest.facts, security_id)[1] != fact_bytes
++                        or _issue_snapshot(latest.issues)[1] != issue_bytes
++                        or persisted(self, security_id) != fact_bytes):
++                    raise PolicyIntegrityError("policy provider facts/issues or persisted sources changed")
++
++            current()
++            expected = builder(security_id=security_id, as_of_utc=as_of_utc,
++                template_id=template_id, facts=facts, issues=issues,
++                registry=registry, registry_manifest=graph.manifest)
++            stored = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
++            if stored is not None and stored.canonical_bytes() != expected.canonical_bytes():
++                raise PolicyIntegrityError("policy receipt differs from complete rebuilt inputs")
++            values, blockers = ((), ("current_receipt_absent",)) if stored is None else evaluator(
++                slots=slots, facts=facts, issues=issues, as_of_utc=as_of_utc)
++            current()
++            reread = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
++            if ((reread is None) != (stored is None)
++                    or (reread is not None and reread.canonical_bytes() != expected.canonical_bytes())):
++                raise PolicyIntegrityError("policy receipt changed during projection")
++            require_policy(policy_registry)
++            current()
++            payload = dict(request, rule_ids=list(rule_ids), selectors=selectors,
++                policy_contract_hash=policy["contract_hash"],
++                slots=[s.to_dict() for s in slots], values=[v.to_dict() for v in values],
++                blockers=list(blockers), facts=[f.to_dict() for f in facts],
++                issues=[i.to_dict() for i in issues],
++                source_refs=[FormalEvidenceRef.from_formal_fact(f).to_dict() for f in facts],
++                input_hash=expected.input_hash, bundle_hash=expected.bundle_hash(),
++                batch_id=identity[-1], current_receipt_absent=stored is None,
++                algorithm_version="formal-policy-feature-projection-v1")
++            payload["projection_hash"] = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
++            encoded = _canonical_json_bytes(payload)
++
++            def mint():
++                result = object.__new__(PolicyFeatureState)
++                key = id(result)
++                records[key] = (weakref.ref(result, lambda _: records.pop(key, None)), encoded, self,
++                    dict(request, policy_registry=policy_registry, rule_ids=rule_ids))
++                return result
++
++            return barrier.finalize(mint)
++
++    repository_type.select_current_verified_policy_feature_state = select
++    return PolicyFeatureState, dependencies
++
+ __all__ = ["FormalFeatureRepository", "FormalFeatureCurrentInput", "FormalFeatureCurrentInputProvider", "VerifiedMetricFeatureProjection", "VerifiedMetricFeatureAbsence"]
+diff --git a/ashare_pipeline/formal_policy_financial.py b/ashare_pipeline/formal_policy_financial.py
+new file mode 100644
+index 0000000..3e7d75e
+--- /dev/null
++++ b/ashare_pipeline/formal_policy_financial.py
+@@ -0,0 +1,310 @@
++"""Internal authenticated policy financial selections; no publication authority."""
++
++from __future__ import annotations
++
++import json
++import weakref
++from datetime import datetime
++from types import MappingProxyType
++
++from . import formal_feature_repository as feature_module
++from . import formal_metric_batch_guard as provider_module
++from .formal_feature_contract import FormalEvidenceRef
++from .formal_financial_features import select_visible_formal_facts
++from .formal_financial_schema import FormalFinancialFact
++from .formal_metric_context import VerifiedMetricIndustryBatch
++from .formal_policy_registry import FormalPolicyRegistry
++from .formal_policy_values import (
++    PolicyIntegrityError, PolicyPreconditionError, PolicyValue, _decimal_text,
++    bridge_v6, canonical_bytes, digest,
++)
++from .state_store import StateStore
++
++
++# The provider module is fully initialized before this captures its owned type
++# and actual methods. There is no first-selection capture of replaceable aliases.
++PolicyFeatureState, _feature_dependencies = feature_module._install_policy_projection(provider_module)
++del feature_module._install_policy_projection
++
++_BRIDGE = "v6_feature_decimal_bridge_v1"
++_FREEZE = "2026-08-31T07:00:00+00:00"
++
++
++def annual_targets(series_selector):
++    expected = tuple(f"{year}-12-31" for year in range(2021, 2026))
++    observations = tuple(series_selector["observations"])
++    actual = tuple(item["fy_end"] for item in observations)
++    if actual != expected:
++        raise PolicyPreconditionError("annual observations must be the five distinct signed FY ends")
++    return tuple(zip(expected, observations, strict=True))
++
++
++def _leaves(node, path="formula"):
++    if node["op"] == "fact":
++        yield path, node
++    elif node["op"] in {"minimum", "median"}:
++        for index, child in enumerate(node["items"]):
++            yield from _leaves(child, f"{path}.items[{index}]")
++    else:
++        yield from _leaves(node["left"], path + ".left")
++        yield from _leaves(node["right"], path + ".right")
++
++
++def _policy_value(raw, unit, projection_hash, reason=None):
++    return dict(state="domain_conflict" if reason == "financial_domain_conflict" else
++            "missing" if reason else "value",
++        value=None if reason else _decimal_text(bridge_v6(raw)), value_type="decimal", unit=unit,
++        evidence_hashes=[projection_hash], pending=[] if reason is None else [dict(
++            origin="runtime", code=reason, rule_id=None, evidence_hashes=[projection_hash])])
++
++
++def _observation(selector, slot, projected, state, fy_end=None):
++    """Bind every AST occurrence to actual selected fact periods, never slot names."""
++    facts = tuple(FormalFinancialFact.from_dict(w) for w in state["facts"])
++    leaves, diagnostics, source_refs = [], [], {}
++    bases, annual_ends = set(), set()
++    for path, leaf in _leaves(slot["formula"]):
++        period = leaf["period_key"]
++        candidates = tuple(f for f in facts if f.metric_key == leaf["fact_key"])
++        if len(period) == 6 and period.startswith("FY") and period[2:].isdigit():
++            end = period[2:] + "-12-31"
++            selected = select_visible_formal_facts(
++                (f for f in candidates if f.period_kind == "FY" and f.period_end == end), _FREEZE)
++            if "fact_selection_tie_conflict" in selected.blockers:
++                raise PolicyIntegrityError("policy fact selection has ambiguous leading versions")
++            diagnostics.extend(selected.blockers)
++            if len(selected.facts) != 1:
++                diagnostics.append("financial_domain_conflict" if len(selected.facts) > 1 else "financial_input_missing")
++                continue
++            actual = selected.facts
++        elif fy_end is None:
++            # Scalar quarter leaves retain the exact V6 component evidence; the
++            # evaluator already authenticated quarter arithmetic and its periods.
++            evidence_ids = {ref["formal_fact_id"] for ref in (projected or {}).get("evidence", [])}
++            actual = tuple(f for f in candidates if f.id in evidence_ids)
++            if not actual:
++                diagnostics.append("financial_input_missing")
++        else:
++            diagnostics.append("financial_domain_conflict")
++            continue
++        for fact in actual:
++            wire = fact.to_dict()
++            bases.add(wire["accounting_basis"])
++            if fy_end is not None:
++                annual_ends.add(wire["period_end"])
++                previous = str(int(fy_end[:4]) - 1) + "-12-31"
++                if (wire["period_end"] != fy_end and not
++                        (wire["nature"] == "instant" and wire["period_end"] == previous)):
++                    diagnostics.append("financial_domain_conflict")
++            if (wire["period_kind"] == "FY" and wire["nature"] == "duration"
++                    and wire["period_start"] != wire["period_end"][:4] + "-01-01"):
++                diagnostics.append("financial_domain_conflict")
++            leaves.append(dict(ast_path=path, formal_fact_id=wire["id"],
++                fact_key=leaf["fact_key"], period_key=period, **{key: wire[key] for key in
++                ("security_id", "period_start", "period_end", "period_kind", "nature", "statement",
++                 "accounting_basis", "unit", "mapping_version")}))
++            ref = FormalEvidenceRef.from_formal_fact(fact).to_dict()
++            source_refs[canonical_bytes(ref)] = ref
++    if len(bases) > 1 or (fy_end is not None and annual_ends and fy_end not in annual_ends):
++        diagnostics.append("financial_domain_conflict")
++    raw = projected["value"] if projected else None
++    if state["current_receipt_absent"]:
++        reason = "current_receipt_absent"
++    elif state["issues"] or "financial_domain_conflict" in diagnostics:
++        reason = "financial_domain_conflict"
++    elif projected is None or projected["status"] != "derived":
++        missing = (projected or {}).get("missing_reason")
++        reason = {"formula_unit_mismatch": "unsupported_unit",
++            "formula_zero_denominator": "invalid_denominator",
++            "formula_fact_ambiguous": "financial_domain_conflict"}.get(missing, "financial_input_missing")
++    else:
++        reason = "financial_input_missing" if diagnostics else None
++    if projected is not None and (projected["unit"] != selector["expected_unit"]
++            or projected["formula_version"] != selector["formula_version"]):
++        raise PolicyIntegrityError("policy value differs from its signed selector")
++    refs = [source_refs[key] for key in sorted(source_refs)]
++    visibility = dict(as_of_utc=_FREEZE,
++        minimum_published_precision="date" if any(r["published_precision"] != "timestamp" for r in refs) else
++            "timestamp" if refs else None,
++        published_at_utc=sorted({r["published_at_utc"] for r in refs}),
++        effective_at_utc=sorted({r["effective_at_utc"] for r in refs}))
++    record = dict(selector_hash=digest(selector), slot_hash=digest(slot), formula_hash=digest(slot["formula"]),
++        formula_version=slot["formula_version"], value=_policy_value(raw, slot["unit"], state["projection_hash"], reason),
++        unit=slot["unit"], facts=leaves, issues=[*state["issues"], *sorted(set(diagnostics))],
++        source_refs=refs, visibility=visibility, bridge_version=_BRIDGE, projection_hash=state["projection_hash"])
++    if fy_end is not None:
++        record = dict(fy_end=fy_end, **record)
++    return record, dict(original_value=raw, original_value_repr=repr(raw),
++        original_projection_hash=state["projection_hash"], bridge_version=_BRIDGE,
++        converted_value=record["value"]["value"])
++
++
++def _install_financial():
++    repositories, selections = {}, {}
++    feature_type = feature_module.FormalFeatureRepository
++    feature_select = feature_type.select_current_verified_policy_feature_state
++    feature_check, state_wire = _feature_dependencies, PolicyFeatureState.to_dict
++    require_policy, policy_wire = FormalPolicyRegistry.require_verified, FormalPolicyRegistry.to_dict
++    require_industry, industry_wire = VerifiedMetricIndustryBatch.require_verified, VerifiedMetricIndustryBatch.to_dict
++    read_universe = StateStore.get_verified_formal_frozen_universe
++    captured_functions = tuple((name, value) for name, value in globals().items()
++                               if callable(value) and name != "_install_financial")
++
++    def interfaces():
++        if any(globals().get(name) is not value for name, value in captured_functions):
++            raise PolicyIntegrityError("policy financial calculation dependency changed")
++        for cls, methods in own_methods:
++            if set(vars(cls)) != set(methods) or any(vars(cls)[k] is not v for k, v in methods.items()):
++                raise PolicyIntegrityError("policy financial interface changed")
++
++    def dependencies(repository):
++        interfaces()
++        saved = repositories.get(id(repository))
++        if type(repository) is not FormalPolicyFinancialRepository or saved is None or saved[0]() is not repository:
++            raise PolicyIntegrityError("financial repository is forged or copied")
++        feature_check(saved[1], saved[2])
++        return saved[1], saved[2]
++
++    def record(selection):
++        interfaces()
++        saved = selections.get(id(selection))
++        if type(selection) is not PolicyFinancialSelection or saved is None or saved[0]() is not selection:
++            raise PolicyIntegrityError("financial selection is forged or copied")
++        return saved
++
++    def freeze(value):
++        if type(value) is dict:
++            if set(value) == {"state", "value", "value_type", "unit", "evidence_hashes", "pending"}:
++                return PolicyValue.from_dict(value)
++            return MappingProxyType({k: freeze(v) for k, v in value.items()})
++        return tuple(map(freeze, value)) if type(value) is list else value
++
++    class SelectionMeta(type):
++        def __setattr__(cls, name, value):
++            if name in {"__getattribute__", "__bases__"}:
++                raise TypeError("financial selection lookup and inheritance are immutable")
++            return super().__setattr__(name, value)
++
++        def __delattr__(cls, name):
++            if name in {"__getattribute__", "__bases__"}:
++                raise TypeError("financial selection lookup and inheritance are immutable")
++            return super().__delattr__(name)
++
++    class PolicyFinancialSelection(metaclass=SelectionMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("financial selections require authenticated repository reads")
++
++        def __getattribute__(self, name):
++            record(self)
++            return object.__getattribute__(self, name)
++
++        def __getattr__(self, name):
++            payload = json.loads(record(self)[1])
++            if name not in {"values", "annual", "lineage", "selection_hash"}:
++                raise AttributeError(name)
++            return freeze(payload[name])
++
++        def recheck(self):
++            saved = record(self)
++            current = select(saved[2], **saved[3])
++            if record(current)[1] != saved[1]:
++                raise PolicyIntegrityError("financial selection is no longer current")
++
++        def __copy__(self):
++            raise TypeError("financial selections cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("financial selections cannot be copied")
++
++    def select(self, security_id, as_of_utc, *, template_id, policy_registry, industry_batch):
++        feature_repository, provider = dependencies(self)
++        if type(policy_registry) is not FormalPolicyRegistry or type(industry_batch) is not VerifiedMetricIndustryBatch:
++            raise PolicyPreconditionError("genuine policy registry and industry batch required")
++        require_policy(policy_registry)
++        require_industry(industry_batch)
++        policy, industry = policy_wire(policy_registry), industry_wire(industry_batch)
++        frozen = read_universe(feature_repository._store, industry["frozen_input_hash"])
++        if (frozen is None or datetime.fromisoformat(frozen.as_of_utc) != datetime.fromisoformat(as_of_utc) or as_of_utc != _FREEZE
++                or frozen.registry_manifest_hash != policy["registry_manifest_hash"]
++                or frozen.universe_hash != industry["universe_hash"]
++                or industry["registry_manifest_hash"] != policy["registry_manifest_hash"]
++                or industry["industry_registry_hash"] != policy["role_hashes"]["industry"]
++                or set(industry["entries"]) != {m.security_id for m in frozen.members}):
++            raise PolicyPreconditionError("financial industry root/frozen/universe identity mismatch")
++        entry = industry["entries"].get(security_id)
++        if entry is None or any(entry[k] != industry[k] for k in
++                ("registry_manifest_hash", "frozen_input_hash", "universe_hash")):
++            raise PolicyPreconditionError("financial security is outside the authenticated universe")
++        if entry["status"] == "assigned" and entry["template_id"] != template_id:
++            raise PolicyPreconditionError("financial template differs from industry assignment")
++        applicability = ("applicability_unresolved" if entry["status"] != "assigned" else
++            "applicable" if entry["secondary_industry"] in policy["cyclic_secondary_industries"] else "not_applicable")
++        rules = [r for r in policy["rules"] if r["template_id"] == template_id
++            and (r["kind"] == "numeric_redline" or (r["kind"] == "cyclic_protection" and applicability == "applicable"))]
++        rule_ids = tuple(sorted(r["rule_id"] for r in rules))
++        state = feature_select(feature_repository, security_id, as_of_utc, template_id=template_id,
++            registry_manifest_hash=policy["registry_manifest_hash"], policy_registry=policy_registry, rule_ids=rule_ids)
++        wire = state_wire(state)
++        slots = {s["slot_id"]: s for s in wire["slots"]}
++        projected = {v["slot_id"]: v for v in wire["values"]}
++        values, annual, scalar, bridges = {}, {}, {}, {}
++        for rule in rules:
++            for selector in rule["inputs"].values():
++                key = digest(selector)
++                if selector["kind"] == "annual_series":
++                    records = []
++                    for fy_end, observation in annual_targets(selector):
++                        leaf_selector = observation["selector"]
++                        slot_id = leaf_selector["feature_key"]
++                        result, bridge = _observation(leaf_selector, slots[slot_id], projected.get(slot_id), wire, fy_end)
++                        records.append(result)
++                        bridges[result["selector_hash"]] = bridge
++                    annual[key] = records
++                elif selector["kind"] == "feature":
++                    slot_id = selector["feature_key"]
++                    result, bridge = _observation(selector, slots[slot_id], projected.get(slot_id), wire)
++                    values[key], scalar[key], bridges[key] = result["value"], result, bridge
++        state.recheck()
++        dependencies(self)
++        require_policy(policy_registry)
++        require_industry(industry_batch)
++        payload = dict(values=values, annual=annual, lineage=dict(security_id=security_id, template_id=template_id,
++            algorithm_version="formal-policy-financial-selection-v1", contract_version=policy["contract_version"],
++            registry_manifest_hash=policy["registry_manifest_hash"], role_hashes=policy["role_hashes"],
++            policy_contract_hash=policy["contract_hash"], frozen_input_hash=industry["frozen_input_hash"],
++            universe_hash=industry["universe_hash"], industry_batch_hash=industry["batch_hash"], as_of_utc=as_of_utc,
++            applicability=applicability, rule_ids=list(rule_ids), scalar=scalar, bridges=bridges,
++            projection_hash=wire["projection_hash"], input_hash=wire["input_hash"], bundle_hash=wire["bundle_hash"],
++            batch_id=wire["batch_id"], current_receipt_absent=wire["current_receipt_absent"]))
++        payload["selection_hash"] = digest(payload)
++        result = object.__new__(PolicyFinancialSelection)
++        key = id(result)
++        selections[key] = (weakref.ref(result, lambda _: selections.pop(key, None)), canonical_bytes(payload), self,
++            dict(security_id=security_id, as_of_utc=as_of_utc, template_id=template_id,
++                 policy_registry=policy_registry, industry_batch=industry_batch))
++        return result
++
++    class FormalPolicyFinancialRepository:
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, feature_repository, *, current_input_provider):
++            if type(self) is not FormalPolicyFinancialRepository or id(self) in repositories:
++                raise PolicyPreconditionError("financial repository initialization must be exact and single-use")
++            if current_input_provider is None:
++                raise PolicyPreconditionError("an explicit matching owned provider is required")
++            feature_check(feature_repository, current_input_provider)
++            key = id(self)
++            repositories[key] = (weakref.ref(self, lambda _: repositories.pop(key, None)),
++                                 feature_repository, current_input_provider)
++
++    FormalPolicyFinancialRepository.select = select
++    own_methods = tuple((cls, dict(vars(cls))) for cls in (FormalPolicyFinancialRepository, PolicyFinancialSelection, SelectionMeta))
++    return FormalPolicyFinancialRepository, PolicyFinancialSelection
++
++
++FormalPolicyFinancialRepository, PolicyFinancialSelection = _install_financial()
++del _install_financial
++
++__all__ = ["FormalPolicyFinancialRepository", "PolicyFinancialSelection"]
+diff --git a/tests/formal_policy_runtime_fixtures.py b/tests/formal_policy_runtime_fixtures.py
+index 7ba2d1b..bd3505b 100644
+--- a/tests/formal_policy_runtime_fixtures.py
++++ b/tests/formal_policy_runtime_fixtures.py
+@@ -6,20 +6,22 @@ from datetime import date
+ import hashlib
+ import math
+ 
+ from ashare_pipeline.formal_evidence import (
+     OfficialFetch,
+     OfficialRequest,
+     SourcePolicy,
+     verify_official_fetch,
+ )
+ from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
++from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
++from ashare_pipeline.formal_metric_context import FormalMetricContextRepository
+ from ashare_pipeline.formal_universe import canonical_security_id
+ from tests.formal_metric_feature_fixtures import FinancialFixture
+ from tests.formal_metric_fixtures import FREEZE, update_mapping_digest
+ from tests.formal_policy_fixtures import add_policy_documents, rehash_documents
+ from tests.test_formal_context_repository import descriptor
+ from tests.test_formal_feature_contract import formal_fact
+ from tests.test_formal_scoring_registry import TEMPLATES, canonical
+ from tests.test_formal_sources import config
+ 
+ 
+@@ -57,27 +59,27 @@ def _exchange_rows(templates):
+     result = {exchange: [] for exchange in ("BJ", "SH", "SZ")}
+     for security_id in sorted(templates):
+         result[security_id[:2]].append({
+             "security_id": security_id,
+             "listing_status": "listed",
+             "security_type": "ordinary_a",
+         })
+     return result
+ 
+ 
+-def _policy_memberships(templates):
++def _policy_memberships(templates, cyclic):
+     return [
+         {
+             "security_id": security_id,
+             "template_id": templates[security_id],
+             "primary_industry": "fixture-policy",
+-            "secondary_industry": "fixture-cyclic",
++            "secondary_industry": "fixture-cyclic" if cyclic else "fixture-noncyclic",
+         }
+         for security_id in sorted(templates)
+     ]
+ 
+ 
+ def _patch_current_policy_periods(documents):
+     for slot in documents["feature"]["slots"]:
+         if slot["slot_id"].split(".policy.", 1)[-1] in {
+             "equity", "roe", "margin", "profit",
+         }:
+@@ -99,49 +101,74 @@ def _patch_current_policy_periods(documents):
+         for rule_id, rule in documents[role]["rules"].items():
+             if rule_id == "execution_contract" or "inputs" not in rule:
+                 continue
+             for selector in rule["inputs"].values():
+                 patch_selector(selector)
+ 
+ 
+ class PolicyRuntimeFixture(FinancialFixture):
+     """Small producer-backed graph; it does not confer production meaning."""
+ 
+-    def __init__(self, *, range_enabled=False, templates=None):
+-        if type(range_enabled) is not bool:
+-            raise ValueError("range_enabled must be exact bool")
++    def __init__(self, *, range_enabled=False, templates=None, cyclic=True, mutate=None):
++        if type(range_enabled) is not bool or type(cyclic) is not bool:
++            raise ValueError("range_enabled and cyclic must be exact bool")
+         selected_templates = _templates(templates)
+ 
+         def configure(documents):
+-            documents["industry"]["memberships"] = _policy_memberships(selected_templates)
++            documents["industry"]["memberships"] = _policy_memberships(selected_templates, cyclic)
+             update_mapping_digest(documents["industry"])
+             documents["scoring"]["descriptors"].append(descriptor("security_state"))
+             documents["source"]["configs"].extend(
+                 config(dataset="fixture-state", exchange_scope=exchange)
+                 for exchange in ("BJ", "SH", "SZ")
+             )
+             add_policy_documents(documents)
+             _patch_current_policy_periods(documents)
+             if range_enabled:
+                 from tests.formal_range_fixtures import add_range_documents
+                 add_range_documents(documents)
++            if mutate is not None:
++                mutate(documents)
+             rehash_documents(documents)
+ 
+-        super().__init__(
+-            mutate=configure,
+-            exchange_rows=_exchange_rows(selected_templates),
+-        )
+-        self.policy_registry = load_formal_policy_registry(
+-            self.bundle,
+-            scoring_registry=self.scoring,
+-            feature_registry=self.vocabulary,
+-        )
++        try:
++            super().__init__(
++                mutate=configure,
++                exchange_rows=_exchange_rows(selected_templates),
++            )
++            self.policy_registry = load_formal_policy_registry(
++                self.bundle,
++                scoring_registry=self.scoring,
++                feature_registry=self.vocabulary,
++            )
++        except Exception:
++            if hasattr(self, "tempdir"):
++                self.tempdir.cleanup()
++            raise
++        self.policy_context_repository = FormalMetricContextRepository(self.store, self.context,
++            registry_signature_verifier=self.verifier)
++        self.policy_financial_repository = FormalPolicyFinancialRepository(self.feature_repository,
++            current_input_provider=self.provider)
++        self._policy_industry_ids = set()
++
++    def financial_selection(self, security_id):
++        if security_id not in self._policy_industry_ids:
++            self.put_industry(security_id)
++            self._policy_industry_ids.add(security_id)
++        universe = self.policy_context_repository.load_universe(self.frozen.frozen_input_hash,
++            scoring_registry=self.scoring)
++        industry = self.policy_context_repository.resolve_industries(universe)
++        member = next(m for m in self.industry["memberships"] if m["security_id"] == security_id)
++        selected = self.policy_financial_repository.select(security_id, FREEZE,
++            template_id=member["template_id"], policy_registry=self.policy_registry, industry_batch=industry)
++        self.policy_context_repository.recheck_batch(universe, industry)
++        return selected
+ 
+     def put_policy_financial(
+         self,
+         security_id,
+         values,
+         *,
+         fy_end,
+         units,
+         generation="g1",
+         persist=True,
+diff --git a/tests/test_formal_policy_financial.py b/tests/test_formal_policy_financial.py
+new file mode 100644
+index 0000000..a163fbc
+--- /dev/null
++++ b/tests/test_formal_policy_financial.py
+@@ -0,0 +1,363 @@
++"""Authenticate real policy projections without granting metric eligibility."""
++
++import copy
++from decimal import Decimal
++import unittest
++from unittest.mock import patch
++
++from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++from tests.formal_metric_fixtures import FREEZE
++from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
++from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
++from ashare_pipeline.formal_metric_batch_guard import FormalMetricCurrentInputProvider
++from ashare_pipeline.formal_financial_schema import FormalFactIssue, FormalFinancialFact
++
++
++def change_roe_formula(documents, *, wrong_year=False, repeated_leaf=False):
++    slot = next(s for s in documents["feature"]["slots"] if s["slot_id"] == "bank.policy.roe_2021")
++    current = documents["cyclic"]["rules"]["bank_cyclic_top"]["inputs"]["annual_roe"]["observations"][0]["selector"]
++    if wrong_year:
++        slot["formula"]["period_key"] = "FY2020"
++        current["period_keys"] = ["FY2020"]
++    else:
++        numerator = dict(op="fact", fact_key="fixture.policy.profit", period_key="FY2021")
++        slot["formula"] = dict(op="divide", left=numerator,
++            right=dict(op="fact", fact_key="fixture.policy.current.equity", period_key="FY2020"))
++        if repeated_leaf:
++            slot["formula"]["right"] = dict(op="add", left=slot["formula"]["right"],
++                right=dict(op="fact", fact_key="fixture.policy.current.equity", period_key="FY2020"))
++        current["period_keys"] = ["FY2020", "FY2021"]
++
++
++class PolicyFinancialTests(unittest.TestCase):
++    def fixture(self, **kwargs):
++        fixture = PolicyRuntimeFixture(**kwargs)
++        self.addCleanup(fixture.close)
++        return fixture
++
++    def select(self, fixture):
++        self.assertTrue(callable(getattr(fixture, "financial_selection", None)),
++                        "independent authenticated financial selection is missing")
++        return fixture.financial_selection("SH600000")
++
++    def test_optional_policy_slot_does_not_relax_metric_gate(self):
++        fixture = self.fixture()
++        fixture.policy_financial_values("SH600000", current_equity=-1.0)
++        selected = self.select(fixture)
++        self.assertTrue(any(v.state == "value" and v.value == Decimal("-1")
++                            for v in selected.values.values()))
++        with self.assertRaises(ValueError):
++            fixture.feature_repository.select_current_verified_metric_feature_state(
++                "SH600000", FREEZE, template_id="bank",
++                registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
++                required_feature_keys=("bank.policy.equity",))
++
++    def test_five_annual_records_bind_real_fact_paths_and_bridge(self):
++        fixture = self.fixture()
++        fixture.policy_financial_values("SH600000")
++        selected = self.select(fixture)
++        self.assertEqual(len(selected.annual), 3)
++        for records in selected.annual.values():
++            self.assertEqual(tuple(r["fy_end"] for r in records),
++                             tuple(f"{y}-12-31" for y in range(2021, 2026)))
++            self.assertEqual(tuple(r["value"].value for r in records),
++                             tuple(Decimal(v) for v in (1, 2, 3, 4, 5)))
++            for record in records:
++                self.assertEqual(record["bridge_version"], "v6_feature_decimal_bridge_v1")
++                self.assertEqual(len(record["facts"]), 1)
++                leaf = record["facts"][0]
++                self.assertEqual(leaf["ast_path"], "formula")
++                self.assertEqual(leaf["period_end"], record["fy_end"])
++                self.assertTrue(leaf["formal_fact_id"])
++                self.assertTrue(leaf["accounting_basis"])
++        selected.recheck()
++
++    def test_receipt_absence_is_bound_and_appearance_invalidates_selection(self):
++        fixture = self.fixture()
++        fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": -1},
++            fy_end="2025-12-31", units={"fixture.policy.current.equity": "CNY"}, persist=False)
++        selected = self.select(fixture)
++        self.assertTrue(selected.values)
++        for value in selected.values.values():
++            self.assertEqual(value.state, "missing")
++            self.assertEqual(value.to_dict()["pending"][0]["code"], "current_receipt_absent")
++        fixture.persist_features("SH600000")
++        with self.assertRaises(ValueError):
++            selected.recheck()
++
++    def test_receipt_tamper_is_integrity_failure(self):
++        fixture = self.fixture()
++        bundle = fixture.policy_financial_values("SH600000")
++        self.select(fixture)
++        fixture.sql("UPDATE formal_feature_set SET bundle_hash=? WHERE input_hash=?",
++                    ("0" * 64, bundle.input_hash))
++        with self.assertRaises(ValueError):
++            fixture.financial_selection("SH600000")
++
++    def test_missing_fy2021_keeps_target_and_pending(self):
++        fixture = self.fixture()
++        fixture.policy_financial_values("SH600000")
++        fixture.sql("DELETE FROM formal_financial_fact WHERE security_id=? AND period_end=?",
++                    ("SH600000", "2021-12-31"))
++        fixture.publish_current("SH600000")
++        fixture.persist_features("SH600000")
++        selected = self.select(fixture)
++        for records in selected.annual.values():
++            self.assertEqual(records[0]["fy_end"], "2021-12-31")
++            self.assertEqual(records[0]["value"].state, "missing")
++            self.assertIsNone(records[0]["value"].value)
++            self.assertEqual(records[1]["value"].value, Decimal("2"))
++
++    def test_selection_cannot_be_forged_copied_or_shadowed(self):
++        fixture = self.fixture()
++        selected = self.select(fixture)
++        for copier in (copy.copy, copy.deepcopy):
++            with self.assertRaises(TypeError):
++                copier(selected)
++        with self.assertRaises(TypeError):
++            type(selected)()
++        with self.assertRaises(ValueError):
++            object.__new__(type(selected)).recheck()
++        with self.assertRaises((AttributeError, TypeError)):
++            selected.recheck = lambda: None
++
++    def test_provider_generation_change_invalidates_even_equal_values(self):
++        fixture = self.fixture()
++        fixture.policy_financial_values("SH600000")
++        selected = self.select(fixture)
++        fixture.set_generation("SH600000", "new-generation")
++        with self.assertRaises(ValueError):
++            selected.recheck()
++
++    def industry(self, fixture):
++        fixture.put_industry("SH600000")
++        universe = fixture.policy_context_repository.load_universe(fixture.frozen.frozen_input_hash,
++            scoring_registry=fixture.scoring)
++        return fixture.policy_context_repository.resolve_industries(universe)
++
++    def test_unpublished_complete_provider_fails(self):
++        fixture = self.fixture()
++        provider = FormalMetricCurrentInputProvider(fixture.store)
++        feature = FormalFeatureRepository(fixture.store, fixture.files,
++            registry_signature_verifier=fixture.verifier, current_input_provider=provider)
++        repository = FormalPolicyFinancialRepository(feature, current_input_provider=provider)
++        industry = self.industry(fixture)
++        with self.assertRaises(ValueError):
++            repository.select("SH600000", FREEZE, template_id="bank",
++                policy_registry=fixture.policy_registry, industry_batch=industry)
++
++    def test_financial_repository_requires_explicit_matching_owned_provider(self):
++        fixture = self.fixture()
++        for provider in (None, object(), FormalMetricCurrentInputProvider(fixture.store)):
++            with self.subTest(provider=type(provider).__name__), self.assertRaises(ValueError):
++                FormalPolicyFinancialRepository(fixture.feature_repository, current_input_provider=provider)
++
++    def test_noncyclic_needs_only_equity_and_does_not_require_annual_history(self):
++        fixture = self.fixture(cyclic=False)
++        fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": -1},
++            fy_end="2025-12-31", units={"fixture.policy.current.equity": "CNY"})
++        selected = self.select(fixture)
++        self.assertEqual(selected.lineage["applicability"], "not_applicable")
++        self.assertEqual(len(selected.annual), 0)
++        self.assertEqual([v.value for v in selected.values.values()], [Decimal("-1")])
++
++    def test_unresolved_industry_is_pending_not_noncyclic(self):
++        fixture = self.fixture(cyclic=False)
++        universe = fixture.policy_context_repository.load_universe(fixture.frozen.frozen_input_hash,
++            scoring_registry=fixture.scoring)
++        industry = fixture.policy_context_repository.resolve_industries(universe)
++        selected = fixture.policy_financial_repository.select("SH600000", FREEZE, template_id="bank",
++            policy_registry=fixture.policy_registry, industry_batch=industry)
++        self.assertEqual(selected.lineage["applicability"], "applicability_unresolved")
++
++    def test_legitimate_opening_equity_and_repeated_ast_occurrences(self):
++        fixture = self.fixture(mutate=lambda docs: change_roe_formula(docs, repeated_leaf=True))
++        fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": 2},
++            fy_end="2020-12-31", units={"fixture.policy.current.equity": "CNY"}, persist=False)
++        fixture.policy_financial_values("SH600000")
++        selected = self.select(fixture)
++        record = next(records[0] for records in selected.annual.values() if len(records[0]["facts"]) == 3)
++        self.assertEqual(record["value"].value, Decimal("0.25"))
++        self.assertEqual(tuple(f["ast_path"] for f in record["facts"]),
++            ("formula.left", "formula.right.left", "formula.right.right"))
++        self.assertEqual(tuple(f["period_end"] for f in record["facts"]),
++            ("2021-12-31", "2020-12-31", "2020-12-31"))
++
++    def test_wrong_year_ast_cannot_borrow_observation_label(self):
++        fixture = self.fixture(mutate=lambda docs: change_roe_formula(docs, wrong_year=True))
++        fixture.put_policy_financial("SH600000", {"fixture.policy.roe": 99},
++            fy_end="2020-12-31", units={"fixture.policy.roe": "ratio"}, persist=False)
++        fixture.policy_financial_values("SH600000")
++        selected = self.select(fixture)
++        first = [records[0] for records in selected.annual.values()]
++        self.assertEqual(sum(r["value"].state == "domain_conflict" for r in first), 1)
++        self.assertFalse(any(r["value"].value == Decimal("99") for r in first))
++
++    def test_duplicate_fy_observation_is_rejected_before_read(self):
++        def mutate(documents):
++            records = documents["cyclic"]["rules"]["bank_cyclic_top"]["inputs"]["annual_roe"]["observations"]
++            records[1]["fy_end"] = "2021-12-31"
++        with self.assertRaises(ValueError):
++            self.fixture(mutate=mutate)
++
++    def test_zero_denominator_is_typed_pending(self):
++        fixture = self.fixture(mutate=change_roe_formula)
++        fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": 0},
++            fy_end="2020-12-31", units={"fixture.policy.current.equity": "CNY"}, persist=False)
++        fixture.policy_financial_values("SH600000")
++        selected = self.select(fixture)
++        pending = [r[0]["value"].to_dict()["pending"] for r in selected.annual.values()]
++        self.assertTrue(any(p and p[0]["code"] == "invalid_denominator" for p in pending))
++
++    def test_full_issue_snapshot_blocks_values_and_recheck(self):
++        fixture = self.fixture()
++        fixture.policy_financial_values("SH600000")
++        selected = self.select(fixture)
++        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", None,
++            "fixture.policy.roe", {"period": "FY2021"}),)
++        fixture.publish_current("SH600000")
++        fixture.persist_features("SH600000")
++        with self.assertRaises(ValueError):
++            selected.recheck()
++        current = fixture.financial_selection("SH600000")
++        self.assertTrue(all(v.state == "domain_conflict" for v in current.values.values()))
++
++    def test_mixed_accounting_basis_cannot_form_roe(self):
++        fixture = self.fixture(mutate=change_roe_formula)
++        fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": 2},
++            fy_end="2020-12-31", units={"fixture.policy.current.equity": "CNY"}, persist=False)
++        facts = fixture.store.list_formal_financial_facts(security_id="SH600000")
++        fixture.sql("DELETE FROM formal_financial_fact WHERE security_id=?", ("SH600000",))
++        changed = []
++        for fact in facts:
++            wire = fact.to_dict()
++            wire.pop("id")
++            wire["accounting_basis"] = "parent"
++            changed.append(FormalFinancialFact.create(**wire))
++        fixture.store.insert_formal_financial_facts(tuple(changed))
++        fixture.policy_financial_values("SH600000")
++        selected = self.select(fixture)
++        self.assertTrue(any(records[0]["value"].state == "domain_conflict" for records in selected.annual.values()))
++
++    def test_cross_security_template_and_root_fail(self):
++        fixture = self.fixture()
++        industry = self.industry(fixture)
++        for sid, template in (("SH600099", "bank"), ("SH600000", "insurance")):
++            with self.subTest(sid=sid, template=template), self.assertRaises(ValueError):
++                fixture.policy_financial_repository.select(sid, FREEZE, template_id=template,
++                    policy_registry=fixture.policy_registry, industry_batch=industry)
++        other = self.fixture(cyclic=False)
++        with self.assertRaises(ValueError):
++            fixture.policy_financial_repository.select("SH600000", FREEZE, template_id="bank",
++                policy_registry=other.policy_registry, industry_batch=industry)
++
++    def test_provider_alias_and_method_replacement_before_first_select_fail(self):
++        from ashare_pipeline import formal_metric_batch_guard as module
++        fixture = self.fixture()
++        industry = self.industry(fixture)
++        class FakeProvider:
++            pass
++        for owner, name, substitute in ((module, "FormalMetricCurrentInputProvider", FakeProvider),
++                (FormalMetricCurrentInputProvider, "resolve_current_inputs", lambda *_a, **_k: None)):
++            with self.subTest(name=name), patch.object(owner, name, substitute), self.assertRaises(ValueError):
++                fixture.policy_financial_repository.select("SH600000", FREEZE, template_id="bank",
++                    policy_registry=fixture.policy_registry, industry_batch=industry)
++
++    def test_source_correction_invalidates_equal_value_selection(self):
++        fixture = self.fixture()
++        fixture.policy_financial_values("SH600000")
++        selected = self.select(fixture)
++        fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": 1},
++            fy_end="2025-12-31", units={"fixture.policy.current.equity": "CNY"}, generation="correction")
++        with self.assertRaises(ValueError):
++            selected.recheck()
++
++    def test_same_leading_fact_versions_fail_integrity(self):
++        fixture = self.fixture()
++        fixture.policy_financial_values("SH600000")
++        fact = next(f for f in fixture.store.list_formal_financial_facts(security_id="SH600000")
++            if f.metric_key == "fixture.policy.roe" and f.period_end == "2021-12-31")
++        wire = fact.to_dict()
++        wire.pop("id")
++        wire["value"] = 99.0
++        fixture.store.insert_formal_financial_facts((FormalFinancialFact.create(**wire),))
++        fixture.publish_current("SH600000")
++        fixture.persist_features("SH600000")
++        with self.assertRaises(ValueError):
++            self.select(fixture)
++
++    def test_duplicate_actual_fy_fact_basis_is_domain_conflict(self):
++        fixture = self.fixture()
++        fixture.policy_financial_values("SH600000")
++        fact = next(f for f in fixture.store.list_formal_financial_facts(security_id="SH600000")
++            if f.metric_key == "fixture.policy.roe" and f.period_end == "2021-12-31")
++        wire = fact.to_dict()
++        wire.pop("id")
++        wire["accounting_basis"] = "parent"
++        fixture.store.insert_formal_financial_facts((FormalFinancialFact.create(**wire),))
++        fixture.publish_current("SH600000")
++        fixture.persist_features("SH600000")
++        selected = self.select(fixture)
++        self.assertEqual(sum(records[0]["value"].state == "domain_conflict" for records in selected.annual.values()), 1)
++
++    def test_unsigned_unit_conversion_is_not_performed(self):
++        def mutate(documents):
++            slot = next(s for s in documents["feature"]["slots"] if s["slot_id"] == "bank.policy.equity")
++            slot["unit"] = "ratio"
++            documents["redline"]["rules"]["bank_nonpositive_equity"]["inputs"]["value"]["expected_unit"] = "ratio"
++        fixture = self.fixture(cyclic=False, mutate=mutate)
++        fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": -1},
++            fy_end="2025-12-31", units={"fixture.policy.current.equity": "CNY"})
++        value = next(iter(self.select(fixture).values.values()))
++        self.assertEqual(value.state, "missing")
++        self.assertEqual(value.to_dict()["pending"][0]["code"], "unsupported_unit")
++
++    def test_fact_publication_mismatch_is_not_receipt_absence(self):
++        fixture = self.fixture()
++        fixture.policy_financial_values("SH600000")
++        selected = self.select(fixture)
++        fixture.sql("UPDATE formal_financial_fact SET published_at_utc=? WHERE security_id=?",
++                    ("2026-09-01T00:00:00+00:00", "SH600000"))
++        with self.assertRaises(ValueError):
++            selected.recheck()
++
++    def test_feature_state_rejects_arbitrary_slots_and_shadowed_read_paths(self):
++        fixture = self.fixture()
++        request = dict(template_id="bank", registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
++            policy_registry=fixture.policy_registry, rule_ids=("bank_nonpositive_equity",))
++        state = fixture.feature_repository.select_current_verified_policy_feature_state("SH600000", FREEZE, **request)
++        with self.assertRaises(TypeError):
++            copy.copy(state)
++        with self.assertRaises(TypeError):
++            copy.deepcopy(state)
++        with self.assertRaises(ValueError):
++            object.__new__(type(state)).recheck()
++        with self.assertRaises(ValueError):
++            fixture.feature_repository.select_current_verified_policy_feature_state("SH600000", FREEZE,
++                **dict(request, rule_ids=("bank.policy.equity",)))
++        with patch.object(fixture.feature_repository, "_read_authenticated_bundle", lambda **_: None):
++            with self.assertRaises(ValueError):
++                state.recheck()
++
++    def test_state_and_selection_class_lookup_cannot_be_replaced(self):
++        fixture = self.fixture()
++        selected = self.select(fixture)
++        state = fixture.feature_repository.select_current_verified_policy_feature_state("SH600000", FREEZE,
++            template_id="bank", registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
++            policy_registry=fixture.policy_registry, rule_ids=("bank_nonpositive_equity",))
++        for item in (state, selected):
++            cls = type(item)
++            original = cls.__getattribute__
++            try:
++                with self.assertRaises(TypeError):
++                    cls.__getattribute__ = lambda self, name: {}
++            finally:
++                if cls.__getattribute__ is not original:
++                    cls.__getattribute__ = original
++            with patch.object(cls, "values", property(lambda _: {}), create=True):
++                with self.assertRaises(ValueError):
++                    item.values
++
++
++if __name__ == "__main__":
++    unittest.main()
+

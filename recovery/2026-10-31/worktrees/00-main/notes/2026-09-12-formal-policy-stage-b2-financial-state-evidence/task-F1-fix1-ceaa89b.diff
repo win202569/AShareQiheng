@@ -1,0 +1,230 @@
+# F1 scoped fix review
+
+Base: db093077c57a180499a96c1182a603c50ebdb00e
+Head: ceaa89b1b325afd0493643abbfb3062dbafce555
+Scope: F1 whitelist only. Findings: task-F1-review-db09307.md.
+
+ceaa89b fix: preserve exact policy enums and reject invalid fixture securities
+ ashare_pipeline/formal_policy_values.py |  4 ++-
+ tests/formal_policy_runtime_fixtures.py |  4 ++-
+ tests/test_formal_policy_values.py      | 43 ++++++++++++++++++++++++++++++++-
+ 3 files changed, 48 insertions(+), 3 deletions(-)
+diff --git a/ashare_pipeline/formal_policy_values.py b/ashare_pipeline/formal_policy_values.py
+index c26d4a2..4b873a4 100644
+--- a/ashare_pipeline/formal_policy_values.py
++++ b/ashare_pipeline/formal_policy_values.py
+@@ -201,41 +201,43 @@ class PolicyValue:
+             raise ValueError("unknown policy value state")
+         if type(value_type) is not str or value_type not in _VALUE_TYPES:
+             raise ValueError("unknown policy value type")
+         unit = _unit(wire["unit"], value_type)
+         if type(wire["pending"]) is not list:
+             raise ValueError("pending must be an array")
+         pending = tuple(_Pending.from_dict(item) for item in wire["pending"])
+ 
+         if state == "value":
+             if pending:
+                 raise ValueError("a present policy value cannot be pending")
+             if value_type in _COMPOUND_TYPES:
+                 raise ValueError("compound policy values require their closed producer validator")
+             if value_type == "decimal":
+                 value: Decimal | bool | str | None = _decimal(wire["value"])
+             elif value_type == "bool":
+                 if type(wire["value"]) is not bool:
+                     raise ValueError("bool policy value must be exact bool")
+                 value = wire["value"]
+             else:
+-                value = _identifier(wire["value"], "enum policy value")
++                if type(wire["value"]) is not str:
++                    raise ValueError("enum policy value must be exact str")
++                value = wire["value"]
+         else:
+             if wire["value"] is not None:
+                 raise ValueError("missing or conflicting policy value must be null")
+             if not pending:
+                 raise ValueError("missing or conflicting policy value requires a pending reason")
+             value = None
+ 
+         return cls(
+             state=state,
+             value=value,
+             value_type=value_type,
+             unit=unit,
+             evidence_hashes=_hashes(wire["evidence_hashes"], "evidence_hashes"),
+             _pending=pending,
+         )
+ 
+     def to_dict(self) -> dict:
+         value: object = self.value
+         if self.value_type == "decimal" and value is not None:
+             value = _decimal_text(value)
+diff --git a/tests/formal_policy_runtime_fixtures.py b/tests/formal_policy_runtime_fixtures.py
+index 11ea89e..7ba2d1b 100644
+--- a/tests/formal_policy_runtime_fixtures.py
++++ b/tests/formal_policy_runtime_fixtures.py
+@@ -129,41 +129,43 @@ class PolicyRuntimeFixture(FinancialFixture):
+         super().__init__(
+             mutate=configure,
+             exchange_rows=_exchange_rows(selected_templates),
+         )
+         self.policy_registry = load_formal_policy_registry(
+             self.bundle,
+             scoring_registry=self.scoring,
+             feature_registry=self.vocabulary,
+         )
+ 
+     def put_policy_financial(
+         self,
+         security_id,
+         values,
+         *,
+         fy_end,
+         units,
+         generation="g1",
+         persist=True,
+     ):
+-        canonical_security_id(security_id)
++        if (type(security_id) is not str or canonical_security_id(security_id) != security_id
++                or security_id not in {member.security_id for member in self.frozen.members}):
++            raise ValueError("policy financial security must be a canonical frozen-universe member")
+         if type(values) is not dict or not values or type(units) is not dict or set(units) != set(values):
+             raise ValueError("every policy fact requires one explicit unit")
+         if type(fy_end) is not str:
+             raise ValueError("fy_end must be an explicit canonical date")
+         try:
+             parsed_fy_end = date.fromisoformat(fy_end)
+         except ValueError as error:
+             raise ValueError("fy_end must be an explicit canonical date") from error
+         if parsed_fy_end.isoformat() != fy_end:
+             raise ValueError("fy_end must be an explicit canonical date")
+         if type(generation) is not str or not generation or generation.strip() != generation:
+             raise ValueError("generation must be canonical text")
+         if type(persist) is not bool:
+             raise ValueError("persist must be exact bool")
+         for fact_key, value in values.items():
+             if (type(fact_key) is not str or fact_key not in _POLICY_UNITS
+                     or type(units[fact_key]) is not str or units[fact_key] != _POLICY_UNITS[fact_key]
+                     or type(value) not in (int, float) or not math.isfinite(value)):
+                 raise ValueError("policy fact value, key or unit is invalid")
+ 
+diff --git a/tests/test_formal_policy_values.py b/tests/test_formal_policy_values.py
+index 9b6b3b0..e70bf14 100644
+--- a/tests/test_formal_policy_values.py
++++ b/tests/test_formal_policy_values.py
+@@ -88,49 +88,62 @@ class DecimalBridgeTests(unittest.TestCase):
+ 
+ 
+ class PolicyValueTests(unittest.TestCase):
+     def test_scalar_values_use_exact_types_and_normalize_evidence_hashes(self):
+         decimal_value = PolicyValue.from_dict(value_wire())
+         self.assertEqual(decimal_value.value, Decimal("4.2"))
+         self.assertEqual(decimal_value.to_dict()["evidence_hashes"], [HASH_A, HASH_B])
+ 
+         boolean_value = PolicyValue.from_dict(value_wire(
+             value=True, value_type="bool", unit=None, evidence_hashes=[]
+         ))
+         enum_value = PolicyValue.from_dict(value_wire(
+             value="listed", value_type="enum", unit=None, evidence_hashes=[]
+         ))
+         self.assertIs(boolean_value.value, True)
+         self.assertEqual(enum_value.value, "listed")
+ 
+         invalid = (
+             value_wire(value=1, value_type="bool", unit=None),
+             value_wire(value=True, value_type="enum", unit=None),
+-            value_wire(value=" listed", value_type="enum", unit=None),
+             value_wire(value="4.2", value_type="wrong"),
+             value_wire(value="4.2", unit=None),
+             value_wire(value=True, value_type="bool", unit="ratio"),
+         )
+         for wire in invalid:
+             with self.subTest(wire=wire), self.assertRaises(ValueError):
+                 PolicyValue.from_dict(wire)
+ 
++    def test_enum_preserves_exact_strings_without_identifier_restrictions(self):
++        for text in ("listed", " listed ", "trading halted", "风险警示", "status/new!", ""):
++            with self.subTest(text=text):
++                item = PolicyValue.from_dict(value_wire(value=text, value_type="enum", unit=None))
++                self.assertEqual(item.value, text)
++                self.assertEqual(item.to_dict()["value"], text)
++
++        class StringSubclass(str):
++            pass
++
++        for value in (True, 1, None, b"listed", ["listed"], StringSubclass("listed")):
++            with self.subTest(value=value), self.assertRaises(ValueError):
++                PolicyValue.from_dict(value_wire(value=value, value_type="enum", unit=None))
++
+     def test_missing_and_domain_conflict_are_typed_records_not_values(self):
+         for state, value_type in (
+             ("missing", "decimal"),
+             ("domain_conflict", "enum"),
+             ("missing", "event_record"),
+             ("domain_conflict", "calendar_record"),
+             ("missing", "market_window"),
+         ):
+             wire = value_wire(
+                 state=state,
+                 value=None,
+                 value_type=value_type,
+                 unit="ratio" if value_type == "decimal" else None,
+                 pending=[pending_wire()],
+             )
+             with self.subTest(state=state, value_type=value_type):
+                 item = PolicyValue.from_dict(wire)
+                 self.assertIsNone(item.value)
+                 self.assertEqual(item.state, state)
+                 self.assertEqual(item.to_dict()["pending"][0]["evidence_hashes"], [HASH_A, HASH_B])
+@@ -356,23 +369,51 @@ class PolicyRuntimeFixtureTests(unittest.TestCase):
+         self.assertEqual(values[("fixture.policy.current.roe", "2025-12-31")], 9.0)
+         self.assertEqual(values[("fixture.policy.roe", "2025-12-31")], 5.0)
+         self.assertEqual(values[("fixture.policy.current.margin", "2025-12-31")], 8.0)
+         self.assertEqual(values[("fixture.policy.margin", "2025-12-31")], 5.0)
+         self.assertEqual(values[("fixture.policy.current.profit", "2025-12-31")], 7.0)
+         self.assertEqual(values[("fixture.policy.profit", "2025-12-31")], 5.0)
+         slots = {item.slot_id: item.to_dict()["formula"]
+                  for item in fixture.vocabulary.slots_for_template("bank")}
+         self.assertEqual(slots["bank.policy.roe"], {
+             "op": "fact", "fact_key": "fixture.policy.current.roe", "period_key": "FY2025"
+         })
+         self.assertEqual(slots["bank.policy.roe_2025"], {
+             "op": "fact", "fact_key": "fixture.policy.roe", "period_key": "FY2025"
+         })
+         self.assertEqual(bundle.security_id, sid)
+         authenticated = fixture.feature_repository._read_authenticated_bundle(
+             input_hash=bundle.input_hash, require_complete=False
+         )
+         self.assertEqual(authenticated.canonical_bytes(), bundle.canonical_bytes())
+ 
++    def test_financial_helpers_reject_invalid_security_without_persistence(self):
++        def persisted_state(fixture):
++            with closing(sqlite3.connect(fixture.db_path)) as connection:
++                database = tuple(connection.iterdump())
++            files = tuple(
++                (str(path.relative_to(fixture.root)), path.read_bytes())
++                for directory in (fixture.root / "raw", fixture.root / "features")
++                for path in sorted(directory.rglob("*")) if path.is_file()
++            )
++            return database, files
++
++        for method in ("put_policy_financial", "policy_financial_values"):
++            for security_id in (" sh600000 ", "SH600099"):
++                with self.subTest(method=method, security_id=security_id):
++                    fixture = self.fixture()
++                    before = persisted_state(fixture)
++                    try:
++                        with self.assertRaises(ValueError):
++                            if method == "put_policy_financial":
++                                fixture.put_policy_financial(
++                                    security_id, {"fixture.policy.roe": 7.5},
++                                    fy_end="2024-12-31", units={"fixture.policy.roe": "ratio"},
++                                )
++                            else:
++                                fixture.policy_financial_values(security_id)
++                    finally:
++                        self.assertEqual(persisted_state(fixture), before)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+

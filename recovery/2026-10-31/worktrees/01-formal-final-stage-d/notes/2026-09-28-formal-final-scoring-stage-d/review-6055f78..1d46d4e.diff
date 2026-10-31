@@ -1,0 +1,160 @@
+# Review package: 6055f78..1d46d4e
+
+## Commits
+1d46d4e fix: read coverage schema from WAL and block unsigned applicability
+
+## Files changed
+ ashare_pipeline/formal_coverage_manifest.py | 19 +++++++++---------
+ tests/test_formal_coverage_guards.py        | 31 ++++++++++++++++++++++++++++-
+ 2 files changed, 40 insertions(+), 10 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_coverage_manifest.py b/ashare_pipeline/formal_coverage_manifest.py
+index 510e139..1a56270 100644
+--- a/ashare_pipeline/formal_coverage_manifest.py
++++ b/ashare_pipeline/formal_coverage_manifest.py
+@@ -198,21 +198,25 @@ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
+             digest = hashlib.sha256()
+             with path.open("rb") as stream:
+                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                     digest.update(chunk)
+             hashes[suffix] = digest.hexdigest()
+         return hashes
+ 
+     before = db_hashes()
+     db_sha256 = before[""]
+     try:
+-        connection = sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)
++        # Immutable mode is safe only for a checkpointed DB. With a WAL,
++        # normal read-only mode must see the committed frames; a sidecar race
++        # then fails the before/after generation comparison below.
++        read_mode = "?mode=ro" if before["-wal"] is not None else "?mode=ro&immutable=1"
++        connection = sqlite3.connect(db.as_uri() + read_mode, uri=True)
+         try:
+             version = connection.execute("PRAGMA user_version").fetchone()[0]
+             # StateStore owns schema_migration, not SQLite user_version. A
+             # foreign nonzero marker means another schema authority touched it.
+             if version != 0:
+                 raise ValueError("official coverage database schema user_version mismatch")
+             versions = tuple(row[0] for row in connection.execute(
+                 "SELECT version FROM schema_migration ORDER BY version"))
+             expected_versions = tuple(range(2, _state_schema.SCHEMA_VERSION + 1))
+             if versions != expected_versions or expected_schema_version != _state_schema.SCHEMA_VERSION:
+@@ -500,28 +504,25 @@ class FormalCoverageAuditor:
+                     cls = "blocked_registry"; reasons.append("registry_purpose_mismatch")
+                 if registry_disapproved:
+                     cls = "blocked_registry"; reasons.append("registry_not_approved")
+                 if source.get("signature_ok") is False or source.get("hash_ok") is False:
+                     cls = "blocked_integrity"; reasons.append("signature_or_hash_mismatch")
+                 if source.get("source_correction") or source.get("ambiguous_duplicate"):
+                     cls = "blocked_ambiguous"; reasons.append("source_correction_or_duplicate")
+                 if cls == "verified_no_coverage" and not (
+                     source.get("authenticated") and source.get("explicit_source_statement")):
+                     cls = "blocked_integrity"; reasons.append("no_coverage_not_authenticated")
+-                if cls == "not_applicable_signed" and not (
+-                    source.get("authenticated") is True
+-                    and source.get("explicit_source_statement") is True
+-                    and source.get("signature_ok") is True
+-                    and source.get("hash_ok") is True
+-                    and type(source.get("applicability_rule_hash")) is str
+-                    and _SHA256.fullmatch(source["applicability_rule_hash"])):
+-                    cls = "blocked_integrity"; reasons.append("applicability_not_authenticated")
++                if cls == "not_applicable_signed":
++                    # A caller's flags, hash and generic callback are not an
++                    # owning-repository applicability proof. No existing
++                    # coverage adapter can authenticate this class yet.
++                    cls = "blocked_dependency"; reasons.append("applicability_owner_proof_missing")
+                 if cls in {"verified_complete", "verified_partial", "verified_no_coverage"}:
+                     if any(type(source.get(field)) is not str or not source[field].strip()
+                            for field in _VERIFIED_LINEAGE_FIELDS):
+                         cls = "blocked_integrity"; reasons.append("incomplete_verified_lineage")
+                     elif (source.get("authenticated") is not True
+                           or source.get("signature_ok") is not True
+                           or source.get("hash_ok") is not True
+                           or any(type(source.get(field)) is not str
+                                  or _SHA256.fullmatch(source[field]) is None
+                                  for field in ("request_fingerprint", "content_sha256", "manifest_sha256"))
+diff --git a/tests/test_formal_coverage_guards.py b/tests/test_formal_coverage_guards.py
+index 5f4e9f2..0231464 100644
+--- a/tests/test_formal_coverage_guards.py
++++ b/tests/test_formal_coverage_guards.py
+@@ -166,28 +166,39 @@ class CoverageGuardTests(unittest.TestCase):
+         self.a.revoke(manifest)
+         for name in ("_SEALS", "_LIVE_CONTEXTS", "_seal"):
+             with self.subTest(name=name):
+                 self.assertFalse(hasattr(coverage_module, name))
+         with self.assertRaises(ValueError):
+             manifest.require_verified()
+ 
+     def test_signed_applicability_and_partial_required_units_fail_closed(self):
+         not_applicable = dict(self.row, coverage_class="not_applicable_signed")
+         manifest = self.a.audit([self.r], [not_applicable])
+-        self.assertEqual(manifest.rows[0]["coverage_class"], "blocked_integrity")
++        self.assertEqual(manifest.rows[0]["coverage_class"], "blocked_dependency")
+         partial = dict(self.row, coverage_class="verified_partial",
+                        expected_units=["CNY"], observed_units=[])
+         required = CoverageRequirement("f", "SH600000", "financial", "s", "2025", "SH", ("CNY",))
+         manifest = self.a.audit([required], [partial])
+         with self.assertRaises(ValueError):
+             manifest.require_preview_ready()
+ 
++    def test_caller_applicability_flags_and_permissive_callback_do_not_authorize_preview(self):
++        claimed = dict(self.row, coverage_class="not_applicable_signed",
++                       explicit_source_statement=True,
++                       applicability_rule_hash="a" * 64)
++        for callbacks in ({}, {"financial": lambda *_: True}):
++            with self.subTest(callbacks=bool(callbacks)):
++                manifest = FormalCoverageAuditor(repository_validators=callbacks).audit(
++                    [self.r], [claimed])
++                with self.assertRaisesRegex(ValueError, "coverage preview blocked"):
++                    manifest.require_preview_ready()
++
+     def test_verified_lineage_hashes_and_publication_cutoff_are_required(self):
+         for field in ("refresh_generation", "task_id", "collection_state",
+                       "captured_at_utc", "source_updated_at_utc"):
+             with self.subTest(field=field):
+                 row = dict(self.row); row.pop(field, None)
+                 manifest = self.a.audit([self.r], [row])
+                 self.assertEqual(manifest.rows[0]["coverage_class"], "blocked_integrity")
+         for field in ("content_sha256", "manifest_sha256", "request_fingerprint"):
+             with self.subTest(field=field):
+                 manifest = self.a.audit([self.r], [dict(self.row, **{field: "not-a-hash"})])
+@@ -450,20 +461,38 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
+             connection.commit()
+         finally:
+             connection.close()
+         status = json.loads(self.status_path.read_text(encoding="utf-8"))
+         status["db_sha256"] = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+         status["db_generation_hash"] = digest(db_generation(self.db_path))
+         self.status_path.write_text(json.dumps(status), encoding="utf-8")
+         with self.assertRaisesRegex(ValueError, "schema"):
+             self.audit()
+ 
++    def test_committed_wal_migration_removal_is_seen_by_read_only_schema_gate(self):
++        writer = sqlite3.connect(self.db_path)
++        try:
++            writer.execute("PRAGMA journal_mode=WAL")
++            writer.execute("PRAGMA wal_autocheckpoint=0")
++            writer.execute("DELETE FROM schema_migration WHERE version=7")
++            writer.commit()
++            self.assertTrue(self.db_path.with_name(self.db_path.name + "-wal").is_file())
++            status = json.loads(self.status_path.read_text(encoding="utf-8"))
++            status["db_sha256"] = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
++            status["db_generation_hash"] = digest(db_generation(self.db_path))
++            self.status_path.write_text(json.dumps(status), encoding="utf-8")
++            with self.assertRaisesRegex(ValueError, "schema"):
++                coverage_module._read_environment(
++                    Path(__file__).resolve().parents[1], self.db_path, self.status_path, 7)
++        finally:
++            writer.close()
++
+     def test_recheck_timestamp_is_noncanonical_even_in_repository_receipt(self):
+         early = [dict(row, rechecked_at_utc="2026-10-01T00:00:00+00:00") for row in self.records]
+         late = [dict(row, rechecked_at_utc="2026-10-02T00:00:00+00:00") for row in self.records]
+         self.assertEqual(self.audit(records=early).manifest_hash,
+                          self.audit(records=late).manifest_hash)
+ 
+     def test_fabricated_callback_and_empty_database_cannot_grant_official(self):
+         fabricated = [dict(row, selected_snapshot_id="fabricated") for row in self.records]
+         with self.assertRaisesRegex(ValueError, "repository|schema|authority"):
+             self.audit(records=fabricated).require_official_ready()

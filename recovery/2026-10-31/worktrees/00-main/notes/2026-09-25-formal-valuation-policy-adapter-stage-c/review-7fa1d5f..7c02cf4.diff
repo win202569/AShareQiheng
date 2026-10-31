@@ -1,0 +1,598 @@
+# Review package: 7fa1d5f5d8fef479c06b90487306f278eacecc91..7c02cf4
+
+## Commits
+7c02cf4 Mask sibling reads for unbound selections
+
+## Files changed
+ ashare_pipeline/formal_range_contract.py         |  70 ++++++++++++-
+ ashare_pipeline/formal_range_store.py            |  20 +++-
+ tests/test_formal_policy_market_binding_lease.py | 127 ++++++++++++++---------
+ 3 files changed, 158 insertions(+), 59 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_range_contract.py b/ashare_pipeline/formal_range_contract.py
+index 5e8d3a2..3433e10 100644
+--- a/ashare_pipeline/formal_range_contract.py
++++ b/ashare_pipeline/formal_range_contract.py
+@@ -404,25 +404,33 @@ def _build_range_bindings_contract():
+         binding_hash: str
+         market_bytes: bytes
+         calendar_bytes: bytes
+ 
+ 
+     _bindings_records: dict[int, _BindingsRecord] = {}
+     _binding_records: dict[int, _BindingRecord] = {}
+     _binding_read_lease = ContextVar("formal_range_current_binding_read_lease", default=None)
+     _sibling_request_read = ContextVar("formal_range_sibling_request_read", default=None)
+     _sibling_target_read = ContextVar("formal_range_sibling_target_read", default=None)
++    _sibling_exact_only = ContextVar("formal_range_sibling_exact_only", default=None)
+     _lease_records = {}
+     _sibling_records = {}
+     _target_records = {}
++    _exact_records = {}
+     _sibling_request_prover = [None]
+     _sibling_store_codes = [None]
++    request_fields = frozenset({
++        "schema_version", "kind", "source", "dataset", "security_id", "exchange",
++        "as_of_utc", "start_date", "end_date", "anchor_descriptor_id",
++        "calendar_descriptor_id", "range_config_id", "registry_manifest_hash",
++        "page_index", "calendar_coverage_hash",
++    })
+ 
+ 
+     def _envelope(value, fields):
+         return tuple((name, type(object.__getattribute__(value, name)),
+                       object.__getattribute__(value, name)) for name in fields)
+ 
+ 
+     def _lightweight_current(record: _BindingsRecord) -> None:
+         """Recheck mutable current fields without repeating signed graph parsing."""
+         _check_dependencies()
+@@ -487,21 +495,22 @@ def _build_range_bindings_contract():
+         if type(value) is not RangeBinding or record is None or record.reference() is not value:
+             raise ValueError("range binding is forged, copied, or unregistered")
+         parent = record.parent()
+         if parent is None or object.__getattribute__(value, "_RangeBinding__parent") is not parent:
+             raise ValueError("range binding parent changed")
+         lease = _binding_read_lease.get() if current else None
+         if lease is not None:
+             parent_record = _bindings_record(parent)
+             identity = (parent_record.snapshot.root_hash, record.binding_hash, record.key)
+             exact_binding = identity == lease[2]
+-            sibling = _sibling_request_read.get() if not exact_binding else None
++            sibling = (_sibling_request_read.get()
++                       if not exact_binding and _sibling_exact_only.get() is None else None)
+             target = _sibling_target_read.get() if sibling is not None else None
+             sibling_matches = (
+                 sibling is not None
+                 and target is not None
+                 and sibling[0] is lease
+                 and sibling[1] == get_thread_identity()
+                 and sibling[2] is lease[1]
+                 and sibling[3:5] == tuple(lease[7:9])
+                 and parent_record.snapshot == lease[5]
+                 and parent_record.snapshot.root_hash == sibling[7]
+@@ -577,20 +586,27 @@ def _build_range_bindings_contract():
+             raise TypeError("sibling request reads cannot be exported")
+ 
+ 
+     class _SiblingTargetRead:
+         __slots__ = ("__weakref__",)
+ 
+         def __init__(self, *_args, **_kwargs):
+             raise TypeError("sibling targets require their sealed range Store")
+ 
+ 
++    class _SiblingExactOnly:
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *_args, **_kwargs):
++            raise TypeError("exact sibling masks require their sealed range Store")
++
++
+     def install_sibling_request_read(
+             prover, selector_code, read_code, current_code, recheck_code):
+         caller = get_frame(1)
+         if (caller.f_code.co_name != "_build_range_store_type"
+                 or caller.f_globals.get("__name__") != "ashare_pipeline.formal_range_store"
+                 or _sibling_request_prover[0] is not None
+                 or not callable(prover)
+                 or type(selector_code) is not type(install_sibling_request_read.__code__)
+                 or type(read_code) is not type(install_sibling_request_read.__code__)
+                 or type(current_code) is not type(install_sibling_request_read.__code__)
+@@ -636,20 +652,51 @@ def _build_range_bindings_contract():
+                 or saved[0]() is not capability or saved[3] is not True):
+             raise ValueError("sibling target read is forged, copied, or closed")
+         state, token = saved[1:3]
+         if (get_thread_identity() != state[0]
+                 or _sibling_target_read.get() is not state):
+             raise ValueError("sibling target read is cross-thread or out of order")
+         _sibling_target_read.reset(token)
+         saved[3] = False
+ 
+ 
++    def enter_sibling_exact_only():
++        codes = _sibling_store_codes[0]
++        caller = get_frame(1)
++        if codes is None or caller.f_code not in (codes[0], codes[3]):
++            raise ValueError("exact sibling masks require their fixed range Store entry")
++        state = (get_thread_identity(), _binding_read_lease.get())
++        context_token = _sibling_exact_only.set(state)
++        result = object.__new__(_SiblingExactOnly)
++        identity = id(result)
++        reference = weakref.ref(result, lambda ref, key=identity:
++            _exact_records.pop(key, None)
++            if _exact_records.get(key) is not None
++            and _exact_records[key][0] is ref else None)
++        _exact_records[identity] = [reference, state, context_token, True]
++        return result
++
++
++    def close_sibling_exact_only(capability):
++        saved = _exact_records.get(id(capability))
++        if (type(capability) is not _SiblingExactOnly or saved is None
++                or saved[0]() is not capability or saved[3] is not True):
++            raise ValueError("exact sibling mask is forged, copied, or closed")
++        state, token = saved[1:3]
++        if (get_thread_identity() != state[0]
++                or _sibling_exact_only.get() is not state
++                or _binding_read_lease.get() is not state[1]):
++            raise ValueError("exact sibling mask is cross-thread or out of order")
++        _sibling_exact_only.reset(token)
++        saved[3] = False
++
++
+     def _open_sibling_description(
+             request_description, request_fingerprint, *, require_owner_binding):
+         lease = _binding_read_lease.get()
+         if lease is None:
+             return None
+         prior = _sibling_request_read.get()
+         prior_capability = None
+         if prior is not None:
+             if prior[0] is not lease:
+                 raise ValueError("sibling request read belongs to another owner lease")
+@@ -661,20 +708,28 @@ def _build_range_bindings_contract():
+         if (type(request_description) is not dict
+                 or set(request_description) != {"request", "config", "source_registry_hash",
+                                                 "binding_hash", "parent"}
+                 or type(request_description["request"]) is not dict
+                 or type(request_description["config"]) is not dict
+                 or type(request_description["source_registry_hash"]) is not str
+                 or type(request_description["binding_hash"]) is not str
+                 or type(request_fingerprint) is not str):
+             raise ValueError("sibling request read contract is invalid")
+         request = request_description["request"]
++        parent = request_description["parent"]
++        if (set(request) != request_fields
++                or (parent is not None
++                    and (type(parent) is not dict
++                         or set(parent) != {"task_id", "observation_hash", "mode"}
++                         or any(type(parent[key]) is not str or not parent[key]
++                                for key in parent)))):
++            raise ValueError("sibling request fields or parent are invalid")
+         if (request.get("kind") not in {"calendar_range", "market_range"}
+                 or hashlib.sha256(_canonical(request)).hexdigest() != request_fingerprint):
+             raise ValueError("sibling request fingerprint differs")
+         owner_reference = lease[4].bindings.get(lease[2][2])
+         lease_binding = None if owner_reference is None else owner_reference()
+         owner_record = _binding_record(lease_binding)
+         kind = request["kind"]
+         config_bytes = _canonical(request_description["config"])
+         expected_config = (owner_record.calendar_config if kind == "calendar_range"
+                            else owner_record.market_config)
+@@ -1040,30 +1095,32 @@ def _build_range_bindings_contract():
+         if len(matches) != 1:
+             raise ValueError("range task binding absent or ambiguous")
+         _binding_record(matches[0], current=True)
+         return matches[0]
+ 
+     return (RangeBinding, RangeBindings, load_policy_range_bindings, read_planning_binding,
+             lookup_planning_binding, open_current_binding_read_lease,
+             close_current_binding_read_lease, install_sibling_request_read,
+             open_sibling_request_read, open_sibling_record_read,
+             open_sibling_ticket_read, close_sibling_request_read,
+-            enter_sibling_target_read, close_sibling_target_read)
++            enter_sibling_target_read, close_sibling_target_read,
++            enter_sibling_exact_only, close_sibling_exact_only)
+ 
+ 
+ (RangeBinding, RangeBindings, load_policy_range_bindings,
+  _read_range_binding_planning, _lookup_range_binding_planning,
+  _open_current_binding_read_lease,
+  _close_current_binding_read_lease, _install_sibling_request_read,
+  _open_sibling_request_read, _open_sibling_record_read,
+  _open_sibling_ticket_read, _close_sibling_request_read,
+- _enter_sibling_target_read, _close_sibling_target_read) = _build_range_bindings_contract()
++ _enter_sibling_target_read, _close_sibling_target_read,
++ _enter_sibling_exact_only, _close_sibling_exact_only) = _build_range_bindings_contract()
+ del _build_range_bindings_contract
+ 
+ 
+ def _make_range_binding_authority():
+     """Expose immutable genuine anchors to the range source during module init."""
+ 
+     binding_type = RangeBinding
+     require_current = RangeBinding.require_current
+     calendar_config_get = RangeBinding.calendar_config.fget
+     manifest_hash_get = RangeBinding.registry_manifest_hash.fget
+@@ -1131,32 +1188,35 @@ del (_make_range_binding_read_lease_authority, _open_current_binding_read_lease,
+ 
+ 
+ def _make_range_binding_sibling_read_authority():
+     install = _install_sibling_request_read
+     open_read = _open_sibling_request_read
+     open_record = _open_sibling_record_read
+     open_ticket = _open_sibling_ticket_read
+     close_read = _close_sibling_request_read
+     enter_target = _enter_sibling_target_read
+     close_target = _close_sibling_target_read
++    enter_exact = _enter_sibling_exact_only
++    close_exact = _close_sibling_exact_only
+ 
+     def authority():
+         return (install, open_read, open_record, open_ticket, close_read,
+-                enter_target, close_target)
++                enter_target, close_target, enter_exact, close_exact)
+ 
+     return authority
+ 
+ 
+ _range_binding_sibling_read_authority = _make_range_binding_sibling_read_authority()
+ del (_make_range_binding_sibling_read_authority, _install_sibling_request_read,
+      _open_sibling_request_read, _open_sibling_record_read,
+      _open_sibling_ticket_read, _close_sibling_request_read,
+-     _enter_sibling_target_read, _close_sibling_target_read)
++     _enter_sibling_target_read, _close_sibling_target_read,
++     _enter_sibling_exact_only, _close_sibling_exact_only)
+ 
+ 
+ __all__ = [
+     "RangeBinding",
+     "RangeBindings",
+     "RangeConfig",
+     "load_policy_range_bindings",
+     "parse_range_entry",
+ ]
+diff --git a/ashare_pipeline/formal_range_store.py b/ashare_pipeline/formal_range_store.py
+index cb1797f..900e924 100644
+--- a/ashare_pipeline/formal_range_store.py
++++ b/ashare_pipeline/formal_range_store.py
+@@ -115,21 +115,22 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
+             raise ValueError("range StateStore identity changed")
+         if getattr(verifier, "verify") != verify_anchor:
+             raise ValueError("range signature verifier changed")
+         return state, root, verifier, factory, cache
+ 
+     from .formal_range_contract import _range_binding_lookup_authority
+     planning_binding_type, read_planning_binding = _range_binding_planning_authority()
+     lookup_planning_binding = _range_binding_lookup_authority()
+     (install_sibling_read, open_sibling_read, open_sibling_record,
+      open_sibling_ticket, close_sibling_read,
+-     enter_sibling_target, close_sibling_target) = _range_binding_sibling_read_authority()
++     enter_sibling_target, close_sibling_target,
++     enter_sibling_exact, close_sibling_exact) = _range_binding_sibling_read_authority()
+ 
+     def load_binding_identity(store, *, registry_manifest_hash, binding_hash, exchange):
+         state, _, verifier, factory, cache = record(store)
+         root_hash = registry_manifest_hash
+         bundle = FormalRegistryBundleLoader(state, verifier).load(root_hash)
+         key = root_hash, binding_hash, exchange
+         if key not in cache:
+             blob = bundle.blob("feature")
+             vocabulary = load_signed_feature_registry(blob.canonical_json, blob.signature, blob.key_id,
+                 verifier, registry_manifest=bundle.manifest)
+@@ -629,21 +630,26 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
+             """Issue only after the complete independent current selection."""
+             from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
+ 
+             fingerprint = _text(request_fingerprint)
+             request_description = None if request is None else describe_request(request)
+             if (request_description is not None
+                     and _digest(request_description["request"]) != fingerprint):
+                 raise ValueError("range bound request fingerprint differs")
+             sibling_read = (None if request is None else
+                             open_sibling_read(request, fingerprint))
+-            selected, snapshots = self._select_current_with_token(fingerprint)
++            exact_only = enter_sibling_exact() if request is None else None
++            try:
++                selected, snapshots = self._select_current_with_token(fingerprint)
++            finally:
++                if exact_only is not None:
++                    close_sibling_exact(exact_only)
+             if selected is not None and request_description is not None:
+                 selected_wire = observation_wire(selected)[0]
+                 stored = selected_wire["snapshot"]["task_payload"]
+                 if any(_canonical(stored[key]) != _canonical(request_description[key])
+                        for key in ("request", "config", "source_registry_hash", "parent")):
+                     raise ValueError("range persisted task differs from bound request")
+             if selected is None:
+                 if request is None:
+                     raise ValueError("range absence needs a bound request before ticket issuance")
+                 request_description = describe_request(request)
+@@ -686,21 +692,26 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
+                     close_sibling_read(sibling_read)
+                 return _issue_current_ticket(journal, self, "range", (fingerprint,),
+                     baseline, evidence, ((fingerprint,),), None)
+             wire, digest = observation_wire(selected)
+             if request is not None and describe_request(request)["request"] != wire["request"]:
+                 raise ValueError("range selected request differs from bound request")
+             _require_current_scope(journal, self,
+                 root=wire["request"]["registry_manifest_hash"],
+                 as_of_utc=wire["request"]["as_of_utc"], population=(fingerprint,))
+             authenticated = []
+-            reread = read(self, wire["task"]["id"], evidence=authenticated)
++            exact_only = enter_sibling_exact() if request is None else None
++            try:
++                reread = read(self, wire["task"]["id"], evidence=authenticated)
++            finally:
++                if exact_only is not None:
++                    close_sibling_exact(exact_only)
+             if observation_wire(reread)[1] != digest:
+                 raise ValueError("range selected observation changed during ticket issuance")
+             state, root, _, _, _ = record(self)
+             with transaction(state) as connection:
+                 if not {item[0]["request_fingerprint"] for item in authenticated} <= {
+                         key for key, _ in snapshots}:
+                     raise ValueError("range ticket parent was outside selected candidate token")
+                 check_candidate_snapshots(connection, snapshots)
+                 for item in authenticated:
+                     check_read_evidence(connection, root, item)
+@@ -712,20 +723,21 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
+             if sibling_read is not None:
+                 close_sibling_read(sibling_read)
+             return _issue_current_ticket(journal, self, "range", (fingerprint,),
+                                          baseline, evidence, ((fingerprint,),), selected)
+ 
+         def _batch_recheck_ticket(self, evidence):
+             """Compare the original six authenticated records and candidate sets."""
+             fingerprint, digest, authenticated, snapshots, request, request_bytes = evidence
+             sibling_read = (None if request is None else
+                             open_sibling_ticket(request, fingerprint))
++            exact_only = enter_sibling_exact() if request is None else None
+             target = (None if request is None else
+                       enter_sibling_target(fingerprint, "ticket:" + fingerprint))
+             try:
+                 state, root, _, _, _ = record(self)
+                 if fingerprint not in dict(snapshots):
+                     raise ValueError("range ticket evidence is incomplete")
+                 if digest is None:
+                     if (request is None
+                             or request_bytes != _canonical(describe_request(request))
+                             or _digest(describe_request(request)["request"]) != fingerprint
+@@ -735,20 +747,22 @@ def _build_range_store_type(*, describe_request, request_proof, restore_request,
+                     raise ValueError("range present ticket evidence is incomplete")
+                 with transaction(state) as connection:
+                     check_candidate_snapshots(connection, snapshots)
+                     for item in authenticated:
+                         check_read_evidence(connection, root, item)
+             finally:
+                 if target is not None:
+                     close_sibling_target(target)
+                 if sibling_read is not None:
+                     close_sibling_read(sibling_read)
++                if exact_only is not None:
++                    close_sibling_exact(exact_only)
+ 
+     install_sibling_read(request_proof,
+                          FormalRangeStore.select_current_batch_ticket.__code__,
+                          read.__code__, require_current.__code__,
+                          FormalRangeStore._batch_recheck_ticket.__code__)
+ 
+     batch_methods = tuple((cls, name, value)
+         for cls in (FormalRangeStore, source_type, StateStore)
+         for name, value in vars(cls).items()
+         if callable(value) or isinstance(value, (staticmethod, classmethod)))
+diff --git a/tests/test_formal_policy_market_binding_lease.py b/tests/test_formal_policy_market_binding_lease.py
+index 70d486b..414ce45 100644
+--- a/tests/test_formal_policy_market_binding_lease.py
++++ b/tests/test_formal_policy_market_binding_lease.py
+@@ -105,21 +105,21 @@ class MarketBindingLeaseTests(unittest.TestCase):
+             "source_registry_hash": fixture.binding.source_registry_hash,
+             "binding_hash": fixture.binding.binding_hash,
+             "parent": {"arbitrary": True},
+         }
+         for field in ("security_id", "as_of_utc", "start_date", "end_date"):
+             description["request"].pop(field)
+         forged_fingerprint = hashlib.sha256(json.dumps(
+             description["request"], sort_keys=True, ensure_ascii=False,
+             separators=(",", ":"), allow_nan=False,
+         ).encode("utf-8")).hexdigest()
+-        _, open_sibling, _, _, _, _, _ = contract._range_binding_sibling_read_authority()
++        _, open_sibling, _, _, _, _, _, _, _ = contract._range_binding_sibling_read_authority()
+         first_calendar_code = vars(type(fixture.source))["first_calendar_request"].__code__
+         rejected = FormalBatchReadJournal.open(
+             repository,
+             registry_manifest_hash=fixture.graph.manifest.manifest_hash,
+             as_of_utc=FREEZE, population=("SH600000",), required_keys=(("SH",),))
+ 
+         def inject(frame, event, arg):
+             if event == "return" and frame.f_code is first_calendar_code:
+                 sys.setprofile(None)
+                 open_sibling(description, forged_fingerprint)
+@@ -232,20 +232,50 @@ class MarketBindingLeaseTests(unittest.TestCase):
+             "sibling-fingerprint-worker", lease_seconds=3600)
+         self.assertEqual(second_lease["id"], second_task["id"])
+         fixture.range_store.persist(
+             second_task["id"], "sibling-fingerprint-worker",
+             second_lease["attempt_id"], fetch=bank_source.fetch_verified(second_request))
+         self.assertIsNotNone(fixture.range_store.select_current(
+             second_request.request_fingerprint))
+         selector_code = vars(type(fixture.range_store))[
+             "select_current_batch_ticket"
+         ].__code__
++        select_with_token_code = vars(type(fixture.range_store))[
++            "_select_current_with_token"
++        ].__code__
++        same_request_scope = FormalBatchReadJournal.open(
++            repository,
++            registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
++            as_of_utc=FREEZE,
++            population=("SH600002",),
++            required_keys=(("SH",),),
++        )
++
++        def borrow_for_same_request(frame, event, arg):
++            if (event == "return" and frame.f_code is select_with_token_code
++                    and frame.f_locals.get("request_fingerprint")
++                    == broker_request.request_fingerprint):
++                sys.setprofile(None)
++                fixture.range_store.select_current_batch_ticket(
++                    same_request_scope, broker_request.request_fingerprint,
++                    request=None)
++
++        sys.setprofile(borrow_for_same_request)
++        try:
++            with self.assertRaisesRegex(ValueError, "cross-binding"):
++                repository.select_calendar_batch_ticket(
++                    same_request_scope, broker, FREEZE)
++        finally:
++            sys.setprofile(None)
++        with self.assertRaisesRegex(ValueError, "closed"):
++            same_request_scope.checkpoint()
++
+         borrowed_scope = FormalBatchReadJournal.open(
+             repository,
+             registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
+             as_of_utc=FREEZE,
+             population=("SH600002",),
+             required_keys=(("SH",),),
+         )
+ 
+         def borrow_for_another_request(frame, event, arg):
+             if (event == "return" and frame.f_code is selector_code
+@@ -269,89 +299,84 @@ class MarketBindingLeaseTests(unittest.TestCase):
+             repository,
+             registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
+             as_of_utc=FREEZE,
+             population=("SH600002",),
+             required_keys=(("SH",),),
+         )
+         self.assertIsNotNone(repository.select_calendar_batch_ticket(
+             fresh_borrow_scope, broker, FREEZE))
+         fresh_borrow_scope.close()
+ 
+-        from ashare_pipeline import formal_range_contract as contract
+-        from ashare_pipeline.formal_range_format import _range_config_to_dict
+-
+-        _, open_sibling, _, _, _, _, _ = contract._range_binding_sibling_read_authority()
+-        first_calendar_code = vars(type(fixture.source_factory(broker)))[
+-            "first_calendar_request"
+-        ].__code__
+-        base_description = {
+-            "request": broker_request.to_dict(),
+-            "config": _range_config_to_dict(broker.calendar_config),
+-            "source_registry_hash": broker.source_registry_hash,
+-            "binding_hash": broker.binding_hash,
+-            "parent": None,
++        require_current_code = _closure_function(
++            vars(type(fixture.source_factory(broker)))["next_page"],
++            "require_current",
++        ).__code__
++
++        def request_bytes(wire, payload):
++            payload["request"]["start_date"] = "2026-01-01"
++
++        def request_fingerprint(wire, payload):
++            wire["request"]["start_date"] = "2026-01-01"
++
++        def config_bytes(wire, payload):
++            payload["config"]["max_pages"] += 1
++
++        def request_field(field, value):
++            def mutate(wire, payload):
++                wire["request"][field] = value
++                payload["request"][field] = value
++            return mutate
++
++        def source_hash(wire, payload):
++            payload["source_registry_hash"] = "0" * 64
++
++        def forged_shape(wire, payload):
++            for field in ("security_id", "as_of_utc", "start_date", "end_date"):
++                wire["request"].pop(field)
++                payload["request"].pop(field)
++            payload["parent"] = {"arbitrary": True}
++
++        variants = {
++            "request_bytes": (request_bytes, "sibling record proof differs"),
++            "request_fingerprint": (request_fingerprint, "sibling record proof differs"),
++            "config_bytes": (config_bytes, "contract: config"),
++            "range_config_id": (request_field("range_config_id", "0" * 64),
++                                "contract: range_config"),
++            "source_registry_hash": (source_hash, "contract: source"),
++            "registry_root": (request_field("registry_manifest_hash", "0" * 64),
++                              "contract: root"),
++            "exchange": (request_field("exchange", "SZ"), "contract: exchange"),
++            "forged_self_consistent_request": (forged_shape, "sibling request fields"),
+         }
+ 
+-        def digest_request(description):
+-            wire = json.dumps(
+-                description["request"], sort_keys=True, ensure_ascii=False,
+-                separators=(",", ":"), allow_nan=False,
+-            ).encode("utf-8")
+-            return hashlib.sha256(wire).hexdigest()
+-
+-        variants = {}
+-        changed = json.loads(json.dumps(base_description))
+-        changed["request"]["start_date"] = "2026-01-01"
+-        variants["request_bytes"] = (changed, broker_request.request_fingerprint)
+-        variants["request_fingerprint"] = (base_description, "f" * 64)
+-        changed = json.loads(json.dumps(base_description))
+-        changed["config"]["max_pages"] += 1
+-        variants["config_bytes"] = (changed, broker_request.request_fingerprint)
+-        changed = json.loads(json.dumps(base_description))
+-        changed["request"]["range_config_id"] = "0" * 64
+-        variants["range_config_id"] = (changed, digest_request(changed))
+-        changed = json.loads(json.dumps(base_description))
+-        changed["source_registry_hash"] = "0" * 64
+-        variants["source_registry_hash"] = (changed, broker_request.request_fingerprint)
+-        changed = json.loads(json.dumps(base_description))
+-        changed["request"]["registry_manifest_hash"] = "0" * 64
+-        variants["registry_root"] = (changed, digest_request(changed))
+-        changed = json.loads(json.dumps(base_description))
+-        changed["request"]["exchange"] = "SZ"
+-        variants["exchange"] = (changed, digest_request(changed))
+-        changed = json.loads(json.dumps(base_description))
+-        for field in ("security_id", "as_of_utc", "start_date", "end_date"):
+-            changed["request"].pop(field)
+-        changed["parent"] = {"arbitrary": True}
+-        variants["forged_self_consistent_request"] = (changed, digest_request(changed))
+-
+         def new_calendar_scope():
+             return FormalBatchReadJournal.open(
+                 repository,
+                 registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
+                 as_of_utc=FREEZE,
+                 population=("SH600002",),
+                 required_keys=(("SH",),),
+             )
+ 
+-        for label, (description, fingerprint) in variants.items():
++        for label, (mutate, message) in variants.items():
+             with self.subTest(label=label):
+                 rejected_scope = new_calendar_scope()
+ 
+                 def reject_sibling(frame, event, arg):
+-                    if event == "return" and frame.f_code is first_calendar_code:
++                    if event == "call" and frame.f_code is require_current_code:
+                         sys.setprofile(None)
+-                        open_sibling(description, fingerprint)
++                        wire = frame.f_locals["wire"]
++                        mutate(wire, wire["snapshot"]["task_payload"])
+ 
+                 sys.setprofile(reject_sibling)
+                 try:
+-                    with self.assertRaises(ValueError):
++                    with self.assertRaisesRegex(ValueError, message):
+                         repository.select_calendar_batch_ticket(
+                             rejected_scope, broker, FREEZE)
+                 finally:
+                     sys.setprofile(None)
+                 with self.assertRaisesRegex(ValueError, "closed"):
+                     rejected_scope.checkpoint()
+ 
+                 fresh_scope = new_calendar_scope()
+                 fresh_ticket = repository.select_calendar_batch_ticket(
+                     fresh_scope, broker, FREEZE)

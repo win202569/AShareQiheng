@@ -1,0 +1,1 @@
+{"identity": "3511979f34e6f4a8690ef7ccffa6544e139a98460ac74d4772c59d54e9f50c9f", "ids": ["test_financial_features.FinancialFormulaTests.test_growth_edges_do_not_invent_denominators", "test_financial_features.FinancialFormulaTests.test_growth_helpers_fail_closed_on_nonfinite_values"]}

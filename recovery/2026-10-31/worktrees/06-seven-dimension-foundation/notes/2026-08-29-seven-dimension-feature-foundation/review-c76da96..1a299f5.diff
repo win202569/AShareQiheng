@@ -1,0 +1,1189 @@
+# Review package: c76da969ee3b7aed9eee2d45a32b273f02ba42bf..1a299f51e87de9acdcea7430b765a0ec31096184
+
+## Commits
+1a299f5 fix: close lease atomicity review gaps
+
+## Files changed
+ ashare_pipeline/deep_worker.py         |  64 +++---
+ ashare_pipeline/snapshot_repository.py | 145 ++++++------
+ ashare_pipeline/state_store.py         |  23 +-
+ progress.md                            |   7 +
+ tests/test_deep_worker.py              | 397 ++++++++++++++++++++++++++++++++-
+ tests/test_snapshot_repository.py      | 134 ++++++++++-
+ 6 files changed, 649 insertions(+), 121 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/deep_worker.py b/ashare_pipeline/deep_worker.py
+index 2f09dcb..3ebc5fc 100644
+--- a/ashare_pipeline/deep_worker.py
++++ b/ashare_pipeline/deep_worker.py
+@@ -31,21 +31,21 @@ from ashare_pipeline.financial_features import (
+     validate_feature_calendar_request,
+ )
+ from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
+ from ashare_pipeline.snapshot_repository import SnapshotRef, SnapshotRepository
+ from ashare_pipeline.sources import (
+     FinancialStatementSource,
+     RetryableSourceError,
+     SourceBlocked,
+     TerminalSourceError,
+ )
+-from ashare_pipeline.state_store import JobSpec, StateStore, _utc_now
++from ashare_pipeline.state_store import JobSpec, StateStore
+ 
+ 
+ STATEMENT_DATASETS = ("balance_sheet", "profit_sheet", "cash_flow_sheet")
+ 
+ _SECURITY_ID = re.compile(r"^(?:SH|SZ)\d{6}$")
+ _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+ _STATEMENT_PAYLOAD_KEYS = frozenset(
+     {
+         "security_id",
+         "dataset",
+@@ -1220,49 +1220,49 @@ def _write_and_store_feature_bundle(
+     ensure_owned: Callable[[], None],
+     job_id: str | None = None,
+     worker_id: str | None = None,
+ ) -> tuple[str, str, bool]:
+     if (job_id is None) != (worker_id is None):
+         raise ValueError("job_id and worker_id must be provided together")
+     ensure_owned()
+     relative_path = ""
+     bundle_hash = ""
+     file_created = False
+-    with store._transaction(immediate=True) as connection:
+-        if job_id is not None and worker_id is not None:
+-            store._require_unexpired_job_owner(
+-                connection, job_id, worker_id, _utc_now()
+-            )
+-        try:
+-            relative_path, bundle_hash, file_created = write_feature_bundle(
+-                project_root, bundle
+-            )
+-            _feature_set_id, database_created = store.put_feature_bundle(
+-                bundle,
+-                bundle_path=relative_path,
+-                bundle_hash=bundle_hash,
+-                _connection=connection,
+-            )
+-            if job_id is not None and worker_id is not None:
+-                store._require_unexpired_job_owner(
+-                    connection, job_id, worker_id, _utc_now()
+-                )
+-        except BaseException:
+-            if file_created:
+-                target = _feature_file_target(project_root, relative_path)
+-                try:
+-                    current = target.read_bytes()
+-                    if hashlib.sha256(current).hexdigest() == bundle_hash:
+-                        target.unlink()
+-                except FileNotFoundError:
+-                    pass
+-            raise
++    database_created: bool | None = None
++
++    def cleanup(_connection: object) -> None:
++        if file_created and database_created is not False:
++            target = _feature_file_target(project_root, relative_path)
++            try:
++                current = target.read_bytes()
++                if hashlib.sha256(current).hexdigest() == bundle_hash:
++                    target.unlink()
++            except FileNotFoundError:
++                pass
++
++    transaction = (
++        store.owned_job_transaction(job_id, worker_id, on_error=cleanup)
++        if job_id is not None and worker_id is not None
++        else store._transaction(immediate=True, on_error=cleanup)
++    )
++    with transaction as connection:
++        relative_path, bundle_hash, file_created = write_feature_bundle(
++            project_root, bundle
++        )
++        _feature_set_id, database_created = store.put_feature_bundle(
++            bundle,
++            bundle_path=relative_path,
++            bundle_hash=bundle_hash,
++            _connection=connection,
++        )
++    if database_created is None:
++        raise RuntimeError("feature bundle transaction produced no database result")
+     return relative_path, bundle_hash, database_created
+ 
+ 
+ def _execute_feature_job(
+     *,
+     root: Path,
+     store: StateStore,
+     snapshots: SnapshotRepository,
+     context: CandidateContext,
+     job: Mapping[str, object],
+@@ -1688,20 +1688,22 @@ def execute_queued_deep_work(
+                 facts, issues = _normalize_statement_snapshot(
+                     store=store,
+                     snapshots=snapshots,
+                     snapshot=snapshot,
+                     security_id=security_id,
+                     trading_days=_verified_calendar_days(
+                         snapshots, trade_calendar_snapshot
+                     ),
+                     record_issues=True,
+                     ensure_owned=heartbeat.ensure_owned,
++                    job_id=str(job["id"]),
++                    worker_id=worker,
+                 )
+                 counters["snapshots_reused"] += 1
+             else:
+                 batch = None
+                 source_error: (
+                     SourceBlocked | RetryableSourceError | TerminalSourceError | None
+                 ) = None
+                 heartbeat.ensure_owned()
+                 counters["remote_attempts"] += 1
+                 try:
+@@ -1941,20 +1943,22 @@ def execute_queued_deep_work(
+                 "error_classification": "lease_lost",
+             }
+             if security_id is not None:
+                 item_data["security_id"] = security_id
+             if dataset is not None:
+                 item_data["dataset"] = dataset
+             items.append(MappingProxyType(item_data))
+             break
+         except (SourceBlocked, RetryableSourceError, TerminalSourceError):
+             raise
++        except (KeyboardInterrupt, SystemExit):
++            raise
+         except BaseException:
+             # Unexpected local errors are allowed to surface only after the owned
+             # job is safely transitioned when its lease is still valid.
+             try:
+                 heartbeat.final_transition(
+                     store.fail_job_with_followups,
+                     job["id"],
+                     worker,
+                     {"error_classification": "worker_error"},
+                     False,
+diff --git a/ashare_pipeline/snapshot_repository.py b/ashare_pipeline/snapshot_repository.py
+index 9aa2d2d..54ceffb 100644
+--- a/ashare_pipeline/snapshot_repository.py
++++ b/ashare_pipeline/snapshot_repository.py
+@@ -4,21 +4,21 @@ from __future__ import annotations
+ 
+ from contextlib import closing
+ from dataclasses import dataclass, field, replace
+ from pathlib import Path, PurePosixPath, PureWindowsPath
+ from types import MappingProxyType
+ from typing import Mapping
+ 
+ from .feature_contract import canonical_sha256, require_aware_utc
+ from .snapshot_store import SnapshotStore
+ from .sources import FetchBatch
+-from .state_store import StateStore, _utc_now
++from .state_store import StateStore
+ 
+ 
+ @dataclass(frozen=True)
+ class SnapshotRef:
+     id: str
+     source: str
+     dataset: str
+     request_fingerprint: str
+     payload_hash: str
+     payload_path: str
+@@ -52,108 +52,89 @@ class SnapshotRepository:
+ 
+     def persist(
+         self,
+         batch: FetchBatch,
+         *,
+         job_id: str | None = None,
+         worker_id: str | None = None,
+     ) -> tuple[SnapshotRef, bool]:
+         if (job_id is None) != (worker_id is None):
+             raise ValueError("job_id and worker_id must be provided together")
+-        if job_id is not None and worker_id is not None:
+-            return self._persist_owned(batch, job_id, worker_id)
+-        request_fingerprint = canonical_sha256(batch.request)
+-        target, digest, _ = self.snapshot_store.write(batch)
+-        winner = self.snapshot_store.read_verified(target, digest)
+-        winner_fingerprint = canonical_sha256(winner.request)
+-        if (
+-            winner.canonical_bytes() != batch.canonical_bytes()
+-            or winner_fingerprint != request_fingerprint
+-        ):
+-            raise OSError("published snapshot does not match the requested content")
+-        fetched_at = require_aware_utc(winner.fetched_at_utc, "snapshot fetched_at")
+-        relative_path = self._project_relative_data_path(target)
+-        snapshot_id, created = self.state_store.record_snapshot(
+-            winner.source,
+-            winner.dataset,
+-            winner_fingerprint,
+-            digest,
+-            relative_path,
+-            len(winner.records),
+-            fetched_at,
+-        )
+-        snapshot = self.get(snapshot_id)
+-        if snapshot is None:
+-            raise RuntimeError("recorded snapshot could not be retrieved")
+-        return replace(
+-            snapshot,
+-            request=MappingProxyType(dict(winner.request)),
+-        ), created
+-
+-    def _persist_owned(
+-        self, batch: FetchBatch, job_id: str, worker_id: str
+-    ) -> tuple[SnapshotRef, bool]:
+         request_fingerprint = canonical_sha256(batch.request)
+         target: Path | None = None
+         file_created = False
+-        with self.state_store._transaction(immediate=True) as connection:
+-            self.state_store._require_unexpired_job_owner(
+-                connection, job_id, worker_id, _utc_now()
++        database_created: bool | None = None
++
++        def verify_publication(path: Path, digest: str):
++            winner = self.snapshot_store.read_verified(path, digest)
++            winner_fingerprint = canonical_sha256(winner.request)
++            if (
++                winner.canonical_bytes() != batch.canonical_bytes()
++                or winner_fingerprint != request_fingerprint
++            ):
++                raise OSError("published snapshot does not match the requested content")
++            return winner, winner_fingerprint
++
++        def cleanup(connection: object) -> None:
++            if file_created and target is not None:
++                if database_created is False:
++                    return
++                if database_created is None and connection.execute(
++                    """SELECT 1 FROM source_snapshot
++                       WHERE payload_path = ? AND payload_hash = ?""",
++                    (self._project_relative_data_path(target), digest),
++                ).fetchone() is not None:
++                    return
++                try:
++                    target.unlink()
++                except FileNotFoundError:
++                    pass
++
++        if job_id is None and worker_id is None:
++            target, digest, file_created = self.snapshot_store.write(batch)
++            verify_publication(target, digest)
++            transaction = self.state_store._transaction(
++                immediate=True, on_error=cleanup
+             )
+-            try:
+-                target, digest, file_created = self.snapshot_store.write(batch)
+-                winner = self.snapshot_store.read_verified(target, digest)
+-                winner_fingerprint = canonical_sha256(winner.request)
+-                if (
+-                    winner.canonical_bytes() != batch.canonical_bytes()
+-                    or winner_fingerprint != request_fingerprint
+-                ):
+-                    raise OSError(
+-                        "published snapshot does not match the requested content"
+-                    )
+-                fetched_at = require_aware_utc(
+-                    winner.fetched_at_utc, "snapshot fetched_at"
+-                )
+-                relative_path = self._project_relative_data_path(target)
+-                snapshot_id, created = self.state_store.record_snapshot(
+-                    winner.source,
+-                    winner.dataset,
+-                    winner_fingerprint,
+-                    digest,
+-                    relative_path,
+-                    len(winner.records),
+-                    fetched_at,
+-                    _connection=connection,
+-                )
+-                row = connection.execute(
+-                    """SELECT id, source, dataset, request_fingerprint, payload_hash,
+-                              payload_path, row_count, fetched_at, created_at
+-                       FROM source_snapshot WHERE id = ?""",
+-                    (snapshot_id,),
+-                ).fetchone()
+-                if row is None:
+-                    raise RuntimeError("recorded snapshot could not be retrieved")
+-                self.state_store._require_unexpired_job_owner(
+-                    connection, job_id, worker_id, _utc_now()
+-                )
+-                snapshot = self._ref_from_row(row)
+-            except BaseException:
+-                if file_created and target is not None:
+-                    try:
+-                        target.unlink()
+-                    except FileNotFoundError:
+-                        pass
+-                raise
++        else:
++            transaction = self.state_store.owned_job_transaction(
++                job_id, worker_id, on_error=cleanup
++            )
++        with transaction as connection:
++            target, digest, created_after_lock = self.snapshot_store.write(batch)
++            file_created = file_created or created_after_lock
++            winner, winner_fingerprint = verify_publication(target, digest)
++            fetched_at = require_aware_utc(winner.fetched_at_utc, "snapshot fetched_at")
++            relative_path = self._project_relative_data_path(target)
++            snapshot_id, database_created = self.state_store.record_snapshot(
++                winner.source,
++                winner.dataset,
++                winner_fingerprint,
++                digest,
++                relative_path,
++                len(winner.records),
++                fetched_at,
++                _connection=connection,
++            )
++            row = connection.execute(
++                """SELECT id, source, dataset, request_fingerprint, payload_hash,
++                          payload_path, row_count, fetched_at, created_at
++                   FROM source_snapshot WHERE id = ?""",
++                (snapshot_id,),
++            ).fetchone()
++            if row is None:
++                raise RuntimeError("recorded snapshot could not be retrieved")
++            snapshot = self._ref_from_row(row)
+         return replace(
+             snapshot,
+             request=MappingProxyType(dict(winner.request)),
+-        ), created
++        ), database_created
+ 
+     def find_exact(
+         self, source: str, dataset: str, request: dict
+     ) -> SnapshotRef | None:
+         fingerprint = canonical_sha256(request)
+         with closing(self.state_store._connect()) as connection:
+             row = connection.execute(
+                 """SELECT id, source, dataset, request_fingerprint, payload_hash,
+                           payload_path, row_count, fetched_at, created_at
+                    FROM source_snapshot
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index 6764b62..393bba3 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -2,21 +2,21 @@
+ 
+ from __future__ import annotations
+ 
+ import json
+ import sqlite3
+ import uuid
+ from contextlib import closing, contextmanager
+ from dataclasses import dataclass, field
+ from datetime import datetime, timezone
+ from pathlib import Path, PurePosixPath, PureWindowsPath
+-from typing import Iterable, Iterator, Mapping, Sequence
++from typing import Callable, Iterable, Iterator, Mapping, Sequence
+ 
+ from ashare_pipeline.feature_contract import (
+     DIMENSIONS,
+     FINANCIAL_DIMENSIONS,
+     FINANCIAL_PERIODS,
+     EvidenceRef,
+     FeatureBundle,
+     financial_projection_values,
+ )
+ from ashare_pipeline.financial_formulas import (
+@@ -275,27 +275,37 @@ class StateStore:
+ 
+     def _connect(self) -> sqlite3.Connection:
+         connection = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
+         connection.row_factory = sqlite3.Row
+         connection.execute("PRAGMA foreign_keys = ON")
+         connection.execute("PRAGMA journal_mode = WAL")
+         connection.execute("PRAGMA busy_timeout = 5000")
+         return connection
+ 
+     @contextmanager
+-    def _transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
++    def _transaction(
++        self,
++        immediate: bool = False,
++        on_error: Callable[[sqlite3.Connection], None] | None = None,
++    ) -> Iterator[sqlite3.Connection]:
+         connection = self._connect()
+         try:
+             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+             yield connection
+             connection.commit()
+-        except BaseException:
++        except BaseException as error:
++            try:
++                if on_error is not None:
++                    on_error(connection)
++            except BaseException as cleanup_error:
++                connection.rollback()
++                raise error from cleanup_error
+             connection.rollback()
+             raise
+         finally:
+             connection.close()
+ 
+     def initialize(self) -> None:
+         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+         connection = self._connect()
+         try:
+             connection.execute("BEGIN IMMEDIATE")
+@@ -348,24 +358,27 @@ class StateStore:
+                     )
+             connection.commit()
+         except BaseException:
+             connection.rollback()
+             raise
+         finally:
+             connection.close()
+ 
+     @contextmanager
+     def owned_job_transaction(
+-        self, job_id: str, worker_id: str
++        self,
++        job_id: str,
++        worker_id: str,
++        on_error: Callable[[sqlite3.Connection], None] | None = None,
+     ) -> Iterator[sqlite3.Connection]:
+         """Fence a mutation with ownership checks at both transaction boundaries."""
+-        with self._transaction(immediate=True) as connection:
++        with self._transaction(immediate=True, on_error=on_error) as connection:
+             self._require_unexpired_job_owner(
+                 connection, job_id, worker_id, _utc_now()
+             )
+             yield connection
+             self._require_unexpired_job_owner(
+                 connection, job_id, worker_id, _utc_now()
+             )
+ 
+     @staticmethod
+     def _user_tables(connection: sqlite3.Connection) -> set[str]:
+diff --git a/progress.md b/progress.md
+index 3b231ff..b475204 100644
+--- a/progress.md
++++ b/progress.md
+@@ -95,10 +95,17 @@
+ - migration 计划表名与 forged-unclassified 回归的阶段边界已校正；本轮 focused 9/9、受影响模块 329/329、fresh full offline `unittest` 407/407 通过。后续 scoped re-review 与 controller verification 仍是独立门闸，本记录不预判其结论。
+ - 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收；未迁移或改写 runtime/tracked data。
+ - `formal_score_ready=false`、`seven_dimension_ready=false`；未发布 formal scores，正式等待价格池与正式强烈关注池继续关闭且为空。
+ 
+ ## 租约原子性与 heartbeat 收口（2026-09-01）
+ 
+ - leased statement/feature 的 snapshot 文件与行、财务 facts、normalization issues、feature bundle 文件与 `feature_set`/`feature_value` 现均在同一个 `BEGIN IMMEDIATE` 写事务内核验当前 `job_id`、`worker_id`、`running` 状态与未过期租约，并在提交前再次核验；失租回滚只清理由本次尝试新建的 immutable 文件。
+ - heartbeat 关闭会等待受 SQLite timeout 约束的在途续租完成，`KeyboardInterrupt`/`SystemExit` 不再被清理异常替换，普通异常的既有 retry 行为保持不变。
+ - 本轮 focused 5/5、受影响模块 172/172、fresh full offline `unittest` 411/411 通过；未执行真实网络、migration、operational `120/114`、formal scoring、七维 readiness 或正式股票池验收，未改写 runtime/tracked data。
+ - `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。
++
++### Independent review Fix Round 1（2026-09-01）
++
++- same-refresh statement 的 fact/issue 写入现同样强制 owned transaction；statement `KeyboardInterrupt`/`SystemExit` 在任何 failure transition 前原样传播，并在在途续租退出后确认 heartbeat thread 已终止。
++- snapshot 与 feature 的 attempt-local 文件清理现覆盖 transaction context exit/commit failure；ownerless snapshot 在 SQLite 锁等待后重新 publish/reverify 再插行，使 stale cleanup 后的合法 winner 始终保有可验证的 immutable 文件/DB 对。
++- 本轮 focused 13/13、受影响模块 181/181、fresh full offline `unittest` 420/420 通过；未执行网络、runtime/tracked data、schema/migration、scoring/readiness、正式股票池或 operational `120/114`。
++- `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。
+diff --git a/tests/test_deep_worker.py b/tests/test_deep_worker.py
+index 52de141..f362ebb 100644
+--- a/tests/test_deep_worker.py
++++ b/tests/test_deep_worker.py
+@@ -285,20 +285,33 @@ class DeepWorkerTestCase(unittest.TestCase):
+             ),
+         )
+         return self.store.enqueue_job(
+             "feature_build",
+             feature_build_key(
+                 payload["security_id"], payload["report_period"], input_hash
+             ),
+             payload,
+         )
+ 
++    def _expire_recover_and_take_over(self, job_id: str) -> None:
++        with closing(sqlite3.connect(self.store.db_path)) as connection:
++            connection.execute(
++                "UPDATE job SET lease_expires_at = ? WHERE id = ?",
++                ("2000-01-01T00:00:00+00:00", job_id),
++            )
++            connection.commit()
++        self.assertEqual(self.store.recover_expired_leases(), 1)
++        acquired = self.store.lease_next_job(
++            ["deep_statement", "feature_build"], "worker-b", 3600
++        )
++        self.assertEqual(acquired["id"], job_id)
++
+     def _assert_no_feature_artifacts(self) -> None:
+         self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
+         feature_root = self.data_root / "curated" / "formal_features"
+         self.assertEqual(list(feature_root.rglob("*.json")), [])
+         with closing(sqlite3.connect(self.store.db_path)) as connection:
+             self.assertEqual(
+                 connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                 0,
+             )
+             self.assertEqual(
+@@ -1159,47 +1172,200 @@ class DeepWorkerTestCase(unittest.TestCase):
+         self.assertEqual(current["lease_worker"], "worker-b")
+         with closing(sqlite3.connect(self.store.db_path)) as connection:
+             self.assertEqual(connection.execute("SELECT COUNT(*) FROM source_snapshot WHERE source = 'akshare'").fetchone()[0], 0)
+             self.assertEqual(connection.execute("SELECT COUNT(*) FROM financial_fact").fetchone()[0], 0)
+             self.assertEqual(connection.execute("SELECT COUNT(*) FROM quality_issue").fetchone()[0], 0)
+             self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0], 0)
+             self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0], 0)
+         self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+         self._assert_no_feature_artifacts()
+ 
++    def test_same_refresh_takeover_before_fact_write_is_fenced(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        self.repository.persist(fixture_statement_batch("balance_sheet"))
++        job_id = self._enqueue_statement()
++        calendar = self._calendar_ref()
++        entered = threading.Event()
++        release = threading.Event()
++        errors: list[BaseException] = []
++        real_insert = self.store.insert_financial_facts
++
++        def blocked_insert(*args, **kwargs):
++            entered.set()
++            if not release.wait(timeout=5):
++                raise RuntimeError("test did not release same-refresh fact write")
++            return real_insert(*args, **kwargs)
++
++        def run_worker() -> None:
++            try:
++                self._run(
++                    source=FakeStatementSource(),
++                    trade_calendar_snapshot=calendar,
++                    limit=1,
++                    lease_seconds=120,
++                    heartbeat_seconds=60,
++                )
++            except BaseException as error:
++                errors.append(error)
++
++        with patch.object(
++            self.store, "insert_financial_facts", side_effect=blocked_insert
++        ):
++            worker = threading.Thread(target=run_worker)
++            worker.start()
++            try:
++                self.assertTrue(entered.wait(timeout=5), repr(errors))
++                self._expire_recover_and_take_over(job_id)
++            finally:
++                release.set()
++            worker.join(timeout=10)
++
++        self.assertFalse(worker.is_alive())
++        self.assertEqual(len(errors), 1)
++        self.assertIsInstance(errors[0], ValueError)
++        self.assertEqual(self.store.get_job(job_id)["lease_worker"], "worker-b")
++        with closing(sqlite3.connect(self.store.db_path)) as connection:
++            self.assertEqual(connection.execute("SELECT COUNT(*) FROM financial_fact").fetchone()[0], 0)
++            self.assertEqual(connection.execute("SELECT COUNT(*) FROM quality_issue").fetchone()[0], 0)
++        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
++
++    def test_same_refresh_takeover_before_issue_write_is_fenced(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        malformed = fixture_statement_batch("balance_sheet")
++        del malformed.records[0]["REPORT_DATE"]
++        self.repository.persist(malformed)
++        job_id = self._enqueue_statement()
++        calendar = self._calendar_ref()
++        entered = threading.Event()
++        release = threading.Event()
++        errors: list[BaseException] = []
++        real_record = self.store.record_quality_issue
++
++        def blocked_record(*args, **kwargs):
++            entered.set()
++            if not release.wait(timeout=5):
++                raise RuntimeError("test did not release same-refresh issue write")
++            return real_record(*args, **kwargs)
++
++        def run_worker() -> None:
++            try:
++                self._run(
++                    source=FakeStatementSource(),
++                    trade_calendar_snapshot=calendar,
++                    limit=1,
++                    lease_seconds=120,
++                    heartbeat_seconds=60,
++                )
++            except BaseException as error:
++                errors.append(error)
++
++        with (
++            patch.object(
++                self.store,
++                "insert_financial_facts",
++                side_effect=lambda facts, **_kwargs: (0, len(tuple(facts))),
++            ),
++            patch.object(
++                self.store, "record_quality_issue", side_effect=blocked_record
++            ),
++        ):
++            worker = threading.Thread(target=run_worker)
++            worker.start()
++            try:
++                self.assertTrue(entered.wait(timeout=5), repr(errors))
++                self._expire_recover_and_take_over(job_id)
++            finally:
++                release.set()
++            worker.join(timeout=10)
++
++        self.assertFalse(worker.is_alive())
++        self.assertEqual(len(errors), 1)
++        self.assertIsInstance(errors[0], ValueError)
++        self.assertEqual(self.store.get_job(job_id)["lease_worker"], "worker-b")
++        with closing(sqlite3.connect(self.store.db_path)) as connection:
++            self.assertEqual(connection.execute("SELECT COUNT(*) FROM financial_fact").fetchone()[0], 0)
++            self.assertEqual(connection.execute("SELECT COUNT(*) FROM quality_issue").fetchone()[0], 0)
++        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
++
+     def _assert_feature_process_control_propagates(
+         self, error_type: type[BaseException]
+     ) -> None:
+         self._write_candidates({"SH600001": "包装印刷"})
+         context = load_candidate_context(self.data_root)
+         job_id = deep_worker_module.enqueue_feature_build(
+             self.store,
+             security_id="SH600001",
+             report_period=REPORT_PERIOD,
+             as_of_utc="2026-08-29T12:00:00+00:00",
+             candidate_context=context,
+             statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+             trade_calendar_snapshot=None,
+         )
++        original = error_type("feature-stop")
++        renewal_entered = threading.Event()
++        release_renewal = threading.Event()
++        heartbeats: list[deep_worker_module._LeaseHeartbeat] = []
++        real_renew = self.store.renew_job_lease
++        real_init = deep_worker_module._LeaseHeartbeat.__init__
++        real_close = deep_worker_module._LeaseHeartbeat.close
++        renewal_calls = 0
++
++        def renew(*args, **kwargs):
++            nonlocal renewal_calls
++            renewal_calls += 1
++            if renewal_calls == 1:
++                return real_renew(*args, **kwargs)
++            renewal_entered.set()
++            if not release_renewal.wait(timeout=5):
++                raise RuntimeError("test did not release feature renewal")
++            return real_renew(*args, **kwargs)
++
++        def interrupt_build(**_kwargs):
++            if not renewal_entered.wait(timeout=5):
++                raise RuntimeError("feature renewal did not enter")
++            raise original
++
++        def capture_init(heartbeat, *args, **kwargs):
++            real_init(heartbeat, *args, **kwargs)
++            heartbeats.append(heartbeat)
++
++        def coordinated_close(heartbeat):
++            release_renewal.set()
++            return real_close(heartbeat)
+ 
+         with (
++            patch.object(self.store, "renew_job_lease", side_effect=renew),
++            patch.object(
++                deep_worker_module._LeaseHeartbeat,
++                "__init__",
++                new=capture_init,
++            ),
++            patch.object(
++                deep_worker_module._LeaseHeartbeat,
++                "close",
++                new=coordinated_close,
++            ),
+             patch.object(
+                 deep_worker_module,
+                 "build_feature_bundle",
+-                side_effect=error_type("stop"),
++                side_effect=interrupt_build,
+             ),
+-            self.assertRaises(error_type),
+         ):
+-            self._run(source=None, online=False, heartbeat_seconds=0.01)
++            with self.assertRaises(error_type) as caught:
++                self._run(source=None, online=False, heartbeat_seconds=0.01)
+ 
++        self.assertIs(caught.exception, original)
+         self.assertEqual(self.store.get_job(job_id)["status"], "running")
+         self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
++        self.assertEqual(self.store.list_jobs(["deep_statement"]), [])
++        self.assertEqual(len(heartbeats), 1)
++        self.assertFalse(heartbeats[0].thread.is_alive())
+ 
+     def test_feature_keyboard_interrupt_propagates_without_retry_transition(self) -> None:
+         self._assert_feature_process_control_propagates(KeyboardInterrupt)
+ 
+     def test_feature_system_exit_propagates_without_retry_transition(self) -> None:
+         self._assert_feature_process_control_propagates(SystemExit)
+ 
+     def test_inflight_heartbeat_shutdown_preserves_process_control_exception(self) -> None:
+         class BlockingRenewalStore:
+             def __init__(self) -> None:
+@@ -1230,20 +1396,107 @@ class DeepWorkerTestCase(unittest.TestCase):
+                         return real_join()
+                     return real_join(timeout=0)
+ 
+                 heartbeat.thread.join = controlled_join
+                 with self.assertRaises(error_type):
+                     with heartbeat:
+                         self.assertTrue(store.entered.wait(timeout=5))
+                         raise error_type("stop")
+                 self.assertFalse(heartbeat.thread.is_alive())
+ 
++    def _assert_statement_process_control_with_inflight_renewal(
++        self, error_type: type[BaseException]
++    ) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        job_id = self._enqueue_statement()
++        calendar = self._calendar_ref()
++        original = error_type("original-stop")
++        renewal_entered = threading.Event()
++        allow_renewal_finish = threading.Event()
++        heartbeats: list[deep_worker_module._LeaseHeartbeat] = []
++        real_renew = self.store.renew_job_lease
++        real_init = deep_worker_module._LeaseHeartbeat.__init__
++        real_final = deep_worker_module._LeaseHeartbeat.final_transition
++        real_close = deep_worker_module._LeaseHeartbeat.close
++        renewal_calls = 0
++
++        class InterruptingSource:
++            def fetch_financial_statement(self, *_args):
++                self.assert_renewal()
++                raise original
++
++            @staticmethod
++            def assert_renewal():
++                if not renewal_entered.wait(timeout=5):
++                    raise RuntimeError("renewal did not enter")
++
++        def renew(*args, **kwargs):
++            nonlocal renewal_calls
++            renewal_calls += 1
++            if renewal_calls == 1:
++                return real_renew(*args, **kwargs)
++            renewal_entered.set()
++            if not allow_renewal_finish.wait(timeout=5):
++                raise RuntimeError("test did not release statement renewal")
++            raise ValueError("renewal lost")
++
++        def capture_init(heartbeat, *args, **kwargs):
++            real_init(heartbeat, *args, **kwargs)
++            heartbeats.append(heartbeat)
++
++        def coordinated_final(heartbeat, *args, **kwargs):
++            allow_renewal_finish.set()
++            return real_final(heartbeat, *args, **kwargs)
++
++        def coordinated_close(heartbeat):
++            allow_renewal_finish.set()
++            return real_close(heartbeat)
++
++        with (
++            patch.object(self.store, "renew_job_lease", side_effect=renew),
++            patch.object(
++                deep_worker_module._LeaseHeartbeat,
++                "__init__",
++                new=capture_init,
++            ),
++            patch.object(
++                deep_worker_module._LeaseHeartbeat,
++                "final_transition",
++                new=coordinated_final,
++            ),
++            patch.object(
++                deep_worker_module._LeaseHeartbeat,
++                "close",
++                new=coordinated_close,
++            ),
++        ):
++            with self.assertRaises(error_type) as caught:
++                self._run(
++                    source=InterruptingSource(),
++                    trade_calendar_snapshot=calendar,
++                    limit=1,
++                    lease_seconds=2,
++                    heartbeat_seconds=0.01,
++                )
++
++        self.assertIs(caught.exception, original)
++        self.assertEqual(self.store.get_job(job_id)["status"], "running")
++        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
++        self.assertEqual(len(heartbeats), 1)
++        self.assertFalse(heartbeats[0].thread.is_alive())
++
++    def test_statement_keyboard_interrupt_with_inflight_renewal_is_unchanged(self) -> None:
++        self._assert_statement_process_control_with_inflight_renewal(KeyboardInterrupt)
++
++    def test_statement_system_exit_with_inflight_renewal_is_unchanged(self) -> None:
++        self._assert_statement_process_control_with_inflight_renewal(SystemExit)
++
+     def test_feature_ordinary_exception_remains_a_retryable_failure(self) -> None:
+         self._write_candidates({"SH600001": "包装印刷"})
+         context = load_candidate_context(self.data_root)
+         job_id = deep_worker_module.enqueue_feature_build(
+             self.store,
+             security_id="SH600001",
+             report_period=REPORT_PERIOD,
+             as_of_utc="2026-08-29T12:00:00+00:00",
+             candidate_context=context,
+             statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
+@@ -1829,20 +2082,158 @@ class DeepWorkerTestCase(unittest.TestCase):
+         self.assertTrue(created)
+         self.assertEqual(relative_path, target.relative_to(self.project_root).as_posix())
+         self.assertEqual(digest, bundle.bundle_hash())
+         self.assertEqual(target.read_bytes(), original)
+         with closing(sqlite3.connect(self.store.db_path)) as connection:
+             self.assertEqual(
+                 connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                 0,
+             )
+ 
++    def test_feature_commit_failure_cleans_only_attempt_created_file(self) -> None:
++        class CommitFailConnection:
++            def __init__(self, connection):
++                self.connection = connection
++
++            def __getattr__(self, name):
++                return getattr(self.connection, name)
++
++            def commit(self):
++                raise sqlite3.OperationalError("forced commit failure")
++
++        for preexisting in (False, True):
++            with self.subTest(preexisting=preexisting):
++                bundle = self._empty_feature_bundle()
++                target = self.project_root / (
++                    f"data/curated/formal_features/{REPORT_PERIOD}/SH600001/"
++                    f"{bundle.input_hash}.json"
++                )
++                if preexisting:
++                    deep_worker_module.write_feature_bundle(self.project_root, bundle)
++                    original = target.read_bytes()
++                job_id = self.store.enqueue_job(
++                    "feature_build", f"feature-commit:{preexisting}", {}
++                )
++                self.store.lease_next_job(["feature_build"], "worker-a", 3600)
++                real_connect = self.store._connect
++
++                with patch.object(
++                    self.store,
++                    "_connect",
++                    side_effect=lambda: CommitFailConnection(real_connect()),
++                ), self.assertRaisesRegex(sqlite3.OperationalError, "commit failure"):
++                    deep_worker_module._write_and_store_feature_bundle(
++                        project_root=self.project_root,
++                        store=self.store,
++                        bundle=bundle,
++                        ensure_owned=lambda: None,
++                        job_id=job_id,
++                        worker_id="worker-a",
++                    )
++
++                with closing(sqlite3.connect(self.store.db_path)) as connection:
++                    self.assertEqual(
++                        connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
++                        0,
++                    )
++                    self.assertEqual(
++                        connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0],
++                        0,
++                    )
++                if preexisting:
++                    self.assertEqual(target.read_bytes(), original)
++                else:
++                    self.assertFalse(target.exists())
++
++    def test_feature_end_expiry_after_publish_rolls_back_file_and_rows(self) -> None:
++        bundle = self._empty_feature_bundle()
++        target = self.project_root / (
++            f"data/curated/formal_features/{REPORT_PERIOD}/SH600001/"
++            f"{bundle.input_hash}.json"
++        )
++        job_id = self.store.enqueue_job("feature_build", "feature-end-expiry", {})
++        self.store.lease_next_job(["feature_build"], "worker-a", 3600)
++        published = threading.Event()
++        release = threading.Event()
++        errors: list[BaseException] = []
++        real_write = deep_worker_module.write_feature_bundle
++        real_now = deep_worker_module.datetime.now(timezone.utc).isoformat()
++        clock_calls = 0
++
++        def blocked_write(*args, **kwargs):
++            result = real_write(*args, **kwargs)
++            published.set()
++            if not release.wait(timeout=5):
++                raise RuntimeError("test did not release feature publisher")
++            return result
++
++        def expiring_clock():
++            nonlocal clock_calls
++            clock_calls += 1
++            return "2099-01-01T00:00:00+00:00" if clock_calls >= 3 else real_now
++
++        def write_feature() -> None:
++            try:
++                deep_worker_module._write_and_store_feature_bundle(
++                    project_root=self.project_root,
++                    store=self.store,
++                    bundle=bundle,
++                    ensure_owned=lambda: None,
++                    job_id=job_id,
++                    worker_id="worker-a",
++                )
++            except BaseException as error:
++                errors.append(error)
++
++        with (
++            patch.object(
++                deep_worker_module,
++                "write_feature_bundle",
++                side_effect=blocked_write,
++            ),
++            patch("ashare_pipeline.state_store._utc_now", side_effect=expiring_clock),
++        ):
++            worker = threading.Thread(target=write_feature)
++            worker.start()
++            self.assertTrue(published.wait(timeout=5))
++            release.set()
++            worker.join(timeout=10)
++
++        self.assertFalse(worker.is_alive())
++        self.assertEqual(len(errors), 1)
++        self.assertIsInstance(errors[0], ValueError)
++        self.assertFalse(target.exists())
++        with closing(sqlite3.connect(self.store.db_path)) as connection:
++            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0], 0)
++            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0], 0)
++
++    def test_statement_ordinary_exception_keeps_failure_transition(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        job_id = self._enqueue_statement()
++
++        class BrokenSource:
++            @staticmethod
++            def fetch_financial_statement(*_args):
++                raise RuntimeError("ordinary statement failure")
++
++        with self.assertRaisesRegex(RuntimeError, "ordinary statement failure"):
++            self._run(
++                source=BrokenSource(),
++                trade_calendar_snapshot=self._calendar_ref(),
++                limit=1,
++            )
++
++        job = self.store.get_job(job_id)
++        self.assertEqual(job["status"], "terminal_failed")
++        self.assertEqual(job["error"], {"error_classification": "worker_error"})
++        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
++
+     def test_feature_path_is_project_relative_and_never_creates_data_data(self) -> None:
+         bundle = self._empty_feature_bundle()
+         relative_path, digest, _ = deep_worker_module.write_feature_bundle(
+             self.project_root, bundle
+         )
+         observed = deep_worker_module.read_verified_feature_bundle(
+             self.project_root, relative_path, digest
+         )
+ 
+         self.assertEqual(observed, bundle)
+diff --git a/tests/test_snapshot_repository.py b/tests/test_snapshot_repository.py
+index f82b828..1dde5d9 100644
+--- a/tests/test_snapshot_repository.py
++++ b/tests/test_snapshot_repository.py
+@@ -1,16 +1,17 @@
+ import json
+ import sqlite3
+ import tempfile
+ import threading
+ import unittest
+-from contextlib import closing
++from contextlib import closing, contextmanager
++from datetime import datetime, timezone
+ import os
+ from pathlib import Path
+ import subprocess
+ from unittest.mock import patch
+ 
+ from ashare_pipeline.feature_contract import canonical_sha256
+ from ashare_pipeline.snapshot_repository import SnapshotRepository
+ from ashare_pipeline.snapshot_store import SnapshotStore
+ from ashare_pipeline.sources import FetchBatch
+ from ashare_pipeline.state_store import StateStore
+@@ -21,20 +22,31 @@ def statement_batch(symbol: str, total_assets: float, fetched_at: str) -> FetchB
+         "akshare",
+         "balance_sheet",
+         {"symbol": symbol, "report_period": "2026-06-30"},
+         [{"REPORT_DATE": "2026-06-30", "TOTAL_ASSETS": total_assets}],
+         fetched_at,
+         "1.0",
+         {"report_period_match_count": 1},
+     )
+ 
+ 
++class CommitFailConnection:
++    def __init__(self, connection):
++        self.connection = connection
++
++    def __getattr__(self, name):
++        return getattr(self.connection, name)
++
++    def commit(self):
++        raise sqlite3.OperationalError("forced commit failure")
++
++
+ class SnapshotRepositoryTestCase(unittest.TestCase):
+     def setUp(self):
+         self.tempdir = tempfile.TemporaryDirectory()
+         self.project_root = Path(self.tempdir.name)
+         self.data_root = self.project_root / "data"
+         self.state_store = StateStore(self.data_root / "state.sqlite3")
+         self.state_store.initialize()
+         self.snapshot_store = SnapshotStore(self.data_root)
+         self.repository = SnapshotRepository(
+             self.data_root, self.state_store, self.snapshot_store
+@@ -156,20 +168,140 @@ class SnapshotRepositoryTestCase(unittest.TestCase):
+             connection.commit()
+ 
+         with self.assertRaisesRegex(ValueError, "lease owner"):
+             self.repository.persist(batch, job_id=stale_job, worker_id="worker-a")
+ 
+         self.assertTrue(created)
+         self.assertEqual(winner_path.read_bytes(), winner_bytes)
+         with closing(sqlite3.connect(self.data_root / "state.sqlite3")) as connection:
+             self.assertEqual(connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0], 1)
+ 
++    def test_owned_snapshot_commit_failure_removes_attempt_file_and_row(self):
++        batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
++        job_id = self.state_store.enqueue_job(
++            "deep_statement", "snapshot-owner:commit-failure", {}
++        )
++        self.state_store.lease_next_job(["deep_statement"], "worker-a", 3600)
++        real_connect = self.state_store._connect
++
++        with patch.object(
++            self.state_store,
++            "_connect",
++            side_effect=lambda: CommitFailConnection(real_connect()),
++        ), self.assertRaisesRegex(sqlite3.OperationalError, "commit failure"):
++            self.repository.persist(batch, job_id=job_id, worker_id="worker-a")
++
++        with closing(sqlite3.connect(self.state_store.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0],
++                0,
++            )
++        self.assertEqual(list((self.data_root / "raw").rglob("*.json")), [])
++
++    def test_ownerless_winner_republishes_after_owned_end_expiry_cleanup(self):
++        batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
++        job_id = self.state_store.enqueue_job(
++            "deep_statement", "snapshot-owner:adoption-race", {}
++        )
++        self.state_store.lease_next_job(["deep_statement"], "worker-a", 3600)
++        ownerless_transaction_started = threading.Event()
++        owned_published = threading.Event()
++        owned_errors: list[BaseException] = []
++        ownerless_errors: list[BaseException] = []
++        ownerless_results: list[tuple[object, bool]] = []
++        real_transaction = self.state_store._transaction
++        real_write = self.snapshot_store.write
++        snapshot_clock_calls = 0
++        state_clock_calls = 0
++
++        @contextmanager
++        def observed_transaction(*args, **kwargs):
++            if threading.current_thread().name == "ownerless-winner":
++                ownerless_transaction_started.set()
++            with real_transaction(*args, **kwargs) as connection:
++                yield connection
++
++        def observed_write(value):
++            result = real_write(value)
++            if threading.current_thread().name == "owned-loser":
++                owned_published.set()
++            return result
++
++        def snapshot_clock():
++            nonlocal snapshot_clock_calls
++            if threading.current_thread().name != "owned-loser":
++                return datetime.now(timezone.utc).isoformat()
++            snapshot_clock_calls += 1
++            if snapshot_clock_calls == 2:
++                self.assertTrue(ownerless_transaction_started.wait(timeout=5))
++                return "2099-01-01T00:00:00+00:00"
++            return datetime.now(timezone.utc).isoformat()
++
++        def state_clock():
++            nonlocal state_clock_calls
++            if threading.current_thread().name != "owned-loser":
++                return datetime.now(timezone.utc).isoformat()
++            state_clock_calls += 1
++            if state_clock_calls == 3:
++                self.assertTrue(ownerless_transaction_started.wait(timeout=5))
++                return "2099-01-01T00:00:00+00:00"
++            return datetime.now(timezone.utc).isoformat()
++
++        def owned_loser():
++            try:
++                self.repository.persist(
++                    batch, job_id=job_id, worker_id="worker-a"
++                )
++            except BaseException as error:
++                owned_errors.append(error)
++
++        def ownerless_winner():
++            try:
++                ownerless_results.append(self.repository.persist(batch))
++            except BaseException as error:
++                ownerless_errors.append(error)
++
++        with (
++            patch.object(self.state_store, "_transaction", new=observed_transaction),
++            patch.object(self.snapshot_store, "write", side_effect=observed_write),
++            patch(
++                "ashare_pipeline.snapshot_repository._utc_now",
++                side_effect=snapshot_clock,
++                create=True,
++            ),
++            patch("ashare_pipeline.state_store._utc_now", side_effect=state_clock),
++        ):
++            owned = threading.Thread(target=owned_loser, name="owned-loser")
++            owned.start()
++            self.assertTrue(owned_published.wait(timeout=5))
++            ownerless = threading.Thread(
++                target=ownerless_winner, name="ownerless-winner"
++            )
++            ownerless.start()
++            owned.join(timeout=10)
++            ownerless.join(timeout=10)
++
++        self.assertFalse(owned.is_alive())
++        self.assertFalse(ownerless.is_alive())
++        self.assertEqual(len(owned_errors), 1)
++        self.assertIsInstance(owned_errors[0], ValueError)
++        self.assertEqual(ownerless_errors, [])
++        self.assertEqual(len(ownerless_results), 1)
++        winner, created = ownerless_results[0]
++        self.assertTrue(created)
++        self.assertEqual(self.repository.read_verified(winner).batch, batch)
++        with closing(sqlite3.connect(self.state_store.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0],
++                1,
++            )
++
+     def test_concurrent_same_target_persist_keeps_first_published_batch_and_db_ref(self):
+         first_batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+         second_batch = statement_batch("SH600001", 100.0, "2026-08-29T01:00:00+00:00")
+         publish_barrier = threading.Barrier(2)
+         first_persisted = threading.Event()
+         results: dict[str, tuple[object, bool]] = {}
+         errors: list[BaseException] = []
+         result_lock = threading.Lock()
+ 
+         def controlled_publish(real_publish):

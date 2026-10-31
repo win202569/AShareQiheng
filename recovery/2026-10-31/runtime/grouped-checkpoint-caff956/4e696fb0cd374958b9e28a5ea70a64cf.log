@@ -1,0 +1,20 @@
+TEST_STARTED test_formal_financial_features.FormulaTests.test_aggregate_evidence_and_reliability
+test_aggregate_evidence_and_reliability (test_formal_financial_features.FormulaTests.test_aggregate_evidence_and_reliability) ... ok
+TEST_STARTED test_formal_financial_features.FormulaTests.test_binary_operations_cagr_and_units
+test_binary_operations_cagr_and_units (test_formal_financial_features.FormulaTests.test_binary_operations_cagr_and_units) ... ok
+TEST_STARTED test_formal_financial_features.FormulaTests.test_cagr_direction_and_negative_endpoints
+test_cagr_direction_and_negative_endpoints (test_formal_financial_features.FormulaTests.test_cagr_direction_and_negative_endpoints) ... ok
+TEST_STARTED test_formal_financial_features.FormulaTests.test_custom_keys_and_mutated_quarters_rejected
+test_custom_keys_and_mutated_quarters_rejected (test_formal_financial_features.FormulaTests.test_custom_keys_and_mutated_quarters_rejected) ... ok
+TEST_STARTED test_formal_financial_features.FormulaTests.test_economic_units_and_arithmetic_failure
+test_economic_units_and_arithmetic_failure (test_formal_financial_features.FormulaTests.test_economic_units_and_arithmetic_failure) ... ok
+TEST_STARTED test_formal_financial_features.FormulaTests.test_namespace_and_hostile_mapping
+test_namespace_and_hostile_mapping (test_formal_financial_features.FormulaTests.test_namespace_and_hostile_mapping) ... ok
+TEST_STARTED test_formal_financial_features.FormulaTests.test_quarter_reliability_all_operands_and_malformed_nodes
+test_quarter_reliability_all_operands_and_malformed_nodes (test_formal_financial_features.FormulaTests.test_quarter_reliability_all_operands_and_malformed_nodes) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.407s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_financial_features.FormulaTests.test_aggregate_evidence_and_reliability", "test_formal_financial_features.FormulaTests.test_binary_operations_cagr_and_units", "test_formal_financial_features.FormulaTests.test_cagr_direction_and_negative_endpoints", "test_formal_financial_features.FormulaTests.test_custom_keys_and_mutated_quarters_rejected", "test_formal_financial_features.FormulaTests.test_economic_units_and_arithmetic_failure", "test_formal_financial_features.FormulaTests.test_namespace_and_hostile_mapping", "test_formal_financial_features.FormulaTests.test_quarter_reliability_all_operands_and_malformed_nodes"], "passed": ["test_formal_financial_features.FormulaTests.test_aggregate_evidence_and_reliability", "test_formal_financial_features.FormulaTests.test_binary_operations_cagr_and_units", "test_formal_financial_features.FormulaTests.test_cagr_direction_and_negative_endpoints", "test_formal_financial_features.FormulaTests.test_custom_keys_and_mutated_quarters_rejected", "test_formal_financial_features.FormulaTests.test_economic_units_and_arithmetic_failure", "test_formal_financial_features.FormulaTests.test_namespace_and_hostile_mapping", "test_formal_financial_features.FormulaTests.test_quarter_reliability_all_operands_and_malformed_nodes"], "tests_run": 7, "failures": 0, "errors": 0, "skipped": 0}

@@ -1,0 +1,199 @@
+ba0def62a4ffe45cb5e3bee41537ea1b79ff6de0
+ba0def6 fix: authenticate range authority before retry classification
+ ashare_pipeline/formal_range_source.py | 22 ++++++++----
+ tests/test_formal_range_worker.py      | 62 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 77 insertions(+), 7 deletions(-)
+diff --git a/ashare_pipeline/formal_range_source.py b/ashare_pipeline/formal_range_source.py
+index 0deb4f0..773bd6f 100644
+--- a/ashare_pipeline/formal_range_source.py
++++ b/ashare_pipeline/formal_range_source.py
+@@ -876,20 +876,30 @@ def _build_source_type():
+                 and _callable_anchor(record.selected.normalizer, "normalize") == record.selected.normalizer_anchor
+                 and type(config) is RangeConfig
+                 and _range_config_to_dict(config) == record.config_wire
+             )
+         except (AttributeError, TypeError, ValueError):
+             unchanged = False
+         if not unchanged:
+             raise FormalTerminalSourceError("formal range source dependencies changed")
+         return record
+ 
++    def require_acquisition_authority(source, request, previous):
++        # Error classification must not hide transport/parser callback mutation.
++        # Parent replay can itself invoke callbacks, so check both sides of it.
++        source_record(source)
++        request_record(request)
++        if previous is not None:
++            require_observation(previous, current=True)
++        source_record(source)
++        request_record(request)
++
+     class FormalRangeSource:
+         """One binding's sealed transport and exact range implementation registry."""
+ 
+         def __init__(self, binding, *, transport, implementations):
+             if type(binding) is not RangeBinding:
+                 raise ValueError("range source requires an exact genuine RangeBinding")
+             require_binding(binding)
+             config = calendar_config_get(binding)
+             if type(config) is not RangeConfig:
+                 raise ValueError("range binding calendar config is invalid")
+@@ -1011,43 +1021,43 @@ def _build_source_type():
+                 request_wire["registry_manifest_hash"] != manifest_hash_get(record.binding)
+                 or request_source_hash != source_hash_get(record.binding)
+                 or request_config != record.config_wire
+                 or request_config != _range_config_to_dict(config)
+             ):
+                 raise FormalTerminalSourceError("range request config differs from sealed source")
+             sent = _transport_request(config, request_wire)
+             try:
+                 response = record.transport.send(sent)
+             except (FormalRetryableSourceError, FormalSourceBlocked):
++                require_acquisition_authority(self, request, previous)
+                 raise
+             except Exception as error:
++                require_acquisition_authority(self, request, previous)
+                 raise FormalRetryableSourceError("range transport failed") from error
+             source_record(self)
+             try:
+                 response = _snapshot_transport_response(response)
+                 _classify_transport_response(response)
+                 if _https_host(response.original_url, "range response original_url") != _https_host(
+                     config.endpoint_url, "signed range endpoint_url"
+                 ):
+                     raise FormalTerminalSourceError("range response redirected outside the signed host")
+                 document = trusted_parse(record, request_wire, config, response.raw_bytes)
+                 if document.to_dict()["captured_at_utc"] != response.captured_at_utc:
+                     raise FormalTerminalSourceError("document capture time differs from transport")
++            except FormalRetryableSourceError:
++                require_acquisition_authority(self, request, previous)
++                raise
+             except FormalTerminalSourceError as error:
+                 # Parser callbacks may have changed authority or invalidated a
+                 # parent. Those failures must escape as integrity failures.
+-                source_record(self)
+-                request_record(request)
+-                if previous is not None:
+-                    require_observation(previous, current=True)
+-                source_record(self)
+-                request_record(request)
++                require_acquisition_authority(self, request, previous)
+                 raise FormalRangeAcquisitionError(str(error)) from error
+             source_record(self)
+             if previous is not None:
+                 require_observation(previous, current=True)
+                 source_record(self)
+             return mint_fetch(request_wire, config, response, document)
+ 
+         def parse_verified_snapshot(self, request: FormalRangeRequestV1, *, raw_bytes: bytes,
+                                     manifest: dict) -> ParsedRangeDocumentV1:
+             record = source_record(self)
+diff --git a/tests/test_formal_range_worker.py b/tests/test_formal_range_worker.py
+index 4a77397..13a4809 100644
+--- a/tests/test_formal_range_worker.py
++++ b/tests/test_formal_range_worker.py
+@@ -3,21 +3,25 @@
+ from contextlib import closing
+ import json
+ from pathlib import Path
+ import sqlite3
+ import subprocess
+ import sys
+ import textwrap
+ import unittest
+ from unittest.mock import patch
+ 
+-from ashare_pipeline.formal_sources import FormalRetryableSourceError, FormalTerminalSourceError
++from ashare_pipeline.formal_sources import (
++    FormalRetryableSourceError,
++    FormalSourceBlocked,
++    FormalTerminalSourceError,
++)
+ from tests import formal_range_fixtures
+ from tests.test_formal_range_source import document_wire
+ 
+ 
+ NOW = "2026-09-01T00:00:00+00:00"
+ 
+ 
+ def numbered(documents):
+     for config in documents["source"]["range_configs"]:
+         config.update(pagination="numbered_pages_v1", max_pages=2)
+@@ -360,20 +364,76 @@ class FormalRangeWorkerTests(unittest.TestCase):
+         request = fixture.enqueue_calendar()
+         with patch.object(type(fixture.range_store), "persist", side_effect=FormalRetryableSourceError("storage")):
+             with self.assertRaises(FormalRetryableSourceError):
+                 fixture.worker.run_once()
+         self.assertEqual(self.rows(fixture, "SELECT status FROM formal_range_task"), [("leased",)])
+         with patch.object(type(fixture.range_store), "enqueue", side_effect=FormalRetryableSourceError("replay")):
+             with self.assertRaises(FormalRetryableSourceError):
+                 fixture.worker.resume(request, refresh_generation="g1")
+         self.assertEqual(self.rows(fixture, "SELECT outcome FROM formal_range_attempt"), [(None,)])
+ 
++    def test_transport_error_cannot_hide_source_callback_mutation(self):
++        fixture = self.fixture()
++        live_source = []
++
++        def source_factory(binding):
++            source = fixture.source_factory(binding)
++            live_source[:] = [source]
++            return source
++
++        fixture.worker.source_factory = source_factory
++        fixture.transport.on_send = lambda _request: setattr(live_source[0], "_binding", object())
++        errors = (TimeoutError("timeout"), FormalRetryableSourceError("retryable"),
++                  FormalSourceBlocked("blocked"))
++        for index, error in enumerate(errors, 1):
++            with self.subTest(error=type(error).__name__):
++                fixture.enqueue_calendar(refresh_generation=f"g{index}")
++                fixture.transport.error = error
++                with self.assertRaises(FormalTerminalSourceError):
++                    fixture.worker.run_once()
++        self.assertEqual(len(fixture.transport.calls), 3)
++        self.assertEqual(self.rows(fixture, "SELECT status FROM formal_range_task"), [("leased",)] * 3)
++        self.assertEqual(self.rows(fixture, "SELECT outcome FROM formal_range_attempt"), [(None,)] * 3)
++        self.assertEqual(self.rows(fixture, "SELECT count(*) FROM formal_range_snapshot"), [(0,)])
++
++    def test_retryable_response_cannot_hide_original_request_mutation(self):
++        fixture = formal_range_fixtures.RangeSourceFixture()
++        self.addCleanup(fixture.close)
++        for status in (403, 503):
++            with self.subTest(status=status):
++                request = fixture.source.first_calendar_request("2026-08-31T07:00:00+00:00")
++                fixture.reply({}, status_code=status)
++                fixture.transport.on_send = lambda _sent: object.__setattr__(request, "page_index", 2)
++                with self.assertRaises(Exception) as caught:
++                    fixture.source.fetch_verified(request)
++                self.assertIsInstance(caught.exception, ValueError)
++        self.assertEqual(len(fixture.transport.calls), 2)
++
++    def test_blocked_response_cannot_hide_current_parent_corruption(self):
++        fixture = self.fixture(mutate=numbered)
++        first_request = fixture.enqueue_calendar()
++        fixture.reply(self.page(first_request))
++        lease = fixture.range_store.lease_next("producer", lease_seconds=60)
++        parent = fixture.range_store.persist(lease["id"], "producer", lease["attempt_id"],
++            fetch=fixture.source.fetch_verified(lease["request"]))
++        request = fixture.source.next_page(parent)
++        path = Path(parent.snapshot["content_path"])
++        corrupted = path.read_bytes() + b" "
++        fixture.reply({}, status_code=403)
++        fixture.transport.on_send = lambda _sent: path.write_bytes(corrupted)
++        with self.assertRaises(Exception) as caught:
++            fixture.source.fetch_verified(request)
++        self.assertIsInstance(caught.exception, ValueError)
++        self.assertEqual(path.read_bytes(), corrupted)
++        self.assertEqual(self.rows(fixture, "SELECT status FROM formal_range_task"), [("verified",)])
++        self.assertEqual(self.rows(fixture, "SELECT count(*) FROM formal_range_normalization_receipt"), [(1,)])
++
+     def test_authenticated_binding_accessor_rejects_clones_and_replaced_aliases(self):
+         from ashare_pipeline import formal_range_source as source_module
+         accessor = getattr(source_module, "range_request_binding", None)
+         self.assertTrue(callable(accessor), "authenticated request binding reader is absent")
+         fixture = self.fixture()
+         request = fixture.enqueue_calendar()
+         self.assertIs(accessor(request), fixture.binding)
+         forged = object.__new__(type(request))
+         for name, value in request.to_dict().items():
+             object.__setattr__(forged, name, value)
+

@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_feature_store.ProjectTemporaryDirectoryTests.test_helper_uses_writable_user_temp_root
+test_helper_uses_writable_user_temp_root (test_formal_feature_store.ProjectTemporaryDirectoryTests.test_helper_uses_writable_user_temp_root) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.008s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_feature_store.ProjectTemporaryDirectoryTests.test_helper_uses_writable_user_temp_root"], "passed": ["test_formal_feature_store.ProjectTemporaryDirectoryTests.test_helper_uses_writable_user_temp_root"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

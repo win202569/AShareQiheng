@@ -1,0 +1,742 @@
+# Review package: 4be7a8a..2bdb215
+
+## Commits
+2bdb215 feat: plan formal score invalidation scopes
+
+## Files changed
+ ashare_pipeline/formal_final_invalidation.py | 294 ++++++++++++++++++++++++++
+ ashare_pipeline/formal_final_repository.py   |  84 ++++++++
+ tests/test_formal_final_invalidation.py      | 304 +++++++++++++++++++++++++++
+ 3 files changed, 682 insertions(+)
+
+## Diff
+diff --git a/ashare_pipeline/formal_final_invalidation.py b/ashare_pipeline/formal_final_invalidation.py
+new file mode 100644
+index 0000000..e0fccce
+--- /dev/null
++++ b/ashare_pipeline/formal_final_invalidation.py
+@@ -0,0 +1,294 @@
++"""Detached invalidation arithmetic; this module never grants proof authority.
++
++The repository authenticates both the exact historical artifacts and live D1 /
++coverage inputs before calling this core. A returned plan is a description,
++not permission to reuse a proof without verifying it again.
++"""
++
++from dataclasses import dataclass
++import hashlib
++import json
++
++
++@dataclass(frozen=True)
++class FormalRebuildPlan:
++    full_rebuild: bool
++    direct_security_ids: tuple[str, ...]
++    expanded_security_ids: tuple[str, ...]
++    cohort_keys: tuple[tuple[str, ...], ...]
++    d1_rebuild_ids: tuple[str, ...]
++    d2_rebuild_ids: tuple[str, ...]
++    eligibility_rebuild_ids: tuple[str, ...]
++    rescan_pools: bool
++    reason_codes: tuple[str, ...]
++    prior_manifest_hash: str
++    current_manifest_hash: str
++    effect_scopes: tuple[str, ...]
++
++
++_GLOBAL_KEYS = frozenset(("registry_manifest_hash", "frozen_input_hash", "universe_hash",
++    "population_hash", "scoring_registry_hash", "policy_contract_hash",
++    "valuation_adapter_registry_hash", "industry_batch_hash", "as_of_utc"))
++_DIAGNOSTIC_KEYS = frozenset(("diagnostics", "timing_diagnostics", "audit_at_utc",
++    "rechecked_at_utc", "display", "display_format"))
++_DERIVED_KEYS = frozenset(("entry_hash", "input_hash", "base_input_hash", "result_hash",
++    "policy_result_hash", "score_hash", "context_hash", "cohort_hash", "decision_hash",
++    "metric_input_hash", "adjusted_input_hash", "full_feature_bundle_hash", "bundle_hash"))
++_SCOPES = frozenset(("security", "cohort", "pool", "global"))
++
++
++def _digest(value):
++    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
++        separators=(",", ":"), allow_nan=False).encode()).hexdigest()
++
++
++def _aggregate_key(key):
++    return key == "batch_hash" or key.endswith(("_batch_hash", "_batch_canonical_sha256"))
++
++
++def _clean(value):
++    """Remove enclosing seals and non-economic diagnostics, retaining leaf evidence."""
++    if isinstance(value, dict):
++        return {key: _clean(child) for key, child in value.items()
++            if key not in _DIAGNOSTIC_KEYS | _DERIVED_KEYS and not _aggregate_key(key)}
++    if isinstance(value, (list, tuple)):
++        return [_clean(child) for child in value]
++    return value
++
++
++def _slot_source(slot):
++    if slot is None:
++        return None
++    result = {key: value for key, value in slot.items()
++        if key not in ("value", "metric_score", "valuation_score", "valuation_context",
++            "valuation_score_hash", "valuation_context_hash")}
++    metric = slot.get("metric_score")
++    if metric:
++        result["metric_source"] = {key: value for key, value in metric.items()
++            if key not in ("percentile", "average_rank", "peer_count", "peer_context")}
++    valuation = result.get("valuation_input")
++    if valuation:
++        # PolicyResult is repeated verbatim inside Stage C. Its individual
++        # effects are diffed separately, so a cap is not a V normalization.
++        result["valuation_input"] = {key: value for key, value in valuation.items()
++            if key != "policy_result"}
++    return _clean(result)
++
++
++def _context(slot):
++    if not slot:
++        return None
++    return slot.get("valuation_context") or (slot.get("metric_score") or {}).get("peer_context")
++
++
++def _slot_result(slot):
++    return _clean({key: value for key, value in (slot or {}).items()
++        if key in ("value", "metric_score", "valuation_score", "valuation_context")})
++
++
++def _hash_dependencies(inputs):
++    """Reproduce Task 9's original dependency projection without altering history."""
++    rows = []
++    def walk(value, sid, path):
++        if type(value) is dict:
++            for key, child in value.items():
++                child_path = path + "." + key
++                if key.endswith(("_hash", "_sha256")) and type(child) is str and child:
++                    rows.append(dict(security_id=sid, source_kind=key, source_id=child_path,
++                        source_hash=child, effect_scope="global" if sid is None else "security",
++                        dependent_key="run" if sid is None else sid))
++                elif type(child) in (dict, list):
++                    walk(child, sid, child_path)
++        elif type(value) is list:
++            for index, child in enumerate(value):
++                walk(child, sid, path + "." + str(index))
++    walk({key: value for key, value in inputs.items() if key != "inputs"}, None, "batch")
++    for row in inputs["inputs"]:
++        walk(row, row["security_id"], "input." + row["security_id"])
++    return rows
++
++
++def _derive_plan(*, prior_inputs, current_inputs, prior_coverage, current_coverage,
++                 prior_dependencies, prior_identity, current_identity):
++    """Pure diff for already authenticated wires; intentionally private, no mint."""
++    dependencies = [dict(row) for row in prior_dependencies]
++    if any(row.get("effect_scope") not in _SCOPES for row in dependencies):
++        raise ValueError("unknown formal dependency effect scope")
++    canonical = lambda rows: sorted(_digest(row) for row in rows)
++    if canonical(dependencies) != canonical(_hash_dependencies(prior_inputs)):
++        raise ValueError("prior dependencies differ from the exact canonical manifest")
++    old = {row["security_id"]: row for row in prior_inputs["inputs"]}
++    new = {row["security_id"]: row for row in current_inputs["inputs"]}
++    ids = set(old) | set(new)
++    direct, d1, d2, eligibility, cohorts, reasons = set(), set(), set(), set(), set(), set()
++    localized_sources = set()
++    full = False
++
++    def global_change(reason):
++        nonlocal full
++        full = True
++        reasons.add(reason)
++
++    if (set(old) != set(new) or prior_inputs["security_ids"] != current_inputs["security_ids"]):
++        global_change("universe_changed")
++        direct.update(set(old) ^ set(new))
++    for key in _GLOBAL_KEYS:
++        if prior_inputs.get(key) != current_inputs.get(key):
++            global_change("global_context_changed:" + key)
++    current_dependencies = _hash_dependencies(current_inputs)
++    old_global = {row["source_id"]: row["source_hash"] for row in dependencies
++        if row["source_kind"] in _GLOBAL_KEYS}
++    new_global = {row["source_id"]: row["source_hash"] for row in current_dependencies
++        if row["source_kind"] in _GLOBAL_KEYS}
++    if any(old_global[key] != new_global[key] for key in old_global.keys() & new_global.keys()):
++        global_change("global_dependency_changed")
++    for key in ("mode", "code_version", "contract_version"):
++        if prior_identity.get(key) != current_identity.get(key):
++            global_change("run_contract_changed:" + key)
++    for sid in set(old) & set(new):
++        for key in ("template_id", "primary_industry", "secondary_industry"):
++            if old[sid].get(key) != new[sid].get(key):
++                global_change("industry_or_template_changed")
++
++    def security_change(sid, reason, *, score=True):
++        direct.add(sid)
++        d1.add(sid)
++        eligibility.add(sid)
++        if score:
++            d2.add(sid)
++        reasons.add(reason)
++
++    def expand(sid, mid):
++        found = False
++        for members in (old, new):
++            focal = members.get(sid)
++            if focal is None:
++                continue
++            for consumer, row in members.items():
++                context = _context(row.get("slots", {}).get(mid))
++                if not context:
++                    continue
++                peers = set(context["peer_security_ids"])
++                if not peers <= set(members):
++                    raise ValueError("cohort contains a security outside the manifest")
++                if consumer != sid and sid not in peers:
++                    continue
++                found = True
++                scope = context.get("scope")
++                industry = row.get("secondary_industry" if scope == "template_secondary_industry"
++                    else "primary_industry")
++                cohorts.add(tuple(str(value or "") for value in (mid, row.get("template_id"),
++                    scope, industry, context.get("definition_hash"), context.get("direction"))))
++                affected = peers | {consumer, sid}
++                d1.update(affected)
++                d2.update(affected)
++                eligibility.update(affected)
++        if not found:
++            global_change("unlocalizable_cohort_change")
++
++    for sid in sorted(set(old) & set(new)):
++        previous, current = old[sid], new[sid]
++        before_slots, after_slots = previous.get("slots", {}), current.get("slots", {})
++        for mid in sorted(set(before_slots) | set(after_slots)):
++            before, after = before_slots.get(mid), after_slots.get(mid)
++            if _slot_source(before) != _slot_source(after):
++                security_change(sid, "metric_evidence_changed")
++                localized_sources.add("valuation" if mid.startswith("V.") else "base")
++                if mid.startswith("V.") and _clean((before or {}).get("valuation_input", {}).get("original_metric")) != _clean((after or {}).get("valuation_input", {}).get("original_metric")):
++                    localized_sources.add("base")
++                if mid.startswith("V.") or _context(before) or _context(after):
++                    expand(sid, mid)
++            # Membership and percentile changes affect existing consumers too,
++            # even when their own raw evidence did not change.
++            elif _slot_result(before) != _slot_result(after):
++                d1.add(sid)
++                d2.add(sid)
++                eligibility.add(sid)
++                reasons.add("peer_result_changed")
++                expand(sid, mid)
++
++        old_policy, new_policy = previous.get("policy_result", {}), current.get("policy_result", {})
++        effect_keys = ("dimension_caps", "normalization_basis", "pool_prohibitions", "states",
++            "pending_requirements", "evidence_state")
++        effect_changed = False
++        for key in effect_keys:
++            if _clean(old_policy.get(key)) == _clean(new_policy.get(key)):
++                continue
++            effect_changed = True
++            localized_sources.add("policy")
++            security_change(sid, "policy_changed:" + key, score=key not in ("pool_prohibitions", "states"))
++            if key == "normalization_basis":
++                metrics = {mid for mid in set(before_slots) | set(after_slots) if mid.startswith("V.")}
++                if not metrics:
++                    global_change("unlocalizable_cohort_change")
++                for mid in metrics:
++                    expand(sid, mid)
++        if not effect_changed and _clean(old_policy) != _clean(new_policy):
++            localized_sources.add("policy")
++            security_change(sid, "policy_evidence_changed")
++
++        excluded = {"slots", "policy_result", "policy_pending_requirements"}
++        left = _clean({key: value for key, value in previous.items() if key not in excluded})
++        right = _clean({key: value for key, value in current.items() if key not in excluded})
++        if left != right:
++            localized_sources.add("base")
++            security_change(sid, "security_evidence_changed")
++
++    def coverage_rows(manifest):
++        grouped = {}
++        for row in manifest["rows"]:
++            grouped.setdefault(row["security_id"], []).append(_clean(row))
++        return {sid: sorted(_digest(row) for row in rows) for sid, rows in grouped.items()}
++    old_coverage, new_coverage = coverage_rows(prior_coverage), coverage_rows(current_coverage)
++    for sid in set(old_coverage) | set(new_coverage):
++        if old_coverage.get(sid) != new_coverage.get(sid):
++            if sid not in ids:
++                raise ValueError("coverage security lies outside the manifest")
++            security_change(sid, "coverage_evidence_changed")
++    coverage_meta = lambda manifest: _clean({key: value for key, value in manifest.items()
++        if key not in ("rows", "manifest_hash", "blockers")})
++    if coverage_meta(prior_coverage) != coverage_meta(current_coverage):
++        global_change("coverage_context_changed")
++
++    # Aggregate seals bind whole source batches. They cannot identify which
++    # omitted pending input changed; do not invent member IDs in that case.
++    previous_aggregates = {row["source_id"]: row["source_hash"] for row in dependencies
++        if row["security_id"] is None and _aggregate_key(row["source_kind"])
++        and row["source_kind"] != "batch_hash"}
++    current_aggregates = {row["source_id"]: row["source_hash"] for row in current_dependencies
++        if row["security_id"] is None and _aggregate_key(row["source_kind"])
++        and row["source_kind"] != "batch_hash"}
++    # Stage C seals include both base and policy batches, even when their
++    # changes do not affect numeric V inputs (for example a policy cap).
++    if localized_sources & {"base", "policy"}:
++        localized_sources.add("valuation")
++    for path in previous_aggregates.keys() | current_aggregates.keys():
++        if previous_aggregates.get(path) != current_aggregates.get(path):
++            source = path.removeprefix("batch.").split("_", 1)[0]
++            if source not in localized_sources:
++                global_change("unlocalizable_upstream_change")
++    if full:
++        d1.update(new)
++        d2.update(new)
++        eligibility.update(new)
++    # Departed members explain invalidation but are not current build targets.
++    d1.intersection_update(new)
++    d2.intersection_update(new)
++    eligibility.intersection_update(new)
++    expanded = d1 | d2 | eligibility
++    scopes = set()
++    if direct:
++        scopes.add("security")
++    if cohorts:
++        scopes.add("cohort")
++    if full:
++        scopes.add("global")
++    if expanded:
++        scopes.add("pool")
++    return FormalRebuildPlan(full, tuple(sorted(direct)), tuple(sorted(expanded)),
++        tuple(sorted(cohorts)), tuple(sorted(d1)), tuple(sorted(d2)), tuple(sorted(eligibility)),
++        bool(expanded), tuple(sorted(reasons)), _digest(prior_identity), _digest(current_identity),
++        tuple(sorted(scopes)))
++
++
++__all__ = ["FormalRebuildPlan"]
+diff --git a/ashare_pipeline/formal_final_repository.py b/ashare_pipeline/formal_final_repository.py
+index 1e41c99..368e2c8 100644
+--- a/ashare_pipeline/formal_final_repository.py
++++ b/ashare_pipeline/formal_final_repository.py
+@@ -1,17 +1,18 @@
+ """Append-only, atomic V8 Stage D runs and non-authoritative recovery DTOs."""
+ 
+ from contextlib import closing
+ from dataclasses import dataclass
+ from datetime import datetime, timezone
+ from decimal import Decimal
+ import hashlib
++import inspect
+ import json
+ from pathlib import Path
+ from types import MappingProxyType
+ from uuid import uuid4
+ 
+ from .formal_coverage_manifest import VerifiedCoverageManifest
+ from .formal_final_publication import _bind_repository_writer
+ from .formal_final_score_inputs import PolicyAdjustedScoreInputBatch
+ from .formal_final_scoring import FinalScoreCardBatch
+ from .formal_final_eligibility import FormalEligibilityBatch, _validate_scorecard_coverage
+@@ -530,13 +531,96 @@ class FormalFinalRunRepository:
+             MappingProxyType(hashes), *groups)
+ 
+     def list_runs_by_input_manifest(self, input_manifest_hash):
+         with self._store._transaction() as connection:
+             ids = tuple(row[0] for row in connection.execute(
+                 "SELECT run_id FROM formal_final_run WHERE input_manifest_hash = ? ORDER BY created_at,run_id",
+                 (input_manifest_hash,)))
+             return tuple(self._read_run(connection, run_id) for run_id in ids)
+ 
+ 
++def _install_rebuild_planner(repository_type):
++    """Capture existing D1 authorities; expose neither mint nor publication controls."""
++    from .formal_final_score_inputs import _prepare_final_inputs
++    from .formal_final_invalidation import _derive_plan
++
++    authorities = inspect.getclosurevars(_prepare_final_inputs).nonlocals
++    record = authorities["record"]
++    dependencies = authorities["dependencies"]
++    verify_sources = authorities["verify_sources"]
++    input_type, coverage_type = PolicyAdjustedScoreInputBatch, VerifiedCoverageManifest
++    coverage_methods = tuple((name, getattr(coverage_type, name)) for name in
++        ("require_verified", "require_preview_ready", "require_official_ready", "canonical_bytes", "to_dict", "_data"))
++    read_run = repository_type._read_run
++    serialize, identity, coverage_identity = _serialize_payload, _input_identity, _coverage_identity
++    derive = _derive_plan
++
++    def plan_rebuild(self, *, prior_run_id, prior_input_manifest_hash,
++                     input_batch, coverage_manifest, mode="test_preview"):
++        """Compare one exact historical run with freshly authenticated manifests.
++
++        This read-only plan never authenticates recovered DTOs or caches a
++        validity decision. Every call checks the retained source checkpoint;
++        the eventual append-only writer must revalidate again before reuse.
++        """
++        if (type(self) is not repository_type or type(self._store) is not StateStore
++                or Path(self._store.db_path).resolve() != self._path):
++            raise ValueError("rebuild repository identity changed")
++        if mode not in ("test_preview", "official_candidate"):
++            raise ValueError("Stage D run mode is invalid")
++        if (type(prior_run_id) is not str or not prior_run_id
++                or type(prior_input_manifest_hash) is not str or not prior_input_manifest_hash):
++            raise ValueError("rebuild requires an exact prior run and manifest hash")
++        if type(input_batch) is not input_type or type(coverage_manifest) is not coverage_type:
++            raise ValueError("rebuild requires genuine final input and coverage proofs")
++        if any(getattr(coverage_type, name) is not method for name, method in coverage_methods):
++            raise ValueError("rebuild coverage authority changed")
++        saved = record(input_batch, input_type)
++        retention = saved[5]
++        feature = dependencies(retention[0])[0]
++        if feature._store is not self._store:
++            raise ValueError("rebuild input belongs to another source store")
++        checkpoint = retention[3][0]
++        with checkpoint.hold():
++            source_bytes = verify_sources(retention[1])
++            for proof in retention[2]:
++                proof.require_verified()
++            raw = saved[2]
++            inputs = json.loads(raw)
++            if serialize(inputs)[0].encode() != raw:
++                raise ValueError("rebuild input bytes are not canonical")
++            coverage_identity(coverage_manifest, inputs, tuple(inputs["security_ids"]), mode)
++            coverage_raw = coverage_manifest.canonical_bytes()
++            coverage = json.loads(coverage_raw)
++            with self._store._transaction() as connection:
++                prior = read_run(self, connection, prior_run_id)
++            if prior is None or prior.input_manifest_hash != prior_input_manifest_hash:
++                raise ValueError("exact prior run manifest was not found")
++            artifacts = {"score_input_batch": {"artifact_hash": hashlib.sha256(raw).hexdigest()},
++                "coverage_manifest": {"artifact_hash": hashlib.sha256(coverage_raw).hexdigest()}}
++            header = dict(mode=mode, code_version=self._code_version, contract_version=self._contract_version,
++                **{key: inputs[key] for key in ("registry_manifest_hash", "frozen_input_hash", "universe_hash", "as_of_utc")})
++            old_artifacts = {kind: {"artifact_hash": digest} for kind, digest in prior.artifact_hashes.items()}
++            plan = derive(prior_inputs=json.loads(prior.artifacts["score_input_batch"]),
++                current_inputs=inputs, prior_coverage=json.loads(prior.artifacts["coverage_manifest"]),
++                current_coverage=coverage, prior_dependencies=prior.dependencies,
++                prior_identity=identity(prior.header, old_artifacts), current_identity=identity(header, artifacts))
++            # Validity is checked after the diff as well. A byte-identical old
++            # proof cannot survive a revoked capability or changed live source.
++            if record(input_batch, input_type)[2] != raw or verify_sources(retention[1]) != source_bytes:
++                raise ValueError("rebuild sources changed while deriving the plan")
++            dependencies(retention[0])
++            coverage_identity(coverage_manifest, inputs, tuple(inputs["security_ids"]), mode)
++            if coverage_manifest.canonical_bytes() != coverage_raw:
++                raise ValueError("rebuild coverage changed while deriving the plan")
++            checkpoint.recheck()
++            return plan
++
++    return plan_rebuild
++
++
++FormalFinalRunRepository.plan_rebuild = _install_rebuild_planner(FormalFinalRunRepository)
++del _install_rebuild_planner
++
+ _prepare_publication, _publication_controls, _register_publication_owner = _bind_repository_writer(FormalFinalRunRepository)
+ 
+ __all__ = ["FormalFinalRunRepository", "FormalFinalRunReceipt", "FormalFinalRunSnapshot"]
+diff --git a/tests/test_formal_final_invalidation.py b/tests/test_formal_final_invalidation.py
+new file mode 100644
+index 0000000..c0e8575
+--- /dev/null
++++ b/tests/test_formal_final_invalidation.py
+@@ -0,0 +1,304 @@
++"""Manifest differences are data; only the repository authenticates reuse inputs."""
++
++import copy
++import inspect
++import unittest
++from unittest.mock import patch
++
++from ashare_pipeline.formal_final_invalidation import FormalRebuildPlan, _derive_plan
++from ashare_pipeline.formal_final_repository import FormalFinalRunRepository
++
++
++IDS = ("BJ430001", "SH600000", "SZ000001")
++MID = "M.quality"
++VMID = "V.normalized_earnings_yield"
++
++
++def manifests():
++    """Detached canonical producer vocabulary for the non-authoritative diff core."""
++    common = dict(registry_manifest_hash="root", frozen_input_hash="frozen",
++        universe_hash="universe", population_hash="population", as_of_utc="2026-08-31T07:00:00+00:00",
++        scoring_registry_hash="scoring", policy_contract_hash="policy", valuation_adapter_registry_hash="adapter",
++        base_batch_hash="base", policy_batch_hash="policy-batch", valuation_batch_hash="valuation")
++    entries = []
++    for sid in IDS:
++        context = dict(scope="template_secondary_industry", peer_security_ids=list(IDS[:2] if sid != IDS[2] else IDS[2:]),
++            metric_id=MID, definition_hash="definition", direction="higher", cohort_hash="cohort")
++        entries.append(dict(common, security_id=sid, template_id="industrial",
++            primary_industry="primary", secondary_industry="same" if sid != IDS[2] else "other",
++            status="ready", reasons=[], entry_hash="entry-" + sid,
++            policy_result=dict(dimension_caps={}, pool_prohibitions=[], states={}, normalization_basis=[],
++                pending_requirements=[], evidence_state="complete", decisions=[], result_hash="result-" + sid),
++            slots={MID: dict(metric_id=MID, value="50", evidence_refs=[{"content_sha256": "source-" + sid}],
++                metric_score=dict(raw_value="10", percentile="50", average_rank="1", peer_context=context)),
++                VMID: dict(metric_id=VMID, value="50", valuation_input=dict(adjusted_value="10", status="adjusted"),
++                    valuation_context=dict(context, metric_id=VMID),
++                    valuation_score=dict(adjusted_value="10", percentile="50", average_rank="1"))},
++            confidence_cap=None, consensus_context={"content_sha256": "consensus-" + sid}))
++    inputs = dict(common, security_ids=list(IDS), inputs=entries, batch_hash="inputs")
++    coverage = dict(rows=[dict(security_id=sid, domain="financial", selector_hash="selector",
++        period_or_window="2025", exchange=sid[:2], frozen_input_hash="frozen",
++        coverage_class="verified_complete", content_sha256="coverage-" + sid) for sid in IDS])
++    identity = dict(mode="test_preview", code_version="code", contract_version="formal-final-v1",
++        registry_manifest_hash="root", frozen_input_hash="frozen", universe_hash="universe",
++        as_of_utc=common["as_of_utc"], coverage_manifest_hash="coverage", score_input_batch_hash="input")
++    return inputs, coverage, identity
++
++
++def dependencies(inputs):
++    """Task 9's persisted hash-path vocabulary, without live-proof authority."""
++    result = []
++    def walk(value, path, sid):
++        if isinstance(value, dict):
++            for key, child in value.items():
++                if key.endswith(("_hash", "_sha256")) and isinstance(child, str) and child:
++                    result.append(dict(security_id=sid, source_kind=key, source_id=path + "." + key,
++                        source_hash=child, effect_scope="global" if sid is None else "security",
++                        dependent_key="run" if sid is None else sid))
++                elif isinstance(child, (dict, list)):
++                    walk(child, path + "." + key, sid)
++        elif isinstance(value, list):
++            for index, child in enumerate(value):
++                walk(child, path + "." + str(index), sid)
++    walk({k: v for k, v in inputs.items() if k != "inputs"}, "batch", None)
++    for entry in inputs["inputs"]:
++        walk(entry, "input." + entry["security_id"], entry["security_id"])
++    return result
++
++
++class FormalInvalidationScopeTests(unittest.TestCase):
++    def setUp(self):
++        self.old, self.coverage, self.identity = manifests()
++        self.new = copy.deepcopy(self.old)
++        self.new_coverage = copy.deepcopy(self.coverage)
++        self.new_identity = dict(self.identity)
++
++    def plan(self):
++        return _derive_plan(prior_inputs=self.old, current_inputs=self.new,
++            prior_coverage=self.coverage, current_coverage=self.new_coverage,
++            prior_dependencies=dependencies(self.old), prior_identity=self.identity,
++            current_identity=self.new_identity)
++
++    def test_single_non_peer_evidence_change_rebuilds_one_security_and_rescans_pools(self):
++        self.new["inputs"][0]["consensus_context"]["content_sha256"] = "correction"
++        plan = self.plan()
++        self.assertIsInstance(plan, FormalRebuildPlan)
++        self.assertFalse(plan.full_rebuild)
++        self.assertEqual(plan.direct_security_ids, IDS[:1])
++        self.assertEqual(plan.expanded_security_ids, IDS[:1])
++        self.assertEqual(plan.d1_rebuild_ids, IDS[:1])
++        self.assertEqual(plan.d2_rebuild_ids, IDS[:1])
++        self.assertEqual(plan.eligibility_rebuild_ids, IDS[:1])
++        self.assertTrue(plan.rescan_pools)
++        self.assertEqual(plan.effect_scopes, ("pool", "security"))
++
++    def test_peer_or_v_change_expands_to_complete_cohort(self):
++        for mid in (MID, VMID):
++            with self.subTest(mid=mid):
++                self.new = copy.deepcopy(self.old)
++                slot = self.new["inputs"][0]["slots"][mid]
++                if mid == MID:
++                    slot["metric_score"]["raw_value"] = "11"
++                else:
++                    slot["valuation_input"]["adjusted_value"] = "11"
++                plan = self.plan()
++                self.assertFalse(plan.full_rebuild)
++                self.assertEqual(plan.direct_security_ids, IDS[:1])
++                self.assertEqual(plan.expanded_security_ids, IDS[:2])
++                self.assertEqual(plan.d2_rebuild_ids, IDS[:2])
++                self.assertTrue(plan.rescan_pools)
++                self.assertTrue(plan.cohort_keys)
++                self.assertIn("cohort", plan.effect_scopes)
++
++    def test_policy_cap_prohibition_pending_and_normalization_have_distinct_effects(self):
++        cases = (("dimension_caps", {"T": "55"}, IDS[:1], IDS[:1]),
++            ("pool_prohibitions", ["strong"], IDS[:1], ()),
++            ("pending_requirements", [{"code": "missing"}], IDS[:1], IDS[:1]),
++            ("normalization_basis", [{"normalized_profit": "20"}], IDS[:2], IDS[:2]))
++        for key, value, expanded, d2 in cases:
++            with self.subTest(key=key):
++                self.new = copy.deepcopy(self.old)
++                self.new["inputs"][0]["policy_result"][key] = value
++                plan = self.plan()
++                self.assertFalse(plan.full_rebuild)
++                self.assertEqual(plan.expanded_security_ids, expanded)
++                self.assertEqual(plan.d1_rebuild_ids, expanded)
++                self.assertEqual(plan.d2_rebuild_ids, d2)
++                self.assertEqual(plan.eligibility_rebuild_ids, expanded)
++                self.assertTrue(plan.rescan_pools)
++
++    def test_universe_industry_registry_frozen_or_contract_change_forces_full_rebuild(self):
++        for key in ("universe_hash", "registry_manifest_hash", "frozen_input_hash",
++                "policy_contract_hash", "population_hash", "secondary_industry", "contract_version"):
++            with self.subTest(key=key):
++                self.new = copy.deepcopy(self.old)
++                self.new_identity = dict(self.identity)
++                target = self.new_identity if key == "contract_version" else (
++                    self.new["inputs"][0] if key == "secondary_industry" else self.new)
++                target[key] = "changed"
++                plan = self.plan()
++                self.assertTrue(plan.full_rebuild)
++                self.assertEqual(plan.d1_rebuild_ids, IDS)
++                self.assertEqual(plan.d2_rebuild_ids, IDS)
++                self.assertEqual(plan.eligibility_rebuild_ids, IDS)
++                self.assertTrue(plan.rescan_pools)
++
++    def test_diagnostic_timing_or_display_change_does_not_rebuild(self):
++        self.new_coverage["diagnostics"] = {"timing_ms": 100}
++        self.new_coverage["rows"][0]["rechecked_at_utc"] = "later"
++        self.new["inputs"][0]["display"] = {"precision": 2}
++        plan = self.plan()
++        self.assertFalse(plan.full_rebuild)
++        self.assertFalse(plan.rescan_pools)
++        self.assertEqual(plan.expanded_security_ids, ())
++        self.assertEqual(plan.d1_rebuild_ids, ())
++
++    def test_caller_supplied_changed_ids_are_not_an_api_or_authority(self):
++        signature = inspect.signature(FormalFinalRunRepository.plan_rebuild)
++        self.assertNotIn("changed_ids", signature.parameters)
++        self.assertNotIn("changed_security_ids", signature.parameters)
++        with self.assertRaises(TypeError):
++            FormalFinalRunRepository.plan_rebuild(None, changed_ids=[IDS[0]])
++        with self.assertRaises(ValueError):
++            _derive_plan(prior_inputs=self.old, current_inputs=self.new,
++                prior_coverage=self.coverage, current_coverage=self.new_coverage,
++                prior_dependencies=[dict(dependencies(self.old)[0], effect_scope="policy")],
++                prior_identity=self.identity, current_identity=self.new_identity)
++
++    def test_unlocalizable_pending_aggregate_change_forces_explicit_full_rebuild(self):
++        self.old["inputs"][0]["slots"] = {}
++        self.old["inputs"][0]["status"] = "pending_evidence"
++        self.new = copy.deepcopy(self.old)
++        self.new["base_batch_hash"] = "corrected-but-not-localizable"
++        plan = self.plan()
++        self.assertTrue(plan.full_rebuild)
++        self.assertIn("unlocalizable_upstream_change", plan.reason_codes)
++
++    def test_batch_hash_churn_does_not_expand_localized_evidence(self):
++        self.new["inputs"][0]["consensus_context"]["content_sha256"] = "correction"
++        self.new["base_batch_hash"] = "corrected"
++        for row in self.new["inputs"]:
++            row["base_batch_hash"] = "corrected"
++            row["entry_hash"] += "-new"
++        self.assertEqual(self.plan().expanded_security_ids, IDS[:1])
++
++    def test_local_policy_change_cannot_hide_unlocalizable_base_change(self):
++        self.new["inputs"][0]["policy_result"]["dimension_caps"] = {"T": "55"}
++        self.new["base_batch_hash"] = "unrelated-correction"
++        plan = self.plan()
++        self.assertTrue(plan.full_rebuild)
++        self.assertIn("unlocalizable_upstream_change", plan.reason_codes)
++
++    def test_nested_industry_manifest_change_forces_full_rebuild(self):
++        self.old["inputs"][0]["slots"][VMID]["valuation_input"]["industry_batch_hash"] = "old-industry"
++        self.new = copy.deepcopy(self.old)
++        self.new["inputs"][0]["slots"][VMID]["valuation_input"]["industry_batch_hash"] = "new-industry"
++        self.assertTrue(self.plan().full_rebuild)
++
++    def test_policy_copy_inside_valuation_input_does_not_turn_cap_into_cohort_change(self):
++        for row in self.old["inputs"]:
++            row["slots"][VMID]["valuation_input"]["policy_result"] = copy.deepcopy(row["policy_result"])
++        self.new = copy.deepcopy(self.old)
++        row = self.new["inputs"][0]
++        row["policy_result"]["dimension_caps"] = {"T": "55"}
++        row["slots"][VMID]["valuation_input"]["policy_result"] = copy.deepcopy(row["policy_result"])
++        plan = self.plan()
++        self.assertEqual(plan.expanded_security_ids, IDS[:1])
++        self.assertEqual(plan.cohort_keys, ())
++
++    def test_universe_departure_is_diagnostic_but_never_a_current_rebuild_target(self):
++        self.new["inputs"] = self.new["inputs"][:2]
++        self.new["security_ids"] = list(IDS[:2])
++        self.new_coverage["rows"] = self.new_coverage["rows"][:2]
++        plan = self.plan()
++        self.assertTrue(plan.full_rebuild)
++        self.assertIn(IDS[2], plan.direct_security_ids)
++        self.assertEqual(plan.d1_rebuild_ids, IDS[:2])
++        self.assertEqual(plan.d2_rebuild_ids, IDS[:2])
++        self.assertEqual(plan.eligibility_rebuild_ids, IDS[:2])
++
++    def test_newly_eligible_peer_rebuilds_old_and_new_cohort_consumers(self):
++        self.old["inputs"][0]["slots"][MID]["metric_score"]["peer_context"]["peer_security_ids"] = [IDS[1]]
++        self.new = copy.deepcopy(self.old)
++        self.new["inputs"][0]["slots"][MID]["metric_score"]["raw_value"] = "11"
++        self.new["inputs"][1]["slots"][MID]["metric_score"]["peer_context"]["peer_security_ids"] = list(IDS[:2])
++        self.assertEqual(self.plan().expanded_security_ids, IDS[:2])
++
++
++class FormalInvalidationRepositoryTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        from tests.test_formal_final_repository import minimal_batches
++        cls.fixture, cls.batches = minimal_batches()
++
++    def setUp(self):
++        self.repository = FormalFinalRunRepository(self.fixture.store, code_version="task10-test")
++        self.receipt = self.repository.commit_complete_run(**self.batches)
++        self.arguments = dict(prior_run_id=self.receipt.run_id,
++            prior_input_manifest_hash=self.receipt.input_manifest_hash,
++            input_batch=self.batches["input_batch"], coverage_manifest=self.batches["coverage_manifest"])
++
++    def test_restart_selects_prior_exact_manifest_not_later_correction(self):
++        from ashare_pipeline.formal_coverage_manifest import CoverageRequirement, FormalCoverageAuditor
++        requirements = [CoverageRequirement(self.fixture.frozen.frozen_input_hash, sid,
++            "financial", "selector", "2025", sid[:2], ("CNY",)) for sid in IDS]
++        correction = FormalCoverageAuditor().audit(requirements)
++        later = self.repository.commit_complete_run(**dict(self.batches, coverage_manifest=correction))
++        self.assertNotEqual(later.input_manifest_hash, self.receipt.input_manifest_hash)
++        restarted = FormalFinalRunRepository(self.fixture.store, code_version="task10-test")
++        plan = restarted.plan_rebuild(**dict(self.arguments, coverage_manifest=correction))
++        self.assertEqual(plan.prior_manifest_hash, self.receipt.input_manifest_hash)
++        self.assertEqual(plan.current_manifest_hash, later.input_manifest_hash)
++        self.assertTrue(plan.rescan_pools)
++        with self.assertRaises(ValueError):
++            restarted.plan_rebuild(**dict(self.arguments, prior_input_manifest_hash=later.input_manifest_hash))
++
++    def test_old_run_bytes_never_change_after_new_rebuild(self):
++        before = self.repository.get_run(self.receipt.run_id)
++        plan = self.repository.plan_rebuild(**self.arguments)
++        self.assertFalse(plan.rescan_pools)
++        self.assertEqual(plan.prior_manifest_hash, plan.current_manifest_hash)
++        later = self.repository.commit_complete_run(**self.batches)
++        self.assertNotEqual(later.run_id, before.run_id)
++        self.assertEqual(self.repository.get_run(before.run_id), before)
++
++    def test_reuse_requires_current_hash_and_capability_revalidation(self):
++        import ashare_pipeline.formal_final_repository as module
++        from ashare_pipeline.formal_coverage_manifest import CoverageRequirement, FormalCoverageAuditor
++        self.assertFalse(self.repository.plan_rebuild(**self.arguments).rescan_pools)
++        for key in ("input_batch", "coverage_manifest"):
++            proof = self.arguments[key]
++            for fake in (proof.to_dict(), object.__new__(type(proof))):
++                with self.subTest(key=key), self.assertRaises((ValueError, TypeError)):
++                    self.repository.plan_rebuild(**dict(self.arguments, **{key: fake}))
++        r = CoverageRequirement(self.fixture.frozen.frozen_input_hash, IDS[0], "financial", "selector", "2025", "BJ")
++        revoked = FormalCoverageAuditor().audit([r])
++        FormalCoverageAuditor.revoke(revoked)
++        with self.assertRaises(ValueError):
++            self.repository.plan_rebuild(**dict(self.arguments, coverage_manifest=revoked))
++        prepared = []
++        original_prepare = module._prepare_publication
++        def observe(**kwargs):
++            publication = original_prepare(**kwargs)
++            prepared.append(publication)
++            return publication
++        with patch.object(module, "_prepare_publication", observe), patch.object(
++                module, "_insert_rows", side_effect=RuntimeError("injected write failure")):
++            with self.assertRaises(RuntimeError):
++                self.repository.commit_complete_run(**self.batches)
++        with self.assertRaises(ValueError):
++            self.repository.plan_rebuild(**dict(self.arguments, input_batch=prepared[0].batches[0]))
++        # Actual persisted source mutation must fail even though D1 bytes stay sealed.
++        with self.fixture.store._transaction() as connection:
++            row = connection.execute("SELECT id,content_sha256 FROM formal_source_snapshot LIMIT 1").fetchone()
++            connection.execute("UPDATE formal_source_snapshot SET content_sha256=? WHERE id=?", ("0" * 64, row[0]))
++        try:
++            with self.assertRaises(ValueError):
++                self.repository.plan_rebuild(**self.arguments)
++        finally:
++            with self.fixture.store._transaction() as connection:
++                connection.execute("UPDATE formal_source_snapshot SET content_sha256=? WHERE id=?", (row[1], row[0]))
++
++
++if __name__ == "__main__":
++    unittest.main()

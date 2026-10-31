@@ -1,0 +1,809 @@
+# Review package: 2fa7e62a32d612f241356f08277fd97ba7516d6f..3916065333df1a7c2686185c5d1f0dbde7b75915
+
+## Commits
+3916065 feat: calculate capped formal scorecards
+
+## Files changed
+ ashare_pipeline/formal_final_scoring.py   | 423 ++++++++++++++++++++++++++++++
+ tests/test_formal_final_scoring.py        | 224 ++++++++++++++++
+ tests/test_formal_final_scoring_guards.py | 132 ++++++++++
+ 3 files changed, 779 insertions(+)
+
+## Diff
+diff --git a/ashare_pipeline/formal_final_scoring.py b/ashare_pipeline/formal_final_scoring.py
+new file mode 100644
+index 0000000..8cf4e42
+--- /dev/null
++++ b/ashare_pipeline/formal_final_scoring.py
+@@ -0,0 +1,423 @@
++"""Authenticated final scorecards from complete policy-adjusted D1 inputs."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import weakref
++from decimal import Decimal, InvalidOperation, localcontext
++from types import MappingProxyType
++
++from . import formal_final_score_inputs as input_module
++from . import formal_scoring as scoring_module
++from .formal_final_score_inputs import PolicyAdjustedScoreInput, PolicyAdjustedScoreInputBatch
++from .formal_scoring import (
++    _arithmetic_context, _calculate_untrusted_arithmetic,
++    _calculate_untrusted_confidence, _canonical, _digest, _freeze,
++    grade_for_score,
++)
++
++
++_DIMENSION_WEIGHTS = (
++    ("G", Decimal("0.18")), ("V", Decimal("0.18")),
++    ("M", Decimal("0.18")), ("EQ", Decimal("0.12")),
++    ("FS", Decimal("0.08")), ("CA", Decimal("0.16")),
++    ("T", Decimal("0.10")),
++)
++_DIMENSION_COUNTS = MappingProxyType({
++    "G": 4, "V": 3, "M": 3, "EQ": 4, "FS": 3, "CA": 4, "T": 4,
++})
++_RISK_IDS = (
++    "M.return_persistence", "M.margin_persistence",
++    "CA.shareholder_return_and_dilution", "CA.capital_discipline",
++)
++_V_IDS = (
++    "V.enterprise_value_or_sustainable_roe", "V.normalized_earnings_yield",
++    "V.normalized_free_cash_flow_yield",
++)
++
++
++def _number(value, label, *, maximum=Decimal("100")):
++    """Parse one canonical, bounded Decimal without consulting ambient context."""
++    if type(value) is not str:
++        raise ValueError(f"{label} requires canonical decimal text")
++    try:
++        result = Decimal(value)
++    except (InvalidOperation, ValueError) as exc:
++        raise ValueError(f"{label} requires finite decimal text") from exc
++    if (not result.is_finite() or result < 0 or result > maximum
++            or abs(result.as_tuple().exponent) > 100
++            or len(result.as_tuple().digits) > 50):
++        raise ValueError(f"{label} is outside finite bounded decimal range")
++    return result
++
++
++def _cap_trace(wire, *, _decimal=_number, _weights=_DIMENSION_WEIGHTS):
++    result = wire.get("policy_result")
++    if type(result) is not dict or type(result.get("dimension_caps")) is not dict:
++        raise ValueError("final score requires a policy result and exact cap summary")
++    known = frozenset(key for key, _ in _weights)
++    summary = {}
++    for dimension, maximum in result["dimension_caps"].items():
++        if type(dimension) is not str or dimension not in known:
++            raise ValueError("unknown final score cap dimension")
++        summary[dimension] = _decimal(maximum, dimension + " cap")
++    decisions = result.get("decisions")
++    if type(decisions) is not list:
++        raise ValueError("final score policy decisions must be canonical entries")
++    derived, trace = {}, []
++    for decision in decisions:
++        if type(decision) is not dict or type(decision.get("proven_effects")) is not list:
++            raise ValueError("final score policy decision is malformed")
++        if decision.get("security_id") != wire.get("security_id"):
++            raise ValueError("final score cap decision belongs to another security")
++        for effect in decision["proven_effects"]:
++            if type(effect) is not dict:
++                raise ValueError("final score proven effect is malformed")
++            if effect.get("kind") != "dimension_cap":
++                continue
++            dimension = effect.get("dimension")
++            if type(dimension) is not str or dimension not in known:
++                raise ValueError("unknown final score cap dimension")
++            limit = _decimal(effect.get("maximum"), dimension + " cap effect")
++            derived[dimension] = min(derived.get(dimension, limit), limit)
++            item = {key: decision[key] for key in (
++                "rule_id", "role", "semantic_id", "template_id", "security_id",
++                "definition_hash", "decision_hash", "trace",
++            )}
++            item["effect"] = effect
++            trace.append(item)
++    if summary != derived:
++        raise ValueError("final score cap summary differs from proven decisions")
++    return summary, trace
++
++
++def _calculate_untrusted_final(wire, *, _context=_arithmetic_context,
++                               _confidence=_calculate_untrusted_confidence,
++                               _arithmetic=_calculate_untrusted_arithmetic,
++                               _grade=grade_for_score, _caps=_cap_trace,
++                               _decimal=_number, _weights=_DIMENSION_WEIGHTS,
++                               _counts=_DIMENSION_COUNTS, _risk_ids=_RISK_IDS,
++                               _v_ids=_V_IDS):
++    """Calculate detached final arithmetic; this helper grants no proof."""
++    if type(wire) is not dict or wire.get("schema_version") != "policy-adjusted-score-input-v1":
++        raise ValueError("final arithmetic requires a detached D1 entry wire")
++    if wire.get("status") != "ready" or wire.get("reasons") != []:
++        raise ValueError("pending D1 entry cannot produce a scorecard")
++    slots = wire.get("slots")
++    if type(slots) is not dict or len(slots) != 25:
++        raise ValueError("final score requires exactly 25 final slots")
++    if sum(slot.get("evidence_kind") == "policy_adjusted_valuation"
++           for slot in slots.values() if type(slot) is dict) != 3:
++        raise ValueError("final score requires exactly three Stage C valuation slots")
++    raw, numerators, qualities = {}, {}, {}
++    with localcontext(_context()):
++        for dimension, dimension_weight in _weights:
++            mids = tuple(mid for mid in slots if mid.startswith(dimension + "."))
++            if len(mids) != _counts[dimension]:
++                raise ValueError("final score dimension lacks its signed slots")
++            internal_total = Decimal("0")
++            dimension_total = Decimal("0")
++            for mid in mids:
++                slot = slots[mid]
++                if type(slot) is not dict or slot.get("metric_id") != mid:
++                    raise ValueError("final score slot identity is malformed")
++                definition = slot.get("definition")
++                if type(definition) is not dict or type(definition.get("definition")) is not dict:
++                    raise ValueError("final score signed slot definition is missing")
++                bound = definition["definition"]
++                if (definition.get("metric_id") != mid
++                        or definition.get("template_id") != wire.get("template_id")
++                        or bound.get("dimension") != dimension
++                        or dimension + "." + str(bound.get("metric_id")) != mid):
++                    raise ValueError("final score slot differs from signed definition")
++                internal = _decimal(slot.get("internal_weight"), mid + " internal weight",
++                    maximum=Decimal("1"))
++                if (internal != _decimal(bound.get("internal_weight"), mid + " signed weight",
++                        maximum=Decimal("1"))
++                        or _decimal(slot.get("dimension_weight"), mid + " dimension weight",
++                            maximum=Decimal("1")) != dimension_weight):
++                    raise ValueError("final score slot weights differ from signed definition")
++                value = _decimal(slot.get("value"), mid + " value")
++                quality = _decimal(slot.get("temporal_quality"), mid + " temporal quality",
++                    maximum=Decimal("1"))
++                if mid in _v_ids and slot.get("evidence_kind") != "policy_adjusted_valuation":
++                    raise ValueError("final score V slot lacks Stage C provenance")
++                if mid not in _v_ids and slot.get("evidence_kind") == "policy_adjusted_valuation":
++                    raise ValueError("Stage C valuation provenance appears outside V")
++                internal_total += internal
++                dimension_total += internal * value
++                numerators[mid] = dimension_weight * internal
++                qualities[mid] = quality
++            if internal_total != Decimal("1"):
++                raise ValueError("final score dimension internal weights do not total one")
++            raw[dimension] = dimension_total
++        if len(numerators) != 25 or set(numerators) != set(slots):
++            raise ValueError("final score slot membership is incomplete")
++        denominator = sum(numerators.values(), Decimal("0"))
++        if denominator != Decimal("1"):
++            raise ValueError("final score global signed weights do not total one")
++        weights = {mid: value / denominator for mid, value in numerators.items()}
++        cap_summary, cap_trace = _caps(wire)
++        dimensions = {dimension: min(raw[dimension], cap_summary[dimension])
++            if dimension in cap_summary else raw[dimension] for dimension, _ in _weights}
++    neutral = tuple(mid for mid, slot in slots.items()
++        if slot["evidence_kind"] == "registered_consensus_no_coverage")
++    confidence_cap = wire.get("confidence_cap")
++    if (confidence_cap is None and neutral
++            or confidence_cap is not None and (neutral != ("T.expectation_change",)
++                or _decimal(confidence_cap, "confidence cap", maximum=Decimal("1")) != Decimal("0.90"))):
++        raise ValueError("final score confidence cap differs from neutral consensus slot")
++    confidence = _confidence(weights, qualities,
++        continuous_fy_count=wire.get("continuous_fy_count"),
++        confidence_cap=None if confidence_cap is None else Decimal("0.90"))
++    risk_values = {mid: _decimal(slots[mid]["value"], mid + " risk value") for mid in _risk_ids}
++    arithmetic = _arithmetic(
++        dimensions=dimensions, confidence=confidence["C"], metric_values=risk_values)
++    result = dict(raw_dimensions=raw, dimension_caps=cap_summary,
++        cap_trace=cap_trace, dimensions=dimensions,
++        dimension_grades={key: _grade(value) for key, value in dimensions.items()},
++        global_slot_weights=weights, confidence=confidence, risk_metric_values=risk_values,
++        **arithmetic)
++    for key in ("S0", "Sc", "Sbase", "B", "M_persistence", "CA_downside", "R_safety"):
++        result[key + "_grade"] = _grade(result[key])
++    return result
++
++
++def _install_final_scoring():
++    proofs = {}
++    source_batch_type, source_row_type = PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput
++    source_batch_verify = source_batch_type.require_verified
++    source_batch_bytes = source_batch_type.canonical_bytes
++    source_input_for = source_batch_type.input_for
++    source_row_verify = source_row_type.require_verified
++    source_row_bytes = source_row_type.canonical_bytes
++    source_row_wire = source_row_type.to_dict
++    helpers = (_arithmetic_context, _calculate_untrusted_arithmetic,
++        _calculate_untrusted_confidence, grade_for_score, _canonical, _digest, _freeze,
++        _calculate_untrusted_final)
++    core = _calculate_untrusted_final
++    core_defaults = dict(core.__kwdefaults__)
++    cap_defaults = dict(_cap_trace.__kwdefaults__)
++    constants = (_DIMENSION_WEIGHTS, _DIMENSION_COUNTS, _RISK_IDS, _V_IDS)
++    owner = globals()
++    input_owner = vars(input_module)
++    scoring_owner = vars(scoring_module)
++    encode, digest, freeze = _canonical, _digest, _freeze
++    sha256, decode, reference = hashlib.sha256, json.loads, weakref.ref
++
++    def dependencies():
++        if (owner.get("PolicyAdjustedScoreInputBatch") is not source_batch_type
++                or owner.get("PolicyAdjustedScoreInput") is not source_row_type
++                or input_owner.get("PolicyAdjustedScoreInputBatch") is not source_batch_type
++                or input_owner.get("PolicyAdjustedScoreInput") is not source_row_type
++                or any(owner.get(name) is not value for name, value in zip((
++                    "_arithmetic_context", "_calculate_untrusted_arithmetic",
++                    "_calculate_untrusted_confidence", "grade_for_score", "_canonical",
++                    "_digest", "_freeze", "_calculate_untrusted_final"), helpers, strict=True))
++                or any(scoring_owner.get(name) is not value for name, value in zip((
++                    "_arithmetic_context", "_calculate_untrusted_arithmetic",
++                    "_calculate_untrusted_confidence", "grade_for_score", "_canonical",
++                    "_digest", "_freeze"), helpers[:7], strict=True))
++                or source_batch_type.require_verified is not source_batch_verify
++                or source_batch_type.canonical_bytes is not source_batch_bytes
++                or source_batch_type.input_for is not source_input_for
++                or source_row_type.require_verified is not source_row_verify
++                or source_row_type.canonical_bytes is not source_row_bytes
++                or source_row_type.to_dict is not source_row_wire
++                or core.__kwdefaults__ != core_defaults
++                or _cap_trace.__kwdefaults__ != cap_defaults
++                or (_DIMENSION_WEIGHTS, _DIMENSION_COUNTS, _RISK_IDS, _V_IDS) != constants
++                or any(tuple(vars(cls).items()) != members for cls, members in own_members)):
++            raise ValueError("final score authority dependency changed")
++
++    def verify_source(batch):
++        dependencies()
++        if type(batch) is not source_batch_type:
++            raise ValueError("final scoring requires a genuine PolicyAdjustedScoreInputBatch")
++        source_batch_verify(batch)
++        raw = source_batch_bytes(batch)
++        if type(raw) is not bytes:
++            raise ValueError("final score source batch canonical bytes are invalid")
++        return raw
++
++    def record(proof, cls):
++        dependencies()
++        saved = proofs.get(id(proof))
++        if (type(proof) is not cls or saved is None or saved[0]() is not proof
++                or saved[5] is not cls):
++            raise ValueError("final score proof is forged, copied or unregistered")
++        source_batch, source_bytes, source_row, row_bytes = saved[3], saved[4][0], saved[4][1], saved[4][2]
++        if verify_source(source_batch) != source_bytes:
++            raise ValueError("final score source batch has changed or been revoked")
++        if source_row is not None:
++            source_row_verify(source_row)
++            if source_row_bytes(source_row) != row_bytes:
++                raise ValueError("final score source row has changed or been revoked")
++            if source_input_for(source_batch, saved[1]["security_id"]) is not source_row:
++                raise ValueError("final score source row belongs to another batch")
++        return saved
++
++    class SealedMeta(type):
++        def __setattr__(cls, name, value):
++            raise TypeError("final score proof types are immutable")
++
++        def __delattr__(cls, name):
++            raise TypeError("final score proof types are immutable")
++
++    open_subclass = [True]
++
++    class Proof(metaclass=SealedMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init_subclass__(cls, **kwargs):
++            if not open_subclass[0]:
++                raise TypeError("final score proof types cannot be inherited")
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("final score proofs require a verified D1 batch")
++
++        def __getattribute__(self, name):
++            record(self, type(self))
++            return object.__getattribute__(self, name)
++
++        def __getattr__(self, name):
++            data = record(self, type(self))[1]
++            if name not in data:
++                raise AttributeError(name)
++            return data[name]
++
++        def require_verified(self):
++            record(self, type(self))
++
++        def canonical_bytes(self):
++            return record(self, type(self))[2]
++
++        def to_dict(self):
++            return decode(record(self, type(self))[2])
++
++        def __copy__(self):
++            raise TypeError("final score proofs cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("final score proofs cannot be copied")
++
++        def __reduce_ex__(self, protocol):
++            raise TypeError("final score proofs cannot be reconstructed")
++
++    class FinalScoreCard(Proof):
++        __slots__ = ()
++
++    class FinalScoreCardBatch(Proof):
++        __slots__ = ()
++
++        def card_for(self, security_id):
++            saved = record(self, FinalScoreCardBatch)
++            if type(security_id) is not str or security_id not in saved[6]:
++                raise ValueError("final score selector is outside the canonical universe")
++            card = saved[6][security_id]
++            if card is not None:
++                card_state = record(card, FinalScoreCard)
++                if (card_state[3] is not saved[3]
++                        or card_state[1]["security_id"] != security_id
++                        or card_state[1]["score_batch_hash"] != saved[1]["batch_hash"]):
++                    raise ValueError("final score card belongs to another batch")
++            return card
++
++        def pending_for(self, security_id):
++            saved = record(self, FinalScoreCardBatch)
++            if type(security_id) is not str or security_id not in saved[6]:
++                raise ValueError("final score selector is outside the canonical universe")
++            return saved[7].get(security_id)
++
++    open_subclass[0] = False
++
++    def mint(cls, payload, source_batch, source_bytes, source_row=None, row_bytes=None,
++             *, cards=None, pending=None):
++        result = object.__new__(cls)
++        key = id(result)
++        data = dict(payload)
++        if cards is not None:
++            data["cards"] = tuple(card for card in cards.values() if card is not None)
++        proofs[key] = (reference(result, lambda _: proofs.pop(key, None)), freeze(data),
++            encode(payload), source_batch, (source_bytes, source_row, row_bytes), cls,
++            MappingProxyType(cards or {}), MappingProxyType(pending or {}))
++        return result
++
++    def build(inputs):
++        source_bytes = verify_source(inputs)
++        security_ids = tuple(inputs.security_ids)
++        if len(security_ids) != len(set(security_ids)) or security_ids != tuple(sorted(security_ids)):
++            raise ValueError("final score D1 universe is not canonical")
++        rows, row_proofs, pending = [], {}, {}
++        for sid in security_ids:
++            row = source_input_for(inputs, sid)
++            if type(row) is not source_row_type:
++                raise ValueError("final score requires genuine D1 entries")
++            source_row_verify(row)
++            row_bytes = source_row_bytes(row)
++            wire = source_row_wire(row)
++            if (wire.get("security_id") != sid or wire.get("batch_hash") != inputs.batch_hash
++                    or encode(wire) != row_bytes):
++                raise ValueError("final score D1 row binding changed")
++            if wire.get("status") == "pending_evidence":
++                if not wire.get("reasons"):
++                    raise ValueError("pending D1 row has no reasons")
++                pending[sid] = freeze(dict(security_id=sid, reasons=tuple(wire["reasons"]),
++                    base_pending_reasons=tuple(wire["base_pending_reasons"]),
++                    policy_pending_requirements=wire["policy_pending_requirements"],
++                    valuation_pending_reasons=wire["valuation_pending_reasons"],
++                    source_entry_hash=wire["entry_hash"]))
++                row_proofs[sid] = None
++                continue
++            if wire.get("status") != "ready":
++                raise ValueError("final score D1 row has unknown status")
++            calculation = core(wire)
++            provenance = {key: value for key, value in wire.items()
++                if key.endswith("_hash") or key.endswith("_sha256")}
++            payload = dict(schema_version="formal-final-score-card-v1",
++                calculation_stage="policy_final", policy_final=True,
++                security_id=sid, template_id=wire["template_id"],
++                primary_industry=wire["primary_industry"],
++                secondary_industry=wire["secondary_industry"],
++                as_of_utc=wire["as_of_utc"], source_input=wire,
++                **provenance, **calculation)
++            payload.update(source_entry_hash=wire["entry_hash"],
++                source_batch_hash=inputs.batch_hash,
++                source_canonical_sha256=sha256(row_bytes).hexdigest())
++            payload["card_hash"] = digest(payload)
++            rows.append(payload)
++            row_proofs[sid] = (payload, row, row_bytes)
++        common = {key: value for key, value in inputs.to_dict().items()
++            if key.endswith("_hash") or key.endswith("_sha256")}
++        batch_payload = dict(schema_version="formal-final-score-card-batch-v1",
++            security_ids=security_ids, source_batch_hash=inputs.batch_hash,
++            source_canonical_sha256=sha256(source_bytes).hexdigest(),
++            cards=rows, pending={sid: dict(item) for sid, item in pending.items()},
++            **common)
++        batch_payload["batch_hash"] = digest(batch_payload)
++        cards = {}
++        for sid, saved in row_proofs.items():
++            if saved is None:
++                cards[sid] = None
++            else:
++                payload, row, row_bytes = saved
++                cards[sid] = mint(FinalScoreCard,
++                    dict(payload, score_batch_hash=batch_payload["batch_hash"]),
++                    inputs, source_bytes, row, row_bytes)
++        result = mint(FinalScoreCardBatch, batch_payload, inputs, source_bytes,
++            cards=cards, pending=pending)
++        verify_source(inputs)
++        if source_batch_bytes(inputs) != source_bytes:
++            raise ValueError("final score D1 batch changed during calculation")
++        return result
++
++    own_members = tuple((cls, tuple(vars(cls).items())) for cls in
++        (Proof, FinalScoreCard, FinalScoreCardBatch))
++    return FinalScoreCard, FinalScoreCardBatch, build
++
++
++FinalScoreCard, FinalScoreCardBatch, build_final_score_card_batch = _install_final_scoring()
++del _install_final_scoring
++
++__all__ = ["FinalScoreCard", "FinalScoreCardBatch", "build_final_score_card_batch"]
+diff --git a/tests/test_formal_final_scoring.py b/tests/test_formal_final_scoring.py
+new file mode 100644
+index 0000000..a771048
+--- /dev/null
++++ b/tests/test_formal_final_scoring.py
+@@ -0,0 +1,224 @@
++"""Stage D final arithmetic over genuine D1 publications."""
++
++import atexit
++import hashlib
++import unittest
++from decimal import Decimal, localcontext
++from unittest.mock import patch
++
++from ashare_pipeline.formal_final_score_inputs import FormalFinalScoreInputRepository
++from ashare_pipeline.formal_final_scoring import (
++    FinalScoreCard, build_final_score_card_batch,
++)
++from ashare_pipeline.formal_scoring import (
++    _arithmetic_context, _calculate_untrusted_arithmetic,
++    _calculate_untrusted_confidence, calculate_pre_policy_score,
++)
++from tests.formal_final_scoring_fixtures import FinalScoringFixture, FOCAL
++from tests import formal_final_scoring_fixtures as fixture_module
++from tests.test_formal_scoring_registry import canonical
++
++
++DIMENSIONS = ("G", "V", "M", "EQ", "FS", "CA", "T")
++WEIGHTS = {"G": Decimal("0.18"), "V": Decimal("0.18"), "M": Decimal("0.18"),
++           "EQ": Decimal("0.12"), "FS": Decimal("0.08"), "CA": Decimal("0.16"),
++           "T": Decimal("0.10")}
++RISK_IDS = ("M.return_persistence", "M.margin_persistence",
++            "CA.shareholder_return_and_dilution", "CA.capital_discipline")
++NO_CAP_PEER = "SH600000"
++_SHARED = None
++
++
++def d1_batch(fixture):
++    repository = FormalFinalScoreInputRepository(fixture.feature_repository,
++        fixture.context, fixture.range_store, registry_signature_verifier=fixture.verifier)
++    return repository.build_batch(fixture.frozen.frozen_input_hash,
++        scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry,
++        valuation_adapter_registry=fixture.valuation_registry)
++
++
++def shared_ready_batch():
++    global _SHARED
++    if _SHARED is None:
++        original = fixture_module._stage_d_documents
++
++        def with_two_g_caps(documents):
++            original(documents)
++            effects = documents["cyclic"]["rules"]["general_nonfinancial_cyclic_top"]["outcomes"]["on_match"]
++            effects.append({"kind": "dimension_cap", "dimension": "G", "maximum": "1"})
++            effects.sort(key=canonical)
++
++        with patch.object(fixture_module, "_stage_d_documents", with_two_g_caps):
++            fixture = FinalScoringFixture(peer_count=23, consensus_no_coverage=True)
++        atexit.register(fixture.close)
++        fixture.pending_ids = tuple(sorted(set(fixture.templates) - {FOCAL, NO_CAP_PEER}))
++        fixture.populate_final_inputs()
++        generation = "stage-d-peer-consensus"
++        consensus_request = fixture.resolver.resolve(
++            context_kind="consensus_snapshot", scope_key="fixture-consensus",
++            security_id=NO_CAP_PEER, as_of_utc="2026-08-31T07:00:00+00:00",
++            registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
++            upstream_generation=generation)
++        fixture.put_context(consensus_request,
++            {"coverage_status": "covered", "estimates": [
++                {"period": "FY2026", "metric": "profit", "value": 1}]},
++            False, generation)
++        # The stock D1 fixture gives only FOCAL its five-year score history.
++        # Complete the second member through the same producer-backed route.
++        for year in range(2021, 2026):
++            fixture.put_financial(NO_CAP_PEER, {"history": 1},
++                generation=f"stage-d-peer-history-{year}",
++                period_end=f"{year}-12-31", publish=False)
++        for year in (2024, 2025, 2026):
++            for kind, end in (("Q1", "03-31"), ("H1", "06-30"), ("Q3", "09-30")):
++                if year == 2026 and kind == "Q3":
++                    continue
++                fixture.put_financial(NO_CAP_PEER, {"history": 1},
++                    generation=f"stage-d-peer-history-{year}-{kind}",
++                    period_end=f"{year}-{end}", period_kind=kind, publish=False)
++        fixture.publish_current(NO_CAP_PEER)
++        fixture.valuation_feature_bundles[NO_CAP_PEER] = fixture.persist_features(NO_CAP_PEER)
++        inputs = d1_batch(fixture)
++        cards = build_final_score_card_batch(inputs)
++        _SHARED = fixture, inputs, cards
++    return _SHARED
++
++
++class FinalScoreArithmeticTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture, cls.inputs, cls.cards = shared_ready_batch()
++        cls.row = cls.inputs.input_for(FOCAL)
++        cls.card = cls.cards.card_for(FOCAL)
++
++    def test_final_card_rebuilds_all_seven_dimensions_from_final_slots(self):
++        card, row = self.card, self.row
++        self.assertIsInstance(card, FinalScoreCard)
++        self.assertEqual(row.status, "ready")
++        self.assertEqual(len(row.slots), 25)
++        self.assertEqual(len([s for s in row.slots.values()
++            if s["evidence_kind"] == "policy_adjusted_valuation"]), 3)
++        with localcontext(_arithmetic_context()):
++            for dimension in DIMENSIONS:
++                expected = sum((slot["internal_weight"] * slot["value"]
++                    for mid, slot in row.slots.items() if mid.startswith(dimension + ".")),
++                    Decimal("0"))
++                self.assertEqual(card.raw_dimensions[dimension], expected)
++        self.assertEqual(tuple(card.raw_dimensions), DIMENSIONS)
++        self.assertEqual(tuple(card.dimensions), DIMENSIONS)
++        self.assertEqual(card.raw_dimensions["V"], card.dimensions["V"])
++        self.assertEqual(card.source_entry_hash, row.entry_hash)
++        self.assertEqual(card.source_batch_hash, self.inputs.batch_hash)
++        self.assertEqual(card.registry_manifest_hash, row.registry_manifest_hash)
++        self.assertEqual(card.policy_result_hash, row.policy_result_hash)
++        self.assertEqual(card.base_batch_hash, row.base_batch_hash)
++        self.assertEqual(card.valuation_batch_hash, row.valuation_batch_hash)
++        self.assertEqual(card.source_canonical_sha256,
++            hashlib.sha256(row.canonical_bytes()).hexdigest())
++        for mid in ("V.enterprise_value_or_sustainable_roe",
++                    "V.normalized_earnings_yield", "V.normalized_free_cash_flow_yield"):
++            self.assertEqual(card.source_input["slots"][mid]["valuation_score_hash"],
++                row.slots[mid]["valuation_score_hash"])
++            self.assertEqual(card.source_input["slots"][mid]["valuation_context_hash"],
++                row.slots[mid]["valuation_context_hash"])
++
++    def test_multiple_caps_take_minimum_without_changing_confidence(self):
++        card = self.card
++        self.assertEqual(card.dimension_caps, {"G": Decimal("1"), "M": Decimal("80")})
++        self.assertEqual(sorted(item["effect"]["maximum"] for item in card.cap_trace
++            if item["effect"]["dimension"] == "G"), ["1", "80"])
++        self.assertGreater(card.raw_dimensions["G"], Decimal("1"))
++        for dimension, limit in (("G", "1"), ("M", "80")):
++            self.assertEqual(card.dimensions[dimension],
++                min(card.raw_dimensions[dimension], Decimal(limit)))
++            self.assertTrue(any(item["effect"]["dimension"] == dimension
++                and item["rule_id"] and item["definition_hash"] and item["trace"]
++                for item in card.cap_trace))
++        self.assertEqual(card.confidence,
++            _calculate_untrusted_confidence(dict(card.global_slot_weights),
++                {mid: self.row.slots[mid]["temporal_quality"]
++                    for mid in card.global_slot_weights},
++                continuous_fy_count=self.row.continuous_fy_count,
++                confidence_cap=Decimal(self.row.confidence_cap)))
++
++    def test_cap_never_raises_a_dimension(self):
++        for dimension in DIMENSIONS:
++            self.assertLessEqual(self.card.dimensions[dimension],
++                self.card.raw_dimensions[dimension])
++            if dimension not in self.card.dimension_caps:
++                self.assertEqual(self.card.dimensions[dimension],
++                    self.card.raw_dimensions[dimension])
++
++    def test_exact_sc_b_risk_and_grades_use_unrounded_decimal(self):
++        card = self.card
++        with localcontext(_arithmetic_context()):
++            expected_s0 = sum((WEIGHTS[d] * card.dimensions[d] for d in DIMENSIONS), Decimal("0"))
++            expected_sc = Decimal("50") + card.confidence["C"] * (expected_s0 - Decimal("50"))
++            expected_sbase = sum((WEIGHTS[d] * card.dimensions[d] for d in DIMENSIONS[:-1]),
++                Decimal("0")) / Decimal("0.90")
++            expected_b = Decimal("50") + card.confidence["C"] * (expected_sbase - Decimal("50"))
++        self.assertEqual((card.S0, card.Sc, card.Sbase, card.B),
++            (expected_s0, expected_sc, expected_sbase, expected_b))
++        risk = {mid: self.row.slots[mid]["value"] for mid in RISK_IDS}
++        expected = _calculate_untrusted_arithmetic(dimensions=dict(card.dimensions),
++            confidence=card.confidence["C"], metric_values=risk)
++        for key in ("M_persistence", "CA_downside", "R_safety", "risk_exposure"):
++            self.assertEqual(getattr(card, key), expected[key])
++        for key in (*DIMENSIONS, "S0", "Sc", "Sbase", "B", "M_persistence",
++                    "CA_downside", "R_safety"):
++            score = card.dimensions[key] if key in DIMENSIONS else getattr(card, key)
++            grade = card.dimension_grades[key] if key in DIMENSIONS else getattr(card, key + "_grade")
++            if score >= 90:
++                expected_grade = "A+"
++            elif score >= 80:
++                expected_grade = "A"
++            elif score >= 70:
++                expected_grade = "B"
++            elif score >= 60:
++                expected_grade = "C"
++            elif score >= 50:
++                expected_grade = "D"
++            else:
++                expected_grade = "E"
++            self.assertEqual(grade, expected_grade)
++
++    def test_pending_input_has_no_card_and_preserves_all_reasons(self):
++        for sid in self.inputs.security_ids:
++            row = self.inputs.input_for(sid)
++            if row.status == "pending_evidence":
++                self.assertIsNone(self.cards.card_for(sid))
++                pending = self.cards.pending_for(sid)
++                self.assertEqual(pending["reasons"], row.reasons)
++                self.assertEqual(pending["base_pending_reasons"], row.base_pending_reasons)
++                self.assertEqual(pending["policy_pending_requirements"],
++                    row.policy_pending_requirements)
++                self.assertEqual(pending["valuation_pending_reasons"],
++                    row.valuation_pending_reasons)
++                self.assertEqual(pending["source_entry_hash"], row.entry_hash)
++
++    def test_no_cap_parity_matches_existing_arithmetic_but_not_proof_type(self):
++        # A second ready member in the same signed batch has no cyclic cap.
++        row = self.inputs.input_for(NO_CAP_PEER)
++        self.assertEqual(row.status, "ready")
++        card = self.cards.card_for(NO_CAP_PEER)
++        self.assertEqual(card.dimension_caps, {})
++        self.assertEqual(card.raw_dimensions, card.dimensions)
++        expected = _calculate_untrusted_arithmetic(dimensions=dict(card.dimensions),
++            confidence=card.confidence["C"],
++            metric_values={mid: row.slots[mid]["value"] for mid in RISK_IDS})
++        for key, value in expected.items():
++            self.assertEqual(getattr(card, key), value)
++        self.assertNotEqual(type(card), type(calculate_pre_policy_score(
++            self.fixture.base_repository.build_batch(self.fixture.frozen.frozen_input_hash,
++                scoring_registry=self.fixture.scoring).input_for(NO_CAP_PEER))))
++
++    def test_verified_no_consensus_caps_confidence_at_point_90(self):
++        row = self.row
++        self.assertEqual(row.status, "ready")
++        card = self.card
++        self.assertEqual(row.confidence_cap, "0.90")
++        self.assertEqual(card.confidence["C"], Decimal("0.90"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_formal_final_scoring_guards.py b/tests/test_formal_final_scoring_guards.py
+new file mode 100644
+index 0000000..53d2695
+--- /dev/null
++++ b/tests/test_formal_final_scoring_guards.py
+@@ -0,0 +1,132 @@
++"""Final-card proof and numeric boundary guards over a real D1 publication."""
++
++import copy
++import inspect
++import pickle
++import unittest
++from decimal import Context, Decimal, localcontext
++from unittest.mock import patch
++
++from ashare_pipeline.formal_final_score_inputs import PolicyAdjustedScoreInputBatch
++from ashare_pipeline.formal_final_scoring import (
++    FinalScoreCard, FinalScoreCardBatch, _calculate_untrusted_final,
++    build_final_score_card_batch,
++)
++from ashare_pipeline.formal_scoring import calculate_pre_policy_score
++from tests.formal_final_scoring_fixtures import FOCAL
++from tests.test_formal_final_scoring import d1_batch, shared_ready_batch
++
++
++class FinalScoringGuardTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture, cls.inputs, cls.cards = shared_ready_batch()
++        cls.row = cls.inputs.input_for(FOCAL)
++        cls.card = cls.cards.card_for(FOCAL)
++
++    def test_plain_dict_and_pre_policy_calculation_cannot_create_final_proof(self):
++        with self.assertRaises(ValueError):
++            build_final_score_card_batch(self.inputs.to_dict())
++        base = self.fixture.base_repository.build_batch(
++            self.fixture.frozen.frozen_input_hash, scoring_registry=self.fixture.scoring)
++        pre_policy = calculate_pre_policy_score(base.input_for(FOCAL))
++        with self.assertRaises(ValueError):
++            build_final_score_card_batch(pre_policy)
++        with self.assertRaises(TypeError):
++            FinalScoreCard()
++        with self.assertRaises(TypeError):
++            FinalScoreCardBatch()
++
++    def test_cross_batch_or_unknown_selector_cannot_launder_a_card(self):
++        other = d1_batch(self.fixture)
++        self.assertIsNot(other, self.inputs)
++        self.assertEqual(other.batch_hash, self.inputs.batch_hash)
++        with self.assertRaises(ValueError):
++            build_final_score_card_batch((self.inputs, other))
++        with self.assertRaises(ValueError):
++            self.cards.card_for("SH999999")
++        with self.assertRaises(ValueError):
++            self.cards.pending_for("SH999999")
++        self.assertEqual(self.cards.card_for(FOCAL).source_batch_hash, self.inputs.batch_hash)
++        self.assertIsNone(self.cards.pending_for(FOCAL))
++
++    def test_unknown_cap_dimension_and_summary_disagreement_are_rejected(self):
++        wire = self.row.to_dict()
++        wire["policy_result"]["dimension_caps"]["UNKNOWN"] = "70"
++        with self.assertRaises(ValueError):
++            _calculate_untrusted_final(wire)
++        wire = self.row.to_dict()
++        wire["policy_result"]["dimension_caps"]["G"] = "79"
++        with self.assertRaises(ValueError):
++            _calculate_untrusted_final(wire)
++
++    def test_nonnumeric_slot_values_and_invalid_caps_are_rejected(self):
++        mid = "V.normalized_earnings_yield"
++        for value in (True, 5, 5.0, None, "NaN", "Infinity", "-Infinity",
++                      "1e999999999999999999", "1e-999999"):
++            with self.subTest(slot=value):
++                wire = self.row.to_dict()
++                wire["slots"][mid]["value"] = value
++                with self.assertRaises(ValueError):
++                    _calculate_untrusted_final(wire)
++        for value in (True, 5, 5.0, None, "NaN", "Infinity", "-Infinity",
++                      "1e999999999999999999", "1e-999999"):
++            with self.subTest(cap=value):
++                wire = self.row.to_dict()
++                wire["policy_result"]["dimension_caps"]["G"] = value
++                with self.assertRaises(ValueError):
++                    _calculate_untrusted_final(wire)
++
++    def test_global_decimal_context_cannot_round_or_raise_in_final_arithmetic(self):
++        baseline = self.card.canonical_bytes()
++        with localcontext(Context(prec=2)):
++            hostile = build_final_score_card_batch(self.inputs).card_for(FOCAL)
++        self.assertEqual(hostile.canonical_bytes(), baseline)
++        self.assertEqual(hostile.Sc, self.card.Sc)
++        self.assertEqual(hostile.risk_exposure, self.card.risk_exposure)
++
++    def test_cards_cannot_be_copied_pickled_or_reconstructed(self):
++        for proof in (self.card, self.cards):
++            with self.subTest(proof=type(proof).__name__):
++                with self.assertRaises(TypeError):
++                    copy.copy(proof)
++                with self.assertRaises(TypeError):
++                    copy.deepcopy(proof)
++                with self.assertRaises(TypeError):
++                    pickle.dumps(proof)
++                with self.assertRaises(ValueError):
++                    object.__new__(type(proof)).require_verified()
++
++    def test_method_replacement_and_module_helper_rebinding_are_detected(self):
++        import ashare_pipeline.formal_final_scoring as module
++        with self.assertRaises(TypeError):
++            with patch.object(FinalScoreCard, "require_verified", lambda self: None):
++                pass
++        original = module._calculate_untrusted_arithmetic
++        with patch.object(module, "_calculate_untrusted_arithmetic", lambda **kwargs: {}):
++            with self.assertRaises(ValueError):
++                build_final_score_card_batch(self.inputs)
++            with self.assertRaises(ValueError):
++                self.card.require_verified()
++        self.assertIs(module._calculate_untrusted_arithmetic, original)
++        self.card.require_verified()
++
++    def test_revoked_d1_publication_revokes_descendant_on_access(self):
++        record = inspect.getclosurevars(
++            PolicyAdjustedScoreInputBatch.input_for).nonlocals["record"]
++        proofs = inspect.getclosurevars(record).nonlocals["proofs"]
++        publication = proofs[id(self.inputs)][4]
++        self.assertTrue(publication[0])
++        publication[0] = False
++        try:
++            with self.assertRaises(ValueError):
++                build_final_score_card_batch(self.inputs)
++            with self.assertRaises(ValueError):
++                self.card.require_verified()
++        finally:
++            publication[0] = True
++        self.card.require_verified()
++
++
++if __name__ == "__main__":
++    unittest.main()

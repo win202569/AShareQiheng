@@ -1,0 +1,282 @@
+# Integrated Stage A final-fix review delta
+Fix base: committed HEAD 101d42a24a29fce9f5d101760350ba598cea1630, full prior review final-review.diff.
+Fix head: frozen staged three-file snapshot; hashes in final-fix-report.md, no commit yet.
+One root cause: missing selector-family check for Context value expectations.
+Worker focused 15 tests / 11.385s GREEN after 16 failed subcases and 6 genuine KeyErrors. Full corrected policy suite still running; commit waits for its completion. Parent focused verification running separately.
+
+diff --git a/ashare_pipeline/formal_policy_contract.py b/ashare_pipeline/formal_policy_contract.py
+index 1b0750b..35750f0 100644
+--- a/ashare_pipeline/formal_policy_contract.py
++++ b/ashare_pipeline/formal_policy_contract.py
+@@ -252,20 +252,32 @@ def _context_selector(value, path):
+         raise PolicyContractError(
+             "expected_unit must be null", path=f"{path}.expected_unit"
+         )
+     return expected_type
+ 
+ 
+ def _selector(value, path, template_id, *, expected_kind=None):
+     if type(value) is not dict:
+         raise PolicyContractError("selector object required", path=path)
+     kind = value.get("kind")
++    if kind not in ("feature", "annual_series", "context"):
++        raise PolicyContractError(
++            "unsupported selector kind", code="unsupported_contract", path=f"{path}.kind"
++        )
++    if expected_kind is not None:
++        expected_family = (
++            expected_kind if expected_kind in ("feature", "annual_series") else "context"
++        )
++        if kind != expected_family:
++            raise PolicyContractError(
++                f"{expected_family} selector required", path=f"{path}.kind"
++            )
+     if kind == "feature":
+         _feature_selector(value, path, template_id)
+     elif kind == "annual_series":
+         _exact_keys(value, ("kind", "observations"), path)
+         observations = value["observations"]
+         if type(observations) is not list:
+             raise PolicyContractError(
+                 "observations must be an array", path=f"{path}.observations"
+             )
+         years = []
+@@ -280,28 +292,20 @@ def _selector(value, path, template_id, *, expected_kind=None):
+             raise PolicyContractError(
+                 "exact ordered FY2021-FY2025 observations required",
+                 path=f"{path}.observations",
+             )
+     elif kind == "context":
+         actual_type = _context_selector(value, path)
+         if expected_kind is not None and expected_kind != actual_type:
+             raise PolicyContractError(
+                 "Context selector has incompatible value type", path=f"{path}.expected_type"
+             )
+-    else:
+-        raise PolicyContractError(
+-            "unsupported selector kind", code="unsupported_contract", path=f"{path}.kind"
+-        )
+-    if expected_kind in ("feature", "annual_series") and kind != expected_kind:
+-        raise PolicyContractError(
+-            f"{expected_kind} selector required", path=f"{path}.kind"
+-        )
+ 
+ 
+ def _valuation_dependencies(value, path, semantic_id):
+     if type(value) is not list or not value:
+         raise PolicyContractError("nonempty valuation dependency array required", path=path)
+     metric_ids = []
+     fields = (
+         "metric_id",
+         "policy_dependency",
+         "profit_semantic_id",
+diff --git a/tests/test_formal_policy_contract.py b/tests/test_formal_policy_contract.py
+index ddaf0c8..8c2d473 100644
+--- a/tests/test_formal_policy_contract.py
++++ b/tests/test_formal_policy_contract.py
+@@ -1,28 +1,31 @@
+ """Pure syntax tests for detached formal policy declarations."""
+ 
+ import json
+ import unittest
+ 
++from ashare_pipeline import formal_policy_contract as contract_module
+ from ashare_pipeline.formal_policy_contract import (
+     PolicyContractError,
+     iter_rule_selectors,
+     parse_policy_contract,
+     parse_policy_rule,
+ )
+ from tests.formal_policy_fixtures import (
+     FY_ENDS,
++    annual_selector,
+     boolean_rule,
+     canonical,
+     context_selector,
+     cyclic_rule,
+     enum_rule,
++    feature_selector,
+     market_rule,
+     numeric_rule,
+     policy_children,
+ )
+ 
+ 
+ class PolicySyntaxTests(unittest.TestCase):
+     def test_numeric_rule_is_detached_and_deeply_immutable(self):
+         wire = numeric_rule()
+         rule = parse_policy_rule("redline", "bank_equity", canonical(wire))
+@@ -115,20 +118,85 @@ class PolicySelectorSyntaxTests(unittest.TestCase):
+                 self.assert_rule_rejected(wire, role="status")
+ 
+     def test_unknown_selector_kind_reports_the_input_path(self):
+         wire = numeric_rule()
+         wire["inputs"]["value"]["kind"] = "jsonpath"
+         with self.assertRaises(PolicyContractError) as caught:
+             parse_policy_rule("redline", "bank_equity", canonical(wire))
+         self.assertEqual(caught.exception.code, "unsupported_contract")
+         self.assertEqual(caught.exception.path, "redline.rules.bank_equity.inputs.value.kind")
+ 
++    def test_context_inputs_reject_feature_and_annual_selector_families(self):
++        cases = (
++            ("status", boolean_rule, "value"),
++            ("event", boolean_rule, "value"),
++            ("status", enum_rule, "value"),
++            ("event", enum_rule, "value"),
++            ("status", market_rule, "market"),
++            ("status", market_rule, "calendar"),
++        )
++        for role, factory, input_name in cases:
++            for replacement in (
++                feature_selector("bank", "equity", "FY0", "CNY"),
++                annual_selector("bank", "roe"),
++            ):
++                wire = factory()
++                wire["inputs"][input_name] = replacement
++                with self.subTest(role=role, rule=wire["kind"], input=input_name,
++                        selector=replacement["kind"]):
++                    with self.assertRaises(PolicyContractError) as caught:
++                        parse_policy_rule(role, "family", canonical(wire))
++                    self.assertEqual(caught.exception.code, "malformed_contract")
++                    self.assertEqual(caught.exception.path,
++                        f"{role}.rules.family.inputs.{input_name}.kind")
++
++    def test_unknown_selector_kind_remains_unsupported_for_each_input_type(self):
++        for role, factory, input_name in (
++            ("redline", numeric_rule, "value"),
++            ("cyclic", cyclic_rule, "annual_roe"),
++            ("status", boolean_rule, "value"),
++            ("status", enum_rule, "value"),
++            ("status", market_rule, "market"),
++            ("status", market_rule, "calendar"),
++        ):
++            wire = factory()
++            wire["inputs"][input_name] = {"kind": "jsonpath"}
++            with self.subTest(rule=wire["kind"], input=input_name):
++                with self.assertRaises(PolicyContractError) as caught:
++                    parse_policy_rule(role, "unknown", canonical(wire))
++                self.assertEqual(caught.exception.code, "unsupported_contract")
++                self.assertEqual(caught.exception.path,
++                    f"{role}.rules.unknown.inputs.{input_name}.kind")
++
++    def test_generic_selectors_and_valid_rule_families_remain_accepted(self):
++        for selector in (
++            feature_selector("bank", "equity", "FY0", "CNY"),
++            annual_selector("bank", "roe"),
++            context_selector(),
++            context_selector(field="listing_status", expected_type="enum"),
++            context_selector("event_calendar", "event", "event_record",
++                entry_id="fixture-event", expected_unit="CNY"),
++            context_selector("market_close", "record", "market_record"),
++            context_selector("trading_calendar", "record", "calendar_record"),
++        ):
++            with self.subTest(selector=selector):
++                contract_module._selector(selector, "selector", "bank")
++        for role, factory in (
++            ("redline", numeric_rule), ("cyclic", cyclic_rule),
++            ("status", boolean_rule), ("event", boolean_rule),
++            ("status", enum_rule), ("event", enum_rule),
++            ("status", market_rule),
++        ):
++            with self.subTest(role=role, rule=factory.__name__):
++                parsed = parse_policy_rule(role, "valid", canonical(factory()))
++                self.assertEqual(parsed.kind, factory()["kind"])
++
+     def test_malformed_context_discriminators_raise_contract_errors(self):
+         for field, value in (("context_kind", []), ("field", [])):
+             wire = boolean_rule()
+             wire["inputs"]["value"][field] = value
+             with self.subTest(field=field), self.assertRaises(PolicyContractError):
+                 parse_policy_rule("status", "malformed_context", canonical(wire))
+ 
+     def test_iter_rule_selectors_keeps_annual_series_grouped(self):
+         wire = numeric_rule()
+         rule = parse_policy_rule("redline", "bank_equity", canonical(wire))
+diff --git a/tests/test_formal_policy_registry_guards.py b/tests/test_formal_policy_registry_guards.py
+index 88f3772..758e85c 100644
+--- a/tests/test_formal_policy_registry_guards.py
++++ b/tests/test_formal_policy_registry_guards.py
+@@ -14,35 +14,81 @@ from ashare_pipeline import formal_context_schema as context_module
+ from ashare_pipeline import formal_feature_contract as feature_module
+ from ashare_pipeline import formal_policy_contract as contract_module
+ from ashare_pipeline import formal_policy_registry as policy_module
+ from ashare_pipeline import formal_registry_manifest as manifest_module
+ from ashare_pipeline import formal_scoring_registry as scoring_module
+ from ashare_pipeline import formal_sources as sources_module
+ from ashare_pipeline.formal_policy_registry import (
+     FormalPolicyRegistry, load_formal_policy_registry,
+ )
+ from ashare_pipeline.formal_scoring import calculate_pre_policy_score
+-from tests.formal_policy_fixtures import policy_graph
++from tests.formal_policy_fixtures import (
++    annual_selector, boolean_rule, enum_rule, feature_selector, policy_graph,
++)
+ 
+ 
+ class _PolicyGraphTestCase(unittest.TestCase):
+     @classmethod
+     def setUpClass(cls):
+         cls.bundle, cls.feature, cls.scoring, _, _ = policy_graph()
+ 
+     def load(self, **overrides):
+         arguments = dict(bundle=self.bundle, scoring_registry=self.scoring,
+             feature_registry=self.feature)
+         arguments.update(overrides)
+         return load_formal_policy_registry(**arguments)
+ 
+ 
++class PolicySignedSelectorFamilyTests(unittest.TestCase):
++    def assert_signed_input_rejected(self, rule_id, input_name, *, extra_factory=None):
++        for selector in (
++            feature_selector("bank", "equity", "FY0", "CNY"),
++            annual_selector("bank", "roe"),
++        ):
++            def change(documents):
++                rules = documents["status"]["rules"]
++                if extra_factory is not None:
++                    rules[rule_id] = extra_factory()
++                    rules[rule_id]["semantic_id"] = rule_id
++                    active = rules["execution_contract"]["rule_ids"]
++                    active.append(rule_id)
++                    active.sort()
++                rules[rule_id]["inputs"][input_name] = selector
++
++            with self.subTest(rule=rule_id, input=input_name, selector=selector["kind"]):
++                # Mutation precedes hashing/signing; A3 receives genuine same-root inputs.
++                bundle, feature, scoring, _, _ = policy_graph(mutate=change)
++                with self.assertRaises(contract_module.PolicyContractError) as caught:
++                    load_formal_policy_registry(bundle,
++                        scoring_registry=scoring, feature_registry=feature)
++                self.assertEqual(caught.exception.code, "malformed_contract")
++                self.assertEqual(caught.exception.path,
++                    f"status.rules.{rule_id}.inputs.{input_name}.kind")
++
++    def test_signed_market_input_rejects_financial_selector_substitution(self):
++        self.assert_signed_input_rejected("bank_no_effective_trade_20d", "market")
++
++    def test_signed_calendar_input_rejects_financial_selector_substitution(self):
++        self.assert_signed_input_rejected("bank_no_effective_trade_20d", "calendar")
++
++    def test_signed_extra_boolean_rule_rejects_financial_selector_substitution(self):
++        self.assert_signed_input_rejected("bank_extra_boolean", "value",
++            extra_factory=boolean_rule)
++
++    def test_signed_extra_enum_rule_rejects_financial_selector_substitution(self):
++        self.assert_signed_input_rejected("bank_extra_enum", "value",
++            extra_factory=enum_rule)
++
++    def test_signed_mandatory_st_rejects_substitution_with_contract_error(self):
++        self.assert_signed_input_rejected("bank_st", "value")
++
++
+ class PolicyProofTests(_PolicyGraphTestCase):
+     def test_loaded_contract_is_immutable_but_does_not_grant_runtime_readiness(self):
+         proof = self.load()
+         proof.require_verified()
+         raw = proof.canonical_bytes()
+         self.assertEqual(proof.contract_hash, hashlib.sha256(raw).hexdigest())
+         self.assertNotIn("contract_hash", json.loads(raw))
+         self.assertEqual(proof.to_dict()["contract_hash"], proof.contract_hash)
+         self.assertEqual(proof.to_dict()["role_hashes"], dict(self.scoring.role_hashes))
+         self.assertEqual(len(proof.rules), 80)
+

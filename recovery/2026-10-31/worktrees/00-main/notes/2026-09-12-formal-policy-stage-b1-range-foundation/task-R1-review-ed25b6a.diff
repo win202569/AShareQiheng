@@ -1,0 +1,1759 @@
+# R1 fixed review package
+
+Base: 7cf6b5996f029e95be9331010c22638c804f40a2
+Head: ed25b6a553f0738c4de24dd88583c28061d196e0
+Scope: the R1 four-file whitelist only; intervening documentation commit is excluded.
+
+## Commits
+
+ed25b6a feat: bind signed policy range source configurations
+
+## Stat
+
+ ashare_pipeline/formal_range_contract.py | 854 +++++++++++++++++++++++++++++++
+ ashare_pipeline/formal_sources.py        |  99 +++-
+ tests/formal_range_fixtures.py           | 162 ++++++
+ tests/test_formal_range_contract.py      | 312 +++++++++++
+ 4 files changed, 1420 insertions(+), 7 deletions(-)
+
+## Diff
+
+diff --git a/ashare_pipeline/formal_range_contract.py b/ashare_pipeline/formal_range_contract.py
+new file mode 100644
+index 0000000..c767a39
+--- /dev/null
++++ b/ashare_pipeline/formal_range_contract.py
+@@ -0,0 +1,854 @@
++"""Closed signed range-source declarations and active-policy bindings.
++
++This module authorizes configuration only.  It deliberately does not create a
++range request or claim that any date interval has been covered.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import dataclass
++import hashlib
++import json
++import math
++import re
++from types import MappingProxyType
++import weakref
++
++
++_SOURCES = frozenset({"cninfo", "sse", "szse", "bse", "csrc"})
++_EXCHANGES = frozenset({"SH", "SZ", "BJ"})
++_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
++_VERSION_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
++_SHA256 = re.compile(r"^[0-9a-f]{64}$")
++_PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
++_PLACEHOLDERS = frozenset(
++    {"security_id", "exchange", "start_date", "end_date", "page_index"}
++)
++_RANGE_FIELDS = (
++    "schema_version",
++    "capability",
++    "kind",
++    "anchor_descriptor_id",
++    "calendar_descriptor_id",
++    "source",
++    "dataset",
++    "endpoint_url",
++    "http_method",
++    "parser_id",
++    "parser_version",
++    "mapping_version",
++    "normalizer_version",
++    "request_version",
++    "exchange_scope",
++    "calendar_anchor_selector",
++    "request_template",
++    "pagination",
++    "max_pages",
++    "max_calendar_days_per_request",
++    "timeout_seconds",
++    "retry_base_seconds",
++    "retry_max_attempts",
++    "challenge_cooldown_seconds",
++)
++_RANGE_FIELD_SET = frozenset(_RANGE_FIELDS)
++_CONTEXT_SELECTOR_FIELDS = frozenset(
++    {
++        "kind",
++        "descriptor_id",
++        "context_kind",
++        "scope_key",
++        "field",
++        "entry_id",
++        "expected_type",
++        "expected_unit",
++    }
++)
++_LEGACY_CONFIG_FIELDS = frozenset(
++    {
++        "source",
++        "dataset",
++        "endpoint_url",
++        "http_method",
++        "parser_id",
++        "parser_version",
++        "mapping_version",
++        "request_template",
++        "timeout_seconds",
++        "retry_base_seconds",
++        "retry_max_attempts",
++        "challenge_cooldown_seconds",
++        "exchange_scope",
++        "calendar_selector",
++        "bootstrap_calendar",
++    }
++)
++
++
++def _canonical(value: object) -> bytes:
++    return json.dumps(
++        value,
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++        allow_nan=False,
++    ).encode("utf-8")
++
++
++def _text(value: object, label: str, *, version: bool = False) -> str:
++    pattern = _VERSION_IDENTIFIER if version else _IDENTIFIER
++    if type(value) is not str or pattern.fullmatch(value) is None:
++        raise ValueError(f"{label} must be an exact identifier")
++    return value
++
++
++def _hash(value: object, label: str) -> str:
++    if type(value) is not str or _SHA256.fullmatch(value) is None:
++        raise ValueError(f"{label} must be a lowercase SHA-256")
++    return value
++
++
++def _exchange(value: object, label: str = "exchange") -> str:
++    if type(value) is not str or value not in _EXCHANGES:
++        raise ValueError(f"{label} must be SH, SZ, or BJ")
++    return value
++
++
++def _positive_number(value: object, label: str) -> int | float:
++    if (
++        type(value) not in (int, float)
++        or isinstance(value, bool)
++        or not math.isfinite(value)
++        or value <= 0
++    ):
++        raise ValueError(f"{label} must be a positive finite number")
++    return value
++
++
++def _positive_integer(value: object, label: str) -> int:
++    if type(value) is not int or value <= 0:
++        raise ValueError(f"{label} must be a positive integer")
++    return value
++
++
++def _https_url(value: object, label: str) -> str:
++    if type(value) is not str or not value or value != value.strip():
++        raise ValueError(f"{label} must be an absolute HTTPS URL")
++    if any(ord(char) <= 0x20 or ord(char) == 0x7F or char.isspace() for char in value):
++        raise ValueError(f"{label} contains forbidden whitespace or controls")
++    if not value[:8].lower() == "https://" or "#" in value:
++        raise ValueError(f"{label} must be an absolute HTTPS URL without a fragment")
++    authority = value[8:].split("/", 1)[0].split("?", 1)[0]
++    if not authority or "@" in authority or authority.startswith("[") or authority.count(":") > 1:
++        raise ValueError(f"{label} hostname is invalid")
++    host, separator, port = authority.partition(":")
++    if not host or (separator and (not port or not port.isascii() or not port.isdecimal())):
++        raise ValueError(f"{label} hostname or port is invalid")
++    return value
++
++
++def _placeholder_text(value: object, label: str, *, nonempty: bool = False) -> str:
++    if type(value) is not str or value != value.strip() or (nonempty and not value):
++        raise ValueError(f"{label} must be an already-trimmed string")
++    remaining = _PLACEHOLDER.sub("", value)
++    if "{" in remaining or "}" in remaining:
++        raise ValueError(f"{label} has an invalid placeholder")
++    if any(match.group(1) not in _PLACEHOLDERS for match in _PLACEHOLDER.finditer(value)):
++        raise ValueError(f"{label} has an unknown placeholder")
++    return value
++
++
++def _template_tree(value: object, label: str, seen: set[int]) -> object:
++    if value is None:
++        return None
++    if type(value) is str:
++        _placeholder_text(value, label)
++        return value
++    if type(value) is list:
++        if id(value) in seen:
++            raise ValueError("range request template aliases or cycles are forbidden")
++        seen.add(id(value))
++        return [_template_tree(item, label, seen) for item in value]
++    if type(value) is dict:
++        if id(value) in seen:
++            raise ValueError("range request template aliases or cycles are forbidden")
++        seen.add(id(value))
++        result = {}
++        for key, item in value.items():
++            _placeholder_text(key, f"{label} key", nonempty=True)
++            result[key] = _template_tree(item, label, seen)
++        return result
++    raise ValueError(f"{label} must be a JSON mapping/list/string/null tree")
++
++
++def _request_template(value: object, method: str, kind: str) -> dict[str, object]:
++    if type(value) is not dict or set(value) != {"query", "headers", "body"}:
++        raise ValueError("request_template must contain exactly query, headers, and body")
++    if type(value["query"]) is not dict or type(value["headers"]) is not dict:
++        raise ValueError("request_template query and headers must be exact objects")
++    copied = _template_tree(value, "request_template", set())
++    assert type(copied) is dict
++    placeholders = {
++        match.group(1)
++        for text in _walk_strings(copied)
++        for match in _PLACEHOLDER.finditer(text)
++    }
++    if kind == "calendar_range" and "security_id" in placeholders:
++        raise ValueError("calendar range template cannot use security_id")
++    if method == "GET" and copied["body"] is not None:
++        raise ValueError("GET request_template body must be null")
++    for key, item in copied["query"].items():
++        if _PLACEHOLDER.search(key) or any(char in item for char in ("&", "#")):
++            raise ValueError("range query template is unsafe")
++    for key, item in copied["headers"].items():
++        if _PLACEHOLDER.search(key) or re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", key) is None:
++            raise ValueError("range header template is unsafe")
++        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in item):
++            raise ValueError("range header template contains controls")
++    return copied
++
++
++def _walk_strings(value: object):
++    if type(value) is str:
++        yield value
++    elif type(value) is list:
++        for item in value:
++            yield from _walk_strings(item)
++    elif type(value) is dict:
++        for key, item in value.items():
++            yield key
++            yield from _walk_strings(item)
++
++
++def _context_selector(value: object) -> dict[str, object]:
++    if type(value) is not dict or set(value) != _CONTEXT_SELECTOR_FIELDS:
++        raise ValueError("policy calendar selector has unknown or missing keys")
++    result = dict(value)
++    if result["kind"] != "context" or result["context_kind"] != "trading_calendar":
++        raise ValueError("policy calendar selector must identify trading_calendar Context")
++    _hash(result["descriptor_id"], "policy calendar descriptor_id")
++    for field in ("scope_key", "field", "expected_type"):
++        _text(result[field], f"policy calendar {field}")
++    for field in ("entry_id", "expected_unit"):
++        if result[field] is not None:
++            _text(result[field], f"policy calendar {field}")
++    return result
++
++
++def _bridge(value: object, kind: str, exchange: str) -> dict[str, object] | None:
++    if kind == "calendar_range":
++        if value is not None:
++            raise ValueError("calendar range calendar_anchor_selector must be null")
++        return None
++    if type(value) is not dict or set(value) != {"selector", "exchange"}:
++        raise ValueError("market range calendar_anchor_selector has invalid keys")
++    bridge_exchange = _exchange(value["exchange"], "calendar anchor exchange")
++    if bridge_exchange != exchange:
++        raise ValueError("calendar anchor exchange must match exchange_scope")
++    return {"selector": _context_selector(value["selector"]), "exchange": bridge_exchange}
++
++
++def _freeze(value: object) -> object:
++    if type(value) is dict:
++        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
++    if type(value) is list:
++        return tuple(_freeze(item) for item in value)
++    return value
++
++
++def _thaw(value: object) -> object:
++    if isinstance(value, Mapping):
++        return {key: _thaw(item) for key, item in value.items()}
++    if type(value) in (tuple, list):
++        return [_thaw(item) for item in value]
++    return value
++
++
++@dataclass(frozen=True, init=False)
++class RangeConfig:
++    schema_version: str
++    capability: str
++    kind: str
++    anchor_descriptor_id: str
++    calendar_descriptor_id: str
++    source: str
++    dataset: str
++    endpoint_url: str
++    http_method: str
++    parser_id: str
++    parser_version: str
++    mapping_version: str
++    normalizer_version: str
++    request_version: str
++    exchange_scope: str
++    calendar_anchor_selector: Mapping[str, object] | None
++    request_template: Mapping[str, object]
++    pagination: str
++    max_pages: int
++    max_calendar_days_per_request: int
++    timeout_seconds: int | float
++    retry_base_seconds: int | float
++    retry_max_attempts: int
++    challenge_cooldown_seconds: int | float
++
++    def __init__(self, *_args: object, **_kwargs: object) -> None:
++        raise ValueError("RangeConfig must be constructed by parse_range_entry")
++
++    def to_dict(self) -> dict[str, object]:
++        return _range_config_to_dict(self)
++
++    @property
++    def entry_id(self) -> str:
++        return hashlib.sha256(_canonical(_range_config_to_dict(self))).hexdigest()
++
++
++def _range_config_to_dict(config: object) -> dict[str, object]:
++    if type(config) is not RangeConfig:
++        raise ValueError("exact RangeConfig required")
++    return {
++        field: _thaw(object.__getattribute__(config, field)) for field in _RANGE_FIELDS
++    }
++
++
++def parse_range_entry(wire: dict) -> RangeConfig:
++    """Parse one independent, closed range configuration ENTRY."""
++    if type(wire) is not dict or set(wire) != _RANGE_FIELD_SET:
++        raise ValueError("range config has unknown or missing keys")
++    if wire["schema_version"] != "formal-range-source-config-v1":
++        raise ValueError("range config schema_version is invalid")
++    if wire["capability"] != "verified_market_window_v1":
++        raise ValueError("range config capability is invalid")
++    if type(wire["kind"]) is not str or wire["kind"] not in {"calendar_range", "market_range"}:
++        raise ValueError("range config kind is invalid")
++    kind = wire["kind"]
++    _hash(wire["anchor_descriptor_id"], "range anchor_descriptor_id")
++    _hash(wire["calendar_descriptor_id"], "range calendar_descriptor_id")
++    if type(wire["source"]) is not str or wire["source"] not in _SOURCES:
++        raise ValueError("range source is not an eligible official source")
++    _text(wire["dataset"], "range dataset", version=True)
++    _https_url(wire["endpoint_url"], "range endpoint_url")
++    if type(wire["http_method"]) is not str or wire["http_method"] not in {"GET", "POST"}:
++        raise ValueError("range http_method must be GET or POST")
++    for field in (
++        "parser_id",
++        "parser_version",
++        "mapping_version",
++        "normalizer_version",
++        "request_version",
++    ):
++        _text(wire[field], f"range {field}", version=True)
++    if wire["request_version"] != "formal-range-request-v1":
++        raise ValueError("range request_version is invalid")
++    exchange = _exchange(wire["exchange_scope"], "range exchange_scope")
++    bridge = _bridge(wire["calendar_anchor_selector"], kind, exchange)
++    template = _request_template(wire["request_template"], wire["http_method"], kind)
++    if type(wire["pagination"]) is not str or wire["pagination"] not in {
++        "single_response_v1",
++        "numbered_pages_v1",
++    }:
++        raise ValueError("range pagination is invalid")
++    max_pages = _positive_integer(wire["max_pages"], "range max_pages")
++    if wire["pagination"] == "single_response_v1" and max_pages != 1:
++        raise ValueError("single_response_v1 requires max_pages=1")
++    _positive_integer(
++        wire["max_calendar_days_per_request"],
++        "range max_calendar_days_per_request",
++    )
++    for field in (
++        "timeout_seconds",
++        "retry_base_seconds",
++        "challenge_cooldown_seconds",
++    ):
++        _positive_number(wire[field], f"range {field}")
++    _positive_integer(wire["retry_max_attempts"], "range retry_max_attempts")
++
++    values = dict(wire)
++    values["calendar_anchor_selector"] = bridge
++    values["request_template"] = template
++    result = object.__new__(RangeConfig)
++    for field in _RANGE_FIELDS:
++        value = values[field]
++        if field in {"calendar_anchor_selector", "request_template"}:
++            value = _freeze(value)
++        object.__setattr__(result, field, value)
++    return result
++
++
++def _load_canonical_object(raw: object, label: str) -> dict[str, object]:
++    if type(raw) is not bytes:
++        raise ValueError(f"{label} must be canonical UTF-8 bytes")
++
++    def pairs(items):
++        result = {}
++        for key, value in items:
++            if key in result:
++                raise ValueError(f"{label} has duplicate JSON keys")
++            result[key] = value
++        return result
++
++    def constant(value):
++        raise ValueError(f"{label} has non-finite value {value}")
++
++    try:
++        value = json.loads(
++            raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant
++        )
++    except (UnicodeError, TypeError, json.JSONDecodeError) as error:
++        raise ValueError(f"{label} is invalid") from error
++    if type(value) is not dict or _canonical(value) != raw:
++        raise ValueError(f"{label} must be a canonical JSON object")
++    return value
++
++
++def _range_catalog_from_source(raw: bytes) -> tuple[dict[str, object], tuple[RangeConfig, ...]]:
++    source = _load_canonical_object(raw, "source registry")
++    if set(source) != {"registry_role", "schema_version", "configs", "range_configs"}:
++        raise ValueError("Stage B requires a closed formal-source-registry-v2")
++    if source["registry_role"] != "source" or source["schema_version"] != "formal-source-registry-v2":
++        raise ValueError("Stage B requires formal-source-registry-v2")
++    if type(source["configs"]) is not list or any(
++        type(item) is not dict or set(item) != _LEGACY_CONFIG_FIELDS
++        for item in source["configs"]
++    ):
++        raise ValueError("source registry legacy configs are not closed")
++    if type(source["range_configs"]) is not list:
++        raise ValueError("source registry range_configs must be a list")
++    configs = tuple(parse_range_entry(item) for item in source["range_configs"])
++    identities = set()
++    for config in configs:
++        wire = _range_config_to_dict(config)
++        identity = (
++            wire["kind"],
++            wire["capability"],
++            wire["anchor_descriptor_id"],
++            wire["calendar_descriptor_id"],
++            wire["exchange_scope"],
++        )
++        if identity in identities:
++            raise ValueError("source registry has duplicate range config identity")
++        identities.add(identity)
++    return source, configs
++
++
++def _calendar_bridge(selector: dict[str, object], exchange: str) -> dict[str, object]:
++    return {"selector": dict(selector), "exchange": exchange}
++
++
++def _pair_key(entry: dict[str, object]):
++    return (
++        entry["capability"],
++        entry["exchange_scope"],
++        entry["calendar_descriptor_id"],
++    )
++
++
++def _require_pair(
++    market: dict[str, object],
++    calendar: dict[str, object],
++    selector: dict[str, object],
++    exchange: str,
++) -> None:
++    if market["kind"] != "market_range" or calendar["kind"] != "calendar_range":
++        raise ValueError("range pair kind mismatch")
++    if _pair_key(market) != _pair_key(calendar):
++        raise ValueError("range calendar identity mismatch")
++    if calendar["anchor_descriptor_id"] != calendar["calendar_descriptor_id"]:
++        raise ValueError("calendar anchor must identify itself")
++    if market["calendar_anchor_selector"] != _calendar_bridge(selector, exchange):
++        raise ValueError("policy calendar bridge mismatch")
++
++
++_interfaces = None
++
++
++def _trusted_interfaces():
++    global _interfaces
++    if _interfaces is None:
++        from .formal_context_schema import _descriptor
++        from .formal_policy_registry import FormalPolicyRegistry
++        from .formal_registry_manifest import VerifiedRegistryBundle
++        from .formal_scoring_registry import FormalScoringRegistry
++
++        _interfaces = (
++            VerifiedRegistryBundle,
++            VerifiedRegistryBundle.require_official,
++            VerifiedRegistryBundle.blob,
++            FormalScoringRegistry,
++            FormalScoringRegistry.require_official,
++            FormalPolicyRegistry,
++            FormalPolicyRegistry.require_verified,
++            FormalPolicyRegistry.canonical_bytes,
++            _descriptor,
++        )
++    return _interfaces
++
++
++def _derive_graph(bundle, scoring_registry, policy_registry):
++    (
++        bundle_type,
++        require_bundle,
++        blob_for,
++        scoring_type,
++        require_scoring,
++        policy_type,
++        require_policy,
++        policy_bytes_for,
++        validate_descriptor,
++    ) = _trusted_interfaces()
++    if (
++        type(bundle) is not bundle_type
++        or type(scoring_registry) is not scoring_type
++        or type(policy_registry) is not policy_type
++    ):
++        raise ValueError("range bindings require exact genuine registry types")
++    require_bundle(bundle)
++    require_scoring(scoring_registry, bundle)
++    require_policy(policy_registry)
++    policy = json.loads(policy_bytes_for(policy_registry))
++    root_hash = hashlib.sha256(bundle.manifest.canonical_json).hexdigest()
++    if root_hash != bundle.manifest.manifest_hash:
++        raise ValueError("range binding registry root hash mismatch")
++    if policy["registry_manifest_hash"] != root_hash:
++        raise ValueError("policy and range registry roots differ")
++    role_hashes = {}
++    for role in ("source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event"):
++        blob = blob_for(bundle, role)
++        digest = hashlib.sha256(blob.canonical_json).hexdigest()
++        if digest != blob.registry_hash or digest != getattr(bundle.manifest, role + "_registry_hash"):
++            raise ValueError("range binding actual child hash mismatch")
++        role_hashes[role] = digest
++    if policy["role_hashes"] != role_hashes:
++        raise ValueError("policy roles differ from the current range graph")
++
++    source_wire, range_configs = _range_catalog_from_source(blob_for(bundle, "source").canonical_json)
++    wrapper = _load_canonical_object(blob_for(bundle, "scoring").canonical_json, "scoring registry")
++    descriptors = {}
++    scopes = set()
++    raw_descriptors = wrapper.get("descriptors")
++    if type(raw_descriptors) is not list:
++        raise ValueError("scoring registry Context descriptors are absent")
++    for descriptor in raw_descriptors:
++        validate_descriptor(descriptor)
++        identity = hashlib.sha256(_canonical(descriptor)).hexdigest()
++        scope = (descriptor["context_kind"], descriptor["scope_key"], descriptor["security_scope"])
++        if identity in descriptors or scope in scopes:
++            raise ValueError("duplicate Context descriptor in range graph")
++        descriptors[identity] = descriptor
++        scopes.add(scope)
++
++    legacy_configs = source_wire["configs"]
++    definitions = {}
++    market_rules = [rule for rule in policy["rules"] if rule["kind"] == "market_liquidity"]
++    if not market_rules:
++        raise ValueError("active market policy is absent")
++    for rule in market_rules:
++        capability = rule["parameters"]["required_evidence_capability"]
++        if capability != "verified_market_window_v1":
++            raise ValueError("active market policy lacks authorized range capability")
++        market_selector = rule["inputs"]["market"]
++        calendar_selector = rule["inputs"]["calendar"]
++        if (
++            market_selector["kind"] != "context"
++            or market_selector["context_kind"] != "market_close"
++            or calendar_selector["kind"] != "context"
++            or calendar_selector["context_kind"] != "trading_calendar"
++        ):
++            raise ValueError("market policy Context selectors are invalid")
++        market_descriptor = descriptors.get(market_selector["descriptor_id"])
++        policy_calendar_descriptor = descriptors.get(calendar_selector["descriptor_id"])
++        if market_descriptor is None or policy_calendar_descriptor is None:
++            raise ValueError("market policy Context descriptor is absent")
++        for exchange in ("SH", "SZ", "BJ"):
++            market_matches = [
++                config
++                for config in range_configs
++                if config.kind == "market_range"
++                and config.capability == capability
++                and config.anchor_descriptor_id == market_selector["descriptor_id"]
++                and config.exchange_scope == exchange
++            ]
++            if len(market_matches) != 1:
++                raise ValueError("market range config is absent or ambiguous")
++            market_config = market_matches[0]
++            calendar_matches = [
++                config
++                for config in range_configs
++                if config.kind == "calendar_range"
++                and config.capability == capability
++                and config.calendar_descriptor_id == market_config.calendar_descriptor_id
++                and config.exchange_scope == exchange
++            ]
++            if len(calendar_matches) != 1:
++                raise ValueError("calendar range config is absent or ambiguous")
++            calendar_config = calendar_matches[0]
++            market_wire = _range_config_to_dict(market_config)
++            calendar_wire = _range_config_to_dict(calendar_config)
++            _require_pair(market_wire, calendar_wire, calendar_selector, exchange)
++            bootstrap = descriptors.get(calendar_config.calendar_descriptor_id)
++            if bootstrap is None:
++                raise ValueError("range bootstrap calendar descriptor is absent")
++            if (
++                bootstrap["context_kind"] != "trading_calendar"
++                or bootstrap["security_scope"] != "none"
++                or bootstrap["request_security"] != "none"
++                or bootstrap["exchange_rule"] != "fixed_exchange"
++                or bootstrap["fixed_exchange"] != exchange
++                or bootstrap["bootstrap_calendar"] is not True
++                or bootstrap["calendar_selector"] is not None
++            ):
++                raise ValueError("range calendar anchor is not the exchange bootstrap descriptor")
++            if calendar_selector["descriptor_id"] == calendar_config.calendar_descriptor_id:
++                raise ValueError("policy calendar C cannot be used as bootstrap calendar Bx")
++            if (market_config.source, market_config.dataset) != (
++                market_descriptor["source"],
++                market_descriptor["dataset"],
++            ):
++                raise ValueError("market range source differs from its M descriptor")
++            if (calendar_config.source, calendar_config.dataset) != (
++                bootstrap["source"],
++                bootstrap["dataset"],
++            ):
++                raise ValueError("calendar range source differs from its Bx descriptor")
++            bootstrap_sources = [
++                config
++                for config in legacy_configs
++                if config["source"] == bootstrap["source"]
++                and config["dataset"] == bootstrap["dataset"]
++                and config["exchange_scope"] is None
++            ]
++            if len(bootstrap_sources) != 1:
++                raise ValueError("bootstrap source config is absent or ambiguous")
++            old = bootstrap_sources[0]
++            for field in (
++                "source",
++                "dataset",
++                "parser_id",
++                "parser_version",
++                "mapping_version",
++                "bootstrap_calendar",
++                "calendar_selector",
++            ):
++                if type(old[field]) is not type(bootstrap[field]) or old[field] != bootstrap[field]:
++                    raise ValueError("bootstrap descriptor and legacy source config differ")
++
++            binding_wire = {
++                "schema_version": "formal-policy-range-binding-v1",
++                "rule_id": rule["rule_id"],
++                "exchange": exchange,
++                "market_config_id": market_config.entry_id,
++                "calendar_config_id": calendar_config.entry_id,
++                "policy_calendar_selector": _calendar_bridge(calendar_selector, exchange),
++                "registry_manifest_hash": root_hash,
++            }
++            binding_hash = hashlib.sha256(_canonical(binding_wire)).hexdigest()
++            definitions[(rule["rule_id"], exchange)] = (
++                market_config,
++                calendar_config,
++                binding_wire["policy_calendar_selector"],
++                binding_hash,
++            )
++    return root_hash, role_hashes, definitions
++
++
++@dataclass(frozen=True)
++class _BindingsRecord:
++    reference: weakref.ReferenceType[object]
++    bundle: object
++    scoring_registry: object
++    policy_registry: object
++    root_hash: str
++    role_hashes: dict[str, str]
++    definition_fingerprint: bytes
++    bindings: dict[tuple[str, str], object]
++
++
++@dataclass(frozen=True)
++class _BindingRecord:
++    reference: weakref.ReferenceType[object]
++    parent: object
++    key: tuple[str, str]
++    market_config: RangeConfig
++    calendar_config: RangeConfig
++    selector: Mapping[str, object]
++    binding_hash: str
++    market_bytes: bytes
++    calendar_bytes: bytes
++
++
++_bindings_records: dict[int, _BindingsRecord] = {}
++_binding_records: dict[int, _BindingRecord] = {}
++
++
++def _definitions_fingerprint(definitions) -> bytes:
++    rows = []
++    for (rule_id, exchange), (market, calendar, selector, binding_hash) in sorted(definitions.items()):
++        rows.append(
++            {
++                "rule_id": rule_id,
++                "exchange": exchange,
++                "market": _range_config_to_dict(market),
++                "calendar": _range_config_to_dict(calendar),
++                "selector": selector,
++                "binding_hash": binding_hash,
++            }
++        )
++    return _canonical(rows)
++
++
++def _bindings_record(value: object, *, current: bool = False) -> _BindingsRecord:
++    record = _bindings_records.get(id(value))
++    if type(value) is not RangeBindings or record is None or record.reference() is not value:
++        raise ValueError("range bindings are forged, copied, or unregistered")
++    if current:
++        root_hash, role_hashes, definitions = _derive_graph(
++            record.bundle, record.scoring_registry, record.policy_registry
++        )
++        if (
++            root_hash != record.root_hash
++            or role_hashes != record.role_hashes
++            or _definitions_fingerprint(definitions) != record.definition_fingerprint
++        ):
++            raise ValueError("range binding sources changed")
++    return record
++
++
++def _binding_record(value: object, *, current: bool = False) -> _BindingRecord:
++    record = _binding_records.get(id(value))
++    if type(value) is not RangeBinding or record is None or record.reference() is not value:
++        raise ValueError("range binding is forged, copied, or unregistered")
++    parent_record = _bindings_record(record.parent, current=current)
++    if parent_record.bindings.get(record.key) is not value:
++        raise ValueError("range binding no longer belongs to its binding set")
++    if (
++        type(record.market_config) is not RangeConfig
++        or type(record.calendar_config) is not RangeConfig
++        or _canonical(_range_config_to_dict(record.market_config)) != record.market_bytes
++        or _canonical(_range_config_to_dict(record.calendar_config)) != record.calendar_bytes
++    ):
++        raise ValueError("range binding configuration changed")
++    return record
++
++
++class RangeBinding:
++    """A current, same-root M/C/Bx configuration authorization."""
++
++    __slots__ = ("__weakref__",)
++
++    def __init__(self, *_args: object, **_kwargs: object) -> None:
++        raise ValueError("RangeBinding must be loaded from a verified graph")
++
++    @property
++    def market_config(self) -> RangeConfig:
++        return _binding_record(self).market_config
++
++    @property
++    def calendar_config(self) -> RangeConfig:
++        return _binding_record(self).calendar_config
++
++    @property
++    def policy_calendar_selector(self) -> Mapping[str, object]:
++        return _binding_record(self).selector
++
++    @property
++    def registry_manifest_hash(self) -> str:
++        return _bindings_record(_binding_record(self).parent).root_hash
++
++    @property
++    def binding_hash(self) -> str:
++        return _binding_record(self).binding_hash
++
++    def require_current(self) -> None:
++        _binding_record(self, current=True)
++
++    def __copy__(self):
++        raise TypeError("range bindings cannot be copied")
++
++    def __deepcopy__(self, _memo):
++        raise TypeError("range bindings cannot be copied")
++
++
++class RangeBindings:
++    """All range authorizations for the active market rules in one signed root."""
++
++    __slots__ = ("__weakref__",)
++
++    def __init__(self, *_args: object, **_kwargs: object) -> None:
++        raise ValueError("RangeBindings must be loaded from a verified graph")
++
++    def for_rule(self, rule_id: str, exchange: str) -> RangeBinding:
++        record = _bindings_record(self)
++        _text(rule_id, "range binding rule_id")
++        _exchange(exchange, "range binding exchange")
++        binding = record.bindings.get((rule_id, exchange))
++        if type(binding) is not RangeBinding:
++            raise ValueError("range binding is absent")
++        _binding_record(binding)
++        return binding
++
++    def __copy__(self):
++        raise TypeError("range binding sets cannot be copied")
++
++    def __deepcopy__(self, _memo):
++        raise TypeError("range binding sets cannot be copied")
++
++
++def load_policy_range_bindings(
++    bundle, *, scoring_registry, policy_registry
++) -> RangeBindings:
++    """Bind signed range configs to every active market rule and exchange."""
++    root_hash, role_hashes, definitions = _derive_graph(
++        bundle, scoring_registry, policy_registry
++    )
++    result = object.__new__(RangeBindings)
++    binding_objects = {}
++    for key, (market, calendar, selector, binding_hash) in definitions.items():
++        binding = object.__new__(RangeBinding)
++        selector_snapshot = _freeze(selector)
++        binding_objects[key] = binding
++        binding_identity = id(binding)
++
++        def forget_binding(reference, *, identity=binding_identity):
++            record = _binding_records.get(identity)
++            if record is not None and record.reference is reference:
++                _binding_records.pop(identity, None)
++
++        reference = weakref.ref(binding, forget_binding)
++        _binding_records[binding_identity] = _BindingRecord(
++            reference,
++            result,
++            key,
++            market,
++            calendar,
++            selector_snapshot,
++            binding_hash,
++            _canonical(_range_config_to_dict(market)),
++            _canonical(_range_config_to_dict(calendar)),
++        )
++    identity = id(result)
++
++    def forget_bindings(reference, *, identity=identity):
++        record = _bindings_records.get(identity)
++        if record is not None and record.reference is reference:
++            _bindings_records.pop(identity, None)
++
++    reference = weakref.ref(result, forget_bindings)
++    _bindings_records[identity] = _BindingsRecord(
++        reference,
++        bundle,
++        scoring_registry,
++        policy_registry,
++        root_hash,
++        dict(role_hashes),
++        _definitions_fingerprint(definitions),
++        binding_objects,
++    )
++    return result
++
++
++__all__ = [
++    "RangeBinding",
++    "RangeBindings",
++    "RangeConfig",
++    "load_policy_range_bindings",
++    "parse_range_entry",
++]
+diff --git a/ashare_pipeline/formal_sources.py b/ashare_pipeline/formal_sources.py
+index d2e113e..5d6a74e 100644
+--- a/ashare_pipeline/formal_sources.py
++++ b/ashare_pipeline/formal_sources.py
+@@ -2,40 +2,41 @@
+ 
+ This module deliberately contains no production endpoint, parser, or network
+ client.  Callers supply a signed registry, an injected transport, and an
+ injected document parser for every collection attempt.
+ """
+ 
+ from __future__ import annotations
+ 
+ from collections.abc import Mapping
+ from dataclasses import dataclass
+ from datetime import datetime
+ import hashlib
+ import json
+ import math
+ import re
+ from types import MappingProxyType
+ from typing import Literal, Protocol
+ import uuid
+ import weakref
+ 
++from .formal_range_contract import RangeConfig, parse_range_entry
+ from .formal_evidence import (
+     EvidenceVerification,
+     OfficialFetch,
+     OfficialRequest,
+     OfficialSnapshotRef,
+     SourcePolicy,
+     VerifiedCalendarBinding,
+     verify_official_fetch,
+ )
+ from .formal_time import FORMAL_FREEZE_AT_CN, resolve_effective_at
+ 
+ 
+ _SOURCES = frozenset({"cninfo", "sse", "szse", "bse", "csrc"})
+ _EXCHANGES = frozenset({"SH", "SZ", "BJ"})
+ _SECURITY_ID = re.compile(r"^(?:SH|SZ|BJ)[0-9]{6}$")
+ _VERSION_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+ _DATE_ONLY_ANCHOR = re.compile(r"^\d{4}-\d{2}-\d{2}T00:00:00\+00:00$")
+ _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
+ _UNRESERVED = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+@@ -584,254 +585,338 @@ def _make_signed_source_registry_type() -> type[object]:
+         "key_id",
+     )
+     config_fields = (
+         "source",
+         "dataset",
+         "endpoint_url",
+         "http_method",
+         "parser_id",
+         "parser_version",
+         "mapping_version",
+         "request_template",
+         "timeout_seconds",
+         "retry_base_seconds",
+         "retry_max_attempts",
+         "challenge_cooldown_seconds",
+         "registry_hash",
+         "exchange_scope",
+         "calendar_selector",
+         "bootstrap_calendar",
+     )
++    range_config_type = RangeConfig
++    parse_range_config = parse_range_entry
++    range_config_fields = (
++        "schema_version",
++        "capability",
++        "kind",
++        "anchor_descriptor_id",
++        "calendar_descriptor_id",
++        "source",
++        "dataset",
++        "endpoint_url",
++        "http_method",
++        "parser_id",
++        "parser_version",
++        "mapping_version",
++        "normalizer_version",
++        "request_version",
++        "exchange_scope",
++        "calendar_anchor_selector",
++        "request_template",
++        "pagination",
++        "max_pages",
++        "max_calendar_days_per_request",
++        "timeout_seconds",
++        "retry_base_seconds",
++        "retry_max_attempts",
++        "challenge_cooldown_seconds",
++    )
+ 
+     @dataclass(frozen=True)
+     class _RegistryRecord:
+         reference: weakref.ReferenceType[object]
+         registry_fingerprint: tuple[object, ...]
+         configs: tuple[SourceAdapterConfig, ...]
+         configs_fingerprint: tuple[object, ...]
++        range_configs: tuple[RangeConfig, ...]
++        range_configs_fingerprint: tuple[object, ...]
+         canonical_json: bytes
+         registry_hash: str
+         signature: str
+         key_id: str
+ 
+     verified_registries: dict[int, _RegistryRecord] = {}
+ 
+     def configs_from_canonical(
+         canonical_json: bytes, registry_hash: str
+-    ) -> tuple[SourceAdapterConfig, ...]:
++    ) -> tuple[tuple[SourceAdapterConfig, ...], tuple[RangeConfig, ...]]:
+         wire = _load_canonical_object(canonical_json, label="source registry")
+-        if set(wire) != {"configs", "registry_role", "schema_version"}:
++        version = wire.get("schema_version")
++        expected_keys = (
++            {"configs", "registry_role", "schema_version"}
++            if version == "formal-source-registry-v1"
++            else {"configs", "range_configs", "registry_role", "schema_version"}
++            if version == "formal-source-registry-v2"
++            else None
++        )
++        if expected_keys is None or set(wire) != expected_keys:
+             raise ValueError("source registry has unknown or missing keys")
+         if wire["registry_role"] != "source":
+             raise ValueError("source registry role must be source")
+-        if wire["schema_version"] != "formal-source-registry-v1":
+-            raise ValueError("source registry schema_version is invalid")
+         if type(wire["configs"]) is not list:
+             raise ValueError("source registry configs must be a list")
+         configs: list[SourceAdapterConfig] = []
+         identities: set[tuple[str, str, str | None]] = set()
+         for item in wire["configs"]:
+             if type(item) is not dict or set(item) != _CONFIG_KEYS:
+                 raise ValueError("source registry config has unknown or missing keys")
+             config = SourceAdapterConfig(
+                 source=item["source"],
+                 dataset=item["dataset"],
+                 endpoint_url=item["endpoint_url"],
+                 http_method=item["http_method"],
+                 parser_id=item["parser_id"],
+                 parser_version=item["parser_version"],
+                 mapping_version=item["mapping_version"],
+                 request_template=item["request_template"],
+                 timeout_seconds=item["timeout_seconds"],
+                 retry_base_seconds=item["retry_base_seconds"],
+                 retry_max_attempts=item["retry_max_attempts"],
+                 challenge_cooldown_seconds=item["challenge_cooldown_seconds"],
+                 registry_hash=registry_hash,
+                 exchange_scope=item["exchange_scope"],
+                 calendar_selector=_selector_from_wire(item["calendar_selector"]),
+                 bootstrap_calendar=item["bootstrap_calendar"],
+             )
+             identity = (config.source, config.dataset, config.exchange_scope)
+             if identity in identities:
+                 raise ValueError("source registry has duplicate config identity")
+             identities.add(identity)
+             configs.append(config)
+-        return tuple(configs)
++        range_configs: list[RangeConfig] = []
++        range_identities: set[tuple[str, str, str, str, str]] = set()
++        if version == "formal-source-registry-v2":
++            if type(wire["range_configs"]) is not list:
++                raise ValueError("source registry range_configs must be a list")
++            for item in wire["range_configs"]:
++                config = parse_range_config(item)
++                identity = (
++                    config.kind,
++                    config.capability,
++                    config.anchor_descriptor_id,
++                    config.calendar_descriptor_id,
++                    config.exchange_scope,
++                )
++                if identity in range_identities:
++                    raise ValueError("source registry has duplicate range config identity")
++                range_identities.add(identity)
++                range_configs.append(config)
++        return tuple(configs), tuple(range_configs)
+ 
+     def value_fingerprint(value: object) -> object:
+         """Preserve type, order, and nesting so mutation is never normalized away."""
+ 
+         if type(value) is CalendarSelector:
+             return (
+                 "CalendarSelector",
+                 value.context_kind,
+                 value.scope_key,
+                 value.exchange,
+                 value.as_of_rule,
+             )
+         if isinstance(value, Mapping):
+             return (
+                 "Mapping",
+                 type(value).__module__,
+                 type(value).__qualname__,
+                 tuple(
+                     (value_fingerprint(key), value_fingerprint(item))
+                     for key, item in value.items()
+                 ),
+             )
+         if type(value) is tuple or type(value) is list:
+             return (type(value).__name__, tuple(value_fingerprint(item) for item in value))
+         if type(value) in {str, int, float, bool, bytes, type(None)}:
+             return (type(value).__name__, value)
+         return ("unexpected", type(value).__module__, type(value).__qualname__, id(value))
+ 
+     def config_fingerprint(config: object) -> tuple[object, ...]:
+         if type(config) is not SourceAdapterConfig:
+             return ("invalid-config", type(config).__module__, type(config).__qualname__)
+         return tuple(
+             (field, value_fingerprint(getattr(config, field, object()))) for field in config_fields
+         )
+ 
++    def range_config_fingerprint(config: object) -> tuple[object, ...]:
++        if type(config) is not range_config_type:
++            return ("invalid-range-config", type(config).__module__, type(config).__qualname__)
++        return tuple(
++            (field, value_fingerprint(object.__getattribute__(config, field)))
++            for field in range_config_fields
++        )
++
+     def registry_fingerprint(registry: object) -> tuple[object, ...]:
+         return tuple(
+             (field, value_fingerprint(getattr(registry, field, object()))) for field in registry_fields
+         )
+ 
+     def configs_fingerprint(configs: object) -> tuple[object, ...]:
+         if type(configs) is not tuple:
+             return ("invalid-configs", type(configs).__module__, type(configs).__qualname__)
+         return tuple(config_fingerprint(config) for config in configs)
+ 
++    def range_configs_fingerprint(configs: object) -> tuple[object, ...]:
++        if type(configs) is not tuple:
++            return ("invalid-range-configs", type(configs).__module__, type(configs).__qualname__)
++        return tuple(range_config_fingerprint(config) for config in configs)
++
+     def remember_verified(registry: object) -> None:
+         identity = id(registry)
+ 
+         def discard(reference: weakref.ReferenceType[object], *, identity: int = identity) -> None:
+             record = verified_registries.get(identity)
+             if record is not None and record.reference is reference:
+                 verified_registries.pop(identity, None)
+ 
+         reference = weakref.ref(registry, discard)
+         configs = getattr(registry, "configs")
++        range_configs = getattr(registry, "range_configs")
+         assert type(configs) is tuple
++        assert type(range_configs) is tuple
+         verified_registries[identity] = _RegistryRecord(
+             reference,
+             registry_fingerprint(registry),
+             configs,
+             configs_fingerprint(configs),
++            range_configs,
++            range_configs_fingerprint(range_configs),
+             getattr(registry, "canonical_json"),
+             getattr(registry, "registry_hash"),
+             getattr(registry, "signature"),
+             getattr(registry, "key_id"),
+         )
+ 
+     def verified_record(registry: object) -> _RegistryRecord:
+         record = verified_registries.get(id(registry))
+         if not (
+             record is not None
+             and record.reference() is registry
+             and getattr(registry, "configs", None) is record.configs
++            and getattr(registry, "range_configs", None) is record.range_configs
+             and registry_fingerprint(registry) == record.registry_fingerprint
+             and configs_fingerprint(getattr(registry, "configs", None)) == record.configs_fingerprint
++            and range_configs_fingerprint(getattr(registry, "range_configs", None))
++            == record.range_configs_fingerprint
+         ):
+             raise ValueError("signed source registry was not verified by from_signed_bytes")
+         return record
+ 
+     def is_verified(registry: object) -> bool:
+         try:
+             verified_record(registry)
+         except ValueError:
+             return False
+         return True
+ 
+     def trusted_config_snapshots(registry: object) -> tuple[SourceAdapterConfig, ...]:
+         record = verified_record(registry)
+-        return configs_from_canonical(record.canonical_json, record.registry_hash)
++        return configs_from_canonical(record.canonical_json, record.registry_hash)[0]
++
++    def trusted_range_config_snapshots(registry: object) -> tuple[RangeConfig, ...]:
++        record = verified_record(registry)
++        return configs_from_canonical(record.canonical_json, record.registry_hash)[1]
+ 
+     def trusted_config_snapshot(
+         registry: object, request: OfficialRequest
+     ) -> SourceAdapterConfig:
+         _, exchange = _validate_request(request)
+         matching = [
+             config
+             for config in trusted_config_snapshots(registry)
+             if config.source == request.source and config.dataset == request.dataset
+         ]
+         if exchange is None:
+             matching = [config for config in matching if config.exchange_scope is None]
+         else:
+             matching = [
+                 config
+                 for config in matching
+                 if config.exchange_scope is None or config.exchange_scope == exchange
+             ]
+         if len(matching) != 1:
+             raise FormalTerminalSourceError("signed source config is absent or ambiguous")
+         return matching[0]
+ 
+     @dataclass(frozen=True, init=False)
+     class SignedSourceRegistry:
+         """A canonical, verifier-approved source registry with no default configs."""
+ 
+         canonical_json: bytes
+         registry_hash: str
+         signature: str
+         key_id: str
+         configs: tuple[SourceAdapterConfig, ...]
++        range_configs: tuple[RangeConfig, ...]
+ 
+         def __init__(self, *args: object, **kwargs: object) -> None:
+             raise ValueError("SignedSourceRegistry must be loaded with from_signed_bytes")
+ 
+         def _require_verified(self) -> None:
+             if not is_verified(self):
+                 raise ValueError("signed source registry was not verified by from_signed_bytes")
+ 
+         @staticmethod
+         def _trusted_config_snapshots(registry: object) -> tuple[SourceAdapterConfig, ...]:
+             return trusted_config_snapshots(registry)
+ 
++        @staticmethod
++        def _trusted_range_config_snapshots(registry: object) -> tuple[RangeConfig, ...]:
++            return trusted_range_config_snapshots(registry)
++
+         @staticmethod
+         def _trusted_config_snapshot(
+             registry: object, request: OfficialRequest
+         ) -> SourceAdapterConfig:
+             return trusted_config_snapshot(registry, request)
+ 
+         @classmethod
+         def from_signed_bytes(
+             cls,
+             registry_bytes: bytes,
+             signature: str,
+             key_id: str,
+             verifier: RegistrySignatureVerifier,
+         ) -> "SignedSourceRegistry":
+             if cls is not SignedSourceRegistry:
+                 raise ValueError("SignedSourceRegistry must have exact type")
+             signature_text, key_text = _verify_signature(
+                 registry_bytes, signature, key_id, verifier, label="source registry"
+             )
+             registry_hash = hashlib.sha256(registry_bytes).hexdigest()
+-            configs = configs_from_canonical(registry_bytes, registry_hash)
++            configs, range_configs = configs_from_canonical(registry_bytes, registry_hash)
+             registry = object.__new__(SignedSourceRegistry)
+             object.__setattr__(registry, "canonical_json", registry_bytes)
+             object.__setattr__(registry, "registry_hash", registry_hash)
+             object.__setattr__(registry, "signature", signature_text)
+             object.__setattr__(registry, "key_id", key_text)
+             object.__setattr__(registry, "configs", configs)
++            object.__setattr__(registry, "range_configs", range_configs)
+             remember_verified(registry)
+             return registry
+ 
+         def select(self, request: OfficialRequest) -> SourceAdapterConfig:
+             return trusted_config_snapshot(self, request)
+ 
+     return SignedSourceRegistry
+ 
+ 
+ SignedSourceRegistry = _make_signed_source_registry_type()
+ del _make_signed_source_registry_type
+ 
+ 
+ def _validate_request(request: object) -> tuple[OfficialRequest, str | None]:
+     if type(request) is not OfficialRequest:
+         raise FormalTerminalSourceError("request must have exact type OfficialRequest")
+     try:
+         _require_source(request.source, "request source")
+         _require_trimmed_text(request.dataset, "request dataset", identifier=True)
+     except ValueError as error:
+diff --git a/tests/formal_range_fixtures.py b/tests/formal_range_fixtures.py
+new file mode 100644
+index 0000000..b79f823
+--- /dev/null
++++ b/tests/formal_range_fixtures.py
+@@ -0,0 +1,162 @@
++"""Byte-sensitive signed range-catalog fixtures; never production mappings."""
++
++import hashlib
++
++from tests.formal_policy_fixtures import policy_graph, rehash_documents
++from tests.test_formal_context_repository import descriptor
++from tests.test_formal_scoring_registry import canonical
++from tests.test_formal_sources import config
++
++
++def range_entry(**changes):
++    entry = dict(
++        schema_version="formal-range-source-config-v1",
++        capability="verified_market_window_v1",
++        kind="calendar_range",
++        anchor_descriptor_id="a" * 64,
++        calendar_descriptor_id="a" * 64,
++        source="cninfo",
++        dataset="fixture-range-calendar",
++        endpoint_url="https://www.cninfo.com.cn/fixture/range-calendar.json",
++        http_method="GET",
++        parser_id="fixture-range-parser",
++        parser_version="fixture-range-v1",
++        mapping_version="fixture-range-map-v1",
++        normalizer_version="fixture-range-normalizer-v1",
++        request_version="formal-range-request-v1",
++        exchange_scope="SH",
++        calendar_anchor_selector=None,
++        request_template=dict(
++            query={
++                "start": "{start_date}",
++                "end": "{end_date}",
++                "exchange": "{exchange}",
++                "page": "{page_index}",
++            },
++            headers={"accept": "application/json"},
++            body=None,
++        ),
++        pagination="single_response_v1",
++        max_pages=1,
++        max_calendar_days_per_request=400,
++        timeout_seconds=3.0,
++        retry_base_seconds=1.0,
++        retry_max_attempts=2,
++        challenge_cooldown_seconds=15.0,
++    )
++    entry.update(changes)
++    return entry
++
++
++def _descriptor_id(entry):
++    return hashlib.sha256(canonical(entry)).hexdigest()
++
++
++def add_range_documents(documents):
++    """Add only Bx/config/range declarations to an already-complete policy graph."""
++    wrapper = documents["scoring"]
++    source = documents["source"]
++
++    bootstrap = config(
++        dataset="trading_calendar",
++        endpoint_url="https://www.cninfo.com.cn/fixture/bootstrap-calendar.json",
++        request_template={
++            "query": {"date": "{period_or_date}"},
++            "headers": {"accept": "application/json"},
++            "body": None,
++        },
++        exchange_scope=None,
++        calendar_selector=None,
++        bootstrap_calendar=True,
++    )
++    identities = {
++        (item["source"], item["dataset"], item["exchange_scope"])
++        for item in source["configs"]
++    }
++    identity = (bootstrap["source"], bootstrap["dataset"], None)
++    if identity not in identities:
++        source["configs"].append(bootstrap)
++
++    bootstrap_by_exchange = {}
++    for exchange in ("SH", "SZ", "BJ"):
++        entry = descriptor(
++            "trading_calendar",
++            scope_key=f"fixture-range-calendar-{exchange.lower()}",
++            security_scope="none",
++            request_security="none",
++            exchange_rule="fixed_exchange",
++            fixed_exchange=exchange,
++            source="cninfo",
++            dataset="trading_calendar",
++            calendar_selector=None,
++            bootstrap_calendar=True,
++        )
++        wrapper["descriptors"].append(entry)
++        bootstrap_by_exchange[exchange] = (entry, _descriptor_id(entry))
++
++    policy = documents["status"]
++    rule_id = next(
++        rule_id
++        for rule_id in policy["rules"]["execution_contract"]["rule_ids"]
++        if policy["rules"][rule_id]["kind"] == "market_liquidity"
++    )
++    rule = policy["rules"][rule_id]
++    market_selector = rule["inputs"]["market"]
++    calendar_selector = rule["inputs"]["calendar"]
++    descriptors = {
++        _descriptor_id(entry): entry for entry in wrapper["descriptors"]
++    }
++    market_descriptor = descriptors[market_selector["descriptor_id"]]
++
++    ranges = []
++    for exchange in ("SH", "SZ", "BJ"):
++        bootstrap_entry, bootstrap_id = bootstrap_by_exchange[exchange]
++        ranges.append(
++            range_entry(
++                anchor_descriptor_id=bootstrap_id,
++                calendar_descriptor_id=bootstrap_id,
++                source=bootstrap_entry["source"],
++                dataset=bootstrap_entry["dataset"],
++                exchange_scope=exchange,
++            )
++        )
++        ranges.append(
++            range_entry(
++                kind="market_range",
++                anchor_descriptor_id=market_selector["descriptor_id"],
++                calendar_descriptor_id=bootstrap_id,
++                source=market_descriptor["source"],
++                dataset=market_descriptor["dataset"],
++                endpoint_url="https://www.cninfo.com.cn/fixture/range-market.json",
++                calendar_anchor_selector={
++                    "selector": dict(calendar_selector),
++                    "exchange": exchange,
++                },
++                request_template=dict(
++                    query={
++                        "symbol": "{security_id}",
++                        "start": "{start_date}",
++                        "end": "{end_date}",
++                        "exchange": "{exchange}",
++                        "page": "{page_index}",
++                    },
++                    headers={"accept": "application/json"},
++                    body=None,
++                ),
++                exchange_scope=exchange,
++            )
++        )
++    source.update(
++        schema_version="formal-source-registry-v2",
++        range_configs=ranges,
++    )
++
++
++def range_graph(*, mutate=None):
++    def prepare(documents):
++        add_range_documents(documents)
++        if mutate is not None:
++            mutate(documents)
++        rehash_documents(documents)
++
++    return policy_graph(mutate=prepare)
+diff --git a/tests/test_formal_range_contract.py b/tests/test_formal_range_contract.py
+new file mode 100644
+index 0000000..4d3ff7b
+--- /dev/null
++++ b/tests/test_formal_range_contract.py
+@@ -0,0 +1,312 @@
++"""Closed signed range catalog and active-policy binding tests."""
++
++import copy
++import hashlib
++import unittest
++from unittest.mock import patch
++
++from ashare_pipeline.formal_evidence import OfficialRequest
++from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
++from ashare_pipeline.formal_sources import SignedSourceRegistry
++from tests.formal_range_fixtures import range_entry, range_graph
++from tests.test_formal_scoring_registry import HmacVerifier, canonical
++from tests.test_formal_sources import config
++
++
++class FormalRangeContractTests(unittest.TestCase):
++    def _registry(self, wire):
++        verifier = HmacVerifier()
++        raw = canonical(wire)
++        return SignedSourceRegistry.from_signed_bytes(
++            raw, verifier.sign(raw), "scoring-test-key", verifier
++        )
++
++    def _load(self, mutate=None):
++        from ashare_pipeline.formal_range_contract import load_policy_range_bindings
++
++        bundle, vocabulary, scoring, repository, verifier = range_graph(mutate=mutate)
++        policy = load_formal_policy_registry(
++            bundle, scoring_registry=scoring, feature_registry=vocabulary
++        )
++        bindings = load_policy_range_bindings(
++            bundle, scoring_registry=scoring, policy_registry=policy
++        )
++        return bindings, bundle, vocabulary, scoring, policy, repository, verifier
++
++    def test_closed_range_contract(self):
++        from ashare_pipeline.formal_range_contract import parse_range_entry
++
++        self.assertEqual(parse_range_entry(range_entry()).to_dict(), range_entry())
++        for changes in (
++            {"max_pages": True},
++            {"max_pages": 2},
++            {"exchange_scope": None},
++            {"unapproved": 1},
++        ):
++            with self.subTest(changes=changes), self.assertRaises(ValueError):
++                parse_range_entry(range_entry(**changes))
++
++    def test_range_format_rejects_wrong_types_versions_templates_and_bridge_shapes(self):
++        from ashare_pipeline.formal_range_contract import parse_range_entry
++
++        invalid = (
++            {"schema_version": "other"},
++            {"capability": "other"},
++            {"kind": "other"},
++            {"anchor_descriptor_id": "A" * 64},
++            {"source": "blog"},
++            {"endpoint_url": "http://www.cninfo.com.cn/range.json"},
++            {"http_method": "PATCH"},
++            {"normalizer_version": ""},
++            {"request_version": "formal-context-request-v1"},
++            {"pagination": "unknown"},
++            {"max_calendar_days_per_request": 0},
++            {"timeout_seconds": float("nan")},
++            {"retry_max_attempts": True},
++            {"calendar_anchor_selector": {}},
++            {
++                "request_template": {
++                    "query": {"date": "{period_or_date}"},
++                    "headers": {},
++                    "body": None,
++                }
++            },
++            {
++                "request_template": {
++                    "query": {"symbol": "{security_id}"},
++                    "headers": {},
++                    "body": None,
++                }
++            },
++        )
++        for changes in invalid:
++            with self.subTest(changes=changes), self.assertRaises(ValueError):
++                parse_range_entry(range_entry(**changes))
++
++        bridge = {
++            "selector": {
++                "kind": "context",
++                "descriptor_id": "b" * 64,
++                "context_kind": "trading_calendar",
++                "scope_key": "calendar",
++                "field": "record",
++                "entry_id": None,
++                "expected_type": "calendar_record",
++                "expected_unit": None,
++            },
++            "exchange": "SH",
++        }
++        market = range_entry(
++            kind="market_range",
++            calendar_anchor_selector=bridge,
++            request_template={
++                "query": {"symbol": "{security_id}"},
++                "headers": {},
++                "body": None,
++            },
++        )
++        self.assertEqual(parse_range_entry(market).to_dict(), market)
++        for bad_bridge in (
++            None,
++            {**bridge, "extra": 1},
++            {**bridge, "exchange": "SZ"},
++            {"selector": {**bridge["selector"], "descriptor_id": "bad"}, "exchange": "SH"},
++        ):
++            with self.subTest(bridge=bad_bridge), self.assertRaises(ValueError):
++                parse_range_entry({**market, "calendar_anchor_selector": bad_bridge})
++
++    def test_source_registry_versions_are_closed_and_old_configs_stay_closed(self):
++        v1 = {
++            "registry_role": "source",
++            "schema_version": "formal-source-registry-v1",
++            "configs": [config()],
++        }
++        self.assertEqual(self._registry(v1).range_configs, ())
++        for bad in (
++            {**v1, "range_configs": []},
++            {
++                "registry_role": "source",
++                "schema_version": "formal-source-registry-v2",
++                "configs": [config()],
++            },
++            {
++                "registry_role": "source",
++                "schema_version": "formal-source-registry-v2",
++                "configs": [{**config(), "max_pages": 1}],
++                "range_configs": [range_entry()],
++            },
++        ):
++            with self.subTest(wire=bad), self.assertRaises(ValueError):
++                self._registry(bad)
++
++    def test_v2_registry_keeps_legacy_selection_separate_and_seals_range_snapshots(self):
++        wire = {
++            "registry_role": "source",
++            "schema_version": "formal-source-registry-v2",
++            "configs": [config()],
++            "range_configs": [range_entry()],
++        }
++        registry = self._registry(wire)
++        self.assertIsInstance(registry.range_configs, tuple)
++        self.assertEqual(len(registry.range_configs), 1)
++        selected = registry.select(OfficialRequest("cninfo", "annual_report", "SZ000001", "2025-12-31", "SZ"))
++        self.assertEqual(selected.dataset, "annual_report")
++        snapshot = SignedSourceRegistry._trusted_range_config_snapshots(registry)[0]
++        self.assertIsNot(snapshot, registry.range_configs[0])
++        self.assertEqual(snapshot.entry_id, registry.range_configs[0].entry_id)
++
++        original = registry.range_configs[0]
++        with patch.object(type(original), "to_dict", return_value={"forged": True}):
++            self.assertEqual(
++                SignedSourceRegistry._trusted_range_config_snapshots(registry)[0].dataset,
++                "fixture-range-calendar",
++            )
++
++        object.__setattr__(original, "dataset", "unsigned-dataset")
++        with self.assertRaises(ValueError):
++            registry._require_verified()
++
++        registry = self._registry(wire)
++        object.__setattr__(registry, "range_configs", ())
++        with self.assertRaises(ValueError):
++            registry._require_verified()
++
++    def test_complete_graph_binds_every_active_market_rule_for_every_exchange(self):
++        bindings, bundle, _, _, policy, *_ = self._load()
++        market_rules = [rule for rule in policy.rules if rule["kind"] == "market_liquidity"]
++        self.assertEqual(len(market_rules), 5)
++        checked_current = False
++        for rule in market_rules:
++            for exchange in ("SH", "SZ", "BJ"):
++                binding = bindings.for_rule(rule["rule_id"], exchange)
++                if not checked_current:
++                    binding.require_current()
++                    checked_current = True
++                self.assertEqual(binding.registry_manifest_hash, bundle.manifest.manifest_hash)
++                self.assertEqual(binding.market_config.kind, "market_range")
++                self.assertEqual(binding.calendar_config.kind, "calendar_range")
++                self.assertEqual(binding.market_config.exchange_scope, exchange)
++                self.assertEqual(binding.calendar_config.exchange_scope, exchange)
++                self.assertEqual(binding.market_config.calendar_descriptor_id,
++                                 binding.calendar_config.calendar_descriptor_id)
++                self.assertEqual(binding.policy_calendar_selector["exchange"], exchange)
++                self.assertEqual(len(binding.binding_hash), 64)
++        with self.assertRaises(ValueError):
++            bindings.for_rule("unknown", "SH")
++        with self.assertRaises(ValueError):
++            bindings.for_rule(market_rules[0]["rule_id"], "HK")
++
++    def test_absent_and_duplicate_pairs_are_contract_failures(self):
++        def absent(documents):
++            ranges = documents["source"]["range_configs"]
++            ranges[:] = [item for item in ranges
++                         if not (item["kind"] == "market_range" and item["exchange_scope"] == "SH")]
++
++        def duplicate(documents):
++            item = next(item for item in documents["source"]["range_configs"]
++                        if item["kind"] == "market_range" and item["exchange_scope"] == "SH")
++            documents["source"]["range_configs"].append(copy.deepcopy(item))
++
++        for mutate in (absent, duplicate):
++            with self.subTest(mutate=mutate.__name__), self.assertRaises(ValueError):
++                self._load(mutate)
++
++    def test_wrong_source_exchange_and_active_capability_are_rejected(self):
++        def wrong_source(documents):
++            item = next(item for item in documents["source"]["range_configs"]
++                        if item["kind"] == "market_range" and item["exchange_scope"] == "SH")
++            item["source"] = "sse"
++
++        def wrong_exchange(documents):
++            item = next(item for item in documents["source"]["range_configs"]
++                        if item["kind"] == "calendar_range" and item["exchange_scope"] == "SH")
++            item["exchange_scope"] = "SZ"
++
++        def unauthorized_capability(documents):
++            for rule_id in documents["status"]["rules"]["execution_contract"]["rule_ids"]:
++                rule = documents["status"]["rules"][rule_id]
++                if rule["kind"] == "market_liquidity":
++                    rule["parameters"]["required_evidence_capability"] = "unapproved-capability"
++                    break
++
++        for mutate in (wrong_source, wrong_exchange, unauthorized_capability):
++            with self.subTest(mutate=mutate.__name__), self.assertRaises(ValueError):
++                self._load(mutate)
++
++    def test_market_calendar_and_bootstrap_identities_cannot_be_mixed(self):
++        def context_and_bootstrap(documents):
++            descriptors = documents["scoring"]["descriptors"]
++            context = next(item for item in descriptors
++                           if item["context_kind"] == "trading_calendar" and not item["bootstrap_calendar"])
++            bootstrap = {item["fixed_exchange"]: item for item in descriptors
++                         if item["context_kind"] == "trading_calendar" and item["bootstrap_calendar"]}
++            return context, bootstrap
++
++        def c_as_bx(documents):
++            context, _ = context_and_bootstrap(documents)
++            context_id = hashlib.sha256(canonical(context)).hexdigest()
++            calendar = next(item for item in documents["source"]["range_configs"]
++                            if item["kind"] == "calendar_range" and item["exchange_scope"] == "SH")
++            market = next(item for item in documents["source"]["range_configs"]
++                          if item["kind"] == "market_range" and item["exchange_scope"] == "SH")
++            calendar["anchor_descriptor_id"] = context_id
++            calendar["calendar_descriptor_id"] = context_id
++            market["calendar_descriptor_id"] = context_id
++
++        def bx_as_c(documents):
++            _, bootstrap = context_and_bootstrap(documents)
++            bootstrap_entry = bootstrap["SH"]
++            bootstrap_id = hashlib.sha256(canonical(bootstrap_entry)).hexdigest()
++            for rule_id in documents["status"]["rules"]["execution_contract"]["rule_ids"]:
++                rule = documents["status"]["rules"][rule_id]
++                if rule["kind"] == "market_liquidity":
++                    selector = rule["inputs"]["calendar"]
++                    selector["descriptor_id"] = bootstrap_id
++                    selector["scope_key"] = bootstrap_entry["scope_key"]
++                    break
++
++        def sh_uses_sz_bx(documents):
++            _, bootstrap = context_and_bootstrap(documents)
++            sz_id = hashlib.sha256(canonical(bootstrap["SZ"])).hexdigest()
++            market = next(item for item in documents["source"]["range_configs"]
++                          if item["kind"] == "market_range" and item["exchange_scope"] == "SH")
++            market["calendar_descriptor_id"] = sz_id
++
++        def same_text_wrong_descriptor(documents):
++            item = next(item for item in documents["source"]["range_configs"]
++                        if item["kind"] == "market_range" and item["exchange_scope"] == "SH")
++            item["calendar_anchor_selector"]["selector"]["descriptor_id"] = "f" * 64
++
++        for mutate in (c_as_bx, bx_as_c, sh_uses_sz_bx, same_text_wrong_descriptor):
++            with self.subTest(mutate=mutate.__name__), self.assertRaises(ValueError):
++                self._load(mutate)
++
++    def test_wrong_root_and_mutated_returned_binding_fail_current_validation(self):
++        from ashare_pipeline.formal_range_contract import load_policy_range_bindings
++
++        bindings, _, _, _, _, *_ = self._load()
++        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
++        object.__setattr__(binding.market_config, "dataset", "unsigned-dataset")
++        with self.assertRaises(ValueError):
++            binding.require_current()
++
++        _, bundle1, _, scoring1, policy1, *_ = self._load()
++
++        def changed_root(documents):
++            documents["source"]["range_configs"][0]["endpoint_url"] = (
++                "https://www.cninfo.com.cn/fixture/changed-range.json"
++            )
++
++        _, bundle2, _, scoring2, _, *_ = self._load(changed_root)
++        with self.assertRaises(ValueError):
++            load_policy_range_bindings(
++                bundle2, scoring_registry=scoring2, policy_registry=policy1
++            )
++        # The original genuine trio remains valid; this guards against a shared global seal.
++        load_policy_range_bindings(
++            bundle1, scoring_registry=scoring1, policy_registry=policy1
++        ).for_rule("bank_no_effective_trade_20d", "SH").require_current()
++
++
++if __name__ == "__main__":
++    unittest.main()
+

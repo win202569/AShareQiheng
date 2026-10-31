@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_performance.RunnerPerformanceTests.test_each_stage_is_built_once_and_diagnostics_do_not_change_result_hash
+test_each_stage_is_built_once_and_diagnostics_do_not_change_result_hash (test_formal_final_performance.RunnerPerformanceTests.test_each_stage_is_built_once_and_diagnostics_do_not_change_result_hash) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 4873.024s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_performance.RunnerPerformanceTests.test_each_stage_is_built_once_and_diagnostics_do_not_change_result_hash"], "passed": ["test_formal_final_performance.RunnerPerformanceTests.test_each_stage_is_built_once_and_diagnostics_do_not_change_result_hash"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

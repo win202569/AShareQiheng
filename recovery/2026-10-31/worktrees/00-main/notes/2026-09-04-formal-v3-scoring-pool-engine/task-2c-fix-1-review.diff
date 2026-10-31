@@ -1,0 +1,844 @@
+# Task 2C fix round 1 — scoped review
+
+Base: original six-file staged review baseline (task-2c-review.diff), HEAD dbf075dd5764c4dcd0ed3cba5074cc6ec330f49a. No fix commit yet. This package contains only unstaged changes relative to that baseline and the two newly added guard files. No data/progress/index changes.
+
+warning: in the working copy of 'ashare_pipeline/formal_metric_engine.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/formal_metric_feature_fixtures.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_formal_metric_engine.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/ashare_pipeline/formal_metric_engine.py b/ashare_pipeline/formal_metric_engine.py
+index ff64674..82de4bc 100644
+--- a/ashare_pipeline/formal_metric_engine.py
++++ b/ashare_pipeline/formal_metric_engine.py
+@@ -4,20 +4,21 @@ from decimal import Context, Decimal, DivisionByZero, InvalidOperation, Overflow
+ from dataclasses import fields
+ import hashlib
+ import json
+ from types import MappingProxyType
+ import weakref
+ 
+ from .formal_context_repository import FormalContextRepository
+ from .formal_feature_repository import FormalFeatureRepository, VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence
+ from .formal_feature_repository import _require_authentic_metric_feature_repository
+ from .formal_metric_context import FormalMetricContextRepository
++from .formal_metric_batch_guard import _metric_batch_guard
+ from .formal_registry_manifest import FormalRegistryBundleLoader
+ from .formal_scoring_registry import FormalScoringRegistry
+ 
+ 
+ def _arithmetic_context():
+     # Explicit every context option: neither getcontext nor DefaultContext is
+     # authoritative. Recurring division retains 50 deterministic significant
+     # digits, without display quantization; it is not claimed to be exact.
+     return Context(prec=50, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999,
+         capitals=1, clamp=0, flags=[], traps=[InvalidOperation, DivisionByZero, Overflow])
+@@ -61,20 +62,21 @@ def _freeze(value):
+         result = tuple(_freeze(item) for item in value)
+         return value if type(value) is tuple and all(a is b for a, b in zip(value, result, strict=True)) else result
+     return value
+ 
+ 
+ def _install_engine():
+     repositories, proofs = {}, {}
+     context_type = FormalMetricContextRepository
+     feature_read = FormalFeatureRepository.select_current_verified_metric_feature_state
+     require_feature = _require_authentic_metric_feature_repository
++    batch_guard = _metric_batch_guard
+     load_root = FormalRegistryBundleLoader.load
+     decimal_context = _arithmetic_context
+     encode, digest, freeze = _canonical, _digest, _freeze
+     checked = tuple((cls, name, method) for cls in (context_type, FormalFeatureRepository,
+         FormalContextRepository, FormalRegistryBundleLoader, FormalScoringRegistry)
+         for name, method in vars(cls).items() if callable(method) or isinstance(method, (staticmethod, classmethod)))
+ 
+     def state(feature, context, verifier):
+         require_feature(feature)
+         if (type(feature) is not FormalFeatureRepository or type(context) is not FormalContextRepository
+@@ -94,21 +96,21 @@ def _install_engine():
+         record = repositories.get(id(repo))
+         if type(repo) is not FormalMetricInputRepository or record is None or record[0]() is not repo:
+             raise ValueError("metric input repository is uninitialized or copied")
+         feature, context, verifier, metric_context, initial = record[1:]
+         if state(feature, context, verifier) != initial:
+             raise ValueError("metric input repository trust dependencies changed")
+         return feature, context, verifier, metric_context
+ 
+     def record(proof, cls):
+         found = proofs.get(id(proof))
+-        if type(proof) is not cls or found is None or found[0]() is not proof:
++        if type(proof) is not cls or found is None or found[0]() is not proof or not found[4][0]:
+             raise ValueError("metric proof is forged or copied")
+         return found
+ 
+     class Proof:
+         __slots__ = ("__weakref__",)
+ 
+         def __init__(self, *args, **kwargs):
+             raise TypeError("metric proofs are produced only by authenticated complete batches")
+ 
+         def __getattr__(self, name):
+@@ -132,56 +134,59 @@ def _install_engine():
+         def __deepcopy__(self, memo):
+             raise TypeError("metric proof cannot be copied")
+ 
+     class MetricInput(Proof):
+         __slots__ = ()
+ 
+     class MetricInputBatch(Proof):
+         __slots__ = ()
+ 
+         def input_for(self, security_id, metric_id):
++            if type(security_id) is not str or type(metric_id) is not str:
++                raise ValueError("metric selectors require exact strings")
+             result = record(self, MetricInputBatch)[3]["index"].get((security_id, metric_id))
+             if result is None:
+                 raise ValueError("security or qualified metric is outside this complete batch")
+             return result
+ 
+     class MetricPeerContext(Proof):
+         __slots__ = ()
+ 
+     class MetricScore(Proof):
+         __slots__ = ()
+ 
+-    def mint(cls, payload, *, attributes=None, private=None):
++    def mint(cls, payload, *, attributes=None, private=None, publication=None):
+         proof = object.__new__(cls)
+         identity = id(proof)
+         data = dict(payload)
+         data.update(attributes or {})
+-        proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)), freeze(data), encode(payload), private)
++        proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)), freeze(data), encode(payload),
++            private, [True] if publication is None else publication)
+         return proof
+ 
+     def definitions(scoring):
+         result = {}
+         for tid in scoring.templates:
+             template = scoring.template_for(tid)
+             result[tid] = {}
+             for dimension, metrics in template.metrics.items():
+                 for metric in metrics:
+                     key = dimension + "." + metric.metric_id
+                     definition = {field.name: _plain(getattr(metric, field.name)) for field in fields(metric)}
+                     payload = dict(template_id=tid, metric_id=key, definition=definition,
+                         registry_manifest_hash=scoring.registry_manifest_hash,
+                         scoring_registry_hash=scoring.content_sha256, feature_registry_hash=scoring.role_hashes["feature"])
+                     payload["definition_hash"] = digest(payload)
+                     result[tid][key] = payload
+         return result
+ 
+-    def build(repo, frozen_input_hash, scoring, metric_ids):
++    def build(repo, frozen_input_hash, scoring, metric_ids, guard):
+         feature, _, verifier, context = dependencies(repo)
+         universe = context.load_universe(frozen_input_hash, scoring_registry=scoring)
+         if universe is None:
+             return None
+         universe.require_verified()
+         root = load_root(FormalRegistryBundleLoader(feature._store, verifier), universe.registry_manifest_hash)
+         scoring.require_official(root)
+         defs = definitions(scoring)
+         known = set().union(*(set(items) for items in defs.values()))
+         selected = tuple(sorted(known)) if metric_ids is None else metric_ids
+@@ -254,55 +259,83 @@ def _install_engine():
+             current.require_verified()
+             if current.canonical_bytes() != markers[sid]:
+                 raise ValueError("metric feature correction or absence changed during complete batch")
+         context.recheck_batch(universe, industry)
+         scoring.require_official(root)
+         dependencies(repo)
+         payload = dict(common, schema_version="formal-metric-input-batch-v1", metric_ids=selected,
+             security_ids=tuple(universe.security_ids), definitions=defs, inputs=rows,
+             feature_states={sid: json.loads(wire) for sid, wire in markers.items()})
+         payload["batch_hash"] = digest(payload)
+-        inputs = tuple(mint(MetricInput, dict(row, batch_hash=payload["batch_hash"])) for row in rows)
+-        index = {(item.security_id, item.metric_id): item for item in inputs}
+-        return mint(MetricInputBatch, payload, attributes=dict(inputs=inputs), private=dict(index=index,
+-            groups=None, ranks={}, contexts={}))
++        # Expensive immutable preparation holds no writer reservation. Every
++        # prepared proof shares this closure-private, unpublished capability.
++        publication = [False]
++        inputs = tuple(mint(MetricInput, dict(row, batch_hash=payload["batch_hash"]),
++            publication=publication) for row in rows)
++        index = {(row["security_id"], row["metric_id"]): item for row, item in zip(rows, inputs, strict=True)}
++        prepared = mint(MetricInputBatch, payload, attributes=dict(inputs=inputs), private=dict(index=index,
++            groups=None, ranks={}, contexts={}), publication=publication)
++
++        def publish_complete():
++            publication[0] = True
++            return prepared
++
++        try:
++            return guard.finalize(publish_complete)
++        except BaseException:
++            publication[0] = False
++            raise
+ 
+     class FormalMetricInputRepository:
+         __slots__ = ("__weakref__",)
+ 
+         def __init__(self, feature_repository, context_repository, *, registry_signature_verifier):
+             if type(self) is not FormalMetricInputRepository or id(self) in repositories:
+                 raise ValueError("metric input repository initialization must be exact and single-use")
+             snapshot = state(feature_repository, context_repository, registry_signature_verifier)
+             context = context_type(feature_repository._store, context_repository,
+                 registry_signature_verifier=registry_signature_verifier)
+             identity = id(self)
+             repositories[identity] = (weakref.ref(self, lambda _: repositories.pop(identity, None)),
+                 feature_repository, context_repository, registry_signature_verifier, context, snapshot)
+ 
+         def build_batch(self, frozen_input_hash, *, scoring_registry, metric_ids=None):
+-            return build(self, frozen_input_hash, scoring_registry, metric_ids)
++            feature, _, _, _ = dependencies(self)
++            result = None
++            try:
++                with batch_guard(feature._current_input_provider, feature._store) as guard:
++                    result = build(self, frozen_input_hash, scoring_registry, metric_ids, guard)
++            except BaseException:
++                # Also revoke if context-manager rollback/close fails after the
++                # inner finalizer returned its prepared capability.
++                if result is not None:
++                    proofs[id(result)][4][0] = False
++                raise
++            return result
+ 
+         def __copy__(self):
+             raise TypeError("metric input repository cannot be copied")
+ 
+         def __deepcopy__(self, memo):
+             raise TypeError("metric input repository cannot be copied")
+ 
+     def eligible(item):
+         return record(item, MetricInput)[1]["invalid_reason"] is None
+ 
+     def peer_context(batch, *, metric_id, security_id):
++        if type(security_id) is not str or type(metric_id) is not str:
++            raise ValueError("metric selectors require exact strings")
+         data, private = record(batch, MetricInputBatch)[1], record(batch, MetricInputBatch)[3]
+         focal = private["index"].get((security_id, metric_id))
+         if focal is None:
+             raise ValueError("security or qualified metric is outside this complete batch")
++        security_id, metric_id = focal.security_id, focal.metric_id
+         key = (security_id, metric_id)
+         if key in private["contexts"]:
+             return private["contexts"][key]
+         if private["groups"] is None:
+             groups = {}
+             for item in data["inputs"]:
+                 if eligible(item):
+                     for scope, industry_id in (("template_secondary_industry", item.secondary_industry),
+                             ("template_primary_industry", item.primary_industry)):
+                         group = (item.metric_id, item.template_id, scope, industry_id)
+@@ -319,28 +352,28 @@ def _install_engine():
+             if scope is None:
+                 reason = "peer_count_below_20"
+         payload = dict(schema_version="formal-metric-peer-context-v1", batch_hash=data["batch_hash"],
+             registry_manifest_hash=data["registry_manifest_hash"], frozen_input_hash=data["frozen_input_hash"],
+             universe_hash=data["universe_hash"], metric_id=metric_id, security_id=security_id,
+             definition_hash=focal.definition_hash, direction=focal.direction, scope=scope,
+             peer_security_ids=peers, peer_count=len(peers), reason=reason)
+         payload["cohort_hash"] = digest(dict(batch_hash=data["batch_hash"], metric_id=metric_id,
+             definition_hash=focal.definition_hash, direction=focal.direction, scope=scope, peer_security_ids=peers))
+         payload["context_hash"] = digest(payload)
+-        result = mint(MetricPeerContext, payload, attributes=dict(peer_security_ids=peers), private=batch)
++        result = mint(MetricPeerContext, payload, attributes=dict(peer_security_ids=peers), private=weakref.ref(batch))
+         private["contexts"][key] = result
+         return result
+ 
+     def score(batch, context):
+         batch_record = record(batch, MetricInputBatch)
+         context_record = record(context, MetricPeerContext)
+-        if context_record[3] is not batch:
++        if context_record[3]() is not batch:
+             raise ValueError("metric peer context belongs to another complete batch")
+         c, private = context_record[1], batch_record[3]
+         if c["reason"] is not None:
+             return None
+         if c["peer_count"] < 20:
+             raise ValueError("formal percentile requires at least twenty peers")
+         cohort = c["cohort_hash"]
+         if cohort not in private["ranks"]:
+             values = sorted(private["index"][(sid, c["metric_id"])].raw_value for sid in c["peer_security_ids"])
+             ranks = {}
+diff --git a/tests/formal_metric_feature_fixtures.py b/tests/formal_metric_feature_fixtures.py
+index 13b15c7..5ff9a22 100644
+--- a/tests/formal_metric_feature_fixtures.py
++++ b/tests/formal_metric_feature_fixtures.py
+@@ -1,17 +1,18 @@
+ """Same-store, member-specific financial receipts for metric engine tests."""
+ 
+ import hashlib
+ 
+ from ashare_pipeline.formal_evidence import OfficialFetch, OfficialRequest, SourcePolicy, verify_official_fetch
+ from ashare_pipeline.formal_feature_contract import load_signed_feature_registry
+ from ashare_pipeline.formal_feature_repository import FormalFeatureCurrentInput, FormalFeatureRepository
++from ashare_pipeline.formal_metric_batch_guard import FormalMetricCurrentInputProvider
+ from ashare_pipeline.formal_feature_store import FormalFeatureBundleStore
+ from ashare_pipeline.formal_financial_features import build_formal_feature_bundle
+ from tests.formal_metric_fixtures import MetricFixture, FREEZE, update_mapping_digest
+ from tests.test_formal_feature_contract import formal_fact
+ from tests.test_formal_feature_store import project_temporary_directory
+ from tests.test_formal_scoring_registry import canonical
+ 
+ METRICS = ("G.operating_profit_per_share_cagr_3y", "G.operating_profit_per_share_yoy",
+     "G.operating_revenue_cagr_3y", "G.operating_revenue_yoy")
+ 
+@@ -48,29 +49,46 @@ class FinancialFixture(MetricFixture):
+             rows = {exchange: [dict(security_id=sid, listing_status="listed", security_type="ordinary_a") for sid in ids]
+                 for exchange, ids in {"BJ": ["BJ430001"], "SH": [f"SH{600000+i}" for i in range(20)], "SZ": ["SZ000001"]}.items()}
+         super().__init__(mutate=configure, exchange_rows=rows, tempdir=project_temporary_directory())
+         self.files = FormalFeatureBundleStore(self.root / "features")
+         self.store._formal_feature_bundle_store = self.files
+         self.issues = {}
+         self.generations = {}
+         child = self.bundle.blob("feature")
+         self.vocabulary = load_signed_feature_registry(child.canonical_json, child.signature, child.key_id,
+             self.verifier, registry_manifest=self.bundle.manifest)
++        self.provider = FormalMetricCurrentInputProvider(self.store)
++        for member in self.industry["memberships"]:
++            self.publish_current(member["security_id"])
+         self.feature_repository = FormalFeatureRepository(self.store, self.files,
+-            registry_signature_verifier=self.verifier, current_input_provider=self)
++            registry_signature_verifier=self.verifier, current_input_provider=self.provider)
+ 
+     def resolve_current_inputs(self, **request):
+         sid = request["security_id"]
+         return FormalFeatureCurrentInput(**request, batch_id=self.generations.get(sid, "generation-1"),
+             facts=self.store.list_formal_financial_facts(security_id=sid), issues=self.issues.get(sid, ()), complete=True)
+ 
+-    def put_financial(self, sid, values, *, generation="financial-1", updated=None):
++    def publish_current(self, sid):
++        if hasattr(self, "provider"):
++            member = next(m for m in self.industry["memberships"] if m["security_id"] == sid)
++            self.provider.publish(self.resolve_current_inputs(security_id=sid, as_of_utc=FREEZE,
++                template_id=member["template_id"], registry_manifest_hash=self.bundle.manifest.manifest_hash))
++
++    def set_generation(self, sid, generation):
++        self.generations[sid] = generation
++        self.publish_current(sid)
++
++    def set_issues(self, sid, issues):
++        self.issues[sid] = issues
++        self.publish_current(sid)
++
++    def put_financial(self, sid, values, *, generation="financial-1", updated=None, publish=True):
+         raw = canonical(values)
+         task = self.store.enqueue_formal_task("formal_statement", sid + generation, generation, {})
+         leased = self.store.lease_next_formal_task(("formal_statement",), "financial-fixture", 300)
+         self.assertEqual(leased["id"], task)
+         fetch = OfficialFetch(request=OfficialRequest("cninfo", "annual_report", sid, "2025-12-31", sid[:2]),
+             raw_bytes=raw, original_url="https://www.cninfo.com.cn/fixture/annual.json",
+             published_at_utc="2026-03-20T08:00:00+00:00", published_precision="timestamp",
+             source_updated_at_utc=updated, captured_at_utc="2026-09-04T07:00:00+00:00",
+             effective_at_utc="2026-03-20T08:00:00+00:00", effective_time_evidence_hash=None,
+             refresh_generation=generation, parser_id="fixture-annual", parser_version="fixture-annual-v1",
+@@ -78,20 +96,22 @@ class FinancialFixture(MetricFixture):
+         verification = verify_official_fetch(fetch, SourcePolicy.cninfo())
+         ref = self.snapshots.persist_verified(fetch, verification, producing_task_id=task, worker_id="financial-fixture")
+         facts = tuple(formal_fact(security_id=sid, metric_key=key, value=float(value), source_field=key,
+             raw_value_sha256=hashlib.sha256(canonical(value)).hexdigest(), source_snapshot_id=ref.snapshot_id,
+             source_content_sha256=ref.content_sha256, source_refresh_generation=ref.refresh_generation,
+             source_producing_task_id=ref.producing_task_id, parser_id=ref.parser_id, parser_version=ref.parser_version,
+             mapping_version=ref.mapping_version, source_updated_at_utc=ref.source_updated_at_utc,
+             captured_at_utc=ref.captured_at_utc) for key, value in values.items())
+         self.store.insert_formal_financial_facts(facts)
+         self.store.complete_formal_task(task, "financial-fixture", {"snapshot": ref.snapshot_id})
++        if publish:
++            self.publish_current(sid)
+         return ref
+ 
+     def persist_features(self, sid):
+         member = next(m for m in self.industry["memberships"] if m["security_id"] == sid)
+         bundle = build_formal_feature_bundle(security_id=sid, as_of_utc=FREEZE, template_id=member["template_id"],
+             facts=self.store.list_formal_financial_facts(security_id=sid), issues=self.issues.get(sid, ()),
+             registry=self.vocabulary, registry_manifest=self.bundle.manifest)
+         self.store.put_formal_feature_bundle(bundle, self.files.write(bundle))
+         return bundle
+ 
+diff --git a/tests/test_formal_metric_engine.py b/tests/test_formal_metric_engine.py
+index da2b6b5..f9fd619 100644
+--- a/tests/test_formal_metric_engine.py
++++ b/tests/test_formal_metric_engine.py
+@@ -219,23 +219,23 @@ class MetricClosureTests(unittest.TestCase):
+         for mutation in ("facts", "issues", "provider", "receipt"):
+             fired = False
+             def profile(frame, event, arg):
+                 nonlocal fired
+                 if (not fired and event == "return" and frame.f_code.co_name == "resolve_current_inputs"
+                         and getattr(arg, "security_id", None) == "SH600000"):
+                     fired = True
+                     if mutation == "facts":
+                         self.fixture.put_financial("BJ430001", {METRICS[0]: 1}, generation="correction")
+                     elif mutation == "issues":
+-                        self.fixture.issues["BJ430001"] = (FormalFactIssue("unknown_source_field", None, "OTHER", {}),)
++                        self.fixture.set_issues("BJ430001", (FormalFactIssue("unknown_source_field", None, "OTHER", {}),))
+                     elif mutation == "provider":
+-                        self.fixture.generations["BJ430001"] = "changed-provider"
++                        self.fixture.set_generation("BJ430001", "changed-provider")
+                     else:
+                         self.fixture.persist_features("BJ430001")
+             previous = sys.getprofile()
+             try:
+                 sys.setprofile(profile)
+                 with self.subTest(mutation=mutation), self.assertRaisesRegex(ValueError, "changed during complete batch"):
+                     self.build(metric_ids=(METRICS[0],))
+             finally:
+                 sys.setprofile(previous)
+             self.assertTrue(fired)
+
+warning: in the working copy of 'ashare_pipeline/formal_metric_batch_guard.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/ashare_pipeline/formal_metric_batch_guard.py b/ashare_pipeline/formal_metric_batch_guard.py
+new file mode 100644
+index 0000000..2a75aab
+--- /dev/null
++++ b/ashare_pipeline/formal_metric_batch_guard.py
+@@ -0,0 +1,170 @@
++"""Owned provider publications and a bounded optimistic database read barrier.
++
++The completeness owner explicitly publishes whole current-input records. This
++module does not infer missing issues or authenticate numeric facts; existing
++feature repository reads still authenticate all published facts and receipts.
++"""
++
++from contextlib import contextmanager
++import json
++import sqlite3
++from threading import RLock
++import weakref
++
++from .formal_feature_repository import (
++    FormalFeatureCurrentInput, FormalFeatureRepository, _fact_snapshot,
++    _issue_snapshot, _request,
++)
++from .formal_feature_contract import _canonical_json_bytes
++from .formal_financial_schema import FormalFinancialFact, FormalFactIssue
++from .formal_repository_identity import _require_repository_initialization
++from .state_store import StateStore
++
++
++def _owned_provider():
++    records = {}
++    connect = StateStore._connect
++    initialized = _require_repository_initialization
++    identity = FormalFeatureRepository._snapshot_identity
++    snapshot_facts, snapshot_issues, request_values = _fact_snapshot, _issue_snapshot, _request
++    encode = _canonical_json_bytes
++
++    def require(provider, store=None):
++        record = records.get(id(provider))
++        if type(provider) is not FormalMetricCurrentInputProvider or record is None or record["ref"]() is not provider:
++            raise ValueError("complete metric batch requires a genuine owned current-input provider")
++        actual = record["store"]
++        initialized(actual)
++        if (type(actual) is not StateStore or (store is not None and store is not actual)
++                or str(actual.db_path) != record["db_path"] or StateStore._connect is not connect
++                or "_connect" in vars(actual)):
++            raise ValueError("metric provider database dependency changed")
++        if any(vars(FormalMetricCurrentInputProvider).get(name) is not method for name, method in methods):
++            raise ValueError("metric provider publication dependency changed")
++        return record
++
++    class FormalMetricCurrentInputProvider:
++        """Trusted completeness owner publishes detached, explicitly complete inputs.
++
++        An unregistered request fails: there is no implicit empty complete input.
++        All records and the monotonic publication epoch are closure-private.
++        """
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, state_store):
++            if type(self) is not FormalMetricCurrentInputProvider or id(self) in records:
++                raise ValueError("metric provider initialization is exact and single-use")
++            if type(state_store) is not StateStore:
++                raise ValueError("metric provider requires an exact StateStore")
++            initialized(state_store)
++            key = id(self)
++            records[key] = dict(ref=weakref.ref(self, lambda _: records.pop(key, None)), store=state_store,
++                db_path=str(state_store.db_path), lock=RLock(), epoch=0, snapshots={}, finalizing=False)
++
++        def publish(self, snapshot):
++            record = require(self)
++            if type(snapshot) is not FormalFeatureCurrentInput:
++                raise ValueError("metric publication requires an exact current-input snapshot")
++            request = request_values(snapshot.security_id, snapshot.as_of_utc, snapshot.template_id,
++                snapshot.registry_manifest_hash)
++            captured_identity = identity(snapshot, request)
++            facts, fact_bytes = snapshot_facts(snapshot.facts, snapshot.security_id)
++            issues, issue_bytes = snapshot_issues(snapshot.issues)
++            payload = dict(request, batch_id=captured_identity[-1], facts=[item.to_dict() for item in facts],
++                issues=[item.to_dict() for item in issues], complete=True)
++            canonical = encode(payload)
++            if (identity(snapshot, request) != captured_identity
++                    or snapshot_facts(snapshot.facts, snapshot.security_id)[1] != fact_bytes
++                    or snapshot_issues(snapshot.issues)[1] != issue_bytes):
++                raise ValueError("metric publication changed while detaching")
++            with record["lock"]:
++                require(self)
++                record["epoch"] += 1
++                if record["finalizing"]:
++                    # Reentrant publication cannot hide behind an RLock, even
++                    # if its caller catches the rejection inside finalization.
++                    raise ValueError("metric provider changed during complete batch finalization")
++                record["snapshots"][tuple(request.values())] = canonical
++
++        def resolve_current_inputs(self, *, security_id, as_of_utc, template_id, registry_manifest_hash):
++            record = require(self)
++            request = request_values(security_id, as_of_utc, template_id, registry_manifest_hash)
++            with record["lock"]:
++                raw = record["snapshots"].get(tuple(request.values()))
++            if raw is None:
++                raise ValueError("metric provider has no explicitly complete published request")
++            payload = json.loads(raw)
++            payload["facts"] = tuple(FormalFinancialFact.from_dict(item) for item in payload["facts"])
++            payload["issues"] = tuple(FormalFactIssue(**item) for item in payload["issues"])
++            return FormalFeatureCurrentInput(**payload)
++
++        def __copy__(self):
++            raise TypeError("metric provider cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("metric provider cannot be copied")
++
++    methods = tuple(vars(FormalMetricCurrentInputProvider).items())
++
++    @contextmanager
++    def guard(provider, store):
++        record = require(provider, store)
++        observer = None
++        active, finalized = False, False
++        try:
++            # Both captures precede all universe/context/feature reads. The
++            # observer performs no writes; its own data_version is comparable.
++            with record["lock"]:
++                epoch = record["epoch"]
++                observer = connect(store)
++                observer.execute("PRAGMA busy_timeout = 1000")
++                database_epoch = observer.execute("PRAGMA data_version").fetchone()[0]
++            active = True
++
++            class Guard:
++                __slots__ = ()
++
++                def finalize(self, mint):
++                    nonlocal finalized
++                    if not active or finalized:
++                        raise ValueError("metric batch guard is closed or already finalized")
++                    finalized = True
++                    with record["lock"]:
++                        require(provider, store)
++                        if record["epoch"] != epoch:
++                            raise ValueError("metric provider changed during complete batch")
++                        record["finalizing"] = True
++                        try:
++                            # Short writer exclusion closes check-to-mint races;
++                            # normal potentially long reads hold no writer lock.
++                            observer.execute("BEGIN IMMEDIATE")
++                            if observer.execute("PRAGMA data_version").fetchone()[0] != database_epoch:
++                                raise ValueError("metric database changed during complete batch")
++                            result = mint()
++                            if record["epoch"] != epoch:
++                                raise ValueError("metric provider changed during complete batch finalization")
++                            return result
++                        finally:
++                            try:
++                                observer.rollback()
++                            finally:
++                                record["finalizing"] = False
++
++            yield Guard()
++        except sqlite3.Error as error:
++            raise ValueError("metric batch database guard unavailable") from error
++        finally:
++            active = False
++            if observer is not None:
++                try:
++                    observer.rollback()
++                finally:
++                    observer.close()
++
++    return FormalMetricCurrentInputProvider, guard
++
++
++FormalMetricCurrentInputProvider, _metric_batch_guard = _owned_provider()
++del _owned_provider
++
++__all__ = ["FormalMetricCurrentInputProvider"]
+
+warning: in the working copy of 'tests/test_formal_metric_batch_guard.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/tests/test_formal_metric_batch_guard.py b/tests/test_formal_metric_batch_guard.py
+new file mode 100644
+index 0000000..a845219
+--- /dev/null
++++ b/tests/test_formal_metric_batch_guard.py
+@@ -0,0 +1,272 @@
++"""Review regressions for complete-read interval, exact identity and ownership."""
++
++import gc
++import copy
++import importlib
++from dataclasses import replace
++import sqlite3
++import sys
++import unittest
++import weakref
++
++from tests.formal_metric_feature_fixtures import FinancialFixture, METRICS
++from tests.formal_metric_fixtures import FREEZE
++from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
++
++
++class Spoof(str):
++    def __new__(cls, target):
++        result = super().__new__(cls, "forged-selector")
++        result.target = target
++        return result
++
++    def __eq__(self, other):
++        return other == self.target
++
++    def __hash__(self):
++        return hash(self.target)
++
++
++class MetricBatchReviewTests(unittest.TestCase):
++    def fixture(self, *, missing=True):
++        fixture = FinancialFixture(missing_memberships=missing)
++        self.addCleanup(fixture.close)
++        api = importlib.import_module("ashare_pipeline.formal_metric_engine")
++        repo = api.FormalMetricInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier)
++        return fixture, api, repo
++
++    def test_security_and_metric_selectors_reject_hostile_string_subclasses(self):
++        fixture, api, repo = self.fixture()
++        batch = repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++        for sid, mid in ((Spoof("BJ430001"), METRICS[0]), ("BJ430001", Spoof(METRICS[0]))):
++            with self.subTest(selector=str(sid)), self.assertRaises(ValueError):
++                batch.input_for(sid, mid)
++            with self.subTest(selector=str(mid)), self.assertRaises(ValueError):
++                api.build_metric_peer_context(batch, security_id=sid, metric_id=mid)
++
++    def test_cached_contexts_do_not_root_their_batch_or_input_proofs(self):
++        fixture, api, repo = self.fixture()
++        batch = repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++        context = api.build_metric_peer_context(batch, security_id="BJ430001", metric_id=METRICS[0])
++        batch_ref, context_ref, input_ref = weakref.ref(batch), weakref.ref(context), weakref.ref(batch.inputs[0])
++        self.assertIs(context, api.build_metric_peer_context(batch, security_id="BJ430001", metric_id=METRICS[0]))
++        del batch
++        gc.collect()
++        self.assertIsNone(batch_ref())
++        self.assertIsNone(input_ref())
++        # A detached context remains a historical proof, but cannot score a new batch.
++        other = repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++        with self.assertRaises(ValueError):
++            api.score_metric_percentile(other, context)
++        del context
++        gc.collect()
++        self.assertIsNone(context_ref())
++
++    def test_earlier_member_provider_change_during_final_sweep_rejects_then_recovers(self):
++        fixture, api, repo = self.fixture(missing=False)
++        count = 0
++        def profile(frame, event, result):
++            nonlocal count
++            if event == "return" and frame.f_code.co_name == "resolve_current_inputs" and getattr(result, "security_id", None) == "SH600000":
++                count += 1
++                if count == 3:
++                    fixture.set_generation("BJ430001", "changed-during-final-sweep")
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            with self.assertRaisesRegex(ValueError, "changed during complete batch"):
++                repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++        finally:
++            sys.setprofile(previous)
++        self.assertGreaterEqual(count, 3)
++        batch = repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++        self.assertEqual(batch.feature_states["BJ430001"]["batch_id"], "changed-during-final-sweep")
++
++    def test_earlier_member_database_correction_during_final_sweep_rejects_then_recovers(self):
++        fixture, api, repo = self.fixture(missing=False)
++        fixture.put_financial("BJ430001", {METRICS[0]: 1})
++        count = 0
++        def profile(frame, event, result):
++            nonlocal count
++            if event == "return" and frame.f_code.co_name == "resolve_current_inputs" and getattr(result, "security_id", None) == "SH600000":
++                count += 1
++                if count == 3:
++                    fixture.put_financial("BJ430001", {METRICS[0]: 2}, generation="final-db-correction",
++                        updated="2026-04-01T00:00:00+00:00", publish=False)
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            with self.assertRaisesRegex(ValueError, "database changed during complete batch"):
++                repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++        finally:
++            sys.setprofile(previous)
++        self.assertGreaterEqual(count, 3)
++        fixture.publish_current("BJ430001")
++        batch = repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++        self.assertEqual(batch.feature_states["BJ430001"]["status"], "current_receipt_absent")
++
++    def test_all_pending_factory_rejects_generic_and_copied_providers_but_old_reads_work(self):
++        fixture, api, _ = self.fixture()
++        for provider in (fixture, object.__new__(type(fixture.provider))):
++            feature = FormalFeatureRepository(fixture.store, fixture.files,
++                registry_signature_verifier=fixture.verifier, current_input_provider=provider)
++            repo = api.FormalMetricInputRepository(feature, fixture.context,
++                registry_signature_verifier=fixture.verifier)
++            with self.assertRaisesRegex(ValueError, "genuine owned current-input provider"):
++                repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++            if provider is fixture:
++                self.assertIsNone(feature.select_current_verified_metric_features("BJ430001", FREEZE,
++                    template_id="general_nonfinancial", registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
++                    required_feature_keys=("general_nonfinancial." + METRICS[0],)))
++
++    def test_canonical_preparation_does_not_hold_the_writer_reservation(self):
++        fixture, api, repo = self.fixture()
++        observed = 0
++        def profile(frame, event, result):
++            nonlocal observed
++            if (event == "call" and frame.f_code.co_name == "_canonical"
++                    and frame.f_code.co_filename.endswith("formal_metric_engine.py")):
++                observed += 1
++                connection = sqlite3.connect(fixture.db_path, timeout=0, isolation_level=None)
++                try:
++                    try:
++                        connection.execute("BEGIN IMMEDIATE")
++                    except sqlite3.OperationalError:
++                        self.fail("expensive canonical preparation held the metric writer reservation")
++                    connection.rollback()
++                finally:
++                    connection.close()
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            batch = repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++        finally:
++            sys.setprofile(previous)
++        self.assertGreater(observed, 0)
++        batch.require_verified()
++
++    def test_prepared_metric_rows_are_unusable_until_the_complete_batch_is_published(self):
++        fixture, api, repo = self.fixture()
++        captured = []
++        def profile(frame, event, result):
++            if event == "return" and frame.f_code.co_name == "mint" and type(result) is api.MetricInput:
++                captured.append(result)
++                with self.assertRaises(ValueError):
++                    result.require_verified()
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            batch = repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++        finally:
++            sys.setprofile(previous)
++        self.assertEqual(len(captured), 3)
++        for proof in captured:
++            proof.require_verified()
++        self.assertIs(batch.inputs[0], captured[0])
++
++    def test_failed_finalization_revokes_prepared_proofs_and_recovers_publication(self):
++        for failure in ("provider", "closed_connection"):
++            fixture, api, repo = self.fixture()
++            captured = []
++            def profile(frame, event, result):
++                if (event == "return" and type(result) is api.MetricInputBatch and frame.f_back is not None
++                        and frame.f_back.f_code.co_name == "finalize" and not captured):
++                    captured.append(result)
++                    if failure == "provider":
++                        with self.assertRaises(ValueError):
++                            fixture.set_generation("SH600099", "during-publication")
++                    else:
++                        # Close the actual observer to exercise a real SQLite
++                        # rollback failure, without replacing a trusted reader.
++                        frame.f_back.f_locals["observer"].close()
++            previous = sys.getprofile()
++            try:
++                sys.setprofile(profile)
++                with self.subTest(failure=failure), self.assertRaises((ValueError, sqlite3.Error)):
++                    repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++            finally:
++                sys.setprofile(previous)
++            self.assertEqual(len(captured), 1)
++            with self.assertRaises(ValueError):
++                captured[0].require_verified()
++            fixture.set_generation("SH600099", "recovered-publication")
++            repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],)).require_verified()
++
++
++class OwnedProviderGuardTests(unittest.TestCase):
++    def setUp(self):
++        self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_metric_batch_guard"), "owned batch guard is missing")
++        self.api = importlib.import_module("ashare_pipeline.formal_metric_batch_guard")
++        self.fixture = FinancialFixture(missing_memberships=True)
++        self.addCleanup(self.fixture.close)
++        self.provider = self.api.FormalMetricCurrentInputProvider(self.fixture.store)
++
++    def test_published_complete_inputs_are_detached_and_unknown_requests_fail(self):
++        request = dict(security_id="BJ430001", as_of_utc=FREEZE, template_id="general_nonfinancial",
++            registry_manifest_hash=self.fixture.bundle.manifest.manifest_hash)
++        snapshot = self.fixture.resolve_current_inputs(**request)
++        with self.assertRaises(ValueError):
++            self.provider.resolve_current_inputs(**request)
++        with self.assertRaises(ValueError):
++            self.provider.publish(replace(snapshot, complete=False))
++        self.provider.publish(snapshot)
++        object.__setattr__(snapshot, "batch_id", "mutated-after-publication")
++        result = self.provider.resolve_current_inputs(**request)
++        self.assertEqual(result.batch_id, "generation-1")
++        object.__setattr__(result, "batch_id", "mutated-read")
++        self.assertEqual(self.provider.resolve_current_inputs(**request).batch_id, "generation-1")
++
++    def test_generic_and_copied_provider_cannot_open_a_guard(self):
++        for candidate in (self.fixture, object.__new__(type(self.provider))):
++            with self.assertRaises(ValueError):
++                with self.api._metric_batch_guard(candidate, self.fixture.store):
++                    self.fail("a forged provider opened a guard")
++        with self.assertRaises(TypeError):
++            copy.copy(self.provider)
++
++    def test_guard_observes_other_connection_commits_and_releases_after_rejection(self):
++        called = []
++        with self.api._metric_batch_guard(self.provider, self.fixture.store) as guard:
++            self.fixture.sql("UPDATE formal_collection_task SET updated_at='2026-09-08T00:00:00+00:00'")
++            with self.assertRaisesRegex(ValueError, "database changed during complete batch"):
++                guard.finalize(lambda: called.append(True))
++        self.assertEqual(called, [])
++        with self.api._metric_batch_guard(self.provider, self.fixture.store) as guard:
++            self.assertEqual(guard.finalize(lambda: "stable"), "stable")
++
++    def test_finalization_fences_writers_and_always_releases_the_connection(self):
++        def while_fenced():
++            connection = sqlite3.connect(self.fixture.db_path, timeout=0, isolation_level=None)
++            try:
++                with self.assertRaises(sqlite3.OperationalError):
++                    connection.execute("BEGIN IMMEDIATE")
++            finally:
++                connection.close()
++            return "minted"
++        with self.api._metric_batch_guard(self.provider, self.fixture.store) as guard:
++            self.assertEqual(guard.finalize(while_fenced), "minted")
++        connection = sqlite3.connect(self.fixture.db_path, timeout=0, isolation_level=None)
++        try:
++            connection.execute("BEGIN IMMEDIATE")
++            connection.rollback()
++        finally:
++            connection.close()
++
++    def test_reentrant_publication_cannot_be_swallowed_inside_finalization(self):
++        snapshot = self.fixture.resolve_current_inputs(security_id="BJ430001", as_of_utc=FREEZE,
++            template_id="general_nonfinancial", registry_manifest_hash=self.fixture.bundle.manifest.manifest_hash)
++        self.provider.publish(snapshot)
++        def intercepted_mint():
++            with self.assertRaises(ValueError):
++                self.provider.publish(replace(snapshot, batch_id="reentrant"))
++            return "must-not-escape"
++        with self.api._metric_batch_guard(self.provider, self.fixture.store) as guard:
++            with self.assertRaisesRegex(ValueError, "changed during complete batch finalization"):
++                guard.finalize(intercepted_mint)
++        with self.api._metric_batch_guard(self.provider, self.fixture.store) as guard:
++            self.assertEqual(guard.finalize(lambda: "recovered"), "recovered")
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,103 @@
+# Review package: 671793e..ec8781a
+
+## Commits
+ec8781a fix: reject formal final schema trigger name collisions
+
+## Files changed
+ ashare_pipeline/state_store.py       |  7 +++++--
+ tests/test_formal_final_migration.py | 35 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 40 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index 99ae6c0..0eaf9ea 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -1930,29 +1930,32 @@ class StateStore:
+ 
+     @classmethod
+     def _apply_v7_migration(cls, connection: sqlite3.Connection) -> None:
+         for statement in (*_V7_TABLE_DDL.values(), *_V7_INDEX_DDL.values()):
+             connection.execute(statement)
+         cls._assert_schema_ddl(connection, _V7_TABLE_DDL, _V7_INDEX_DDL, "v7 schema")
+         connection.execute("INSERT INTO schema_migration VALUES (7, ?)", (_utc_now(),))
+ 
+     @classmethod
+     def _assert_v8_objects(cls, connection: sqlite3.Connection, *, applied: bool) -> None:
+-        approved = set(_V8_TABLE_DDL) | set(_V8_INDEX_DDL)
++        approved = {("table", name) for name in _V8_TABLE_DDL} | {
++            ("index", name) for name in _V8_INDEX_DDL
++        }
+         for row in connection.execute("SELECT type,name,tbl_name,sql FROM sqlite_master"):
+             kind, name, table, sql = row
+             if name.lower().startswith("formal_final_") or table.lower() in _V8_TABLE_DDL:
+                 # SQLite creates only primary-key autoindexes for the V8 tables.
+                 if (applied and kind == "index" and sql is None
++                        and table in _V8_TABLE_DDL
+                         and name == f"sqlite_autoindex_{table}_1"):
+                     continue
+-                if not applied or name not in approved:
++                if not applied or (kind, name) not in approved:
+                     raise RuntimeError(f"unexpected v8 schema object {name}")
+ 
+     @classmethod
+     def _apply_v8_migration(cls, connection: sqlite3.Connection) -> None:
+         cls._assert_v8_objects(connection, applied=False)
+         for statement in (*_V8_TABLE_DDL.values(), *_V8_INDEX_DDL.values()):
+             connection.execute(statement)
+         cls._assert_schema_ddl(connection, _V8_TABLE_DDL, _V8_INDEX_DDL, "v8 schema")
+         cls._assert_v8_objects(connection, applied=True)
+         connection.execute("INSERT INTO schema_migration VALUES (8, ?)", (_utc_now(),))
+diff --git a/tests/test_formal_final_migration.py b/tests/test_formal_final_migration.py
+index 41d929c..4c0f5c9 100644
+--- a/tests/test_formal_final_migration.py
++++ b/tests/test_formal_final_migration.py
+@@ -242,13 +242,48 @@ class FormalFinalMigrationTests(unittest.TestCase):
+                 if migrated:
+                     StateStore(path).initialize()
+                 with closing(sqlite3.connect(path)) as connection:
+                     connection.execute("CREATE TABLE FORMAL_FINAL_UNKNOWN(payload TEXT)")
+                     connection.commit()
+                 before = self.snapshot(path)
+                 with self.assertRaises(RuntimeError):
+                     StateStore(path).initialize()
+                 self.assertEqual(self.snapshot(path), before)
+ 
++    def assert_named_trigger_collisions_rejected(self, names):
++        for scenario, migrated, target in (
++            ("premature-legacy", False, "score_run"),
++            ("reopen-legacy", True, "score_run"),
++            ("reopen-v8", True, "formal_final_run"),
++        ):
++            path = self.root / f"trigger-{scenario}.sqlite"
++            with closing(sqlite3.connect(path)) as connection:
++                connection.executescript(Path(__file__).with_name("fixtures").joinpath("schema_v7.sql").read_text(encoding="utf-8"))
++            if migrated:
++                StateStore(path).initialize()
++            for name in names:
++                with self.subTest(scenario=scenario, trigger_name=name):
++                    with closing(sqlite3.connect(path)) as connection:
++                        connection.execute(f"CREATE TRIGGER {name} AFTER INSERT ON {target} BEGIN SELECT 1; END")
++                        connection.commit()
++                    before = self.snapshot(path)
++                    try:
++                        with self.assertRaisesRegex(RuntimeError, "unexpected v8 schema object"):
++                            StateStore(path).initialize()
++                        self.assertEqual(self.snapshot(path), before)
++                    finally:
++                        with closing(sqlite3.connect(path)) as connection:
++                            connection.execute(f"DROP TRIGGER {name}")
++                            connection.commit()
++
++    def test_v8_table_named_trigger_rejects_without_advancing_ledger(self):
++        self.assert_named_trigger_collisions_rejected(TABLES)
++
++    def test_v8_index_named_trigger_rejects_without_advancing_ledger(self):
++        self.assert_named_trigger_collisions_rejected((
++            "formal_final_run_input", "formal_final_selected_ordinal",
++            "formal_final_dependency_source", "formal_final_dependency_effect",
++        ))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

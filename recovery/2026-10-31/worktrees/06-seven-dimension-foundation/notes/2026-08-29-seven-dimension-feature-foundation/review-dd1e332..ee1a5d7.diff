@@ -1,0 +1,575 @@
+# Review package: dd1e3322dfa73c7c53ca7c0944544c895b781789..ee1a5d78e4e1d123ddd002c54c80bda8f41fd133
+
+## Commits
+ee1a5d7 fix: enforce feature evidence PIT boundaries
+
+## Files changed
+ ashare_pipeline/feature_contract.py |  16 +++
+ progress.md                         |   8 ++
+ tests/test_feature_contract.py      |  83 ++++++++++++++
+ tests/test_orchestrator.py          | 214 +++++++++++++++++++++++++++++++++++-
+ tests/test_state_store.py           |  38 +++++++
+ 5 files changed, 358 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/ashare_pipeline/feature_contract.py b/ashare_pipeline/feature_contract.py
+index 996e441..dbf4582 100644
+--- a/ashare_pipeline/feature_contract.py
++++ b/ashare_pipeline/feature_contract.py
+@@ -417,31 +417,47 @@ class FeatureBundle:
+         object.__setattr__(self, "as_of_utc", require_aware_utc(self.as_of_utc, "as_of_utc"))
+         if self.confidence_inputs.data_completeness_ratio != coverage:
+             raise ValueError("financial coverage must match confidence completeness")
+         if (
+             self.confidence_inputs.formal_confidence is not None
+             or self.is_formal_score_ready is not False
+         ):
+             raise ValueError("formal score must not be ready in the feature contract")
+         if any(not isinstance(v, DimensionInput) for v in self.dimension_inputs.values()):
+             raise ValueError("dimension inputs must be DimensionInput values")
++        as_of_instant = datetime.fromisoformat(self.as_of_utc)
++        if any(
++            datetime.fromisoformat(evidence.effective_at_utc) > as_of_instant
++            for dimension in self.dimension_inputs.values()
++            for value in dimension.values
++            for evidence in value.evidence
++        ):
++            raise ValueError("evidence effective instant must not exceed bundle as_of")
+         if any(
+             not isinstance(blocker, str) or not blocker
+             for blocker in self.blockers
+         ):
+             raise ValueError("blockers must contain non-empty strings")
+         if len(self.blockers) != len(set(self.blockers)):
+             raise ValueError("blockers must not contain duplicates")
+         financial_blockers = set(self.blockers) - {
+             "formal_industry_mapping_missing"
+         }
+         template = TEMPLATES[self.industry.template_id]
++        if template.template_id == "unclassified" and (
++            self.financial_status != "blocked"
++            or coverage != 0.0
++            or "industry_template_unclassified" not in self.blockers
++        ):
++            raise ValueError(
++                "unclassified template requires blocked status, zero coverage, and blocker"
++            )
+         specialized_inputs_pending = (
+             template.template_id != "unclassified"
+             and template.specialized_inputs_required
+         )
+         if specialized_inputs_pending and (
+             self.financial_status != "blocked"
+             or "specialized_financial_inputs_missing" not in financial_blockers
+         ):
+             raise ValueError(
+                 "specialized financial template requires blocked status and missing-input blocker"
+diff --git a/progress.md b/progress.md
+index 70eb266..f412e39 100644
+--- a/progress.md
++++ b/progress.md
+@@ -56,10 +56,18 @@
+ - 治理、事件、ESG重大性、拥挤和周期阶段使用否决/状态/口径修正，不继续叠加普通权重。
+ 
+ ## 七维财务特征基础层（2026-08-31）
+ 
+ - 状态库已为 schema v3；当前财务特征合约版本为 `feature-contract-v1`。
+ - 本阶段新增 3 个密封端到端测试；完整 `unittest` 回归为 337/337 通过。
+ - 现有 tracked 线上运营状态记录了 120 个候选，但不包含 schema v3 deep 财务契约所需的三表覆盖字段；因此尚未按 v3 deep 契约完成线上运营验收，不声明当前分子/分母或 `>=95%` 覆盖。
+ - 本阶段仅产出七维模型所需的财务特征输入，不代表七维正式评分已就绪；`formal_score_ready=false`。
+ - 正式等待价格池为 0，正式强烈关注池为 0，两个正式池的发布门闸仍关闭。
+ - 下一步：补齐市场、资本配置和治理输入，完成正式评分与发布验收。
++
++## 七维财务特征信任边界修复（2026-08-31）
++
++- 后续修复波次已收紧公共合约与真实持久化边界：所有证据的生效时点不得晚于 bundle `as_of_utc`；`unclassified` 模板只能保持 `blocked`、零财务覆盖率并携带 `industry_template_unclassified`。上述 PIT cutoff 与 unclassified blocked 不变量均由隔离测试覆盖。
++- DB-backed 财务证据存在性、字段一致性以及 canonical source snapshot 参照核验仍在 StateStore 事务与 verified progress 读取路径中强制执行；本轮完整 `unittest` 回归为 370/370 通过。
++- 后续独立 scoped review 与 fresh whole-branch review 仍是必须完成的门闸；本记录不预判其结论。
++- 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
++- `formal_score_ready=false`，未发布 formal scores；正式等待价格池与正式强烈关注池均保持关闭且为空。
+diff --git a/tests/test_feature_contract.py b/tests/test_feature_contract.py
+index 5428b3f..bbe8e76 100644
+--- a/tests/test_feature_contract.py
++++ b/tests/test_feature_contract.py
+@@ -1,13 +1,14 @@
+ import copy
+ import math
+ import unittest
++from datetime import datetime
+ 
+ from ashare_pipeline.feature_contract import (
+     CONTRACT_VERSION, DIMENSIONS, FINANCIAL_DIMENSIONS, ConfidenceInputs, DimensionInput,
+     EvidenceRef, FeatureBundle, FeatureValue, IndustryContext,
+ )
+ 
+ 
+ def evidence(snapshot_id="snapshot-a"):
+     return EvidenceRef("fact-a", snapshot_id, "TOTAL_ASSETS", "a" * 64,
+                        "2026-08-20T15:59:59+00:00", "2026-08-21T07:00:00+00:00")
+@@ -42,20 +43,26 @@ def real_general_ready_bundle():
+ 
+     return build_bundle_with_overrides()
+ 
+ 
+ def real_specialized_bundle(industry_name):
+     from tests.test_financial_features import build_bundle_with_overrides
+ 
+     return build_bundle_with_overrides(source_industry_name=industry_name)
+ 
+ 
++def real_unclassified_bundle():
++    from tests.test_financial_features import build_bundle_with_overrides
++
++    return build_bundle_with_overrides(source_industry_name="不存在行业")
++
++
+ def retag_missing_revenue_slot(payload, attack):
+     dimensions = payload["dimension_inputs"]
+     target = next(
+         value
+         for value in dimensions["G"]["values"]
+         if value["key"] == "g.revenue.FY2021"
+     )
+     dimensions["G"]["values"].remove(target)
+     if attack == "derived_wrong_dimension":
+         replacement = copy.deepcopy(next(
+@@ -338,20 +345,96 @@ class FeatureContractTests(unittest.TestCase):
+             baseline = real_specialized_bundle(industry_name).to_dict()
+             self.assertIn("specialized_financial_inputs_missing", baseline["blockers"])
+             for status in ("financial_ready", "blocked"):
+                 with self.subTest(industry=industry_name, status=status):
+                     payload = copy.deepcopy(baseline)
+                     payload["financial_status"] = status
+                     payload["blockers"].remove("specialized_financial_inputs_missing")
+                     with self.assertRaises(ValueError):
+                         FeatureBundle.from_dict(payload)
+ 
++    def test_public_parse_enforces_point_in_time_cutoff_for_all_evidence(self):
++        attacks = (
++            (bundle().to_dict(), "T", "t.sample", "observed_nonfinancial_partial"),
++            (
++                real_general_ready_bundle().to_dict(),
++                "M",
++                "m.gross_profit.FY2021",
++                "derived_financial_ready",
++            ),
++        )
++        for payload, dimension, feature_key, case in attacks:
++            with self.subTest(case=case):
++                target = next(
++                    value
++                    for value in payload["dimension_inputs"][dimension]["values"]
++                    if value["key"] == feature_key
++                )
++                target["evidence"][0]["effective_at_utc"] = (
++                    "2026-08-29T12:30:00-04:00"
++                )
++                with self.assertRaisesRegex(ValueError, "effective.*as_of"):
++                    FeatureBundle.from_dict(payload)
++
++        accepted = (
++            ("exact_equal", "2026-08-30T00:00:00+08:00"),
++            ("earlier_despite_later_wall_clock", "2026-08-29T17:00:00+02:00"),
++        )
++        for case, effective_at in accepted:
++            with self.subTest(case=case):
++                payload = bundle().to_dict()
++                target = payload["dimension_inputs"]["T"]["values"][0]
++                target["evidence"][0]["effective_at_utc"] = effective_at
++                restored = FeatureBundle.from_dict(payload)
++                self.assertLessEqual(
++                    datetime.fromisoformat(
++                        restored.dimension_inputs["T"]
++                        .values[0]
++                        .evidence[0]
++                        .effective_at_utc
++                    ),
++                    datetime.fromisoformat(restored.as_of_utc),
++                )
++
++    def test_public_parse_keeps_unclassified_blocked_with_zero_coverage(self):
++        baseline = real_unclassified_bundle().to_dict()
++        attacks = {
++            "partial_with_blocker": lambda value: value.__setitem__(
++                "financial_status", "partial"
++            ),
++            "partial_without_blocker": lambda value: (
++                value.__setitem__("financial_status", "partial"),
++                value["blockers"].remove("industry_template_unclassified"),
++            ),
++            "blocked_without_blocker": lambda value: value["blockers"].remove(
++                "industry_template_unclassified"
++            ),
++            "nonzero_coverage": lambda value: (
++                value.__setitem__("financial_coverage", 0.25),
++                value["confidence_inputs"].__setitem__(
++                    "data_completeness_ratio", 0.25
++                ),
++            ),
++        }
++        for case, attack in attacks.items():
++            with self.subTest(case=case):
++                payload = copy.deepcopy(baseline)
++                attack(payload)
++                with self.assertRaisesRegex(ValueError, "unclassified"):
++                    FeatureBundle.from_dict(payload)
++
++        restored = FeatureBundle.from_dict(copy.deepcopy(baseline))
++        self.assertEqual(restored.industry.template_id, "unclassified")
++        self.assertEqual(restored.financial_status, "blocked")
++        self.assertEqual(restored.financial_coverage, 0.0)
++        self.assertIn("industry_template_unclassified", restored.blockers)
++
+     def test_general_ready_bundle_still_has_canonical_public_round_trip(self):
+         candidate = real_general_ready_bundle()
+ 
+         restored = FeatureBundle.from_dict(candidate.to_dict())
+ 
+         self.assertEqual(restored.financial_status, "financial_ready")
+         self.assertEqual(restored.financial_coverage, 1.0)
+         self.assertEqual(restored.canonical_bytes(), candidate.canonical_bytes())
+ 
+ 
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+index b23ee14..b7751d7 100644
+--- a/tests/test_orchestrator.py
++++ b/tests/test_orchestrator.py
+@@ -19,30 +19,31 @@ from ashare_pipeline.deep_worker import (
+     write_feature_bundle,
+ )
+ from ashare_pipeline.feature_contract import (
+     CONTRACT_VERSION,
+     DIMENSIONS,
+     ConfidenceInputs,
+     DimensionInput,
+     FeatureBundle,
+     FeatureValue,
+     IndustryContext,
++    canonical_json_bytes,
+     canonical_sha256,
+ )
+ from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
+ from ashare_pipeline.snapshot_repository import SnapshotRepository
+ from ashare_pipeline.snapshot_store import SnapshotStore
+ from ashare_pipeline.sources import FetchBatch, SourceBlocked
+ from ashare_pipeline.state_store import StateStore
+ from ashare_pipeline import orchestrator
+ from tests.test_feature_contract import retag_missing_revenue_slot
+-from tests.test_financial_features import build_bundle_with_overrides
++from tests.test_financial_features import build_bundle_with_overrides, rebuild_fact
+ from tests.test_state_store import installed_ready_bundle
+ 
+ 
+ def batch(source, dataset, records, request=None, fetched_at="2026-08-29T12:00:00+00:00"):
+     return FetchBatch(source, dataset, request or {}, records, fetched_at, "test", {})
+ 
+ 
+ def records_hash(records):
+     payload = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+     return hashlib.sha256(payload).hexdigest()
+@@ -1238,20 +1239,231 @@ class OrchestratorTestCase(unittest.TestCase):
+             status["deep"]["feature_set_counts"],
+             {"partial": 0, "financial_ready": 1, "blocked": 0},
+         )
+         self.assertFalse(status["formal_score_ready"])
+         self.assertFalse(status["seven_dimension_ready"])
+         self.assertEqual(
+             status["official_pool_counts"],
+             {"waiting_price": 0, "strong_attention": 0},
+         )
+ 
++    def test_equal_effective_instant_persists_reads_and_counts_ready(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        built, facts, _snapshot_ids = installed_ready_bundle(
++            store,
++            candidate_set_hash=context.candidate_set_hash,
++            snapshot_tag="pit-equality",
++            as_of_utc="2026-04-01T07:00:00+00:00",
++        )
++        self.assertTrue(all(fact.effective_at_utc == built.as_of_utc for fact in facts))
++
++        relative_path, bundle_hash, _created = write_feature_bundle(self.base, built)
++        _feature_id, stored = store.put_feature_bundle(
++            built, bundle_path=relative_path, bundle_hash=bundle_hash
++        )
++        verified = read_verified_feature_bundle(
++            self.base, relative_path, bundle_hash
++        )
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-29T20:00:00+08:00",
++        )
++
++        self.assertTrue(stored)
++        self.assertEqual(verified.canonical_bytes(), built.canonical_bytes())
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 1, "blocked": 0},
++        )
++        self.assertEqual(status["deep"]["unknown_failure_count"], 0)
++        self.assertFalse(status["formal_score_ready"])
++        self.assertFalse(status["seven_dimension_ready"])
++        self.assertEqual(
++            status["official_pool_counts"],
++            {"waiting_price": 0, "strong_attention": 0},
++        )
++
++    def test_progress_rejects_newest_future_evidence_artifact_without_fallback(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        older, _older_facts, _older_snapshots = installed_ready_bundle(
++            store,
++            candidate_set_hash=context.candidate_set_hash,
++            snapshot_tag="pit-older",
++            as_of_utc="2026-08-28T16:00:00+00:00",
++        )
++        seed, seed_facts, _newer_snapshots = installed_ready_bundle(
++            store,
++            candidate_set_hash=context.candidate_set_hash,
++            snapshot_tag="pit-newer",
++        )
++        future_facts = tuple(
++            rebuild_fact(
++                fact, effective_at_utc="2026-08-30T00:00:00+00:00"
++            )
++            for fact in seed_facts
++        )
++        inserted, ignored = store.insert_financial_facts(future_facts)
++        self.assertEqual((inserted, ignored), (len(future_facts), 0))
++        newer = build_bundle_with_overrides(
++            candidate_set_hash=context.candidate_set_hash,
++            facts=future_facts,
++            statement_snapshot_hashes={
++                "balance_sheet": seed.input_hash,
++                "profit_sheet": seed.input_hash,
++                "cash_flow_sheet": seed.input_hash,
++            },
++            as_of_utc="2026-08-30T00:00:00+00:00",
++        )
++        locations = []
++        for candidate in (older, newer):
++            relative_path, bundle_hash, _created = write_feature_bundle(
++                self.base, candidate
++            )
++            store.put_feature_bundle(
++                candidate, bundle_path=relative_path, bundle_hash=bundle_hash
++            )
++            locations.append((relative_path, bundle_hash))
++
++        newer_path, newer_hash = locations[-1]
++        forged_payload = newer.to_dict()
++        forged_payload["as_of_utc"] = "2026-08-29T16:00:00+00:00"
++        forged_bytes = canonical_json_bytes(forged_payload)
++        forged_hash = hashlib.sha256(forged_bytes).hexdigest()
++        (self.base / newer_path).write_bytes(forged_bytes)
++        with closing(sqlite3.connect(store.db_path)) as connection:
++            connection.execute(
++                "UPDATE feature_set SET as_of_utc=?, bundle_hash=? WHERE bundle_hash=?",
++                (forged_payload["as_of_utc"], forged_hash, newer_hash),
++            )
++            connection.commit()
++
++        with self.assertRaises(OSError):
++            read_verified_feature_bundle(self.base, newer_path, forged_hash)
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-29T20:00:00+08:00",
++        )
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 0, "blocked": 0},
++        )
++        self.assertEqual(status["deep"]["unknown_failure_count"], 1)
++        self.assertFalse(status["formal_score_ready"])
++        self.assertFalse(status["seven_dimension_ready"])
++        self.assertEqual(
++            status["official_pool_counts"],
++            {"waiting_price": 0, "strong_attention": 0},
++        )
++
++    def test_forged_unclassified_partial_cannot_cross_real_boundaries(self):
++        write_candidate_documents(self.root, {"SH600001": "不存在行业"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        forged = build_bundle_with_overrides(
++            candidate_set_hash=context.candidate_set_hash,
++            source_industry_name="不存在行业",
++        )
++        object.__setattr__(forged, "financial_status", "partial")
++        object.__setattr__(
++            forged,
++            "blockers",
++            tuple(
++                blocker
++                for blocker in forged.blockers
++                if blocker != "industry_template_unclassified"
++            ),
++        )
++        crossed = False
++        try:
++            relative_path, bundle_hash, _created = write_feature_bundle(
++                self.base, forged
++            )
++            store.put_feature_bundle(
++                forged, bundle_path=relative_path, bundle_hash=bundle_hash
++            )
++            read_verified_feature_bundle(self.base, relative_path, bundle_hash)
++            crossed = True
++        except (OSError, ValueError):
++            pass
++
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-29T20:00:00+08:00",
++        )
++        self.assertFalse(crossed)
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 0, "blocked": 0},
++        )
++        self.assertFalse(status["formal_score_ready"])
++        self.assertFalse(status["seven_dimension_ready"])
++        self.assertEqual(
++            status["official_pool_counts"],
++            {"waiting_price": 0, "strong_attention": 0},
++        )
++
++    def test_builder_unclassified_persists_reads_and_counts_blocked(self):
++        write_candidate_documents(self.root, {"SH600001": "不存在行业"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        built = build_bundle_with_overrides(
++            candidate_set_hash=context.candidate_set_hash,
++            source_industry_name="不存在行业",
++        )
++        relative_path, bundle_hash, _created = write_feature_bundle(self.base, built)
++        _feature_id, stored = store.put_feature_bundle(
++            built, bundle_path=relative_path, bundle_hash=bundle_hash
++        )
++        verified = read_verified_feature_bundle(
++            self.base, relative_path, bundle_hash
++        )
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-29T20:00:00+08:00",
++        )
++
++        self.assertTrue(stored)
++        self.assertEqual(verified.financial_status, "blocked")
++        self.assertEqual(verified.financial_coverage, 0.0)
++        self.assertIn("industry_template_unclassified", verified.blockers)
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 0, "blocked": 1},
++        )
++        self.assertEqual(status["deep"]["unknown_failure_count"], 0)
++        self.assertFalse(status["formal_score_ready"])
++        self.assertFalse(status["seven_dimension_ready"])
++        self.assertEqual(
++            status["official_pool_counts"],
++            {"waiting_price": 0, "strong_attention": 0},
++        )
++
+     def test_progress_excludes_newest_bundle_after_evidence_snapshot_loss_without_fallback(self):
+         write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+         store = StateStore(self.root / "state.sqlite3")
+         store.initialize()
+         context = orchestrator.load_candidate_context(self.root)
+         older, _older_facts, _older_snapshots = installed_ready_bundle(
+             store,
+             candidate_set_hash=context.candidate_set_hash,
+             snapshot_tag="progress-older",
+             as_of_utc="2026-08-28T16:00:00+00:00",
+diff --git a/tests/test_state_store.py b/tests/test_state_store.py
+index 2fbd334..b51f673 100644
+--- a/tests/test_state_store.py
++++ b/tests/test_state_store.py
+@@ -1,10 +1,11 @@
++import copy
+ import math
+ import sqlite3
+ import tempfile
+ import threading
+ import unittest
+ from contextlib import closing
+ from dataclasses import FrozenInstanceError, replace
+ from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+ 
+@@ -701,20 +702,57 @@ class StateStoreTestCase(unittest.TestCase):
+             self.assertEqual(
+                 connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                 1,
+             )
+             self.assertEqual(
+                 connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0],
+                 363,
+             )
+         self.assertEqual(feature_id, bundle.bundle_hash())
+ 
++    def test_put_feature_bundle_rejects_future_fact_on_idempotent_success_path(self) -> None:
++        bundle, _facts, _snapshot_ids = self.installed_ready_bundle(
++            self.store,
++            snapshot_tag="pit-idempotent",
++            as_of_utc="2026-04-01T07:00:00+00:00",
++        )
++        path = "data/curated/formal_features/2026-06-30/SH600001/pit.json"
++        feature_id, created = self.store.put_feature_bundle(
++            bundle, bundle_path=path, bundle_hash=bundle.bundle_hash()
++        )
++        self.assertTrue(created)
++
++        forged = copy.copy(bundle)
++        object.__setattr__(forged, "as_of_utc", "2026-04-01T06:59:59+00:00")
++        forged_hash = forged.bundle_hash()
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            connection.execute(
++                "UPDATE feature_set SET as_of_utc=?, bundle_hash=? WHERE id=?",
++                (forged.as_of_utc, forged_hash, feature_id),
++            )
++            connection.commit()
++
++        with self.assertRaisesRegex(ValueError, "effective.*as_of"):
++            self.store.put_feature_bundle(
++                forged, bundle_path=path, bundle_hash=forged_hash
++            )
++
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
++                1,
++            )
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0],
++                363,
++            )
++
+     def test_put_feature_bundle_rejects_missing_or_mismatched_evidence_rows(self) -> None:
+         cases = (
+             "missing_fact",
+             "missing_snapshot",
+             "source_snapshot_id",
+             "source_field",
+             "raw_row_hash",
+             "announced_at_utc",
+             "effective_at_utc",
+         )

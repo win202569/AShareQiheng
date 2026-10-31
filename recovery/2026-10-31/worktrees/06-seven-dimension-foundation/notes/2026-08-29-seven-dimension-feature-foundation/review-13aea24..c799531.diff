@@ -1,0 +1,665 @@
+# Review package: 13aea24636744490115f21b78bd696fd538f6400..c799531f8a8a2173c5557db4d1d9afaf6ebd464e
+
+## Commits
+c799531 fix: bind registered raw feature slots
+
+## Files changed
+ ashare_pipeline/feature_contract.py   | 34 ++++++++++++----
+ ashare_pipeline/financial_features.py | 51 +++++++-----------------
+ ashare_pipeline/financial_schema.py   | 75 ++++++++++++++++++++++++++++++++++-
+ tests/test_feature_contract.py        | 61 ++++++++++++++++++++++++++++
+ tests/test_financial_features.py      |  9 ++++-
+ tests/test_orchestrator.py            | 57 ++++++++++++++++++++++++++
+ 6 files changed, 241 insertions(+), 46 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/feature_contract.py b/ashare_pipeline/feature_contract.py
+index 1058ef4..996e441 100644
+--- a/ashare_pipeline/feature_contract.py
++++ b/ashare_pipeline/feature_contract.py
+@@ -380,20 +380,21 @@ class FeatureBundle:
+     def __post_init__(self) -> None:
+         if not isinstance(self.dimension_inputs, Mapping):
+             raise ValueError("dimension_inputs must be a mapping")
+         object.__setattr__(self, "dimension_inputs", MappingProxyType(dict(self.dimension_inputs)))
+         if not isinstance(self.blockers, (list, tuple)):
+             raise ValueError("blockers must be a list")
+         object.__setattr__(self, "blockers", tuple(self.blockers))
+         self.validate()
+ 
+     def validate(self) -> None:
++        from .financial_schema import raw_financial_slot_descriptor
+         from .industry_templates import TEMPLATES
+ 
+         if (
+             isinstance(self.schema_version, bool)
+             or not isinstance(self.schema_version, int)
+             or self.schema_version != 1
+             or self.contract_version != CONTRACT_VERSION
+         ):
+             raise ValueError("unsupported feature contract")
+         if not isinstance(self.security_id, str) or _SECURITY_ID.fullmatch(self.security_id) is None:
+@@ -462,42 +463,61 @@ class FeatureBundle:
+                 dimension.status not in {"input_ready", "not_applicable"}
+                 for dimension in financial_inputs.values()
+             ) or any(
+                 value.status in {"missing", "blocked"}
+                 for dimension in financial_inputs.values()
+                 for value in dimension.values
+             ):
+                 raise ValueError(
+                     "financial_ready requires complete applicable financial dimensions"
+                 )
+-            registered_slot_periods = {
+-                (slot, period_key)
++            descriptors = {
++                slot: raw_financial_slot_descriptor(slot)
+                 for slot in template.financial_slots
++            }
++            registered_slot_periods = {
++                (descriptor.metric_key, period_key)
++                for descriptor in descriptors.values()
+                 for period_key in FINANCIAL_PERIOD_KEYS
+             }
+             supplied_slot_periods: list[tuple[str, str]] = []
++            supplied_fact_ids: list[str] = []
+             for dimension_name, dimension in financial_inputs.items():
+                 for value in dimension.values:
+                     parts = value.key.split(".")
+-                    if (
++                    if not (
+                         len(parts) == 3
+-                        and parts[0] == dimension_name.lower()
+-                        and parts[1] in template.financial_slots
++                        and parts[1] in descriptors
+                         and parts[2] == value.period_key
+                         and value.period_key in FINANCIAL_PERIOD_KEYS
+-                        and value.status in {"observed", "derived"}
+                     ):
+-                        supplied_slot_periods.append((parts[1], value.period_key))
++                        continue
++                    descriptor = descriptors[parts[1]]
++                    if (
++                        dimension_name != descriptor.dimension
++                        or value.key != descriptor.canonical_key(value.period_key)
++                        or value.status not in descriptor.allowed_statuses
++                        or value.formula_version != descriptor.formula_version
++                        or value.unit != descriptor.unit
++                        or len(value.evidence) != 1
++                        or value.evidence[0].source_field not in descriptor.source_fields
++                    ):
++                        raise ValueError(
++                            "registered raw financial slot has noncanonical metadata"
++                        )
++                    supplied_slot_periods.append((parts[1], value.period_key))
++                    supplied_fact_ids.append(value.evidence[0].financial_fact_id)
+             if (
+                 not registered_slot_periods
+                 or len(supplied_slot_periods) != len(registered_slot_periods)
+                 or set(supplied_slot_periods) != registered_slot_periods
++                or len(supplied_fact_ids) != len(set(supplied_fact_ids))
+             ):
+                 raise ValueError(
+                     "financial_ready requires every registered slot for every financial period"
+                 )
+ 
+     def to_dict(self) -> dict[str, Any]:
+         return {"schema_version": self.schema_version, "contract_version": self.contract_version,
+                 "security_id": self.security_id, "report_period": self.report_period, "as_of_utc": require_aware_utc(self.as_of_utc, "as_of_utc"),
+                 "candidate_set_hash": self.candidate_set_hash, "industry": self.industry.to_dict(), "input_hash": self.input_hash,
+                 "financial_status": self.financial_status, "financial_coverage": self.financial_coverage,
+diff --git a/ashare_pipeline/financial_features.py b/ashare_pipeline/financial_features.py
+index 4c5f3bb..c31c934 100644
+--- a/ashare_pipeline/financial_features.py
++++ b/ashare_pipeline/financial_features.py
+@@ -22,20 +22,21 @@ from ashare_pipeline.feature_contract import (
+     IndustryContext,
+     canonical_sha256,
+     require_aware_utc,
+ )
+ from ashare_pipeline.financial_schema import (
+     DATASET_TO_STATEMENT,
+     MAPPING_VERSION,
+     FinancialFact,
+     classify_period,
+     field_rules,
++    raw_financial_slot_descriptor,
+ )
+ from ashare_pipeline.industry_templates import (
+     TEMPLATE_VERSION,
+     TemplateDefinition,
+     resolve_template,
+ )
+ from ashare_pipeline.sources import FetchBatch
+ 
+ 
+ SHANGHAI = ZoneInfo("Asia/Shanghai")
+@@ -55,50 +56,20 @@ _REQUIRED_PERIODS = FINANCIAL_PERIODS
+ _PERIOD_KEY = dict(_REQUIRED_PERIODS)
+ _OPENING_PERIOD = {
+     "2022-12-31": "2021-12-31",
+     "2023-12-31": "2022-12-31",
+     "2024-12-31": "2023-12-31",
+     "2025-12-31": "2024-12-31",
+     "2025-06-30": "2024-12-31",
+     "2026-06-30": "2025-12-31",
+ }
+ 
+-_RAW_DIMENSION = {
+-    "revenue": "G",
+-    "operating_cost": "M",
+-    "operating_profit": "M",
+-    "total_profit": "M",
+-    "income_tax": "M",
+-    "net_profit": "M",
+-    "parent_net_profit": "M",
+-    "deduct_parent_net_profit": "M",
+-    "interest_expense": "M",
+-    "rd_expense": "M",
+-    "operating_cash_flow": "EQ",
+-    "capital_expenditure": "CA",
+-    "cash_dividends": "CA",
+-    "interest_paid": "CA",
+-    "acquisition_cash_paid": "CA",
+-    "disposal_long_asset_cash": "CA",
+-    "equity_financing_cash": "CA",
+-    "debt_financing_cash": "CA",
+-    "debt_repayment_cash": "CA",
+-    "share_repurchase_cash": "CA",
+-}
+-_EXPECTED_UNITS = {
+-    rule.metric_key: rule.unit
+-    for statement in ("income", "balance", "cash_flow")
+-    for rule in field_rules(statement)
+-}
+-_EXPECTED_UNITS["share_repurchase_cash"] = "CNY"
+-
+-
+ def _deep_freeze(value: object) -> object:
+     if isinstance(value, Mapping):
+         frozen = {
+             key: _deep_freeze(value[key])
+             for key in sorted(value, key=lambda item: (type(item).__name__, repr(item)))
+         }
+         return MappingProxyType(frozen)
+     if isinstance(value, (list, tuple)):
+         return tuple(_deep_freeze(item) for item in value)
+     if isinstance(value, (set, frozenset)):
+@@ -598,28 +569,35 @@ def _evidence_tuple(facts: Iterable[FinancialFact]) -> tuple[EvidenceRef, ...]:
+             fact.raw_row_hash,
+             fact.announced_at_utc,
+             fact.effective_at_utc,
+         ): _evidence(fact)
+         for fact in facts
+     }
+     return tuple(by_content[key] for key in sorted(by_content))
+ 
+ 
+ def _observed_value(metric_key: str, period_key: str, fact: FinancialFact) -> FeatureValue:
+-    dimension = _RAW_DIMENSION.get(metric_key, "FS")
++    descriptor = raw_financial_slot_descriptor(metric_key)
++    if (
++        fact.metric_key != descriptor.metric_key
++        or fact.mapping_version != descriptor.formula_version
++        or fact.unit != descriptor.unit
++        or fact.source_field not in descriptor.source_fields
++    ):
++        raise ValueError("financial fact does not match its canonical raw slot")
+     return FeatureValue(
+-        key=f"{dimension.lower()}.{metric_key}.{period_key}",
++        key=descriptor.canonical_key(period_key),
+         value=fact.value,
+         unit=fact.unit,
+         period_key=period_key,
+-        status="observed",
+-        formula_version=MAPPING_VERSION,
++        status=descriptor.allowed_statuses[0],
++        formula_version=descriptor.formula_version,
+         evidence=(_evidence(fact),),
+         missing_reason=None,
+     )
+ 
+ 
+ def _missing_value(
+     dimension: str,
+     metric_key: str,
+     period_key: str,
+     unit: str,
+@@ -946,27 +924,28 @@ def assemble_bundle_from_registered_slots(
+     blockers: Sequence[str],
+ ) -> FeatureBundle:
+     facts_by_key: dict[tuple[str, str], FinancialFact] = {}
+     for fact in facts:
+         if fact.period_end in _PERIOD_KEY:
+             facts_by_key[(fact.metric_key, fact.period_end)] = fact
+ 
+     dimensions: dict[str, list[FeatureValue]] = {key: [] for key in DIMENSIONS}
+     if template.financial_slots:
+         for metric_key in template.financial_slots:
+-            dimension = _RAW_DIMENSION.get(metric_key, "FS")
++            descriptor = raw_financial_slot_descriptor(metric_key)
++            dimension = descriptor.dimension
+             for period_end, period_key in _REQUIRED_PERIODS:
+                 fact = facts_by_key.get((metric_key, period_end))
+                 if fact is None:
+                     dimensions[dimension].append(_missing_value(
+                         dimension, metric_key, period_key,
+-                        _EXPECTED_UNITS.get(metric_key, "CNY"),
++                        descriptor.unit,
+                         f"financial_fact_missing:{metric_key}",
+                     ))
+                 else:
+                     dimensions[dimension].append(_observed_value(metric_key, period_key, fact))
+         for period_end, period_key in _REQUIRED_PERIODS:
+             _add_period_formulas(dimensions, facts_by_key, period_end, period_key)
+         _add_growth_formulas(dimensions, facts_by_key)
+ 
+     applicable_values = [
+         value
+diff --git a/ashare_pipeline/financial_schema.py b/ashare_pipeline/financial_schema.py
+index 88b220c..b9f5ddf 100644
+--- a/ashare_pipeline/financial_schema.py
++++ b/ashare_pipeline/financial_schema.py
+@@ -1,21 +1,25 @@
+ """Versioned contracts for normalized, point-in-time financial facts."""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ from datetime import date, datetime
+ import math
+ import re
+ from typing import Any, Literal, Mapping
+ 
+-from ashare_pipeline.feature_contract import canonical_sha256, require_aware_utc
++from ashare_pipeline.feature_contract import (
++    FINANCIAL_DIMENSIONS,
++    canonical_sha256,
++    require_aware_utc,
++)
+ 
+ 
+ MAPPING_VERSION = "eastmoney-financial-mapping-v1"
+ FINANCIAL_REQUEST_VERSION = "eastmoney-financial-request-v1"
+ 
+ StatementDataset = Literal["balance_sheet", "profit_sheet", "cash_flow_sheet"]
+ StatementKind = Literal["balance", "income", "cash_flow"]
+ 
+ DATASET_TO_STATEMENT: dict[str, str] = {
+     "balance_sheet": "balance",
+@@ -126,20 +130,89 @@ _FIELD_RULES: tuple[FieldRule, ...] = (
+     FieldRule("cash_flow", "debt_repayment_cash", ("PAY_DEBT_CASH",), "CNY", "duration"),
+ )
+ 
+ # The tracked Eastmoney cash-flow snapshots expose no dedicated, auditable share-repurchase field.
+ # Mixed fields such as PAY_OTHER_FINANCE must not be presented as a repurchase payment.
+ UNMAPPED_COMMON_FACTS: dict[str, str] = {
+     "share_repurchase_cash": "source_field_unavailable",
+ }
+ 
+ 
++@dataclass(frozen=True)
++class RawFinancialSlotDescriptor:
++    metric_key: str
++    dimension: str
++    kind: str
++    allowed_statuses: tuple[str, ...]
++    formula_version: str
++    unit: str
++    source_fields: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        if not self.metric_key or self.dimension not in FINANCIAL_DIMENSIONS:
++            raise ValueError("raw financial slot requires a canonical dimension")
++        if self.kind != "raw_fact" or self.allowed_statuses != ("observed",):
++            raise ValueError("raw financial slot must require observed raw facts")
++        if self.formula_version != MAPPING_VERSION:
++            raise ValueError("raw financial slot must use the active mapping version")
++        if self.unit not in FACT_UNITS or not self.source_fields:
++            raise ValueError("raw financial slot requires unit and source-field metadata")
++
++    def canonical_key(self, period_key: str) -> str:
++        return f"{self.dimension.lower()}.{self.metric_key}.{period_key}"
++
++
++def _raw_dimension(rule: FieldRule) -> str:
++    if rule.metric_key == "revenue":
++        return "G"
++    if rule.statement == "income":
++        return "M"
++    if rule.metric_key == "operating_cash_flow":
++        return "EQ"
++    if rule.statement == "cash_flow":
++        return "CA"
++    return "FS"
++
++
++_RAW_FINANCIAL_SLOT_DESCRIPTORS = {
++    rule.metric_key: RawFinancialSlotDescriptor(
++        metric_key=rule.metric_key,
++        dimension=_raw_dimension(rule),
++        kind="raw_fact",
++        allowed_statuses=("observed",),
++        formula_version=MAPPING_VERSION,
++        unit=rule.unit,
++        source_fields=rule.source_fields,
++    )
++    for rule in _FIELD_RULES
++}
++_RAW_FINANCIAL_SLOT_DESCRIPTORS["share_repurchase_cash"] = (
++    RawFinancialSlotDescriptor(
++        metric_key="share_repurchase_cash",
++        dimension="CA",
++        kind="raw_fact",
++        allowed_statuses=("observed",),
++        formula_version=MAPPING_VERSION,
++        unit="CNY",
++        source_fields=("SHARE_REPURCHASE_CASH",),
++    )
++)
++
++
++def raw_financial_slot_descriptor(metric_key: str) -> RawFinancialSlotDescriptor:
++    """Return the canonical metadata for one registered raw fact slot."""
++    try:
++        return _RAW_FINANCIAL_SLOT_DESCRIPTORS[metric_key]
++    except KeyError as error:
++        raise ValueError(f"unknown raw financial slot: {metric_key!r}") from error
++
++
+ def field_rules(statement: StatementKind | str) -> tuple[FieldRule, ...]:
+     """Return the immutable, ordered fact mappings for one statement kind."""
+     if statement not in STATEMENT_TO_DATASET:
+         raise ValueError(f"invalid statement: {statement!r}")
+     return tuple(rule for rule in _FIELD_RULES if rule.statement == statement)
+ 
+ 
+ def _require_iso_date(value: str | None, field: str, *, allow_none: bool) -> str | None:
+     if value is None and allow_none:
+         return None
+diff --git a/tests/test_feature_contract.py b/tests/test_feature_contract.py
+index c0d67da..5428b3f 100644
+--- a/tests/test_feature_contract.py
++++ b/tests/test_feature_contract.py
+@@ -42,20 +42,65 @@ def real_general_ready_bundle():
+ 
+     return build_bundle_with_overrides()
+ 
+ 
+ def real_specialized_bundle(industry_name):
+     from tests.test_financial_features import build_bundle_with_overrides
+ 
+     return build_bundle_with_overrides(source_industry_name=industry_name)
+ 
+ 
++def retag_missing_revenue_slot(payload, attack):
++    dimensions = payload["dimension_inputs"]
++    target = next(
++        value
++        for value in dimensions["G"]["values"]
++        if value["key"] == "g.revenue.FY2021"
++    )
++    dimensions["G"]["values"].remove(target)
++    if attack == "derived_wrong_dimension":
++        replacement = copy.deepcopy(next(
++            value
++            for value in dimensions["M"]["values"]
++            if value["key"] == "m.gross_profit.FY2021"
++        ))
++        replacement["key"] = "m.revenue.FY2021"
++        dimensions["M"]["values"].append(replacement)
++    elif attack == "derived_correct_dimension":
++        replacement = copy.deepcopy(next(
++            value
++            for value in dimensions["M"]["values"]
++            if value["key"] == "m.gross_profit.FY2021"
++        ))
++        replacement["key"] = "g.revenue.FY2021"
++        dimensions["G"]["values"].append(replacement)
++    elif attack == "observed_wrong_dimension":
++        target["key"] = "m.revenue.FY2021"
++        dimensions["M"]["values"].append(target)
++    elif attack == "observed_wrong_formula":
++        target["formula_version"] = "financial-derived-v1"
++        dimensions["G"]["values"].append(target)
++    elif attack == "other_observed_raw_slot":
++        replacement = copy.deepcopy(next(
++            value
++            for value in dimensions["M"]["values"]
++            if value["key"] == "m.operating_cost.FY2021"
++        ))
++        replacement["key"] = "g.revenue.FY2021"
++        dimensions["G"]["values"].append(replacement)
++    else:
++        raise AssertionError(f"unknown retag attack: {attack}")
++    for dimension in dimensions.values():
++        dimension["values"].sort(key=lambda value: (value["key"], value["period_key"]))
++    return payload
++
++
+ class FeatureContractTests(unittest.TestCase):
+     def test_bundle_requires_exactly_seven_dimensions_and_is_never_formal(self):
+         self.assertEqual(DIMENSIONS, ("G", "V", "M", "EQ", "FS", "CA", "T"))
+         with self.assertRaisesRegex(ValueError, "dimension keys"):
+             bundle({key: value for key, value in dimensions().items() if key != "G"})
+         with self.assertRaisesRegex(ValueError, "formal score"):
+             bundle(dimensions(), is_formal_score_ready=True)
+ 
+     def test_zero_missing_and_nonfinite_values_have_distinct_contracts(self):
+         self.assertEqual(dimensions()["G"].values[0].value, 0.0)
+@@ -265,20 +310,36 @@ class FeatureContractTests(unittest.TestCase):
+         payload = real_general_ready_bundle().to_dict()
+         payload["dimension_inputs"]["G"]["values"] = [
+             value
+             for value in payload["dimension_inputs"]["G"]["values"]
+             if value["key"] != "g.revenue.FY2021"
+         ]
+ 
+         with self.assertRaises(ValueError):
+             FeatureBundle.from_dict(payload)
+ 
++    def test_public_parse_rejects_registered_raw_slot_retag_substitutions(self):
++        attacks = (
++            "derived_wrong_dimension",
++            "derived_correct_dimension",
++            "observed_wrong_dimension",
++            "observed_wrong_formula",
++            "other_observed_raw_slot",
++        )
++        for attack in attacks:
++            with self.subTest(attack=attack):
++                payload = retag_missing_revenue_slot(
++                    real_general_ready_bundle().to_dict(), attack
++                )
++                with self.assertRaises(ValueError):
++                    FeatureBundle.from_dict(payload)
++
+     def test_public_parse_enforces_specialized_template_blocker(self):
+         for industry_name in ("房地产开发", "工业金属", "银行"):
+             baseline = real_specialized_bundle(industry_name).to_dict()
+             self.assertIn("specialized_financial_inputs_missing", baseline["blockers"])
+             for status in ("financial_ready", "blocked"):
+                 with self.subTest(industry=industry_name, status=status):
+                     payload = copy.deepcopy(baseline)
+                     payload["financial_status"] = status
+                     payload["blockers"].remove("specialized_financial_inputs_missing")
+                     with self.assertRaises(ValueError):
+diff --git a/tests/test_financial_features.py b/tests/test_financial_features.py
+index 8044b69..6cc62be 100644
+--- a/tests/test_financial_features.py
++++ b/tests/test_financial_features.py
+@@ -17,21 +17,25 @@ from ashare_pipeline.financial_features import (
+     FORMULA_VERSION,
+     QualityIssue,
+     build_feature_bundle,
+     build_financial_facts,
+     feature_input_hash,
+     positive_cagr,
+     select_visible_facts,
+     symmetric_growth,
+     trading_days_from_batch,
+ )
+-from ashare_pipeline.financial_schema import FinancialFact, MAPPING_VERSION
++from ashare_pipeline.financial_schema import (
++    FinancialFact,
++    MAPPING_VERSION,
++    raw_financial_slot_descriptor,
++)
+ from ashare_pipeline.industry_templates import TEMPLATE_VERSION, resolve_template
+ from ashare_pipeline.sources import FetchBatch
+ 
+ 
+ FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "financial"
+ REQUIRED_PERIODS = {
+     "2021-12-31", "2022-12-31", "2023-12-31", "2024-12-31",
+     "2025-12-31", "2025-06-30", "2026-06-30",
+ }
+ STATEMENT_FIXTURES = (
+@@ -60,20 +64,21 @@ INSTANT_METRICS = {
+ 
+ BALANCE_METRICS = INSTANT_METRICS
+ CASH_FLOW_METRICS = {
+     "operating_cash_flow", "capital_expenditure", "cash_dividends", "interest_paid",
+     "acquisition_cash_paid", "disposal_long_asset_cash", "equity_financing_cash",
+     "debt_financing_cash", "debt_repayment_cash", "share_repurchase_cash",
+ }
+ 
+ 
+ def bundle_fact(metric_key: str, period_end: str, value: float, *, serial: int = 0) -> FinancialFact:
++    descriptor = raw_financial_slot_descriptor(metric_key)
+     nature = "instant" if metric_key in INSTANT_METRICS else "duration"
+     statement = (
+         "balance" if metric_key in BALANCE_METRICS
+         else "cash_flow" if metric_key in CASH_FLOW_METRICS
+         else "income"
+     )
+     period_kind = "FY" if period_end.endswith("12-31") else "H1"
+     return FinancialFact.create(
+         security_id="SH600001",
+         statement=statement,
+@@ -81,21 +86,21 @@ def bundle_fact(metric_key: str, period_end: str, value: float, *, serial: int =
+         period_start=None if nature == "instant" else f"{period_end[:4]}-01-01",
+         period_end=period_end,
+         period_kind=period_kind,
+         value=value,
+         unit="shares" if metric_key == "share_capital" else "CNY",
+         nature=nature,
+         announced_at_utc="2026-03-31T15:59:59+00:00",
+         effective_at_utc="2026-04-01T07:00:00+00:00",
+         source_updated_at_utc=None,
+         source_snapshot_id=f"snapshot-{period_end}-{metric_key}-{serial}",
+-        source_field=metric_key.upper(),
++        source_field=descriptor.source_fields[0],
+         raw_row_hash=canonical_sha256({"metric": metric_key, "period": period_end, "value": value, "serial": serial}),
+         mapping_version=MAPPING_VERSION,
+         created_at="2026-08-29T00:00:00+00:00",
+     )
+ 
+ 
+ def hand_checked_general_facts(*, fy2025_revenue: float = 1_000.0) -> tuple[FinancialFact, ...]:
+     values_by_period = {
+         "2024-12-31": {
+             "total_assets": 800.0, "total_equity": 400.0, "cash": 100.0,
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+index 765e15e..15ca216 100644
+--- a/tests/test_orchestrator.py
++++ b/tests/test_orchestrator.py
+@@ -27,20 +27,21 @@ from ashare_pipeline.feature_contract import (
+     FeatureValue,
+     IndustryContext,
+     canonical_sha256,
+ )
+ from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
+ from ashare_pipeline.snapshot_repository import SnapshotRepository
+ from ashare_pipeline.snapshot_store import SnapshotStore
+ from ashare_pipeline.sources import FetchBatch, SourceBlocked
+ from ashare_pipeline.state_store import StateStore
+ from ashare_pipeline import orchestrator
++from tests.test_feature_contract import retag_missing_revenue_slot
+ from tests.test_financial_features import build_bundle_with_overrides
+ 
+ 
+ def batch(source, dataset, records, request=None, fetched_at="2026-08-29T12:00:00+00:00"):
+     return FetchBatch(source, dataset, request or {}, records, fetched_at, "test", {})
+ 
+ 
+ def records_hash(records):
+     payload = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+     return hashlib.sha256(payload).hexdigest()
+@@ -1136,20 +1137,76 @@ class OrchestratorTestCase(unittest.TestCase):
+             status["deep"]["feature_set_counts"],
+             {"partial": 0, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertFalse(status["formal_score_ready"])
+         self.assertFalse(status["seven_dimension_ready"])
+         self.assertEqual(
+             status["official_pool_counts"],
+             {"waiting_price": 0, "strong_attention": 0},
+         )
+ 
++    def test_derived_retag_cannot_cross_verified_storage_or_count_ready(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        built = build_bundle_with_overrides(
++            candidate_set_hash=context.candidate_set_hash
++        )
++        forged_payload = retag_missing_revenue_slot(
++            built.to_dict(), "derived_wrong_dimension"
++        )
++        try:
++            parsed = FeatureBundle.from_dict(forged_payload)
++        except ValueError:
++            parsed = None
++        verified = None
++        if parsed is not None:
++            relative_path, bundle_hash, _created = write_feature_bundle(
++                self.base, parsed
++            )
++            store.put_feature_bundle(
++                parsed,
++                bundle_path=relative_path,
++                bundle_hash=bundle_hash,
++            )
++            verified = read_verified_feature_bundle(
++                self.base, relative_path, bundle_hash
++            )
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-29T20:00:00+08:00",
++        )
++
++        if verified is not None:
++            self.assertEqual(verified.financial_status, "financial_ready")
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 0, "blocked": 0},
++        )
++        with closing(sqlite3.connect(store.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
++                0,
++            )
++        feature_root = self.root / "curated" / "formal_features"
++        self.assertEqual(list(feature_root.rglob("*.json")), [])
++        self.assertFalse(status["formal_score_ready"])
++        self.assertFalse(status["seven_dimension_ready"])
++        self.assertEqual(
++            status["official_pool_counts"],
++            {"waiting_price": 0, "strong_attention": 0},
++        )
++
+     def test_general_ready_round_trips_through_verified_storage_and_progress(self):
+         write_candidate_documents(self.root, {"SH600001": "包装印刷"})
+         store = StateStore(self.root / "state.sqlite3")
+         store.initialize()
+         context = orchestrator.load_candidate_context(self.root)
+         built = build_bundle_with_overrides(
+             candidate_set_hash=context.candidate_set_hash
+         )
+         parsed = FeatureBundle.from_dict(built.to_dict())
+ 

@@ -1,0 +1,168 @@
+# Review package: 1a10a41aff3116b49ee2cba972f4e461050fc195..c7a71c28e3447758fad6a23b3d4789f75f2c5177
+
+## Commits
+c7a71c2 fix: retain identities on pending final inputs
+
+## Files changed
+ ashare_pipeline/formal_final_score_inputs.py | 20 +++++++++++++++++--
+ tests/test_formal_final_score_inputs.py      | 30 ++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_final_score_inputs.py b/ashare_pipeline/formal_final_score_inputs.py
+index 337d50f..0ea934d 100644
+--- a/ashare_pipeline/formal_final_score_inputs.py
++++ b/ashare_pipeline/formal_final_score_inputs.py
+@@ -181,20 +181,33 @@ def _install_final_inputs():
+                 or tuple((row.security_id, row.metric_id) for row in valuation.inputs)
+                     != tuple((sid, mid) for sid in ids for mid in v_metrics)):
+             raise ValueError("final score source policy, industry or valuation closure mismatch")
+         ready_ids = tuple(row.security_id for row in base.inputs)
+         if (len(ready_ids) != len(set(ready_ids)) or ready_ids != tuple(sorted(ready_ids))
+                 or set(ready_ids) & set(base.pending_reasons)
+                 or set(ready_ids) | set(base.pending_reasons) != set(ids)):
+             raise ValueError("final score base batch membership is incomplete")
+         return ids
+ 
++    def member_identity(sid, industry, valuation_inputs, original):
++        fields = ("template_id", "primary_industry", "secondary_industry")
++        identity = {field: industry.get(field) for field in fields}
++        if industry["security_id"] != sid:
++            raise ValueError("final score member identity mismatch")
++        inputs = valuation_inputs + (() if original is None else (original,))
++        for item in inputs:
++            item.require_verified()
++            if (any(getattr(item, field) != identity[field] for field in fields)
++                    or item.security_id != sid):
++                raise ValueError("final score member identity mismatch")
++        return identity
++
+     class FormalFinalScoreInputRepository(metaclass=SealedMeta):
+         __slots__ = ("__weakref__",)
+ 
+         def __init__(self, feature_repository, context_repository, range_store,
+                      *, registry_signature_verifier):
+             if type(self) is not FormalFinalScoreInputRepository or id(self) in repositories:
+                 raise ValueError("final score repository initialization is exact and single-use")
+             interfaces()
+             verifier = registry_signature_verifier
+             base = FormalScoreInputRepository(feature_repository, context_repository,
+@@ -251,22 +264,24 @@ def _install_final_inputs():
+                         base_reasons = tuple(base.pending_reasons.get(sid, ()))
+                         reasons = {"base:" + reason for reason in base_reasons}
+                         policy_pending = policy_result.to_dict()["pending_requirements"]
+                         if policy_result.evidence_state == "pending_evidence" or policy_pending:
+                             reasons.add("policy:pending_evidence")
+                         valuation_reasons, adjusted_slots = {}, {}
+                         if original is not None:
+                             if type(original) is not FormalScoreInput or original.security_id != sid:
+                                 raise ValueError("final score base entry identity mismatch")
+                             original.require_verified()
+-                        for mid in v_metrics:
+-                            adjusted = valuation.input_for(sid, mid)
++                        valuation_inputs = tuple(valuation.input_for(sid, mid) for mid in v_metrics)
++                        identity = member_identity(sid, policy.evidence_batch.industry["entries"][sid],
++                            valuation_inputs, original)
++                        for mid, adjusted in zip(v_metrics, valuation_inputs, strict=True):
+                             context = peer_context(valuation, metric_id=mid, security_id=sid)
+                             context.require_verified()
+                             if adjusted.adjustment["policy_result_hash"] != policy_result.result_hash:
+                                 raise ValueError("final score valuation policy result mismatch")
+                             score = percentile(valuation, context)
+                             derived.append(context)
+                             if score is None:
+                                 if context.reason is None:
+                                     raise ValueError("final score valuation score absent without a reason")
+                                 valuation_reasons[mid] = context.reason
+@@ -293,20 +308,21 @@ def _install_final_inputs():
+                         # A pending row must never expose an unadjusted V score as final.
+                         for mid in v_metrics:
+                             slots.pop(mid, None)
+                         slots.update(adjusted_slots)
+                         if not reasons and (original is None or len(slots) != 25
+                                 or len(set(slots) - set(v_metrics)) != 22 or len(adjusted_slots) != 3):
+                             raise ValueError("ready final score requires 22 base and three Stage C slots")
+                         payload = {} if original is None else original.to_dict()
+                         payload.pop("batch_hash", None)
+                         payload.pop("input_hash", None)
++                        payload.update(identity)
+                         payload.update(common, schema_version="policy-adjusted-score-input-v1",
+                             security_id=sid, status="pending_evidence" if reasons else "ready",
+                             reasons=tuple(sorted(reasons)), slots=slots,
+                             base_input_hash=None if original is None else original.input_hash,
+                             base_pending_reasons=base_reasons, policy_result=policy_result.to_dict(),
+                             policy_result_hash=policy_result.result_hash,
+                             policy_pending_requirements=policy_pending,
+                             valuation_pending_reasons=valuation_reasons)
+                         payload["entry_hash"] = digest(payload)
+                         rows.append(payload)
+diff --git a/tests/test_formal_final_score_inputs.py b/tests/test_formal_final_score_inputs.py
+index a357862..8fbd5fd 100644
+--- a/tests/test_formal_final_score_inputs.py
++++ b/tests/test_formal_final_score_inputs.py
+@@ -1,14 +1,15 @@
+ """D1 composition over genuine, signed repository outputs."""
+ 
+ from decimal import Decimal
+ import hashlib
++import inspect
+ import unittest
+ 
+ from ashare_pipeline.formal_final_score_inputs import (
+     FormalFinalScoreInputRepository, PolicyAdjustedScoreInput,
+ )
+ from ashare_pipeline.formal_valuation_engine import (
+     build_valuation_peer_context, score_valuation_percentile,
+ )
+ from tests.formal_final_scoring_fixtures import FinalScoringFixture, FOCAL
+ 
+@@ -55,20 +56,49 @@ class FinalScoreInputContractTests(unittest.TestCase):
+             self.assertEqual(row.status, "pending_evidence")
+             self.assertEqual(len(row.entry_hash), 64)
+             self.assertTrue(row.reasons)
+             self.assertEqual(row.base_pending_reasons, self.sources.base.pending_reasons[sid])
+             self.assertEqual(row.policy_result_hash, policy[sid].result_hash)
+             self.assertEqual(row.to_dict()["policy_pending_requirements"],
+                 policy[sid].to_dict()["pending_requirements"])
+         self.assertTrue(self.batch.input_for("SH600000").policy_pending_requirements)
+         self.assertTrue(self.batch.input_for(FOCAL).valuation_pending_reasons)
+ 
++    def test_pending_without_base_retains_authenticated_member_identity(self):
++        industry = self.sources.policy.evidence_batch.industry["entries"]
++        for sid in self.batch.security_ids:
++            self.assertIsNone(self.sources.base.input_for(sid))
++            row = self.batch.input_for(sid)
++            self.assertEqual(row.status, "pending_evidence")
++            for field in ("template_id", "primary_industry", "secondary_industry"):
++                self.assertIn(field, tuple(row.to_dict()))
++                self.assertEqual(getattr(row, field), industry[sid][field])
++
++    def test_member_identity_rejects_inconsistent_genuine_valuation_inputs(self):
++        # Inspect only the composition closure; never mint or alter a source proof.
++        validate = inspect.getclosurevars(
++            FormalFinalScoreInputRepository.build_batch).nonlocals["member_identity"]
++        industry = self.sources.policy.evidence_batch.industry["entries"][FOCAL]
++        genuine = tuple(self.sources.valuation.input_for(FOCAL, mid) for mid in V_METRICS)
++        expected = {field: industry[field] for field in
++            ("template_id", "primary_industry", "secondary_industry")}
++        self.assertEqual(validate(FOCAL, industry, genuine, None), expected)
++        for index, mid in enumerate(V_METRICS):
++            with self.subTest(metric=mid):
++                other = self.sources.valuation.input_for("SH600000", mid)
++                other.require_verified()
++                self.assertNotEqual(other.secondary_industry, expected["secondary_industry"])
++                conflicting = list(genuine)
++                conflicting[index] = other
++                with self.assertRaisesRegex(ValueError, "member identity mismatch"):
++                    validate(FOCAL, industry, tuple(conflicting), None)
++
+     def test_batch_binds_root_frozen_universe_policy_and_valuation_hashes(self):
+         batch, sources = self.batch, self.sources
+         self.assertEqual(batch.registry_manifest_hash, self.fixture.bundle.manifest.manifest_hash)
+         self.assertEqual(batch.frozen_input_hash, self.fixture.frozen.frozen_input_hash)
+         self.assertEqual(batch.universe_hash, sources.base.universe_hash)
+         for prefix, source in zip(("base", "policy", "valuation"), sources):
+             self.assertEqual(getattr(batch, prefix + "_batch_hash"), source.batch_hash)
+             self.assertEqual(getattr(batch, prefix + "_batch_canonical_sha256"),
+                 hashlib.sha256(source.canonical_bytes()).hexdigest())
+         self.assertEqual(batch.policy_contract_hash, sources.policy.policy_contract_hash)

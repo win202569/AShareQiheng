@@ -1,0 +1,1065 @@
+# Task 3A2 review package
+Base and HEAD: 37ab15c6d47213646f88693b975cb5f81eb1fa0e
+Frozen uncommitted implementation; no task commits yet. Exact six-file allowlist.
+
+warning: in the working copy of 'ashare_pipeline/formal_metric_context.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/formal_metric_feature_fixtures.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/formal_metric_fixtures.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/ashare_pipeline/formal_metric_context.py b/ashare_pipeline/formal_metric_context.py
+index ec2dfc4..20c25c2 100644
+--- a/ashare_pipeline/formal_metric_context.py
++++ b/ashare_pipeline/formal_metric_context.py
+@@ -286,17 +286,18 @@ def _metric_context_types():
+             if _canonical(resolve_payload(self, current)) != batch_record[2]:
+                 raise ValueError("metric industry Context correction or absence changed during batch")
+             dependencies(self)
+ 
+         def __copy__(self):
+             raise TypeError("metric Context repository cannot be copied")
+ 
+         def __deepcopy__(self, memo):
+             raise TypeError("metric Context repository cannot be copied")
+ 
+-    return FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch
++    return FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch, dependencies
+ 
+ 
+-FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch = _metric_context_types()
++(FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch,
++ _require_authentic_metric_context_repository) = _metric_context_types()
+ del _metric_context_types
+ 
+ __all__ = ["FormalMetricContextRepository", "VerifiedMetricUniverse", "VerifiedMetricIndustryBatch"]
+diff --git a/tests/formal_metric_feature_fixtures.py b/tests/formal_metric_feature_fixtures.py
+index 5ff9a22..1149537 100644
+--- a/tests/formal_metric_feature_fixtures.py
++++ b/tests/formal_metric_feature_fixtures.py
+@@ -23,39 +23,42 @@ def configuration(docs):
+             for metric in metrics:
+                 metric.update(period_rule=["FY2025"], unit_rule="CNY")
+                 if metric["metric_id"] == "operating_revenue_yoy":
+                     metric["direction"] = "lower"
+     for slot in docs["feature"]["slots"]:
+         leaf = ".".join(slot["slot_id"].split(".")[1:])
+         slot.update(unit="CNY", formula=dict(op="fact", fact_key=leaf, period_key="FY2025"))
+ 
+ 
+ class FinancialFixture(MetricFixture):
+-    def __init__(self, *, population=False, missing_memberships=False):
++    def __init__(self, *, population=False, missing_memberships=False, mutate=None, calendar_binding_resolver=None):
+         rows = None
+         def configure(docs):
+             configuration(docs)
+             if missing_memberships:
+                 docs["industry"]["memberships"] = [dict(security_id="SH600099", template_id="bank",
+                     primary_industry="banks", secondary_industry="banks")]
+                 update_mapping_digest(docs["industry"])
++            if mutate:
++                mutate(docs)
+             if population:
+                 ids = ["BJ430001"] + [f"SH{600000 + i}" for i in range(20)] + ["SZ000001"]
+                 docs["industry"]["memberships"] = [dict(security_id=sid,
+                     template_id="bank" if sid == "SZ000001" else "general_nonfinancial",
+                     primary_industry="manufacturing", secondary_industry="other" if sid == "SH600019" else "machinery")
+                     for sid in sorted(ids)]
+                 update_mapping_digest(docs["industry"])
+         if population:
+             rows = {exchange: [dict(security_id=sid, listing_status="listed", security_type="ordinary_a") for sid in ids]
+                 for exchange, ids in {"BJ": ["BJ430001"], "SH": [f"SH{600000+i}" for i in range(20)], "SZ": ["SZ000001"]}.items()}
+-        super().__init__(mutate=configure, exchange_rows=rows, tempdir=project_temporary_directory())
++        super().__init__(mutate=configure, exchange_rows=rows, tempdir=project_temporary_directory(),
++            calendar_binding_resolver=calendar_binding_resolver)
+         self.files = FormalFeatureBundleStore(self.root / "features")
+         self.store._formal_feature_bundle_store = self.files
+         self.issues = {}
+         self.generations = {}
+         child = self.bundle.blob("feature")
+         self.vocabulary = load_signed_feature_registry(child.canonical_json, child.signature, child.key_id,
+             self.verifier, registry_manifest=self.bundle.manifest)
+         self.provider = FormalMetricCurrentInputProvider(self.store)
+         for member in self.industry["memberships"]:
+             self.publish_current(member["security_id"])
+@@ -74,35 +77,39 @@ class FinancialFixture(MetricFixture):
+                 template_id=member["template_id"], registry_manifest_hash=self.bundle.manifest.manifest_hash))
+ 
+     def set_generation(self, sid, generation):
+         self.generations[sid] = generation
+         self.publish_current(sid)
+ 
+     def set_issues(self, sid, issues):
+         self.issues[sid] = issues
+         self.publish_current(sid)
+ 
+-    def put_financial(self, sid, values, *, generation="financial-1", updated=None, publish=True):
++    def put_financial(self, sid, values, *, generation="financial-1", updated=None, publish=True,
++                      period_end="2025-12-31", period_kind="FY", nature="duration"):
+         raw = canonical(values)
+         task = self.store.enqueue_formal_task("formal_statement", sid + generation, generation, {})
+         leased = self.store.lease_next_formal_task(("formal_statement",), "financial-fixture", 300)
+         self.assertEqual(leased["id"], task)
+-        fetch = OfficialFetch(request=OfficialRequest("cninfo", "annual_report", sid, "2025-12-31", sid[:2]),
++        fetch = OfficialFetch(request=OfficialRequest("cninfo", "annual_report", sid, period_end, sid[:2]),
+             raw_bytes=raw, original_url="https://www.cninfo.com.cn/fixture/annual.json",
+             published_at_utc="2026-03-20T08:00:00+00:00", published_precision="timestamp",
+             source_updated_at_utc=updated, captured_at_utc="2026-09-04T07:00:00+00:00",
+             effective_at_utc="2026-03-20T08:00:00+00:00", effective_time_evidence_hash=None,
+             refresh_generation=generation, parser_id="fixture-annual", parser_version="fixture-annual-v1",
+-            mapping_version="fixture-annual-map-v1", declared_security_id=sid, declared_period="2025-12-31")
++            mapping_version="fixture-annual-map-v1", declared_security_id=sid, declared_period=period_end)
+         verification = verify_official_fetch(fetch, SourcePolicy.cninfo())
+         ref = self.snapshots.persist_verified(fetch, verification, producing_task_id=task, worker_id="financial-fixture")
+         facts = tuple(formal_fact(security_id=sid, metric_key=key, value=float(value), source_field=key,
++            period_end=period_end, period_kind=period_kind, nature=nature,
++            statement="income" if nature == "duration" else "balance",
++            period_start=period_end[:4] + "-01-01" if nature == "duration" else None,
+             raw_value_sha256=hashlib.sha256(canonical(value)).hexdigest(), source_snapshot_id=ref.snapshot_id,
+             source_content_sha256=ref.content_sha256, source_refresh_generation=ref.refresh_generation,
+             source_producing_task_id=ref.producing_task_id, parser_id=ref.parser_id, parser_version=ref.parser_version,
+             mapping_version=ref.mapping_version, source_updated_at_utc=ref.source_updated_at_utc,
+             captured_at_utc=ref.captured_at_utc) for key, value in values.items())
+         self.store.insert_formal_financial_facts(facts)
+         self.store.complete_formal_task(task, "financial-fixture", {"snapshot": ref.snapshot_id})
+         if publish:
+             self.publish_current(sid)
+         return ref
+diff --git a/tests/formal_metric_fixtures.py b/tests/formal_metric_fixtures.py
+index 9f8df86..c4a8ad5 100644
+--- a/tests/formal_metric_fixtures.py
++++ b/tests/formal_metric_fixtures.py
+@@ -32,26 +32,26 @@ def industry_document():
+ 
+ 
+ def update_mapping_digest(doc):
+     doc["mapping_sha256"] = hashlib.sha256(canonical({k: doc[k] for k in
+         ("classification_system", "source_version", "effective_date", "memberships")})).hexdigest()
+ 
+ 
+ class MetricFixture:
+     """A plain helper; no imported/inherited TestCase can duplicate suite discovery."""
+ 
+-    def __init__(self, *, mutate=None, exchange_rows=None, tempdir=None):
++    def __init__(self, *, mutate=None, exchange_rows=None, tempdir=None, calendar_binding_resolver=None):
+         self.tempdir = tempdir or tempfile.TemporaryDirectory()
+         self.root = Path(self.tempdir.name)
+         self.db_path = self.root / "metric.sqlite"
+         StateStore(self.db_path).initialize()
+-        self.raw = FormalSnapshotStore(self.root / "raw")
++        self.raw = FormalSnapshotStore(self.root / "raw", calendar_binding_resolver=calendar_binding_resolver)
+         def configure(docs):
+             docs["industry"] = industry_document()
+             docs["scoring"]["descriptors"] = [descriptor("industry_snapshot", scope_key="fixture-industry",
+                 dataset="fixture-industry", referenced_roles=["industry", "scoring", "source"])]
+             docs["source"]["configs"] = [config(dataset="fixture-industry", exchange_scope=e) for e in ("BJ", "SH", "SZ")]
+             docs["feature"]["source_registry_hash"] = hashlib.sha256(canonical(docs["source"])).hexdigest()
+             if mutate:
+                 mutate(docs)
+         self.bundle, vocabulary, graph, self.verifier = signed_graph(mutate=configure)
+         self.industry = __import__("json").loads(self.bundle.blob("industry").canonical_json)
+
+diff --git a/ashare_pipeline/formal_score_inputs.py b/ashare_pipeline/formal_score_inputs.py
+new file mode 100644
+--- /dev/null
++++ b/ashare_pipeline/formal_score_inputs.py
+@@ -0,0 +1,399 @@
++"""Repository-owned complete-company inputs; no scorecard or policy arithmetic.
++
++Metric eligibility and complete-company readiness are separate. The inner metric
++batch is a historical proof in its own right; every outer proof shares a separate
++revocable publication capability until the enclosing current-state guard exits.
++"""
++
++from decimal import Decimal
++import hashlib
++import json
++import weakref
++
++from . import formal_metric_engine as metric_module
++from . import formal_metric_context as metric_context_module
++from . import formal_feature_repository as feature_module
++from . import formal_financial_features as financial_module
++from . import formal_metric_batch_guard as guard_module
++from .formal_context_repository import FormalContextRepository
++from .formal_context_schema import FormalContextFact
++from .formal_feature_contract import (FormalEvidenceRef, FormalFeatureBundle, FormalFeatureSlot,
++    FormalFeatureValue, SignedFormalFeatureRegistry)
++from .formal_feature_repository import (FormalFeatureRepository, VerifiedMetricFeatureAbsence,
++    VerifiedMetricFeatureProjection)
++from .formal_metric_context import (FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch)
++from .formal_metric_engine import (FormalMetricInputRepository, MetricInput, MetricInputBatch,
++    MetricPeerContext, MetricScore)
++from .formal_scoring_registry import FormalScoringRegistry
++
++
++_FREEZE = "2026-08-31T07:00:00+00:00"
++_EMPTY_ISSUES = hashlib.sha256(b"[]").hexdigest()
++
++
++def _consensus_branch(link, actual):
++    """Classify already-authenticated Context; never grants provenance itself."""
++    if link is None:
++        return False, ()
++    if actual is None:
++        return False, ("consensus_context_absent",)
++    value = actual["value"]
++    if actual["no_coverage"] is True and value["coverage_status"] == "no_valid_coverage" and not value["estimates"]:
++        return True, ()
++    if actual["no_coverage"] is False and value["coverage_status"] == "covered" and value["estimates"]:
++        return False, ()
++    raise ValueError("complete score consensus coverage response is malformed")
++
++
++def _temporal_quality(refs):
++    if not refs or any(ref["published_precision"] not in ("timestamp", "date_only") for ref in refs):
++        raise ValueError("complete score temporal quality requires actual precision evidence")
++    return min(Decimal("1") if ref["published_precision"] == "timestamp" else Decimal("0.8") for ref in refs)
++
++
++def _full_company_gate(bundle, signed_slots, marker, *, cyclic, exempt_key):
++    """Pure readiness diagnostics. This helper never creates an authenticated proof."""
++    history = financial_module.require_formal_history(bundle.history_endpoints,
++        comparable_quarter_keys=bundle.comparable_quarter_keys[-8:], as_of_utc=_FREEZE, cyclic=cyclic)
++    reasons = set(history.blockers)
++    if exempt_key is None:
++        reasons.update(bundle.blockers)
++    elif marker["issue_snapshot_hash"] != _EMPTY_ISSUES:
++        reasons.add("nonempty_current_issues")
++    values = {value.slot_id: value for value in bundle.values}
++    if tuple(values) != tuple(slot.slot_id for slot in signed_slots):
++        raise ValueError("complete score full signed slot identities differ")
++    nonexempt_derived = False
++    for slot in signed_slots:
++        value = values[slot.slot_id]
++        if value.unit != slot.unit or value.formula_version != slot.formula_version:
++            raise ValueError("complete score signed slot unit or formula differs")
++        if value.status not in ("derived", "missing"):
++            reasons.add("full_slot_blocked:" + slot.slot_id)
++        elif slot.required and slot.slot_id != exempt_key:
++            if value.status != "derived":
++                reasons.add("full_required_slot_missing:" + slot.slot_id)
++            else:
++                nonexempt_derived = True
++    if exempt_key is not None and not nonexempt_derived:
++        reasons.add("neutral_requires_nonexempt_derived_slot")
++    count = 0
++    for year in range(2025, 2020, -1):
++        if f"{year}-12-31" not in bundle.history_endpoints:
++            break
++        count += 1
++    return tuple(sorted(reasons)), count
++
++
++def _install_score_inputs():
++    repositories, proofs = {}, {}
++    require_feature = feature_module._require_authentic_metric_feature_repository
++    require_context = metric_context_module._require_authentic_metric_context_repository
++    batch_guard = guard_module._metric_batch_guard
++    metric_build = FormalMetricInputRepository.build_batch
++    peer_context = metric_module.build_metric_peer_context
++    percentile = metric_module.score_metric_percentile
++    full_read = FormalFeatureRepository._read_authenticated_bundle
++    registry_read = FormalFeatureRepository._registry
++    consensus_read = FormalContextRepository.get_verified_many
++    encode, digest, freeze = metric_module._canonical, metric_module._digest, metric_module._freeze
++    full_gate = _full_company_gate
++    consensus_branch, temporal_quality = _consensus_branch, _temporal_quality
++    checked_functions = tuple((module, name, getattr(module, name)) for module, names in (
++        (metric_module, ("build_metric_peer_context", "score_metric_percentile", "_plain", "_canonical",
++            "_digest", "_freeze", "_arithmetic_context", "FormalMetricInputRepository")),
++        (feature_module, ("_require_authentic_metric_feature_repository",)),
++        (metric_context_module, ("_require_authentic_metric_context_repository", "FormalMetricContextRepository")),
++        (financial_module, ("require_formal_history",)),
++        (guard_module, ("_metric_batch_guard",))) for name in names)
++    classes = {base for cls in (FormalMetricInputRepository, MetricInput, MetricInputBatch, MetricPeerContext,
++        MetricScore, FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch,
++        VerifiedMetricFeatureAbsence, VerifiedMetricFeatureProjection, FormalFeatureRepository, FormalContextRepository,
++        FormalContextFact, FormalFeatureBundle, FormalEvidenceRef, FormalFeatureValue, FormalFeatureSlot,
++        SignedFormalFeatureRegistry, FormalScoringRegistry) for base in cls.__mro__ if base is not object}
++
++    def resolved_method(cls, name):
++        return next((vars(base)[name] for base in cls.__mro__ if name in vars(base)), None)
++
++    def capture_methods(types):
++        return tuple((cls, name, resolved_method(cls, name)) for cls in types
++            for name in sorted({name for base in cls.__mro__ if base is not object
++                for name, value in vars(base).items()
++                if callable(value) or isinstance(value, (staticmethod, classmethod))}))
++
++    checked_methods = capture_methods(classes)
++
++    def methods_unchanged(checks):
++        if any(resolved_method(cls, name) is not value for cls, name, value in checks):
++            raise ValueError("complete score proof or read dependency changed")
++
++    def dependencies(repository):
++        record = repositories.get(id(repository))
++        if type(repository) is not FormalScoreInputRepository or record is None or record[0]() is not repository:
++            raise ValueError("complete score repository is uninitialized or copied")
++        feature, context, verifier, metrics, contexts = record[1:]
++        methods_unchanged(checked_methods)
++        methods_unchanged(own_methods)
++        if (_full_company_gate is not full_gate or _consensus_branch is not consensus_branch
++                or _temporal_quality is not temporal_quality or any(getattr(module, name) is not value
++                for module, name, value in checked_functions)):
++            raise ValueError("complete score calculation dependency changed")
++        require_feature(feature)
++        store, actual_context, actual_verifier = require_context(contexts)
++        if (actual_context is not context or actual_verifier is not verifier or feature._store is not store
++                or feature._verifier is not verifier or context._verifier is not verifier):
++            raise ValueError("complete score repository trust dependencies changed")
++        return feature, context, verifier, metrics, contexts
++
++    def proof_record(proof, cls):
++        record = proofs.get(id(proof))
++        if (type(proof) is not cls or record is None or record[0]() is not proof or not record[4][0]):
++            raise ValueError("complete score proof is forged, copied, unpublished or revoked")
++        methods_unchanged(own_methods)
++        return record
++
++    class Proof:
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("complete score proofs require an authenticated repository batch")
++
++        def __getattr__(self, name):
++            data = proof_record(self, type(self))[1]
++            if name not in data:
++                raise AttributeError(name)
++            return data[name]
++
++        def require_verified(self):
++            proof_record(self, type(self))
++
++        def canonical_bytes(self):
++            return proof_record(self, type(self))[2]
++
++        def to_dict(self):
++            return json.loads(proof_record(self, type(self))[2])
++
++        def __copy__(self):
++            raise TypeError("complete score proofs cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("complete score proofs cannot be copied")
++
++    class FormalScoreInput(Proof):
++        __slots__ = ()
++
++    class FormalScoreInputBatch(Proof):
++        __slots__ = ()
++
++        def input_for(self, security_id):
++            record = proof_record(self, FormalScoreInputBatch)
++            if type(security_id) is not str or security_id not in record[3]:
++                raise ValueError("complete score selector is outside the canonical universe")
++            return record[3][security_id]
++
++    def mint(cls, payload, publication, *, attributes=None, index=None):
++        result = object.__new__(cls)
++        identity = id(result)
++        data = dict(payload)
++        data.update(attributes or {})
++        proofs[identity] = (weakref.ref(result, lambda _: proofs.pop(identity, None)),
++            freeze(data), encode(payload), index, publication)
++        return result
++
++    def read_full(repository, batch, sid):
++        feature, _, _, _, _ = dependencies(repository)
++        marker = batch.feature_states[sid]
++        result = full_read(feature, input_hash=marker["input_hash"], require_complete=False)
++        dependencies(repository)
++        if type(result) is not FormalFeatureBundle or result.bundle_hash() != marker["bundle_hash"]:
++            raise ValueError("complete score current full bundle disappeared or changed")
++        for field in ("input_hash", "registry_manifest_hash", "feature_registry_hash", "security_id", "template_id", "as_of_utc"):
++            if getattr(result, field) != marker[field]:
++                raise ValueError("complete score current full bundle identity mismatch")
++        if result.as_of_utc != _FREEZE:
++            raise ValueError("complete score full bundle cutoff mismatch")
++        return result
++
++    def read_consensus(repository, batch, groups, links):
++        _, context, _, _, _ = dependencies(repository)
++        result = {}
++        for scope, ids in sorted(groups.items()):
++            dependencies(repository)
++            facts = consensus_read(context, "consensus_snapshot", scope, tuple(sorted(ids)),
++                _FREEZE, batch.registry_manifest_hash)
++            dependencies(repository)
++            for sid in ids:
++                fact = facts[sid]
++                if fact is None:
++                    result[sid] = None
++                    continue
++                if type(fact) is not FormalContextFact:
++                    raise ValueError("complete score consensus requires actual authenticated Context")
++                wire = json.loads(fact.canonical_bytes())
++                if (wire["security_id"] != sid or wire["as_of_utc"] != _FREEZE
++                        or wire["registry_manifest_hash"] != batch.registry_manifest_hash
++                        or wire["scope_key"] != scope or wire["context_kind"] != "consensus_snapshot"
++                        or wire["evidence"]["descriptor_id"] != links[sid]["descriptor_id"]):
++                    raise ValueError("complete score linked consensus identity mismatch")
++                result[sid] = wire
++        return result
++
++    def build(repository, frozen_input_hash, scoring, guard, publication):
++        feature, _, _, metrics, _ = dependencies(repository)
++        batch = metric_build(metrics, frozen_input_hash, scoring_registry=scoring, metric_ids=None)
++        dependencies(repository)
++        if batch is None:
++            return guard.finalize(lambda: dependencies(repository) and None)
++        if type(batch) is not MetricInputBatch:
++            raise ValueError("complete score requires the owned genuine metric batch")
++        batch.require_verified()
++        graph, vocabulary = registry_read(feature, batch.registry_manifest_hash)
++        scoring.require_official(graph)
++        full, links, groups = {}, {}, {}
++        for sid in batch.security_ids:
++            marker = batch.feature_states.get(sid)
++            if marker is not None and marker.get("status") != "current_receipt_absent":
++                full[sid] = read_full(repository, batch, sid)
++            # Link follows genuine signed template classification, including
++            # pending members: selected Context absence participates in closure.
++            tid = batch.input_for(sid, batch.metric_ids[0]).template_id
++            link = scoring.consensus_no_coverage_links.get(tid)
++            if link is not None:
++                links[sid] = link
++                groups.setdefault(link["scope_key"], []).append(sid)
++        consensus = read_consensus(repository, batch, groups, links)
++        common = dict(registry_manifest_hash=batch.registry_manifest_hash, registry_hashes=dict(scoring.role_hashes),
++            frozen_input_hash=batch.frozen_input_hash, universe_hash=batch.universe_hash,
++            population_hash=batch.population_hash, metric_batch_hash=batch.batch_hash, as_of_utc=_FREEZE)
++        ready, pending = [], {}
++        for sid in batch.security_ids:
++            first = batch.input_for(sid, batch.metric_ids[0])
++            reasons = set()
++            if first.template_id is None:
++                reasons.add("invalid_template")
++            if first.secondary_industry is None:
++                reasons.add("invalid_industry")
++            bundle = full.get(sid)
++            if bundle is None:
++                reasons.add("current_receipt_absent")
++            actual, link = consensus.get(sid), links.get(sid)
++            neutral, consensus_reasons = consensus_branch(link, actual)
++            reasons.update(consensus_reasons)
++            cyclic = first.secondary_industry in scoring.cyclic_secondary_industries
++            if bundle is not None:
++                full_reasons, count = full_gate(bundle, vocabulary.slots_for_template(bundle.template_id),
++                    batch.feature_states[sid], cyclic=cyclic, exempt_key=link["feature_key"] if neutral else None)
++                reasons.update(full_reasons)
++            if reasons:
++                pending[sid] = tuple(sorted(reasons))
++                continue
++            slots = {}
++            full_values = {value.slot_id: value for value in bundle.values}
++            for mid, definition in batch.definitions[bundle.template_id].items():
++                bound = definition["definition"]
++                feature_values = tuple(full_values[key] for key in bound["required_feature_keys"])
++                refs = {ref.formal_fact_id: ref.to_dict() for value in feature_values for ref in value.evidence}
++                is_neutral = neutral and mid == link["metric_id"]
++                context = None if is_neutral else peer_context(batch, metric_id=mid, security_id=sid)
++                score = None if is_neutral else percentile(batch, context)
++                if not is_neutral and score is None:
++                    reasons.add("metric_pending:" + mid + ":" + context.reason)
++                    continue
++                if is_neutral:
++                    quality = Decimal("0.8") if actual["evidence"]["calendar_binding"] is not None else Decimal("1")
++                else:
++                    score.require_verified()
++                    quality = temporal_quality(tuple(refs.values()))
++                slots[mid] = dict(metric_id=mid, definition=definition,
++                    dimension_weight=scoring.dimension_weights[bound["dimension"]], internal_weight=Decimal(bound["internal_weight"]),
++                    value=Decimal("50") if is_neutral else Decimal(score.percentile),
++                    evidence_kind="registered_consensus_no_coverage" if is_neutral else "metric_percentile",
++                    temporal_quality=quality, evidence_refs=tuple(refs[key] for key in sorted(refs)),
++                    full_feature_values=tuple(value.to_dict() for value in feature_values),
++                    metric_score=None if score is None else score.to_dict(),
++                    context_fact=actual if is_neutral else None, registered_rule=link if is_neutral else None)
++            if reasons:
++                pending[sid] = tuple(sorted(reasons))
++                continue
++            if len(slots) != 25:
++                raise ValueError("complete score input requires exactly all 25 qualified slots")
++            payload = dict(common, schema_version="formal-score-input-v1", security_id=sid,
++                template_id=bundle.template_id, primary_industry=first.primary_industry,
++                secondary_industry=first.secondary_industry, cyclic=cyclic, continuous_fy_count=count,
++                history_endpoints=bundle.history_endpoints, comparable_quarter_keys=bundle.comparable_quarter_keys,
++                feature_state=batch.feature_states[sid], full_feature_bundle=bundle.to_dict(),
++                full_feature_bundle_hash=bundle.bundle_hash(), slots=slots,
++                consensus_context=actual, consensus_rule=link, confidence_cap=Decimal("0.90") if neutral else None)
++            payload["input_hash"] = digest(payload)
++            ready.append(payload)
++        # Authenticate immutable files again after all calculations and Context
++        # reads, outside the short writer fence. DB/provider changes are caught
++        # by the enclosing guard, including missing-to-present transitions.
++        for sid, earlier in full.items():
++            if read_full(repository, batch, sid).canonical_bytes() != earlier.canonical_bytes():
++                raise ValueError("complete score full bundle changed during final sweep")
++        if encode(read_consensus(repository, batch, groups, links)) != encode(consensus):
++            raise ValueError("complete score consensus correction or absence changed during batch")
++        scoring.require_official(graph)
++        dependencies(repository)
++        payload = dict(common, schema_version="formal-score-input-batch-v1", security_ids=batch.security_ids,
++            inputs=ready, pending_reasons=pending, metric_batch=batch.to_dict(),
++            registry_manifest=json.loads(graph.manifest.canonical_json),
++            consensus_facts=consensus)
++        payload["batch_hash"] = digest(payload)
++        inputs = tuple(mint(FormalScoreInput, dict(row, batch_hash=payload["batch_hash"]), publication)
++            for row in ready)
++        index = dict.fromkeys(batch.security_ids)
++        index.update({row["security_id"]: item for row, item in zip(ready, inputs, strict=True)})
++        result = mint(FormalScoreInputBatch, payload, publication, attributes=dict(inputs=inputs), index=index)
++
++        def publish_complete():
++            dependencies(repository)
++            publication[0] = True
++            return result
++
++        return guard.finalize(publish_complete)
++
++    class FormalScoreInputRepository:
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, feature_repository, context_repository, *, registry_signature_verifier):
++            if type(self) is not FormalScoreInputRepository or id(self) in repositories:
++                raise ValueError("complete score repository initialization is exact and single-use")
++            require_feature(feature_repository)
++            contexts = FormalMetricContextRepository(feature_repository._store, context_repository,
++                registry_signature_verifier=registry_signature_verifier)
++            metrics = FormalMetricInputRepository(feature_repository, context_repository,
++                registry_signature_verifier=registry_signature_verifier)
++            identity = id(self)
++            repositories[identity] = (weakref.ref(self, lambda _: repositories.pop(identity, None)),
++                feature_repository, context_repository, registry_signature_verifier, metrics, contexts)
++            dependencies(self)
++
++        def build_batch(self, frozen_input_hash, *, scoring_registry):
++            feature, _, _, _, _ = dependencies(self)
++            publication = [False]
++            try:
++                with batch_guard(feature._current_input_provider, feature._store) as guard:
++                    result = build(self, frozen_input_hash, scoring_registry, guard, publication)
++                dependencies(self)
++                return result
++            except BaseException:
++                publication[0] = False
++                raise
++
++        def __copy__(self):
++            raise TypeError("complete score repository cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("complete score repository cannot be copied")
++
++    own_methods = capture_methods((Proof, FormalScoreInput, FormalScoreInputBatch, FormalScoreInputRepository))
++    return FormalScoreInputRepository, FormalScoreInputBatch, FormalScoreInput
++
++
++FormalScoreInputRepository, FormalScoreInputBatch, FormalScoreInput = _install_score_inputs()
++del _install_score_inputs
++
++__all__ = ["FormalScoreInputRepository", "FormalScoreInputBatch", "FormalScoreInput"]
++
+
+diff --git a/tests/formal_score_input_fixtures.py b/tests/formal_score_input_fixtures.py
+new file mode 100644
+--- /dev/null
++++ b/tests/formal_score_input_fixtures.py
+@@ -0,0 +1,139 @@
++"""Real signed full-company and peer receipts for complete-score boundary tests."""
++
++import hashlib
++from dataclasses import asdict
++
++from ashare_pipeline.formal_context_schema import FormalContextRegistry
++from ashare_pipeline.formal_evidence import OfficialFetch, SourcePolicy, verify_official_fetch
++from ashare_pipeline.formal_sources import CalendarSelector
++from tests.formal_metric_feature_fixtures import FinancialFixture
++from tests.formal_metric_fixtures import FREEZE
++from tests.test_formal_context_repository import FixtureNormalizer, descriptor
++from tests.test_formal_scoring_registry import canonical
++from tests.test_formal_sources import config
++
++FOCAL = "BJ430001"
++
++
++class ScoreFixture(FinancialFixture):
++    def __init__(self, *, linked=True, cyclic=False, extra_required=False, date_only=False, population=True):
++        self.calendar_requests = {}
++        self.date_only = date_only
++        def configure(docs):
++            # Twenty-four independently signed slots deliberately share one toy
++            # source field; expectation remains separately missing-capable.
++            for slot in docs["feature"]["slots"]:
++                slot["formula"]["fact_key"] = "T.expectation_change" if slot["slot_id"].endswith(
++                    ".T.expectation_change") else "score_leaf"
++            if linked:
++                desc = descriptor("consensus_snapshot", scope_key="fixture-consensus", dataset="fixture-consensus")
++                selector = None
++                if date_only:
++                    selector = asdict(CalendarSelector("trading_calendar", "fixture-calendar-BJ", "BJ", "visible_at_freeze"))
++                    desc.update(calendar_selector=selector, exchange_rule="fixed_exchange", fixed_exchange="BJ")
++                    docs["scoring"]["descriptors"].append(descriptor("trading_calendar", scope_key="fixture-calendar-BJ",
++                        security_scope="none", request_security="none", period_rule="none", exchange_rule="fixed_exchange",
++                        fixed_exchange="BJ", dataset="trading_calendar", bootstrap_calendar=True))
++                    docs["source"]["configs"].append(config(dataset="trading_calendar", bootstrap_calendar=True))
++                wrapper = docs["scoring"]
++                metric = wrapper["scoring"]["templates"]["general_nonfinancial"]["metrics"]["T"][2]
++                wrapper.update(schema_version="formal-scoring-registry-v2", input_alternatives=[dict(
++                    rule_id="consensus-no-coverage-neutral-v1", template_id="general_nonfinancial",
++                    metric_id="T.expectation_change", feature_key=metric["required_feature_keys"][0],
++                    descriptor_id=hashlib.sha256(canonical(desc)).hexdigest())])
++                wrapper["descriptors"].append(desc)
++                docs["source"]["configs"].extend(config(dataset="fixture-consensus", exchange_scope=e,
++                    calendar_selector=selector) for e in (("BJ",) if date_only else ("BJ", "SH", "SZ")))
++            if cyclic:
++                industries = docs["cyclic"]["rules"]["classification"]["secondary_industries"]
++                industries.append("machinery")
++                industries.sort()
++                docs["scoring"]["scoring"]["policy_contracts"]["cyclic"]["registry_hash"] = hashlib.sha256(
++                    canonical(docs["cyclic"])).hexdigest()
++            if extra_required:
++                slot = dict(docs["feature"]["slots"][0])
++                slot.update(slot_id="general_nonfinancial.extra", template_id="general_nonfinancial",
++                    formula=dict(op="fact", fact_key="extra", period_key="FY2025"))
++                docs["feature"]["slots"].append(slot)
++                docs["feature"]["slots"].sort(key=lambda s: s["slot_id"])
++            docs["feature"]["source_registry_hash"] = hashlib.sha256(canonical(docs["source"])).hexdigest()
++        super().__init__(population=population, mutate=configure, calendar_binding_resolver=self.resolve_raw_calendar)
++
++    def resolve_raw_calendar(self, candidate):
++        request = self.calendar_requests.get(candidate.canonical_json_bytes())
++        if request is None:
++            raise ValueError("unregistered fixture calendar request")
++        wire = request.to_dict()
++        if request.official_request.canonical_json_bytes() != candidate.canonical_json_bytes():
++            raise ValueError("fixture calendar request identity mismatch")
++        return self.context.resolve_verified_calendar_binding(CalendarSelector(**wire["calendar_selector"]),
++            candidate.exchange, wire["as_of_utc"], wire["registry_manifest_hash"])
++
++    def populate_scores(self, *, missing=(), mature=True, five_years=False, consensus="covered"):
++        for index, member in enumerate(self.industry["memberships"]):
++            sid = member["security_id"]
++            self.put_industry(sid)
++            values = {slot.formula.fact_key: index + 10
++                for slot in self.vocabulary.slots_for_template(member["template_id"])
++                if not (sid == FOCAL and slot.formula.fact_key in missing)}
++            # Synthetic signed FY leaves are balance snapshots. A separate real
++            # duration series proves observed history without repeating 25 toy
++            # fields at every cumulative endpoint.
++            self.put_financial(sid, values, publish=False, nature="instant")
++            if sid == FOCAL and mature:
++                for year in range(2021 if five_years else 2022, 2026):
++                    self.put_financial(sid, {"history": 1}, generation=f"history-{year}",
++                        period_end=f"{year}-12-31", publish=False)
++                for year in (2024, 2025, 2026):
++                    for kind, end in (("Q1", "03-31"), ("H1", "06-30"), ("Q3", "09-30")):
++                        if year == 2026 and kind == "Q3":
++                            continue
++                        self.put_financial(sid, {"history": 1}, generation=f"history-{year}-{kind}",
++                            period_end=f"{year}-{end}", period_kind=kind, publish=False)
++            self.publish_current(sid)
++            self.persist_features(sid)
++        if consensus is not None and self.scoring.consensus_no_coverage_links:
++            if self.date_only:
++                self.put_calendar()
++            self.put_consensus(no_coverage=consensus == "none")
++
++    def put_calendar(self):
++        request = self.resolver.resolve(context_kind="trading_calendar", scope_key="fixture-calendar-BJ",
++            security_id=None, as_of_utc=FREEZE, registry_manifest_hash=self.bundle.manifest.manifest_hash,
++            upstream_generation="calendar-1")
++        return self.put_context(request, dict(exchange="BJ", calendar_version="fixture-v1",
++            trading_days=["2026-08-21", "2026-08-31", "2026-09-02"]), False, "calendar-1")
++
++    def put_consensus(self, *, no_coverage=True, generation="consensus-1"):
++        request = self.resolver.resolve(context_kind="consensus_snapshot", scope_key="fixture-consensus",
++            security_id=FOCAL, as_of_utc=FREEZE, registry_manifest_hash=self.bundle.manifest.manifest_hash,
++            upstream_generation=generation)
++        value = dict(coverage_status="no_valid_coverage" if no_coverage else "covered",
++            estimates=[] if no_coverage else [dict(period="FY2026", metric="profit", value=1)])
++        return self.put_context(request, value, no_coverage, generation)
++
++    def put_context(self, request, value, no_coverage, generation):
++        task = self.store.enqueue_formal_task("formal_context", FOCAL + generation, request.refresh_generation, {})
++        self.store.lease_next_formal_task(("formal_context",), "score-fixture", 300)
++        raw = canonical(dict(value=value, no_coverage=no_coverage))
++        binding = request.calendar_binding
++        if binding is not None:
++            self.calendar_requests[request.official_request.canonical_json_bytes()] = request
++        fetch = OfficialFetch(request=request.official_request, raw_bytes=raw,
++            original_url="https://www.cninfo.com.cn/fixture/consensus.json",
++            published_at_utc="2026-08-19T16:00:00+00:00" if binding else "2026-08-19T07:00:00+00:00",
++            published_precision="date_only" if binding else "timestamp",
++            source_updated_at_utc=None, captured_at_utc="2026-09-04T07:00:00+00:00",
++            effective_at_utc="2026-08-21T07:00:00+00:00" if binding else "2026-08-19T07:00:00+00:00",
++            effective_time_evidence_hash=binding.manifest_sha256 if binding else None,
++            refresh_generation=request.refresh_generation, parser_id=request.parser_id,
++            parser_version=request.parser_version, mapping_version=request.mapping_version,
++            declared_security_id=request.official_request.security_id, declared_period=request.official_request.period_or_date)
++        verified = verify_official_fetch(fetch, SourcePolicy.cninfo(), calendar_binding=binding)
++        ref = self.snapshots.persist_verified(fetch, verified, producing_task_id=task, worker_id="score-fixture")
++        receipt = FormalContextRegistry.load(self.store, self.verifier, self.bundle.manifest.manifest_hash).normalize_verified(
++            request, ref, raw, FixtureNormalizer(), task_id=task, worker_id="score-fixture")
++        self.store.put_formal_context_facts(receipt)
++        self.store.complete_formal_task(task, "score-fixture", {"snapshot": ref.snapshot_id})
++        return receipt.facts[0]
++
+
+diff --git a/tests/test_formal_score_inputs.py b/tests/test_formal_score_inputs.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_formal_score_inputs.py
+@@ -0,0 +1,352 @@
++"""Complete score provenance: real producer-backed receipts, no proof doubles."""
++
++import importlib
++import importlib.util
++import copy
++import gc
++import hashlib
++import sys
++import weakref
++from pathlib import Path
++from dataclasses import replace
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++from decimal import Decimal
++
++from tests.formal_score_input_fixtures import ScoreFixture, FOCAL
++from tests.formal_metric_feature_fixtures import FinancialFixture
++
++
++class FormalScoreInputTests(unittest.TestCase):
++    def api(self):
++        self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_score_inputs"),
++            "complete score input repository must own all provenance")
++        return importlib.import_module("ashare_pipeline.formal_score_inputs")
++
++    def build(self, fixture):
++        api = self.api()
++        repository = api.FormalScoreInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier)
++        return repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++
++    def test_complete_focal_retains_pending_peers_and_all_25_metric_scores(self):
++        fixture = ScoreFixture(linked=False)
++        self.addCleanup(fixture.close)
++        fixture.populate_scores()
++        batch = self.build(fixture)
++        self.assertEqual(len(batch.security_ids), 22)
++        self.assertEqual(tuple(item.security_id for item in batch.inputs), (FOCAL,))
++        focal = batch.input_for(FOCAL)
++        self.assertEqual(len(focal.slots), 25)
++        self.assertEqual(focal.continuous_fy_count, 4)
++        self.assertFalse(focal.cyclic)
++        self.assertEqual(focal.comparable_quarter_keys[-8:],
++            ("2024Q3", "2024Q4", "2025Q1", "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2"))
++        self.assertEqual(focal.slots["M.return_persistence"]["metric_score"]["peer_count"], 20)
++        self.assertEqual(focal.slots["CA.return_persistence"]["temporal_quality"], Decimal("1"))
++        self.assertEqual(len(batch.pending_reasons), 21)
++        self.assertIsNone(batch.input_for("SH600000"))
++        for selector in ("430001", "bj430001", "BJ430001 ", "SH999999", None, 1):
++            with self.subTest(selector=selector), self.assertRaises(ValueError):
++                batch.input_for(selector)
++        for proof in (batch, focal):
++            with self.assertRaises(TypeError):
++                copy.copy(proof)
++            with self.assertRaises((AttributeError, TypeError)):
++                proof.security_id = "SH999999"
++            detached = proof.to_dict()
++            detached.clear()
++            proof.require_verified()
++            forged = object.__new__(type(proof))
++            for method in ("require_verified", "canonical_bytes", "to_dict"):
++                with self.assertRaises(ValueError):
++                    getattr(forged, method)()
++        owner = weakref.ref(batch)
++        raw = focal.canonical_bytes()
++        del proof, batch
++        gc.collect()
++        self.assertIsNone(owner())
++        self.assertEqual(focal.canonical_bytes(), raw)
++
++    def test_registered_actual_no_coverage_waives_only_expectation(self):
++        fixture = ScoreFixture()
++        self.addCleanup(fixture.close)
++        fixture.populate_scores(missing=("T.expectation_change",), consensus="none")
++        focal = self.build(fixture).input_for(FOCAL)
++        self.assertIsNotNone(focal)
++        slot = focal.slots["T.expectation_change"]
++        self.assertEqual(slot["evidence_kind"], "registered_consensus_no_coverage")
++        self.assertEqual(slot["value"], Decimal("50"))
++        self.assertIsNone(slot["metric_score"])
++        self.assertEqual(focal.confidence_cap, Decimal("0.90"))
++        self.assertEqual(slot["context_fact"]["value"]["coverage_status"], "no_valid_coverage")
++        with self.assertRaises(ValueError):
++            fixture.feature_repository.get_verified_formal_feature_bundle(input_hash=focal.feature_state["input_hash"])
++
++    def test_failed_outer_publication_revokes_children_but_not_inner_metric_batch(self):
++        api = self.api()
++        from ashare_pipeline.formal_metric_engine import MetricInputBatch
++        fixture = ScoreFixture(cyclic=True, date_only=True)
++        self.addCleanup(fixture.close)
++        fixture.populate_scores(five_years=True, consensus="none")
++        captured, inner = [], []
++        snapshot = fixture.provider.resolve_current_inputs(security_id=FOCAL,
++            as_of_utc="2026-08-31T07:00:00+00:00", template_id="general_nonfinancial",
++            registry_manifest_hash=fixture.bundle.manifest.manifest_hash)
++        def profile(frame, event, result):
++            if event != "return" or frame.f_code.co_name != "publish_complete":
++                return
++            if type(result) is MetricInputBatch and not inner:
++                inner.append(result)
++            if type(result) is api.FormalScoreInputBatch and not captured:
++                focal = result.input_for(FOCAL)
++                self.assertIsNotNone(focal)
++                self.assertTrue(focal.cyclic)
++                self.assertEqual(focal.continuous_fy_count, 5)
++                self.assertEqual(focal.slots["T.expectation_change"]["value"], Decimal("50"))
++                self.assertEqual(focal.slots["T.expectation_change"]["temporal_quality"], Decimal("0.8"))
++                self.assertIsNotNone(focal.consensus_context["evidence"]["calendar_binding"])
++                self.assertEqual(focal.slots["T.expectation_change"]["full_feature_values"][0]["status"], "derived")
++                captured.extend((result, focal))
++                with self.assertRaises(ValueError):
++                    fixture.provider.publish(replace(snapshot, batch_id="reentrant-outer-revocation"))
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            with self.assertRaisesRegex(ValueError, "changed during complete batch finalization"):
++                self.build(fixture)
++        finally:
++            sys.setprofile(previous)
++        self.assertEqual(len(captured), 2)
++        self.assertEqual(len(inner), 1)
++        inner[0].require_verified()
++        for proof in captured:
++            for method in ("require_verified", "canonical_bytes", "to_dict"):
++                with self.assertRaises(ValueError):
++                    getattr(proof, method)()
++
++
++class ScoreInputGateTests(unittest.TestCase):
++    """Pure diagnostics are not proofs; all minting tests above use real stores."""
++
++    def test_consensus_absence_requires_context_and_unlinked_cannot_neutralize(self):
++        from ashare_pipeline import formal_score_inputs as api
++        self.assertTrue(callable(getattr(api, "_consensus_branch", None)))
++        link = {"metric_id": "T.expectation_change"}
++        actual = dict(no_coverage=True, value=dict(coverage_status="no_valid_coverage", estimates=[]))
++        self.assertEqual(api._consensus_branch(link, None), (False, ("consensus_context_absent",)))
++        self.assertEqual(api._consensus_branch(None, actual), (False, ()))
++        self.assertEqual(api._consensus_branch(link, actual), (True, ()))
++        covered = dict(no_coverage=False, value=dict(coverage_status="covered", estimates=[{"profit": 1}]))
++        self.assertEqual(api._consensus_branch(link, covered), (False, ()))
++        for bad in (dict(no_coverage=True, value=covered["value"]),
++                    dict(no_coverage=False, value=actual["value"])):
++            with self.assertRaises(ValueError):
++                api._consensus_branch(link, bad)
++
++    def test_temporal_quality_is_minimum_actual_ref_precision(self):
++        from ashare_pipeline import formal_score_inputs as api
++        self.assertTrue(callable(getattr(api, "_temporal_quality", None)))
++        self.assertEqual(api._temporal_quality(({"published_precision": "timestamp"},)), Decimal("1"))
++        self.assertEqual(api._temporal_quality(({"published_precision": "timestamp"},
++            {"published_precision": "date_only"})), Decimal("0.8"))
++        for bad in ((), ({"published_precision": "guess"},)):
++            with self.assertRaises(ValueError):
++                api._temporal_quality(bad)
++
++    def test_full_slots_history_and_global_issues_cannot_be_waived(self):
++        from ashare_pipeline.formal_score_inputs import _full_company_gate
++        quarters = ("2024Q3", "2024Q4", "2025Q1", "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2")
++        def slot(key, required=True):
++            return SimpleNamespace(slot_id=key, unit="CNY", formula_version="v1", required=required)
++        def value(key, status="derived"):
++            return SimpleNamespace(slot_id=key, unit="CNY", formula_version="v1", status=status)
++        slots = (slot("extra"), slot("normal"), slot("optional", False), slot("prediction"))
++        bundle = SimpleNamespace(history_endpoints=("2010-12-31", "2022-12-31", "2023-12-31", "2024-12-31", "2025-12-31"),
++            comparable_quarter_keys=quarters, blockers=("feature_required_slot_missing",),
++            values=(value("extra"), value("normal"), value("optional", "missing"), value("prediction", "missing")))
++        marker = {"issue_snapshot_hash": hashlib.sha256(b"[]").hexdigest()}
++        gate = lambda **kw: _full_company_gate(bundle, slots, marker, cyclic=kw.get("cyclic", False),
++            exempt_key=kw.get("exempt_key", "prediction"))
++        self.assertEqual(gate(), ((), 4))
++        self.assertIn("feature_required_slot_missing", gate(exempt_key=None)[0])
++        self.assertIn("history_annual_window_incomplete", gate(cyclic=True)[0])
++        for index, status, reason in ((0, "missing", "full_required_slot_missing:extra"),
++                (2, "blocked", "full_slot_blocked:optional"), (3, "blocked", "full_slot_blocked:prediction")):
++            original = bundle.values
++            bundle.values = tuple(value(item.slot_id, status) if i == index else item for i, item in enumerate(original))
++            self.assertIn(reason, gate()[0])
++            bundle.values = original
++        marker["issue_snapshot_hash"] = "f" * 64
++        self.assertIn("nonempty_current_issues", gate()[0])
++        bundle.comparable_quarter_keys = quarters[:-1]
++        self.assertIn("history_quarter_window_incomplete", gate()[0])
++
++    def test_dependencies_reject_substitution_even_with_no_classified_members(self):
++        from ashare_pipeline import formal_score_inputs as api
++        from ashare_pipeline import formal_metric_engine as engine
++        fixture = FinancialFixture(missing_memberships=True)
++        self.addCleanup(fixture.close)
++        repository = api.FormalScoreInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier)
++        run = lambda: repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++        for cls, name in ((engine.MetricInputBatch.__mro__[1], "__getattr__"),
++                          (engine.MetricInputBatch.__mro__[1], "require_verified"),
++                          (engine.MetricInputBatch, "input_for"),
++                          (engine.FormalMetricInputRepository, "build_batch")):
++            with self.subTest(name=name), patch.object(cls, name, lambda *a, **k: None), self.assertRaises(ValueError):
++                run()
++        for name in ("build_metric_peer_context", "score_metric_percentile"):
++            with patch.object(engine, name, lambda *a, **k: None), self.assertRaises(ValueError):
++                run()
++        with self.assertRaises(ValueError):
++            repository.__init__(fixture.feature_repository, fixture.context, registry_signature_verifier=fixture.verifier)
++        with self.assertRaises(ValueError):
++            object.__new__(api.FormalScoreInputRepository).build_batch(fixture.frozen.frozen_input_hash,
++                scoring_registry=fixture.scoring)
++        batch = run()
++        self.assertEqual(batch.inputs, ())
++        self.assertEqual(len(batch.pending_reasons), 3)
++
++    def test_concrete_proof_cannot_shadow_inherited_verification(self):
++        from ashare_pipeline import formal_score_inputs as api
++        from ashare_pipeline import formal_metric_engine as engine
++        fixture = FinancialFixture(missing_memberships=True)
++        self.addCleanup(fixture.close)
++        repository = api.FormalScoreInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier)
++        for name in ("require_verified", "canonical_bytes", "to_dict", "__getattr__"):
++            original = getattr(engine.MetricInputBatch, name)
++            with self.subTest(name=name), patch.object(engine.MetricInputBatch, name,
++                    lambda *args, **kwargs: original(*args, **kwargs), create=True):
++                with self.assertRaises(ValueError):
++                    repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++
++    def test_transitive_universe_proof_verification_cannot_be_replaced(self):
++        from ashare_pipeline import formal_score_inputs as api
++        from ashare_pipeline.formal_metric_context import VerifiedMetricUniverse, VerifiedMetricIndustryBatch
++        from ashare_pipeline.formal_feature_repository import VerifiedMetricFeatureAbsence, VerifiedMetricFeatureProjection
++        fixture = FinancialFixture(missing_memberships=True)
++        self.addCleanup(fixture.close)
++        repository = api.FormalScoreInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier)
++        for cls in (VerifiedMetricUniverse, VerifiedMetricIndustryBatch, VerifiedMetricFeatureAbsence, VerifiedMetricFeatureProjection):
++            for name in ("require_verified", "canonical_bytes", "to_dict"):
++                with self.subTest(cls=cls.__name__, name=name), patch.object(cls, name, lambda self: None, create=True):
++                    with self.assertRaises(ValueError):
++                        repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++
++    def test_context_missing_to_present_transition_aborts_even_all_pending(self):
++        from ashare_pipeline import formal_score_inputs as api
++        fixture = ScoreFixture(population=False)
++        self.addCleanup(fixture.close)
++        repository = api.FormalScoreInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier)
++        changed = []
++        def profile(frame, event, result):
++            if (event == "return" and frame.f_code.co_name == "read_consensus"
++                    and frame.f_globals.get("__name__") == api.__name__ and not changed):
++                changed.append(True)
++                fixture.put_consensus()
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            with self.assertRaisesRegex(ValueError, "consensus correction or absence changed"):
++                repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++        finally:
++            sys.setprofile(previous)
++        self.assertTrue(changed)
++
++    def test_outer_exit_failure_revokes_already_published_batch(self):
++        from ashare_pipeline import formal_score_inputs as api
++        fixture = FinancialFixture(missing_memberships=True)
++        self.addCleanup(fixture.close)
++        repository = api.FormalScoreInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier)
++        captured = []
++        def profile(frame, event, result):
++            if (event == "return" and frame.f_code.co_name == "publish_complete"
++                    and type(result) is api.FormalScoreInputBatch):
++                captured.append(result)
++            if (event == "return" and frame.f_code.co_name == "guard" and captured
++                    and frame.f_globals.get("__name__") == "ashare_pipeline.formal_metric_batch_guard"):
++                raise RuntimeError("injected outer exit failure")
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            with self.assertRaisesRegex(RuntimeError, "outer exit failure"):
++                repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++        finally:
++            sys.setprofile(previous)
++        self.assertEqual(len(captured), 1)
++        with self.assertRaises(ValueError):
++            captured[0].require_verified()
++
++    def test_actual_source_sql_and_signed_root_tamper_fail_closed(self):
++        from ashare_pipeline import formal_score_inputs as api
++        fixture = ScoreFixture(population=False)
++        self.addCleanup(fixture.close)
++        fact = fixture.put_consensus()
++        repository = api.FormalScoreInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier)
++        run = lambda: repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++        path = Path(fixture.store.get_formal_snapshot(fact.source_snapshot_id).content_path)
++        original = path.read_bytes()
++        try:
++            path.write_bytes(b"tampered actual consensus source")
++            with self.assertRaises(ValueError):
++                run()
++        finally:
++            path.write_bytes(original)
++        fixture.sql("UPDATE formal_context_fact SET value_json=? WHERE id=?", ('{}', fact.id))
++        with self.assertRaises(ValueError):
++            run()
++        fixture.sql("UPDATE formal_registry_manifest SET signature='invalid-byte-sensitive-signature'")
++        with self.assertRaises(ValueError):
++            run()
++
++    def test_absence_and_same_store_dependency_boundary(self):
++        from ashare_pipeline import formal_score_inputs as api
++        from ashare_pipeline.formal_metric_batch_guard import FormalMetricCurrentInputProvider
++        fixture = FinancialFixture(missing_memberships=True)
++        self.addCleanup(fixture.close)
++        repository = api.FormalScoreInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier)
++        self.assertIsNone(repository.build_batch("f" * 64, scoring_registry=fixture.scoring))
++        for source, context in ((object.__new__(type(fixture.feature_repository)), fixture.context),
++                (fixture.feature_repository, object.__new__(type(fixture.context)))):
++            with self.assertRaises(ValueError):
++                api.FormalScoreInputRepository(source, context, registry_signature_verifier=fixture.verifier)
++        original = fixture.feature_repository._current_input_provider
++        try:
++            fixture.feature_repository._current_input_provider = object.__new__(FormalMetricCurrentInputProvider)
++            with self.assertRaises(ValueError):
++                repository.build_batch("f" * 64, scoring_registry=fixture.scoring)
++        finally:
++            fixture.feature_repository._current_input_provider = original
++        for kwargs in ({"security_ids": (FOCAL,)}, {"metric_ids": ("T.expectation_change",)},
++                       {"cyclic": False}, {"no_coverage": True}):
++            with self.subTest(kwargs=kwargs), self.assertRaises(TypeError):
++                repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, **kwargs)
++
++    def test_actual_linked_absence_and_small_cohort_stay_pending(self):
++        from ashare_pipeline import formal_score_inputs as api
++        fixture = ScoreFixture(population=False)
++        self.addCleanup(fixture.close)
++        fixture.populate_scores(consensus=None)
++        repository = api.FormalScoreInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier)
++        missing = repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++        self.assertIn("consensus_context_absent", missing.pending_reasons[FOCAL])
++        self.assertIsNone(missing.input_for(FOCAL))
++        fixture.put_consensus()
++        neutral = repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++        self.assertIsNone(neutral.input_for(FOCAL))
++        self.assertEqual(len(neutral.pending_reasons[FOCAL]), 24)
++        self.assertTrue(all("peer_count_below_20" in reason for reason in neutral.pending_reasons[FOCAL]))
++
++
++if __name__ == "__main__":
++    unittest.main()
++

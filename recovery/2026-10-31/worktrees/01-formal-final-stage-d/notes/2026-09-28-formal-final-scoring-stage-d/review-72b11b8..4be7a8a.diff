@@ -1,0 +1,299 @@
+# Review package: 72b11b8..4be7a8a
+
+## Commits
+4be7a8a fix: seal Stage D frame authority and pool membership
+
+## Files changed
+ ashare_pipeline/formal_final_publication.py | 19 ++++++++---
+ ashare_pipeline/formal_final_repository.py  | 10 +++++-
+ tests/test_formal_final_atomicity.py        | 50 +++++++++++++++++++++++++++++
+ tests/test_formal_final_repository.py       | 30 +++++++++++++++++
+ 4 files changed, 103 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_final_publication.py b/ashare_pipeline/formal_final_publication.py
+index 67caa35..e1a433b 100644
+--- a/ashare_pipeline/formal_final_publication.py
++++ b/ashare_pipeline/formal_final_publication.py
+@@ -5,26 +5,33 @@ exact source batch. No capability, proof constructor or mint operation escapes.
+ The post-commit method contains only the prevalidated shared-state assignment.
+ """
+ 
+ from weakref import ref as _reference
+ from sys import _getframe
+ 
+ 
+ def _install_authority():
+     preparing, controls, repositories = {}, {}, {}
+     writer_binding = []
++    owner, frame_authority, reference_authority = globals(), _getframe, _reference
++
++    def require_runtime_authority():
++        if (owner.get("_getframe") is not frame_authority
++                or owner.get("_reference") is not reference_authority):
++            raise ValueError("publication frame authority dependency changed")
+ 
+     def writer_owner(*, direct=False):
++        require_runtime_authority()
+         if not writer_binding:
+             raise ValueError("publication requires the authenticated repository writer")
+         repository_type, writer, initializer = writer_binding[0]
+-        frame = _getframe(2)
++        frame = frame_authority(2)
+         while frame is not None:
+             if frame.f_code is writer.__code__:
+                 repository = frame.f_locals.get("self")
+                 saved = repositories.get(id(repository))
+                 if (type(repository) is repository_type and saved is not None and saved() is repository
+                         and repository_type.commit_complete_run is writer
+                         and repository_type.__init__ is initializer):
+                     return repository
+                 break
+             if direct:
+@@ -121,21 +128,21 @@ def _install_authority():
+                     raise TypeError("publication cannot be copied")
+ 
+                 def __deepcopy__(self, memo):
+                     raise TypeError("publication cannot be copied")
+ 
+                 def __reduce_ex__(self, protocol):
+                     raise TypeError("publication cannot be reconstructed")
+ 
+             interfaces = ((PreparedPublication, tuple(vars(PreparedPublication).items())),)
+             result = object.__new__(PreparedPublication)
+-            owner[0] = _reference(result)
++            owner[0] = reference_authority(result)
+ 
+             def recheck(connection=None):
+                 authentic(result)
+                 if state[0] == 3:
+                     raise ValueError("publication was revoked")
+                 source_recheck(connection)
+                 for source, raw in zip(sources, source_bytes, strict=True):
+                     source.require_verified()
+                     if source.canonical_bytes() != raw:
+                         raise ValueError("publication source changed")
+@@ -164,31 +171,33 @@ def _install_authority():
+             return result
+ 
+     def take_controls(publication):
+         repository = writer_owner(direct=True)
+         saved = controls.pop(id(publication), None)
+         if saved is None or saved[0] is not publication or saved[1] is not repository:
+             raise ValueError("publication has no repository-owned capability")
+         return saved[2]
+ 
+     def bind(repository_type):
+-        frame = _getframe(1)
++        require_runtime_authority()
++        frame = frame_authority(1)
+         if (writer_binding or frame.f_globals.get("__name__") != "ashare_pipeline.formal_final_repository"
+                 or frame.f_globals.get("FormalFinalRunRepository") is not repository_type):
+             raise ValueError("publication authority binds only the repository module")
+         writer_binding.append((repository_type, repository_type.commit_complete_run, repository_type.__init__))
+ 
+         def register(repository):
++            require_runtime_authority()
+             if (type(repository) is not repository_type
+-                    or _getframe(1).f_code is not writer_binding[0][2].__code__):
++                    or frame_authority(1).f_code is not writer_binding[0][2].__code__):
+                 raise ValueError("publication requires an initialized repository")
+             key = id(repository)
+-            repositories[key] = _reference(repository, lambda _: repositories.pop(key, None))
++            repositories[key] = reference_authority(repository, lambda _: repositories.pop(key, None))
+         return prepare, take_controls, register
+ 
+     return claim, FormalFinalPublicationCoordinator, bind
+ 
+ 
+ _claim_preparation, FormalFinalPublicationCoordinator, _bind_repository_writer = _install_authority()
+ del _install_authority
+ 
+ __all__ = ["FormalFinalPublicationCoordinator"]
+diff --git a/ashare_pipeline/formal_final_repository.py b/ashare_pipeline/formal_final_repository.py
+index 4728aa0..1e41c99 100644
+--- a/ashare_pipeline/formal_final_repository.py
++++ b/ashare_pipeline/formal_final_repository.py
+@@ -216,22 +216,30 @@ def _project_rows(run_id, wires):
+             "strong_prohibited", "wait_prohibited")}
+         rows["formal_final_eligibility"].append(dict(run_id=run_id, security_id=item["security_id"],
+             eligibility_hash=item["eligibility_hash"], **flags, **_payload_columns(item)))
+     expected_pairs = {(sid, pool) for sid in ids for pool in ("strong", "wait")}
+     actual_pairs = [(item["security_id"], item["pool"]) for item in pools["decisions"]]
+     if len(actual_pairs) != len(expected_pairs) or set(actual_pairs) != expected_pairs:
+         raise ValueError("pool decisions must cover both pools and every frozen member")
+     ordinals = {}
+     for pool in ("strong", "wait"):
+         selected = pools[pool + "_security_ids"]
+-        if len(selected) != len(set(selected)) or pools["counts"][pool] != len(selected):
++        if (type(selected) is not list or any(type(sid) is not str for sid in selected)
++                or len(selected) != len(set(selected)) or pools["counts"][pool] != len(selected)
++                or not set(selected) <= set(ids)):
+             raise ValueError("pool selected membership or count is invalid")
++        selected_decisions = {item["security_id"] for item in pools["decisions"]
++            if item["pool"] == pool and item["decision"] == "selected"}
++        if set(selected) != selected_decisions:
++            raise ValueError("pool selected membership differs from its decisions")
++        # The canonical list is the order authority; every projected ordinal
++        # must match its 1-based position during both writing and recovery.
+         ordinals.update({(sid, pool): index for index, sid in enumerate(selected, 1)})
+     for item in pools["decisions"]:
+         ordinal = ordinals.get((item["security_id"], item["pool"]))
+         if (item["decision"] == "selected") != (ordinal is not None):
+             raise ValueError("pool selected membership differs from its decisions")
+         rows["formal_final_pool_decision"].append(dict(run_id=run_id, security_id=item["security_id"],
+             pool_name=item["pool"], decision=item["decision"], selected_ordinal=ordinal,
+             decision_hash=item["decision_hash"], **_payload_columns(item)))
+     # Preserve root-wide and per-member dependencies. Fine-grained upstream
+     # hashes are retained with their field paths for the later rebuild planner.
+diff --git a/tests/test_formal_final_atomicity.py b/tests/test_formal_final_atomicity.py
+index 432d7d1..1587016 100644
+--- a/tests/test_formal_final_atomicity.py
++++ b/tests/test_formal_final_atomicity.py
+@@ -7,20 +7,49 @@ import sqlite3
+ import unittest
+ import weakref
+ from contextlib import closing
+ from unittest.mock import patch
+ 
+ from tests.test_formal_final_repository import minimal_batches
+ from tests.test_formal_final_migration import TABLES
+ 
+ 
+ class FormalFinalAuthorityBoundaryTests(unittest.TestCase):
++    def test_replaced_frame_provider_cannot_authenticate_prepare_or_controls(self):
++        import ashare_pipeline.formal_final_publication as publication
++        import ashare_pipeline.formal_final_repository as module
++        from ashare_pipeline.state_store import StateStore
++        from pathlib import Path
++        from types import SimpleNamespace
++        import tempfile
++
++        class ProducerTripwire:
++            def require_verified(self):
++                raise AssertionError("forged frame reached producer authority")
++
++        with tempfile.TemporaryDirectory() as directory:
++            store = StateStore(Path(directory) / "frame.sqlite")
++            store.initialize()
++            repository = module.FormalFinalRunRepository(store, code_version="frame-attack-test")
++            forged_frame = SimpleNamespace(f_code=type(repository).commit_complete_run.__code__,
++                f_locals={"self": repository}, f_back=None)
++            batches = {name: ProducerTripwire() for name in (
++                "input_batch", "score_batch", "eligibility_batch", "pool_batch")}
++            with patch.object(publication, "_getframe", lambda depth=0: forged_frame):
++                for path, call in (
++                    ("prepare", lambda: module._prepare_publication(**batches)),
++                    ("take_controls", lambda: module._publication_controls(object())),
++                ):
++                    with self.subTest(path=path), self.assertRaisesRegex(ValueError,
++                            "frame authority|authenticated repository writer"):
++                        call()
++
+     def test_exported_coordinator_has_no_publication_authority(self):
+         from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
+         class Tripwire:
+             def require_verified(self):
+                 raise AssertionError("caller reached producer authority")
+         with self.assertRaisesRegex((ValueError, TypeError), "repository"):
+             FormalFinalPublicationCoordinator.prepare(input_batch=Tripwire(), score_batch=Tripwire(),
+                 eligibility_batch=Tripwire(), pool_batch=Tripwire())
+ 
+     def test_source_checkpoint_detects_real_database_and_provider_changes(self):
+@@ -166,20 +195,41 @@ class FormalFinalAtomicityContractTests(unittest.TestCase):
+             for proof in captured[0].batches + captured[0].children:
+                 with self.assertRaises(ValueError):
+                     proof.require_verified()
+         original = self.fixture.store._connect
+         with patch.object(module, "_prepare_publication", capture), patch.object(module,
+                 "_writer_connection", lambda store: FaultConnection(original(), before_commit=observe)):
+             receipt = self.repository.commit_complete_run(**self.batches)
+         for proof in receipt.batches:
+             proof.require_verified()
+ 
++    def test_replaced_frame_provider_cannot_take_a_real_pending_publication(self):
++        import ashare_pipeline.formal_final_publication as publication
++        import ashare_pipeline.formal_final_repository as module
++        from types import SimpleNamespace
++        prepare = module._prepare_publication
++        forged_frame = SimpleNamespace(f_code=type(self.repository).commit_complete_run.__code__,
++            f_locals={"self": self.repository}, f_back=None)
++        def capture(**kwargs):
++            prepared = prepare(**kwargs)
++            with patch.object(publication, "_getframe", lambda depth=0: forged_frame):
++                with self.assertRaisesRegex(ValueError, "frame authority|authenticated repository writer"):
++                    module._publication_controls(prepared)
++            for proof in prepared.batches + prepared.children:
++                with self.assertRaises(ValueError):
++                    proof.require_verified()
++            return prepared
++        with patch.object(module, "_prepare_publication", capture):
++            receipt = self.repository.commit_complete_run(**self.batches)
++        for proof in receipt.batches:
++            proof.require_verified()
++
+     def test_post_commit_mark_committed_is_prevalidated_and_cannot_fail(self):
+         import ashare_pipeline.formal_final_repository as module
+         prepared = self.capture_aborted_preparation()
+         for name in ("prevalidate_commit", "arm", "mark_committed", "revoke", "recheck"):
+             self.assertFalse(hasattr(prepared, name))
+         with self.assertRaisesRegex(ValueError, "repository"):
+             module._publication_controls(prepared)
+         with self.assertRaisesRegex(ValueError, "repository"):
+             module._prepare_publication(**{key: self.batches[key] for key in (
+                 "input_batch", "score_batch", "eligibility_batch", "pool_batch")})
+diff --git a/tests/test_formal_final_repository.py b/tests/test_formal_final_repository.py
+index 6737193..f7e7ecc 100644
+--- a/tests/test_formal_final_repository.py
++++ b/tests/test_formal_final_repository.py
+@@ -118,20 +118,50 @@ class FormalFinalRecoveryBoundaryTests(unittest.TestCase):
+             ("UPDATE formal_final_run SET universe_hash='wrong'", ()),
+         ]
+         for sql, args in attacks:
+             with self.subTest(sql=sql):
+                 self.connection.execute("SAVEPOINT damage")
+                 self.connection.execute(sql, args)
+                 with self.assertRaises(ValueError):
+                     self.read()
+                 self.connection.execute("ROLLBACK TO damage")
+ 
++    def test_recovery_rejects_rehashed_selected_list_decision_mismatches(self):
++        for damage in ("outside_frozen_member", "missing_selected_decision", "extra_selected_decision"):
++            with self.subTest(damage=damage):
++                pools = copy.deepcopy(self.wires[3])
++                if damage == "outside_frozen_member":
++                    pools["strong_security_ids"].append("SH600999")
++                    pools["counts"]["strong"] = 2
++                else:
++                    decision = pools["decisions"][0 if damage == "missing_selected_decision" else 1]
++                    decision["decision"] = "not_qualified" if damage == "missing_selected_decision" else "selected"
++                    decision["decision_hash"] = self.module._serialize_payload({
++                        key: value for key, value in decision.items() if key != "decision_hash"})[1]
++                pools["batch_hash"] = self.module._serialize_payload({
++                    key: value for key, value in pools.items() if key != "batch_hash"})[1]
++                raw, digest = self.module._serialize_payload(pools)
++                self.connection.execute("SAVEPOINT pool_damage")
++                try:
++                    self.connection.execute("UPDATE formal_final_artifact SET payload_json=?,artifact_hash=? "
++                        "WHERE artifact_kind='pool_selection_batch'", (raw, digest))
++                    artifacts = {row["artifact_kind"]: dict(row) for row in self.connection.execute(
++                        "SELECT * FROM formal_final_artifact")}
++                    header = dict(self.connection.execute("SELECT * FROM formal_final_run").fetchone())
++                    self.connection.execute("UPDATE formal_final_run SET result_hash=?",
++                        (self.module._result_hash(header, artifacts),))
++                    with self.assertRaises(ValueError):
++                        self.read()
++                finally:
++                    self.connection.execute("ROLLBACK TO pool_damage")
++                    self.connection.execute("RELEASE pool_damage")
++
+     def test_qualified_canonical_decimal_boundary_preserves_exact_values(self):
+         from ashare_pipeline.formal_pool import _detach_eligibility_rows, _select_detached_rows
+         rows = _detach_eligibility_rows(self.wires[2]["eligibilities"])
+         self.assertEqual(rows[0]["sort_fields"]["Sc"], Decimal(self.wires[1]["cards"][0]["Sc"]))
+         self.assertEqual(_select_detached_rows(rows).strong_ids, ("SH600000",))
+         for bad in ("NaN", "Infinity", " 80", "+80", 80.0):
+             damaged = copy.deepcopy(self.wires[2]["eligibilities"])
+             damaged[0]["sort_fields"]["Sc"] = bad
+             with self.subTest(bad=bad), self.assertRaises(ValueError):
+                 _detach_eligibility_rows(damaged)

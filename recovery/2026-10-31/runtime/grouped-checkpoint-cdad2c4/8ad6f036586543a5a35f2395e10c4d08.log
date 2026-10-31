@@ -1,0 +1,12 @@
+TEST_STARTED test_formal_context_repository.ScoringWrapperIntegrationTests.test_combined_scoring_wrapper_preserves_legacy_descriptor_identity
+test_combined_scoring_wrapper_preserves_legacy_descriptor_identity (test_formal_context_repository.ScoringWrapperIntegrationTests.test_combined_scoring_wrapper_preserves_legacy_descriptor_identity) ... ok
+TEST_STARTED test_formal_context_repository.ScoringWrapperIntegrationTests.test_combined_wrapper_rejects_unknown_keys_versions_and_invalid_descriptors
+test_combined_wrapper_rejects_unknown_keys_versions_and_invalid_descriptors (test_formal_context_repository.ScoringWrapperIntegrationTests.test_combined_wrapper_rejects_unknown_keys_versions_and_invalid_descriptors) ... ok
+TEST_STARTED test_formal_context_repository.ScoringWrapperIntegrationTests.test_v2_linked_consensus_descriptor_resolves_with_canonical_entry_id
+test_v2_linked_consensus_descriptor_resolves_with_canonical_entry_id (test_formal_context_repository.ScoringWrapperIntegrationTests.test_v2_linked_consensus_descriptor_resolves_with_canonical_entry_id) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 1.010s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_context_repository.ScoringWrapperIntegrationTests.test_combined_scoring_wrapper_preserves_legacy_descriptor_identity", "test_formal_context_repository.ScoringWrapperIntegrationTests.test_combined_wrapper_rejects_unknown_keys_versions_and_invalid_descriptors", "test_formal_context_repository.ScoringWrapperIntegrationTests.test_v2_linked_consensus_descriptor_resolves_with_canonical_entry_id"], "passed": ["test_formal_context_repository.ScoringWrapperIntegrationTests.test_combined_scoring_wrapper_preserves_legacy_descriptor_identity", "test_formal_context_repository.ScoringWrapperIntegrationTests.test_combined_wrapper_rejects_unknown_keys_versions_and_invalid_descriptors", "test_formal_context_repository.ScoringWrapperIntegrationTests.test_v2_linked_consensus_descriptor_resolves_with_canonical_entry_id"], "tests_run": 3, "failures": 0, "errors": 0, "skipped": 0}

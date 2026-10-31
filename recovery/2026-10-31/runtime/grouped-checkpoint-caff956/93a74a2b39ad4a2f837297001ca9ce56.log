@@ -1,0 +1,26 @@
+setUpClass (test_formal_metric_batch_guard.DerivedProofPublicationTests) ... ERROR
+
+======================================================================
+ERROR: setUpClass (test_formal_metric_batch_guard.DerivedProofPublicationTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Lenovo\.codex\worktrees\formal-final-stage-d\AShareQiheng\tests\test_formal_metric_batch_guard.py", line 209, in setUpClass
+    cls.fixture.persist_features(sid)
+  File "C:\Users\Lenovo\.codex\worktrees\formal-final-stage-d\AShareQiheng\tests\formal_metric_feature_fixtures.py", line 122, in persist_features
+    bundle = build_formal_feature_bundle(security_id=sid, as_of_utc=FREEZE, template_id=member["template_id"],
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Lenovo\.codex\worktrees\formal-final-stage-d\AShareQiheng\ashare_pipeline\formal_financial_features.py", line 573, in build_formal_feature_bundle
+    registry.require_authenticated(
+  File "C:\Users\Lenovo\.codex\worktrees\formal-final-stage-d\AShareQiheng\ashare_pipeline\formal_feature_contract.py", line 703, in require_authenticated
+    require_bundle_authenticated(
+  File "C:\Users\Lenovo\.codex\worktrees\formal-final-stage-d\AShareQiheng\ashare_pipeline\formal_registry_manifest.py", line 685, in require_authenticated
+    require_authenticated_bundle(self, expected_purpose=expected_purpose)
+  File "C:\Users\Lenovo\.codex\worktrees\formal-final-stage-d\AShareQiheng\ashare_pipeline\formal_registry_manifest.py", line 632, in require_authenticated_bundle
+    raise ValueError("authenticated computation requires a v2 registry manifest")
+ValueError: authenticated computation requires a v2 registry manifest
+
+----------------------------------------------------------------------
+Ran 0 tests in 1.622s
+
+FAILED (errors=1)
+GROUP_SUMMARY {"ids": ["test_formal_metric_batch_guard.DerivedProofPublicationTests.test_failed_finalization_revokes_derived_context_and_actual_score", "test_formal_metric_batch_guard.DerivedProofPublicationTests.test_successful_detached_context_score_and_cohort_cache_remain_valid"], "passed": [], "tests_run": 0, "failures": 0, "errors": 1, "skipped": 0}

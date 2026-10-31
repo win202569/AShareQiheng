@@ -1,0 +1,227 @@
+# Review package: 228b33f..5516548
+
+## Commits
+5516548 fix: accept canonical valuation adapter wire and isolate parsing
+
+## Files changed
+ ashare_pipeline/formal_valuation_adapter.py | 12 +++---
+ tests/test_formal_valuation_adapter.py      | 62 ++++++++++++++++++++++++++++-
+ 2 files changed, 66 insertions(+), 8 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_valuation_adapter.py b/ashare_pipeline/formal_valuation_adapter.py
+index 0077820..c0a5f61 100644
+--- a/ashare_pipeline/formal_valuation_adapter.py
++++ b/ashare_pipeline/formal_valuation_adapter.py
+@@ -67,38 +67,38 @@ def _hash(value, field, label):
+ 
+ def _text(value, label):
+     if type(value) is not str or not value or value != value.strip():
+         raise ValueError(f"{label} must be nonempty trimmed text")
+ 
+ 
+ def _decimal(value):
+     if type(value) is not str:
+         return None, "invalid"
+     try:
+-        parsed = Decimal(value)
++        with localcontext(_arithmetic_context()):
++            parsed = Decimal(value)
+     except InvalidOperation:
+         return None, "invalid"
+     return (parsed, None) if parsed.is_finite() else (None, "nonfinite")
+ 
+ 
+ def _decimal_text(value):
+     if type(value) is not Decimal or not value.is_finite():
+         raise ValueError("finite Decimal required")
+     if value.is_zero():
+         return "0"
+     fixed = format(value, "f")
+     return fixed.rstrip("0").rstrip(".") if "." in fixed else fixed
+ 
+ 
+ def _definition_hash(adapter):
+-    return digest({key: list(value) if key == "preconditions" else value
+-                   for key, value in adapter.items()})
++    return digest(adapter)
+ 
+ 
+ def _dependencies(values, label):
+     if type(values) is not list or not values:
+         raise ValueError(f"{label} requires valuation dependencies")
+     metric_ids = []
+     for item in values:
+         _exact(item, _DEPENDENCY_KEYS, label + " item")
+         metric_ids.append(item["metric_id"])
+     if metric_ids != sorted(set(metric_ids)):
+@@ -160,23 +160,23 @@ def evaluate_valuation_adjustment(*, metric: dict, policy_result: dict,
+         if metric[key] != policy_result[key]:
+             raise ValueError(f"metric and policy result differ in {key}")
+     if (type(policy_result["decisions"]) is not list
+             or len([item for item in policy_result["decisions"]
+                     if type(item) is dict and item.get("role") == "cyclic"]) != 1
+             or cyclic_decision not in policy_result["decisions"]):
+         raise ValueError("cyclic decision is not uniquely bound to policy result")
+     if (cyclic_decision["role"] != "cyclic"
+             or cyclic_decision["semantic_id"] != "cyclic_top"
+             or cyclic_decision["security_id"] != metric["security_id"]
+-            or cyclic_decision["template_id"] != metric["template_id"]
+-            or cyclic_decision["rule_id"] != metric["template_id"] + "_cyclic_top"):
++            or cyclic_decision["template_id"] != metric["template_id"]):
+         raise ValueError("cyclic decision identity differs from metric")
++    _text(cyclic_decision["rule_id"], "cyclic rule ID")
+     if (type(cyclic_decision["parameters"]) is not dict
+             or type(cyclic_decision["parameters"].get("valuation_dependencies")) is not list
+             or not cyclic_decision["parameters"]["valuation_dependencies"]
+             or dependency not in cyclic_decision["parameters"]["valuation_dependencies"]
+             or len([item for item in cyclic_decision["parameters"]["valuation_dependencies"]
+                     if type(item) is dict and item.get("metric_id") == dependency["metric_id"]]) != 1
+             or dependency["metric_id"] != metric["metric_id"]):
+         raise ValueError("dependency differs from cyclic policy or metric")
+     _dependencies(cyclic_decision["parameters"]["valuation_dependencies"],
+                   "cyclic decision")
+@@ -191,21 +191,21 @@ def evaluate_valuation_adjustment(*, metric: dict, policy_result: dict,
+         if adapter is None:
+             raise ValueError("affected dependency requires its signed adapter definition")
+         if dependency["profit_semantic_id"] != cyclic_decision["semantic_id"]:
+             raise ValueError("affected profit semantic differs from cyclic decision")
+         required = dict(template_id=metric["template_id"], metric_id=metric["metric_id"],
+             adapter_id=dependency["adapter_id"], adapter_version=dependency["adapter_version"],
+             profit_semantic_id=dependency["profit_semantic_id"],
+             original_definition_hash=metric["definition_hash"],
+             definition_basis=dependency["definition_basis"], policy_role="cyclic",
+             rule_id=cyclic_decision["rule_id"], operation="profit_ratio_rescale_v1",
+-            decimal_contract="decimal50-half-even-v1", preconditions=_PRECONDITIONS)
++            decimal_contract="decimal50-half-even-v1", preconditions=list(_PRECONDITIONS))
+         if any(adapter[key] != value or type(adapter[key]) is not type(value)
+                for key, value in required.items()):
+             raise ValueError("adapter differs from signed dependency or metric")
+         if (adapter["metric_unit"] != adapter["output_unit"]
+                 or adapter["profit_unit"] != "CNY"):
+             raise ValueError("adapter unit contract is unsupported")
+     state = cyclic_decision["evaluation_state"]
+     if state not in ("clear", "not_applicable", "matched", "pending_evidence"):
+         raise ValueError("unknown cyclic decision state")
+     if state != "matched" and cyclic_decision["operands"].get("normalization_basis") is not None:
+diff --git a/tests/test_formal_valuation_adapter.py b/tests/test_formal_valuation_adapter.py
+index 37b2f1b..3e8751c 100644
+--- a/tests/test_formal_valuation_adapter.py
++++ b/tests/test_formal_valuation_adapter.py
+@@ -1,13 +1,13 @@
+ """Detached valuation arithmetic and per-metric policy state contract."""
+ 
+-from decimal import Decimal, ROUND_DOWN, localcontext
++from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
+ import copy
+ import unittest
+ 
+ from ashare_pipeline.formal_policy_values import digest
+ from ashare_pipeline.formal_valuation_adapter import (
+     evaluate_valuation_adjustment, profit_ratio_rescale,
+ )
+ 
+ 
+ H = "a" * 64
+@@ -22,21 +22,21 @@ def fixtures(*, state="matched", dependency_state="affected", current="10",
+         profit_semantic_id="cyclic_top" if dependency_state == "affected" else None,
+         adapter_id="ratio" if dependency_state == "affected" else None,
+         adapter_version="v1" if dependency_state == "affected" else None,
+         definition_basis="linear current profit")
+     adapter = None if dependency_state == "unaffected" else dict(
+         template_id="bank", metric_id=METRIC, adapter_id="ratio", adapter_version="v1",
+         operation="profit_ratio_rescale_v1", original_definition_hash=H,
+         profit_semantic_id="cyclic_top", metric_unit="ratio", profit_unit="CNY",
+         output_unit="ratio", policy_role="cyclic", rule_id=RULE,
+         decimal_contract="decimal50-half-even-v1",
+-        preconditions=("exact_units", "finite_decimals", "nonzero_original_current_profit"),
++        preconditions=["exact_units", "finite_decimals", "nonzero_original_current_profit"],
+         definition_basis="linear current profit")
+     basis = dict(profit_semantic_id="cyclic_top",
+         original_current_profit=dict(selector_hash=H, value=current, evidence_hashes=[H]),
+         annual_profit=[], ordered_values=[], median_method="ordered_middle_v1",
+         median=normalized, profit_basis_method="minimum_current_and_five_fy_median_v1",
+         normalized_profit=normalized, valuation_dependencies=[copy.deepcopy(dependency)])
+     decision = dict(rule_id=RULE, role="cyclic", semantic_id="cyclic_top",
+         template_id="bank", security_id="SH600000", definition_hash=H,
+         input_references=[dict(input_name="current_profit", selector_hash=H,
+             state="value", value_type="decimal", unit="CNY", evidence_hashes=[H])],
+@@ -178,20 +178,78 @@ class ValuationAdjustmentTests(unittest.TestCase):
+         args["cyclic_decision"]["parameters"]["valuation_dependencies"][0][
+             "profit_semantic_id"] = "other_profit"
+         args["cyclic_decision"]["operands"]["normalization_basis"][
+             "valuation_dependencies"][0]["profit_semantic_id"] = "other_profit"
+         args["policy_result"]["normalization_basis"][0]["valuation_dependencies"][0][
+             "profit_semantic_id"] = "other_profit"
+         rehash(args)
+         with self.assertRaises(ValueError):
+             evaluate_valuation_adjustment(**args)
+ 
++    def test_actual_c2_registry_wire_adapter_is_accepted(self):
++        from ashare_pipeline.formal_valuation_adapter_contract import (
++            load_formal_valuation_adapter_registry,
++        )
++        from tests.test_formal_valuation_adapter_contract import load_graph
++
++        bundle, scoring, policy = load_graph()
++        registry = load_formal_valuation_adapter_registry(bundle,
++            scoring_registry=scoring, policy_registry=policy)
++        wire = registry.to_dict()
++        adapter = wire["adapters"][0]
++        template_id, metric_id = adapter["template_id"], adapter["metric_id"]
++        dependency = next(item for item in policy.to_dict()["valuation_dependencies"][template_id]
++                          if item["metric_id"] == metric_id)
++        definition = wire["metric_definitions"][template_id][metric_id]
++        args = fixtures()
++        args["adapter"] = adapter
++        args["dependency"] = dependency
++        args["metric"].update(template_id=template_id, metric_id=metric_id,
++            definition_hash=adapter["original_definition_hash"],
++            unit=adapter["metric_unit"], direction=definition["definition"]["direction"])
++        args["cyclic_decision"].update(template_id=template_id,
++            rule_id=adapter["rule_id"])
++        args["cyclic_decision"]["parameters"]["valuation_dependencies"] = [
++            copy.deepcopy(dependency)]
++        args["cyclic_decision"]["operands"]["normalization_basis"][
++            "valuation_dependencies"] = [copy.deepcopy(dependency)]
++        args["policy_result"]["normalization_basis"][0]["valuation_dependencies"] = [
++            copy.deepcopy(dependency)]
++        args["policy_result"]["normalization_basis"][0]["rule_id"] = adapter["rule_id"]
++        rehash(args)
++        self.assertIs(type(adapter["preconditions"]), list)
++        self.assertEqual(evaluate_valuation_adjustment(**args)["adjusted_value"], "0.12")
++
++    def test_consistent_nonconventional_signed_rule_id_is_accepted(self):
++        args = fixtures()
++        unusual = "signed_cyclic_rule_2030"
++        args["cyclic_decision"]["rule_id"] = unusual
++        args["adapter"]["rule_id"] = unusual
++        args["policy_result"]["normalization_basis"][0]["rule_id"] = unusual
++        rehash(args)
++        self.assertEqual(evaluate_valuation_adjustment(**args)["status"], "adjusted")
++
++    def test_invalid_decimal_wire_has_identical_result_and_hash_under_ambient_traps(self):
++        for field in ("metric", "current", "normalized"):
++            with self.subTest(field=field):
++                args = fixtures(value="not-decimal" if field == "metric" else "0.20",
++                    current="not-decimal" if field == "current" else "10",
++                    normalized="not-decimal" if field == "normalized" else "6")
++                outputs = []
++                for trap in (True, False):
++                    with localcontext() as ambient:
++                        ambient.traps[InvalidOperation] = trap
++                        outputs.append(evaluate_valuation_adjustment(**args))
++                self.assertEqual(outputs[0], outputs[1])
++                self.assertEqual(outputs[0]["status"], "invalid_adapter_operand")
++                self.assertIsNone(outputs[0]["adjusted_value"])
++
+     def test_local_decimal_context_is_deterministic_and_requires_exact_decimal(self):
+         with localcontext() as ambient:
+             ambient.prec = 2
+             ambient.rounding = ROUND_DOWN
+             first = profit_ratio_rescale(Decimal("0.2"), Decimal("3"), Decimal("2"))
+         self.assertEqual(first, profit_ratio_rescale(Decimal("0.2"), Decimal("3"), Decimal("2")))
+         with self.assertRaises(ValueError):
+             profit_ratio_rescale(0.2, Decimal("3"), Decimal("2"))
+ 
+ 

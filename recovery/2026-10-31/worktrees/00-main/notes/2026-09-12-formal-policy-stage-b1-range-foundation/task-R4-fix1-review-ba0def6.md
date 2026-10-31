@@ -1,0 +1,6 @@
+- **Callback integrity failures can become ordinary retry diagnostics** — **ADDRESSED.** `ashare_pipeline/formal_range_source.py:886-894` authenticates source and request, validates the current parent, then rechecks source/request after parent callbacks. All transport exceptions and typed retry/blocked exits invoke it before classification at `:1030-1035`; response retry/blocked and terminal exits do likewise at `:1047-1054`. Authentication exceptions arise inside handlers and therefore remain outside sibling operational-conversion catches; worker fencing is unchanged.
+- Focused regressions cover generic/typed transport failures, retryable responses, blocked responses, source/request mutation, and current-parent corruption at `tests/test_formal_range_worker.py:374-428`. The report records RED as 3 tests/7 expected failures/exit 1 and GREEN as 6 tests/868.661s/exit 0.
+- **New Breakage in the Fix Diff:** None identified.
+- **Out-of-Scope Observations:** None. The pending 100-case compatibility run and runtime performance concern are validation breadth/performance matters, not defects introduced by this two-file fix.
+- **Checks:** Static inspection only; no tests, suites, Git operations, file mutations, or subagents.
+- **Fix round:** **All findings addressed, no new Critical/Important breakage.**

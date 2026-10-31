@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_integration.GenuineFullChainTests.test_z_legitimate_financial_generation_correction_appends_trusted_rebuild
+test_z_legitimate_financial_generation_correction_appends_trusted_rebuild (test_formal_final_integration.GenuineFullChainTests.test_z_legitimate_financial_generation_correction_appends_trusted_rebuild) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 1518.486s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_integration.GenuineFullChainTests.test_z_legitimate_financial_generation_correction_appends_trusted_rebuild"], "passed": ["test_formal_final_integration.GenuineFullChainTests.test_z_legitimate_financial_generation_correction_appends_trusted_rebuild"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

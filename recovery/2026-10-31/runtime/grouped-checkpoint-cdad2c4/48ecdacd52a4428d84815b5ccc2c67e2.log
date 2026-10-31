@@ -1,0 +1,14 @@
+TEST_STARTED test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_caller_cannot_forge_out_of_scope_state
+test_caller_cannot_forge_out_of_scope_state (test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_caller_cannot_forge_out_of_scope_state) ... ok
+TEST_STARTED test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_mismatched_d1_d2_batches_are_rejected
+test_mismatched_d1_d2_batches_are_rejected (test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_mismatched_d1_d2_batches_are_rejected) ... ok
+TEST_STARTED test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_missing_duplicate_or_extra_scorecards_are_rejected
+test_missing_duplicate_or_extra_scorecards_are_rejected (test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_missing_duplicate_or_extra_scorecards_are_rejected) ... ok
+TEST_STARTED test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_plain_mapping_or_prepolicy_score_cannot_enter_eligibility
+test_plain_mapping_or_prepolicy_score_cannot_enter_eligibility (test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_plain_mapping_or_prepolicy_score_cannot_enter_eligibility) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 1385.253s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_caller_cannot_forge_out_of_scope_state", "test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_mismatched_d1_d2_batches_are_rejected", "test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_missing_duplicate_or_extra_scorecards_are_rejected", "test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_plain_mapping_or_prepolicy_score_cannot_enter_eligibility"], "passed": ["test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_caller_cannot_forge_out_of_scope_state", "test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_mismatched_d1_d2_batches_are_rejected", "test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_missing_duplicate_or_extra_scorecards_are_rejected", "test_formal_final_eligibility_guards.FormalEligibilityGuardTests.test_plain_mapping_or_prepolicy_score_cannot_enter_eligibility"], "tests_run": 4, "failures": 0, "errors": 0, "skipped": 0}

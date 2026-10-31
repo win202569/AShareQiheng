@@ -1,0 +1,16 @@
+TEST_STARTED test_financial_features.FeatureInputHashTests.test_hash_is_sensitive_to_each_runtime_and_version_dependency
+test_hash_is_sensitive_to_each_runtime_and_version_dependency (test_financial_features.FeatureInputHashTests.test_hash_is_sensitive_to_each_runtime_and_version_dependency) ... ok
+TEST_STARTED test_financial_features.FeatureInputHashTests.test_hash_matches_the_exact_declared_canonical_payload
+test_hash_matches_the_exact_declared_canonical_payload (test_financial_features.FeatureInputHashTests.test_hash_matches_the_exact_declared_canonical_payload) ... ok
+TEST_STARTED test_financial_features.FeatureInputHashTests.test_hash_rejects_nan_instead_of_serializing_it
+test_hash_rejects_nan_instead_of_serializing_it (test_financial_features.FeatureInputHashTests.test_hash_rejects_nan_instead_of_serializing_it) ... ok
+TEST_STARTED test_financial_features.FeatureInputHashTests.test_mapping_v2_fact_is_consumed_by_the_feature_bundle
+test_mapping_v2_fact_is_consumed_by_the_feature_bundle (test_financial_features.FeatureInputHashTests.test_mapping_v2_fact_is_consumed_by_the_feature_bundle) ... ok
+TEST_STARTED test_financial_features.FeatureInputHashTests.test_omitted_statement_key_equals_explicit_null_but_real_snapshot_changes_hash
+test_omitted_statement_key_equals_explicit_null_but_real_snapshot_changes_hash (test_financial_features.FeatureInputHashTests.test_omitted_statement_key_equals_explicit_null_but_real_snapshot_changes_hash) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.005s
+
+OK
+GROUP_SUMMARY {"ids": ["test_financial_features.FeatureInputHashTests.test_hash_is_sensitive_to_each_runtime_and_version_dependency", "test_financial_features.FeatureInputHashTests.test_hash_matches_the_exact_declared_canonical_payload", "test_financial_features.FeatureInputHashTests.test_hash_rejects_nan_instead_of_serializing_it", "test_financial_features.FeatureInputHashTests.test_mapping_v2_fact_is_consumed_by_the_feature_bundle", "test_financial_features.FeatureInputHashTests.test_omitted_statement_key_equals_explicit_null_but_real_snapshot_changes_hash"], "passed": ["test_financial_features.FeatureInputHashTests.test_hash_is_sensitive_to_each_runtime_and_version_dependency", "test_financial_features.FeatureInputHashTests.test_hash_matches_the_exact_declared_canonical_payload", "test_financial_features.FeatureInputHashTests.test_hash_rejects_nan_instead_of_serializing_it", "test_financial_features.FeatureInputHashTests.test_mapping_v2_fact_is_consumed_by_the_feature_bundle", "test_financial_features.FeatureInputHashTests.test_omitted_statement_key_equals_explicit_null_but_real_snapshot_changes_hash"], "tests_run": 5, "failures": 0, "errors": 0, "skipped": 0}

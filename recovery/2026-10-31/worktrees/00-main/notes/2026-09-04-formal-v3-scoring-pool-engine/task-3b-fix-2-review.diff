@@ -1,0 +1,98 @@
+# Task3B fix round2 scoped review
+
+No commits. Round1 baseline production b3bede39fe332ba9eb27ef8272207717705e5d2ab74b918db1a7f73d20ed6b18 / tests72469344b328b62c04d67523915b211f4d51423c94bd0ec667cf2a02da6c3392. Exact retained snapshots independently hash matched.
+Round2 production7de79034bbbec7147768fac3f58b07d0ea54be4d4ba9fac291f08eebb12953d5 / tests486c3a9f6c98c1f1e24e3f1fefb6144db8aca06ff15e73bcc7caf46f93c58ce5.
+Only remaining finding: ordinary class __bases__ reassignment removes the dispatch guard. Check narrow fix plus new breakage only; no upstream changes or arithmetic edits.
+
+diff --git a/ashare_pipeline/formal_scoring.py b/ashare_pipeline/formal_scoring.py
+index 89b6708..b9da4a7 100644
+--- a/ashare_pipeline/formal_scoring.py
++++ b/ashare_pipeline/formal_scoring.py
+@@ -307,31 +307,31 @@ def _install_pre_policy_scoring():
+         return payload
+ 
+     def proof_record(proof):
+         dependencies()
+         record = proofs.get(id(proof))
+         if type(proof) is not proof_type or record is None or record[0]() is not proof:
+             raise ValueError("pre-policy score proof is forged, copied or unregistered")
+         verify_source(record[3], record[4])
+         return record
+ 
+     class ProofMeta(type):
+         def __setattr__(cls, name, value):
+-            if name == "__getattribute__":
+-                raise TypeError("pre-policy proof attribute-resolution guard cannot be replaced")
++            if name in ("__getattribute__", "__bases__"):
++                raise TypeError("pre-policy proof attribute-resolution guard or inheritance cannot be replaced")
+             return super().__setattr__(name, value)
+ 
+         def __delattr__(cls, name):
+-            if name == "__getattribute__":
+-                raise TypeError("pre-policy proof attribute-resolution guard cannot be removed")
++            if name in ("__getattribute__", "__bases__"):
++                raise TypeError("pre-policy proof attribute-resolution guard or inheritance cannot be removed")
+             return super().__delattr__(name)
+ 
+     class Proof(metaclass=ProofMeta):
+         __slots__ = ("__weakref__",)
+ 
+         def __init__(self, *args, **kwargs):
+             raise TypeError("pre-policy score proofs require a genuine complete FormalScoreInput")
+ 
+         def __getattribute__(self, name):
+             proof_record(self)
+             return object.__getattribute__(self, name)
+ 
+
+diff --git a/tests/test_formal_scoring.py b/tests/test_formal_scoring.py
+index f3a76c6..a41971f 100644
+--- a/tests/test_formal_scoring.py
++++ b/tests/test_formal_scoring.py
+@@ -176,24 +176,45 @@ class ProofDispatchGuardTests(unittest.TestCase):
+         for owner in (proof_type, proof_type.__mro__[1]):
+             replacement = patch.object(owner, "__getattribute__",
+                 lambda self, name: Decimal("99"), create=True)
+             try:
+                 with self.subTest(owner=owner.__name__), self.assertRaises(TypeError):
+                     replacement.start()
+             finally:
+                 replacement.stop()
+         forged = object.__new__(proof_type)
+         with self.assertRaisesRegex(ValueError, "forged, copied or unregistered"):
+             _ = forged.S0
+ 
++    def test_attribute_resolution_guard_cannot_be_removed_by_replacing_inheritance(self):
++        api = self.api()
++        proof_type = api.PrePolicyScoreCalculation
++        forged = object.__new__(proof_type)
++        original_bases = proof_type.__bases__
++
++        class AlternateBase:
++            __slots__ = ("__weakref__",)
++
++            def __getattribute__(self, name):
++                return Decimal("99")
++
++        try:
++            with self.assertRaises(TypeError):
++                proof_type.__bases__ = (AlternateBase,)
++        finally:
++            if proof_type.__bases__ != original_bases:
++                proof_type.__bases__ = original_bases
++        with self.assertRaisesRegex(ValueError, "forged, copied or unregistered"):
++            _ = forged.S0
++
+ 
+ class AuthenticatedPrePolicyScoringTests(unittest.TestCase):
+     def api(self):
+         return importlib.import_module("ashare_pipeline.formal_scoring")
+ 
+     def build_input(self, fixture):
+         from ashare_pipeline.formal_score_inputs import FormalScoreInputRepository
+         repository = FormalScoreInputRepository(fixture.feature_repository, fixture.context,
+             registry_signature_verifier=fixture.verifier)
+         batch = repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
+         return batch, batch.input_for(FOCAL)
+ 
+

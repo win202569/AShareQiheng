@@ -1,0 +1,165 @@
+# Task 2C fix round 2 — exact scoped review
+
+Base: reviewed round1 source engine F9F26193CF82B31073EB6FE2AE999871CA1BCC2F59184522BA6EB1A05FD64EC2 and original round1 guard test file, reconstructed from retained complete review artifacts with all patch contexts asserted. HEAD remains dbf075d; no commit/index changes. Current engine 49116DC11DA73E2D7ECE843A38FD6B2EC197E47560EBEB7AC1169BDC09206C91; current guard tests 1AA151CDE32E603B32A232DE4F9A839C5340662105FF02A1F5E7B926DCF20965.
+
+ashare_pipeline/formal_metric_engine.py: +3 -2
+tests/test_formal_metric_batch_guard.py: +66 -0
+
+diff --git a/ashare_pipeline/formal_metric_engine.py b/ashare_pipeline/formal_metric_engine.py
+--- a/ashare_pipeline/formal_metric_engine.py
++++ b/ashare_pipeline/formal_metric_engine.py
+@@ -352,21 +352,22 @@
+             if scope is None:
+                 reason = "peer_count_below_20"
+         payload = dict(schema_version="formal-metric-peer-context-v1", batch_hash=data["batch_hash"],
+             registry_manifest_hash=data["registry_manifest_hash"], frozen_input_hash=data["frozen_input_hash"],
+             universe_hash=data["universe_hash"], metric_id=metric_id, security_id=security_id,
+             definition_hash=focal.definition_hash, direction=focal.direction, scope=scope,
+             peer_security_ids=peers, peer_count=len(peers), reason=reason)
+         payload["cohort_hash"] = digest(dict(batch_hash=data["batch_hash"], metric_id=metric_id,
+             definition_hash=focal.definition_hash, direction=focal.direction, scope=scope, peer_security_ids=peers))
+         payload["context_hash"] = digest(payload)
+-        result = mint(MetricPeerContext, payload, attributes=dict(peer_security_ids=peers), private=weakref.ref(batch))
++        result = mint(MetricPeerContext, payload, attributes=dict(peer_security_ids=peers), private=weakref.ref(batch),
++            publication=record(batch, MetricInputBatch)[4])
+         private["contexts"][key] = result
+         return result
+ 
+     def score(batch, context):
+         batch_record = record(batch, MetricInputBatch)
+         context_record = record(context, MetricPeerContext)
+         if context_record[3]() is not batch:
+             raise ValueError("metric peer context belongs to another complete batch")
+         c, private = context_record[1], batch_record[3]
+         if c["reason"] is not None:
+@@ -389,21 +390,21 @@
+                     first = last
+             private["ranks"][cohort] = ranks
+         focal = private["index"][(c["security_id"], c["metric_id"])]
+         rank, percentile = private["ranks"][cohort][focal.raw_value]
+         payload = dict(schema_version="formal-metric-score-v1", batch_hash=batch.batch_hash,
+             registry_manifest_hash=batch.registry_manifest_hash, frozen_input_hash=batch.frozen_input_hash,
+             universe_hash=batch.universe_hash, metric_id=focal.metric_id, security_id=focal.security_id,
+             definition_hash=focal.definition_hash, input_hash=focal.input_hash, raw_value=focal.raw_value,
+             average_rank=rank, percentile=percentile, peer_count=c["peer_count"], peer_context=context.to_dict())
+         payload["score_hash"] = digest(payload)
+-        return mint(MetricScore, payload, attributes=dict(peer_context=context))
++        return mint(MetricScore, payload, attributes=dict(peer_context=context), publication=batch_record[4])
+ 
+     return FormalMetricInputRepository, MetricInput, MetricInputBatch, MetricPeerContext, MetricScore, eligible, peer_context, score
+ 
+ 
+ (FormalMetricInputRepository, MetricInput, MetricInputBatch, MetricPeerContext, MetricScore,
+  metric_peer_eligible, build_metric_peer_context, score_metric_percentile) = _install_engine()
+ del _install_engine
+ 
+ __all__ = ["FormalMetricInputRepository", "MetricInput", "MetricInputBatch", "MetricPeerContext", "MetricScore",
+     "metric_peer_eligible", "build_metric_peer_context", "score_metric_percentile", "percentile_rank"]
+
+diff --git a/tests/test_formal_metric_batch_guard.py b/tests/test_formal_metric_batch_guard.py
+--- a/tests/test_formal_metric_batch_guard.py
++++ b/tests/test_formal_metric_batch_guard.py
+@@ -1,16 +1,17 @@
+ """Review regressions for complete-read interval, exact identity and ownership."""
+ 
+ import gc
+ import copy
+ import importlib
+ from dataclasses import replace
++from decimal import Decimal
+ import sqlite3
+ import sys
+ import unittest
+ import weakref
+ 
+ from tests.formal_metric_feature_fixtures import FinancialFixture, METRICS
+ from tests.formal_metric_fixtures import FREEZE
+ from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
+ 
+ 
+@@ -187,20 +188,85 @@
+                     repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
+             finally:
+                 sys.setprofile(previous)
+             self.assertEqual(len(captured), 1)
+             with self.assertRaises(ValueError):
+                 captured[0].require_verified()
+             fixture.set_generation("SH600099", "recovered-publication")
+             repo.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],)).require_verified()
+ 
+ 
++class DerivedProofPublicationTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture = FinancialFixture(population=True)
++        cls.addClassCleanup(cls.fixture.close)
++        # Genuine complete population with one independently controlled selected
++        # FY2025 metric; every source/industry/feature receipt is persisted.
++        for index, member in enumerate(cls.fixture.industry["memberships"]):
++            sid = member["security_id"]
++            cls.fixture.put_industry(sid)
++            cls.fixture.put_financial(sid, {METRICS[0]: index - 1})
++            cls.fixture.persist_features(sid)
++        cls.api = importlib.import_module("ashare_pipeline.formal_metric_engine")
++        cls.repo = cls.api.FormalMetricInputRepository(cls.fixture.feature_repository, cls.fixture.context,
++            registry_signature_verifier=cls.fixture.verifier)
++
++    def build(self):
++        return self.repo.build_batch(self.fixture.frozen.frozen_input_hash,
++            scoring_registry=self.fixture.scoring, metric_ids=(METRICS[0],))
++
++    def test_failed_finalization_revokes_derived_context_and_actual_score(self):
++        captured = []
++        snapshot = self.fixture.provider.resolve_current_inputs(security_id="BJ430001", as_of_utc=FREEZE,
++            template_id="general_nonfinancial", registry_manifest_hash=self.fixture.bundle.manifest.manifest_hash)
++        def profile(frame, event, result):
++            if (event == "return" and type(result) is self.api.MetricInputBatch and frame.f_back is not None
++                    and frame.f_back.f_code.co_name == "finalize" and not captured):
++                context = self.api.build_metric_peer_context(result, security_id="BJ430001", metric_id=METRICS[0])
++                score = self.api.score_metric_percentile(result, context)
++                self.assertEqual((context.peer_count, score.percentile), (20, Decimal("2.5")))
++                captured.extend((result, context, score))
++                with self.assertRaises(ValueError):
++                    self.fixture.provider.publish(replace(snapshot, batch_id="revoked-publication"))
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            with self.assertRaisesRegex(ValueError, "changed during complete batch finalization"):
++                self.build()
++        finally:
++            sys.setprofile(previous)
++        self.assertEqual(len(captured), 3)
++        for proof in captured:
++            for method in ("require_verified", "canonical_bytes", "to_dict"):
++                with self.subTest(proof=type(proof).__name__, method=method), self.assertRaises(ValueError):
++                    getattr(proof, method)()
++
++    def test_successful_detached_context_score_and_cohort_cache_remain_valid(self):
++        batch = self.build()
++        context = self.api.build_metric_peer_context(batch, security_id="BJ430001", metric_id=METRICS[0])
++        other = self.api.build_metric_peer_context(batch, security_id="SH600000", metric_id=METRICS[0])
++        self.assertIs(context, self.api.build_metric_peer_context(batch, security_id="BJ430001", metric_id=METRICS[0]))
++        self.assertIs(context.peer_security_ids, other.peer_security_ids)
++        score = self.api.score_metric_percentile(batch, context)
++        self.assertEqual((score.peer_count, score.percentile), (20, Decimal("2.5")))
++        context_bytes, score_bytes = context.canonical_bytes(), score.canonical_bytes()
++        owner = weakref.ref(batch)
++        del batch
++        gc.collect()
++        self.assertIsNone(owner())
++        for proof, canonical in ((context, context_bytes), (score, score_bytes)):
++            proof.require_verified()
++            self.assertEqual(proof.canonical_bytes(), canonical)
++            self.assertEqual(proof.to_dict()["security_id"], "BJ430001")
++
++
+ class OwnedProviderGuardTests(unittest.TestCase):
+     def setUp(self):
+         self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_metric_batch_guard"), "owned batch guard is missing")
+         self.api = importlib.import_module("ashare_pipeline.formal_metric_batch_guard")
+         self.fixture = FinancialFixture(missing_memberships=True)
+         self.addCleanup(self.fixture.close)
+         self.provider = self.api.FormalMetricCurrentInputProvider(self.fixture.store)
+ 
+     def test_published_complete_inputs_are_detached_and_unknown_requests_fail(self):
+         request = dict(security_id="BJ430001", as_of_utc=FREEZE, template_id="general_nonfinancial",

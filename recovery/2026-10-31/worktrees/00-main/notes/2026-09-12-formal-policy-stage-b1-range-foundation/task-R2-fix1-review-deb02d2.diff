@@ -1,0 +1,1083 @@
+# R2 fix round 1
+Fix base: 38644671691e244164c267b07732d9756a06142e
+Head: deb02d287e03442002d6e6182e4a68e033c74e01
+Scope: ashare_pipeline/formal_range_request.py ashare_pipeline/formal_range_source.py ashare_pipeline/formal_range_contract.py ashare_pipeline/formal_sources.py tests/formal_range_fixtures.py tests/test_formal_range_source.py
+
+deb02d2 fix: seal range minting parsing and same-root execution
+ ashare_pipeline/formal_range_contract.py |  27 +++
+ ashare_pipeline/formal_range_request.py  | 136 +-------------
+ ashare_pipeline/formal_range_source.py   | 311 ++++++++++++++++++++++++++-----
+ ashare_pipeline/formal_sources.py        |  51 ++---
+ tests/test_formal_range_source.py        | 158 ++++++++++++++++
+ 5 files changed, 467 insertions(+), 216 deletions(-)
+diff --git a/ashare_pipeline/formal_range_contract.py b/ashare_pipeline/formal_range_contract.py
+index bf4c9bc..8637515 100644
+--- a/ashare_pipeline/formal_range_contract.py
++++ b/ashare_pipeline/formal_range_contract.py
+@@ -503,17 +503,44 @@ def _build_range_bindings_contract():
+         )
+         return result
+ 
+     return RangeBinding, RangeBindings, load_policy_range_bindings
+ 
+ 
+ RangeBinding, RangeBindings, load_policy_range_bindings = _build_range_bindings_contract()
+ del _build_range_bindings_contract
+ 
+ 
++def _make_range_binding_authority():
++    """Expose immutable genuine anchors to the range source during module init."""
++
++    binding_type = RangeBinding
++    require_current = RangeBinding.require_current
++    calendar_config_get = RangeBinding.calendar_config.fget
++    manifest_hash_get = RangeBinding.registry_manifest_hash.fget
++    source_hash_get = RangeBinding.source_registry_hash.fget
++    assert calendar_config_get is not None and manifest_hash_get is not None
++    assert source_hash_get is not None
++
++    def authority():
++        return (
++            binding_type,
++            require_current,
++            calendar_config_get,
++            manifest_hash_get,
++            source_hash_get,
++        )
++
++    return authority
++
++
++_range_binding_authority = _make_range_binding_authority()
++del _make_range_binding_authority
++
++
+ __all__ = [
+     "RangeBinding",
+     "RangeBindings",
+     "RangeConfig",
+     "load_policy_range_bindings",
+     "parse_range_entry",
+ ]
+diff --git a/ashare_pipeline/formal_range_request.py b/ashare_pipeline/formal_range_request.py
+index d5984ea..a27b290 100644
+--- a/ashare_pipeline/formal_range_request.py
++++ b/ashare_pipeline/formal_range_request.py
+@@ -1,137 +1,5 @@
+-"""Pure sealed identity for Formal V3 range requests.
+-
+-This module depends only on the pure range format and the standard library so
+-source and contract modules can both capture its authority without import cycles.
+-"""
+-
+-from __future__ import annotations
+-
+-from dataclasses import dataclass
+-import hashlib
+-import re
+-import weakref
+-
+-from .formal_range_format import _canonical
+-
+-
+-_HASH = re.compile(r"^[0-9a-f]{64}$")
+-_FIELDS = (
+-    "schema_version", "kind", "source", "dataset", "security_id", "exchange",
+-    "as_of_utc", "start_date", "end_date", "anchor_descriptor_id",
+-    "calendar_descriptor_id", "range_config_id", "registry_manifest_hash",
+-    "page_index", "calendar_coverage_hash",
+-)
+-
+-
+-def _build_authority():
+-    @dataclass(frozen=True)
+-    class _Record:
+-        reference: weakref.ReferenceType[object]
+-        wire: dict[str, object]
+-        fingerprint: str
+-        config_wire: dict[str, object]
+-        source_registry_hash: str
+-        root_guard: object
+-
+-    records: dict[int, _Record] = {}
+-
+-    @dataclass(frozen=True, init=False)
+-    class FormalRangeRequestV1:
+-        schema_version: str
+-        kind: str
+-        source: str
+-        dataset: str
+-        security_id: str | None
+-        exchange: str
+-        as_of_utc: str
+-        start_date: str
+-        end_date: str
+-        anchor_descriptor_id: str
+-        calendar_descriptor_id: str
+-        range_config_id: str
+-        registry_manifest_hash: str
+-        page_index: int
+-        calendar_coverage_hash: str | None
+-
+-        def __init__(self, *_args: object, **_kwargs: object) -> None:
+-            raise ValueError("FormalRangeRequestV1 cannot be externally constructed")
+-
+-        def to_dict(self) -> dict[str, object]:
+-            return dict(_record(self).wire)
+-
+-        @property
+-        def request_fingerprint(self) -> str:
+-            return _record(self).fingerprint
+-
+-        def __copy__(self):
+-            raise TypeError("formal range requests cannot be copied")
+-
+-        def __deepcopy__(self, _memo):
+-            raise TypeError("formal range requests cannot be copied")
+-
+-    def _record(request: object) -> _Record:
+-        record = records.get(id(request))
+-        if type(request) is not FormalRangeRequestV1 or record is None or record.reference() is not request:
+-            raise ValueError("formal range request is forged, copied, or unregistered")
+-        current = {field: object.__getattribute__(request, field) for field in _FIELDS}
+-        if current != record.wire or hashlib.sha256(_canonical(current)).hexdigest() != record.fingerprint:
+-            raise ValueError("formal range request fields changed")
+-        guard = record.root_guard
+-        if not callable(guard) or guard() is not True:
+-            raise ValueError("formal range request root is no longer current")
+-        return record
+-
+-    def mint(wire: dict[str, object], config_wire: dict[str, object], *,
+-             source_registry_hash: str, root_guard):
+-        if type(wire) is not dict or set(wire) != set(_FIELDS):
+-            raise ValueError("range request has unknown or missing fields")
+-        if wire["schema_version"] != "formal-range-request-v1":
+-            raise ValueError("range request schema_version is invalid")
+-        if wire["kind"] != "calendar_range" or wire["security_id"] is not None:
+-            raise ValueError("R2 can mint only calendar range requests")
+-        if wire["calendar_coverage_hash"] is not None or wire["page_index"] != 1:
+-            raise ValueError("first calendar request identity is invalid")
+-        for field in ("anchor_descriptor_id", "calendar_descriptor_id", "range_config_id",
+-                      "registry_manifest_hash"):
+-            if type(wire[field]) is not str or _HASH.fullmatch(wire[field]) is None:
+-                raise ValueError(f"range request {field} is invalid")
+-        if type(source_registry_hash) is not str or _HASH.fullmatch(source_registry_hash) is None:
+-            raise ValueError("range request private source_registry_hash is invalid")
+-        expected = {
+-            "kind": config_wire.get("kind"), "source": config_wire.get("source"),
+-            "dataset": config_wire.get("dataset"), "exchange": config_wire.get("exchange_scope"),
+-            "anchor_descriptor_id": config_wire.get("anchor_descriptor_id"),
+-            "calendar_descriptor_id": config_wire.get("calendar_descriptor_id"),
+-        }
+-        if any(type(wire[key]) is not type(value) or wire[key] != value
+-               for key, value in expected.items()):
+-            raise ValueError("range request differs from its sealed config")
+-        if not callable(root_guard) or root_guard() is not True:
+-            raise ValueError("range request requires a current root guard")
+-        request = object.__new__(FormalRangeRequestV1)
+-        for field in _FIELDS:
+-            object.__setattr__(request, field, wire[field])
+-        identity = id(request)
+-        def forget(reference, *, identity=identity):
+-            existing = records.get(identity)
+-            if existing is not None and existing.reference is reference:
+-                records.pop(identity, None)
+-        fingerprint = hashlib.sha256(_canonical(wire)).hexdigest()
+-        records[identity] = _Record(
+-            weakref.ref(request, forget), dict(wire), fingerprint, dict(config_wire),
+-            source_registry_hash, root_guard
+-        )
+-        return request
+-
+-    def snapshot(request: object) -> tuple[dict[str, object], dict[str, object], str]:
+-        record = _record(request)
+-        return dict(record.wire), dict(record.config_wire), record.source_registry_hash
+-
+-    return FormalRangeRequestV1, mint, snapshot
+-
+-
+-FormalRangeRequestV1, _mint_range_request, _trusted_range_request_snapshot = _build_authority()
+-del _build_authority
++"""Compatibility import for the range-source-owned authenticated request type."""
+ 
++from .formal_range_source import FormalRangeRequestV1
+ 
+ __all__ = ["FormalRangeRequestV1"]
+diff --git a/ashare_pipeline/formal_range_source.py b/ashare_pipeline/formal_range_source.py
+index daec254..99b3497 100644
+--- a/ashare_pipeline/formal_range_source.py
++++ b/ashare_pipeline/formal_range_source.py
+@@ -6,25 +6,20 @@ from collections.abc import Mapping
+ from dataclasses import dataclass
+ from datetime import date, datetime, timedelta, timezone
+ import hashlib
+ import json
+ import math
+ import re
+ from types import MappingProxyType, MethodType
+ import weakref
+ 
+ from .formal_range_format import RangeConfig, _canonical, _range_config_to_dict
+-from .formal_range_request import (
+-    FormalRangeRequestV1,
+-    _mint_range_request,
+-    _trusted_range_request_snapshot,
+-)
+ from .formal_time import FORMAL_FREEZE_AT_CN
+ 
+ 
+ _HASH = re.compile(r"^[0-9a-f]{64}$")
+ _SECURITY = re.compile(r"^(?:SH|SZ|BJ)[0-9]{6}$")
+ _REQUEST_FIELDS = (
+     "schema_version", "kind", "source", "dataset", "security_id", "exchange",
+     "as_of_utc", "start_date", "end_date", "anchor_descriptor_id",
+     "calendar_descriptor_id", "range_config_id", "registry_manifest_hash",
+     "page_index", "calendar_coverage_hash",
+@@ -136,22 +131,242 @@ def _freeze_json(value: object, *, label: str = "JSON value") -> object:
+ 
+ 
+ from .formal_sources import (
+     FormalOfficialSourceAdapter,
+     FormalRetryableSourceError,
+     FormalSourceBlocked,
+     FormalTerminalSourceError,
+     TransportRequest,
+     TransportResponse,
+     _https_host,
++    _range_registry_authority,
+ )
+-from .formal_range_contract import RangeBinding
++from .formal_range_contract import _range_binding_authority
++
++
++(
++    SignedSourceRegistry,
++    _require_source_registry,
++    _trusted_range_config_snapshots,
++) = _range_registry_authority()
++(
++    RangeBinding,
++    _require_range_binding,
++    _calendar_config_get,
++    _manifest_hash_get,
++    _source_hash_get,
++) = _range_binding_authority()
++
++
++def _build_request_authority():
++    """Own request minting beside eagerly captured genuine binding authority."""
++
++    @dataclass(frozen=True)
++    class _RequestRecord:
++        reference: weakref.ReferenceType[object]
++        binding: object
++        wire: dict[str, object]
++        fingerprint: str
++        config_wire: dict[str, object]
++        source_registry_hash: str
++
++    records: dict[int, _RequestRecord] = {}
++
++    @dataclass(frozen=True, init=False)
++    class FormalRangeRequestV1:
++        schema_version: str
++        kind: str
++        source: str
++        dataset: str
++        security_id: str | None
++        exchange: str
++        as_of_utc: str
++        start_date: str
++        end_date: str
++        anchor_descriptor_id: str
++        calendar_descriptor_id: str
++        range_config_id: str
++        registry_manifest_hash: str
++        page_index: int
++        calendar_coverage_hash: str | None
++
++        def __init__(self, *_args: object, **_kwargs: object) -> None:
++            raise ValueError("FormalRangeRequestV1 cannot be externally constructed")
++
++        def to_dict(self) -> dict[str, object]:
++            return dict(request_record(self).wire)
++
++        @property
++        def request_fingerprint(self) -> str:
++            return request_record(self).fingerprint
++
++        def __copy__(self):
++            raise TypeError("formal range requests cannot be copied")
++
++        def __deepcopy__(self, _memo):
++            raise TypeError("formal range requests cannot be copied")
++
++    def request_record(request: object) -> _RequestRecord:
++        record = records.get(id(request))
++        if (
++            type(request) is not FormalRangeRequestV1
++            or record is None
++            or record.reference() is not request
++        ):
++            raise ValueError("formal range request is forged, copied, or unregistered")
++        current = {
++            field: object.__getattribute__(request, field) for field in _REQUEST_FIELDS
++        }
++        if (
++            any(
++                type(current[field]) is not type(record.wire[field])
++                or current[field] != record.wire[field]
++                for field in _REQUEST_FIELDS
++            )
++            or hashlib.sha256(_canonical(current)).hexdigest() != record.fingerprint
++        ):
++            raise ValueError("formal range request fields changed")
++        _require_range_binding(record.binding)
++        config = _calendar_config_get(record.binding)
++        if (
++            type(config) is not RangeConfig
++            or _range_config_to_dict(config) != record.config_wire
++            or _manifest_hash_get(record.binding) != record.wire["registry_manifest_hash"]
++            or _source_hash_get(record.binding) != record.source_registry_hash
++        ):
++            raise ValueError("formal range request binding, root, or config changed")
++        return record
++
++    def mint_first_calendar(binding: object, as_of_utc: object) -> FormalRangeRequestV1:
++        if type(binding) is not RangeBinding:
++            raise ValueError("range request requires an exact genuine RangeBinding")
++        _require_range_binding(binding)
++        parsed = _aware(as_of_utc, "as_of_utc")
++        if (
++            type(as_of_utc) is not str
++            or as_of_utc != _FREEZE_UTC
++            or parsed != datetime.fromisoformat(_FREEZE_UTC)
++        ):
++            raise ValueError("calendar request as_of_utc must equal the formal freeze in UTC")
++        config = _calendar_config_get(binding)
++        if type(config) is not RangeConfig or config.kind != "calendar_range":
++            raise ValueError("range binding calendar config is invalid")
++        start, end = backward_interval(
++            parsed.date().isoformat(), config.max_calendar_days_per_request
++        )
++        wire = {
++            "schema_version": "formal-range-request-v1",
++            "kind": "calendar_range",
++            "source": config.source,
++            "dataset": config.dataset,
++            "security_id": None,
++            "exchange": config.exchange_scope,
++            "as_of_utc": as_of_utc,
++            "start_date": start,
++            "end_date": end,
++            "anchor_descriptor_id": config.anchor_descriptor_id,
++            "calendar_descriptor_id": config.calendar_descriptor_id,
++            "range_config_id": config.entry_id,
++            "registry_manifest_hash": _manifest_hash_get(binding),
++            "page_index": 1,
++            "calendar_coverage_hash": None,
++        }
++        if type(wire["page_index"]) is not int or wire["page_index"] != 1:
++            raise ValueError("first calendar request page must be exact integer one")
++        if _date(wire["start_date"], "request start_date") > _date(
++            wire["end_date"], "request end_date"
++        ) or wire["end_date"] != parsed.date().isoformat():
++            raise ValueError("first calendar request interval is invalid")
++        request = object.__new__(FormalRangeRequestV1)
++        for field in _REQUEST_FIELDS:
++            object.__setattr__(request, field, wire[field])
++        identity = id(request)
++
++        def forget(reference, *, identity=identity):
++            existing = records.get(identity)
++            if existing is not None and existing.reference is reference:
++                records.pop(identity, None)
++
++        fingerprint = hashlib.sha256(_canonical(wire)).hexdigest()
++        records[identity] = _RequestRecord(
++            weakref.ref(request, forget),
++            binding,
++            dict(wire),
++            fingerprint,
++            _range_config_to_dict(config),
++            _source_hash_get(binding),
++        )
++        request_record(request)
++        return request
++
++    def snapshot(request: object) -> tuple[dict[str, object], dict[str, object], str]:
++        record = request_record(request)
++        return dict(record.wire), dict(record.config_wire), record.source_registry_hash
++
++    return FormalRangeRequestV1, mint_first_calendar, snapshot
++
++
++(
++    FormalRangeRequestV1,
++    _mint_first_calendar_request,
++    _trusted_range_request_snapshot,
++) = _build_request_authority()
++del _build_request_authority
++
++
++def _build_select_range():
++    """Build the genuine registry method from source-owned request authority."""
++
++    request_type = FormalRangeRequestV1
++    request_snapshot = _trusted_range_request_snapshot
++    registry_type = SignedSourceRegistry
++    require_registry = _require_source_registry
++    trusted_configs = _trusted_range_config_snapshots
++    config_to_dict = _range_config_to_dict
++
++    def select_range(self, request) -> RangeConfig:
++        try:
++            if type(self) is not registry_type:
++                raise ValueError("range selection requires an exact genuine registry")
++            require_registry(self)
++            if type(request) is not request_type:
++                raise ValueError("range request must have exact genuine type")
++            wire, sealed_config, source_registry_hash = request_snapshot(request)
++            if source_registry_hash != self.registry_hash:
++                raise ValueError("range request source registry differs from this registry")
++            matches = [
++                config
++                for config in trusted_configs(self)
++                if config.kind == wire["kind"]
++                and config.source == wire["source"]
++                and config.dataset == wire["dataset"]
++                and config.exchange_scope == wire["exchange"]
++                and config.entry_id == wire["range_config_id"]
++                and config.anchor_descriptor_id == wire["anchor_descriptor_id"]
++                and config.calendar_descriptor_id == wire["calendar_descriptor_id"]
++            ]
++            if len(matches) != 1 or config_to_dict(matches[0]) != sealed_config:
++                raise ValueError(
++                    "signed range config is absent, ambiguous, or differs from request"
++                )
++            return matches[0]
++        except FormalTerminalSourceError:
++            raise
++        except ValueError as error:
++            raise FormalTerminalSourceError(str(error)) from error
++
++    return select_range
++
++
++_sealed_select_range = _build_select_range()
++SignedSourceRegistry.select_range = _sealed_select_range
++del _sealed_select_range, _build_select_range
+ 
+ 
+ _snapshot_transport_response = FormalOfficialSourceAdapter._snapshot_response
+ _classify_transport_response = FormalOfficialSourceAdapter._classify_response
+ 
+ 
+ def _callable_anchor(owner: object, name: str) -> tuple[object, object | None]:
+     value = getattr(owner, name, None)
+     if not callable(value):
+         raise ValueError(f"range implementation {name} method is absent")
+@@ -342,21 +557,29 @@ def _build_fetch_type():
+             "pagination_evidence", "record_count", "page_record_count", "page_count",
+             "__weakref__",
+         )
+ 
+         def __init__(self, *_args: object, **_kwargs: object) -> None:
+             raise ValueError("RangeFetch cannot be externally constructed")
+ 
+         def _require(self):
+             record = records.get(id(self))
+             current = tuple(object.__getattribute__(self, field) for field in self.__slots__[:-1])
+-            if record is None or record.reference() is not self or current != record.fields:
++            if (
++                record is None
++                or record.reference() is not self
++                or len(current) != len(record.fields)
++                or any(
++                    type(value) is not type(sealed) or value != sealed
++                    for value, sealed in zip(current, record.fields)
++                )
++            ):
+                 raise ValueError("range fetch is forged or changed")
+             return record
+ 
+         def to_manifest(self) -> dict[str, object]:
+             self._require()
+             return {
+                 "schema_version": "formal-range-fetch-manifest-v1",
+                 "request_fingerprint": self.request_fingerprint,
+                 "range_config_id": self.range_config_id,
+                 "registry_manifest_hash": self.registry_manifest_hash,
+@@ -408,26 +631,26 @@ def _build_fetch_type():
+         return result
+ 
+     return RangeFetch, mint
+ 
+ 
+ RangeFetch, _mint_fetch = _build_fetch_type()
+ del _build_fetch_type
+ 
+ 
+ def _build_source_type():
+-    require_binding = RangeBinding.require_current
+-    calendar_config_get = RangeBinding.calendar_config.fget
+-    source_hash_get = RangeBinding.source_registry_hash.fget
+-    manifest_hash_get = RangeBinding.registry_manifest_hash.fget
+-    assert calendar_config_get is not None and source_hash_get is not None
+-    assert manifest_hash_get is not None
++    require_binding = _require_range_binding
++    calendar_config_get = _calendar_config_get
++    source_hash_get = _source_hash_get
++    manifest_hash_get = _manifest_hash_get
++    mint_request = _mint_first_calendar_request
++    mint_fetch = _mint_fetch
+ 
+     @dataclass(frozen=True)
+     class _ImplementationRecord:
+         parser: object
+         normalizer: object
+         parser_anchor: tuple[object, object | None]
+         normalizer_anchor: tuple[object, object | None]
+ 
+     @dataclass(frozen=True)
+     class _SourceRecord:
+@@ -514,49 +737,23 @@ def _build_source_type():
+                 if records.get(identity) is not None and records[identity].reference is reference:
+                     records.pop(identity, None)
+             records[identity] = _SourceRecord(
+                 weakref.ref(self, forget), binding, transport, transport_anchor,
+                 implementations, items, selected, _range_config_to_dict(config),
+             )
+             source_record(self)
+ 
+         def first_calendar_request(self, as_of_utc: str) -> FormalRangeRequestV1:
+             record = source_record(self)
+-            parsed = _aware(as_of_utc, "as_of_utc")
+-            if as_of_utc != _FREEZE_UTC or parsed != datetime.fromisoformat(_FREEZE_UTC):
+-                raise ValueError("calendar request as_of_utc must equal the formal freeze in UTC")
+-            config = calendar_config_get(record.binding)
+-            start, end = backward_interval(parsed.date().isoformat(), config.max_calendar_days_per_request)
+-            config = calendar_config_get(record.binding)
+-            wire = {
+-                "schema_version": "formal-range-request-v1", "kind": "calendar_range",
+-                "source": config.source, "dataset": config.dataset, "security_id": None,
+-                "exchange": config.exchange_scope, "as_of_utc": as_of_utc,
+-                "start_date": start, "end_date": end,
+-                "anchor_descriptor_id": config.anchor_descriptor_id,
+-                "calendar_descriptor_id": config.calendar_descriptor_id,
+-                "range_config_id": config.entry_id,
+-                "registry_manifest_hash": manifest_hash_get(record.binding),
+-                "page_index": 1, "calendar_coverage_hash": None,
+-            }
+-            def root_guard():
+-                current = source_record(self)
+-                current_config = calendar_config_get(current.binding)
+-                return (
+-                    _range_config_to_dict(current_config) == current.config_wire
+-                    and source_hash_get(current.binding) == source_hash_get(record.binding)
+-                    and manifest_hash_get(current.binding) == wire["registry_manifest_hash"]
+-                )
+-            return _mint_range_request(
+-                wire, _range_config_to_dict(config),
+-                source_registry_hash=source_hash_get(record.binding), root_guard=root_guard
+-            )
++            request = mint_request(record.binding, as_of_utc)
++            source_record(self)
++            return request
+ 
+         @staticmethod
+         def _parse(record, request_wire, config, raw_bytes):
+             if type(raw_bytes) is not bytes:
+                 raise FormalTerminalSourceError("range raw_bytes must be exact bytes")
+             parser_request = dict(request_wire)
+             parser_config = _range_config_to_dict(config)
+             try:
+                 parsed = record.selected.parser.parse(
+                     raw_bytes, request=parser_request, config=dict(parser_config)
+@@ -596,55 +793,69 @@ def _build_source_type():
+                     raise FormalTerminalSourceError("single-response total differs from page rows")
+             elif wire["page_count"] > config.max_pages:
+                 raise FormalTerminalSourceError("range document pagination exceeds signed budget")
+             elif wire["pagination_evidence"] != "source_declared_numbered_pages_v1":
+                 raise FormalTerminalSourceError("numbered pagination lacks source declaration")
+             return document
+ 
+         def fetch_verified(self, request: FormalRangeRequestV1) -> RangeFetch:
+             record = source_record(self)
+             try:
+-                request_wire, request_config, _ = _trusted_range_request_snapshot(request)
++                request_wire, request_config, request_source_hash = (
++                    _trusted_range_request_snapshot(request)
++                )
+             except ValueError as error:
+                 raise FormalTerminalSourceError(str(error)) from error
+             config = calendar_config_get(record.binding)
+-            if request_config != record.config_wire or request_config != _range_config_to_dict(config):
++            if (
++                request_wire["registry_manifest_hash"] != manifest_hash_get(record.binding)
++                or request_source_hash != source_hash_get(record.binding)
++                or request_config != record.config_wire
++                or request_config != _range_config_to_dict(config)
++            ):
+                 raise FormalTerminalSourceError("range request config differs from sealed source")
+             sent = _transport_request(config, request_wire)
+             try:
+                 response = record.transport.send(sent)
+             except (FormalRetryableSourceError, FormalSourceBlocked):
+                 raise
+             except Exception as error:
+                 raise FormalRetryableSourceError("range transport failed") from error
+             source_record(self)
+             response = _snapshot_transport_response(response)
+             _classify_transport_response(response)
+             if _https_host(response.original_url, "range response original_url") != _https_host(
+                 config.endpoint_url, "signed range endpoint_url"
+             ):
+                 raise FormalTerminalSourceError("range response redirected outside the signed host")
+-            document = self._parse(record, request_wire, config, response.raw_bytes)
++            document = trusted_parse(record, request_wire, config, response.raw_bytes)
+             if document.to_dict()["captured_at_utc"] != response.captured_at_utc:
+                 raise FormalTerminalSourceError("document capture time differs from transport")
+             source_record(self)
+-            return _mint_fetch(request_wire, config, response, document)
++            return mint_fetch(request_wire, config, response, document)
+ 
+         def parse_verified_snapshot(self, request: FormalRangeRequestV1, *, raw_bytes: bytes,
+                                     manifest: dict) -> ParsedRangeDocumentV1:
+             record = source_record(self)
+             try:
+-                request_wire, request_config, _ = _trusted_range_request_snapshot(request)
++                request_wire, request_config, request_source_hash = (
++                    _trusted_range_request_snapshot(request)
++                )
+             except ValueError as error:
+                 raise FormalTerminalSourceError(str(error)) from error
+             config = calendar_config_get(record.binding)
+-            if request_config != record.config_wire or request_config != _range_config_to_dict(config):
++            if (
++                request_wire["registry_manifest_hash"] != manifest_hash_get(record.binding)
++                or request_source_hash != source_hash_get(record.binding)
++                or request_config != record.config_wire
++                or request_config != _range_config_to_dict(config)
++            ):
+                 raise FormalTerminalSourceError("range request config differs from sealed source")
+             expected_keys = frozenset({
+                 "schema_version", "request_fingerprint", "range_config_id",
+                 "registry_manifest_hash", "source", "dataset", "original_url",
+                 "content_sha256", "captured_at_utc", "parser_id", "parser_version",
+                 "mapping_version", "normalizer_version", "request_version",
+                 "published_at_utc", "published_precision", "source_updated_at_utc",
+                 "effective_at_utc", "effective_time_evidence_hash", "upstream_generation",
+                 "pagination_evidence", "record_count", "page_record_count", "page_count",
+             })
+@@ -666,33 +877,35 @@ def _build_source_type():
+                    for key, value in expected.items()):
+                 raise FormalTerminalSourceError("range manifest identity or content hash is invalid")
+             try:
+                 if _https_host(manifest["original_url"], "range manifest original_url") != _https_host(
+                     config.endpoint_url, "signed range endpoint_url"
+                 ):
+                     raise FormalTerminalSourceError("range manifest URL host is invalid")
+                 _aware(manifest["captured_at_utc"], "range manifest captured_at_utc")
+             except ValueError as error:
+                 raise FormalTerminalSourceError(str(error)) from error
+-            document = self._parse(record, request_wire, config, raw_bytes)
++            document = trusted_parse(record, request_wire, config, raw_bytes)
+             document_wire = document.to_dict()
+             for key in (
+                 "published_at_utc", "published_precision", "source_updated_at_utc",
+                 "effective_at_utc", "effective_time_evidence_hash", "upstream_generation",
+                 "pagination_evidence", "record_count", "page_record_count", "page_count",
+                 "captured_at_utc",
+             ):
+                 if type(manifest[key]) is not type(document_wire[key]) or manifest[key] != document_wire[key]:
+                     raise FormalTerminalSourceError("range manifest source version differs from parser")
+             return document
+ 
++    trusted_parse = FormalRangeSource._parse
+     return FormalRangeSource
+ 
+ 
+ FormalRangeSource = _build_source_type()
+ del _build_source_type
++del _mint_first_calendar_request, _mint_fetch
+ 
+ 
+ __all__ = [
+     "FormalRangeRequestV1", "FormalRangeSource", "ParsedRangeDocumentV1", "RangeFetch",
+     "backward_interval", "page_successor",
+ ]
+diff --git a/ashare_pipeline/formal_sources.py b/ashare_pipeline/formal_sources.py
+index cc9b6a3..0418994 100644
+--- a/ashare_pipeline/formal_sources.py
++++ b/ashare_pipeline/formal_sources.py
+@@ -12,25 +12,21 @@ from dataclasses import dataclass
+ from datetime import datetime
+ import hashlib
+ import json
+ import math
+ import re
+ from types import MappingProxyType
+ from typing import Literal, Protocol
+ import uuid
+ import weakref
+ 
+-from .formal_range_format import RangeConfig, parse_range_entry, _range_config_to_dict
+-from .formal_range_request import (
+-    FormalRangeRequestV1 as _FormalRangeRequestV1,
+-    _trusted_range_request_snapshot as _range_request_snapshot,
+-)
++from .formal_range_format import RangeConfig, parse_range_entry
+ from .formal_evidence import (
+     EvidenceVerification,
+     OfficialFetch,
+     OfficialRequest,
+     OfficialSnapshotRef,
+     SourcePolicy,
+     VerifiedCalendarBinding,
+     verify_official_fetch,
+ )
+ from .formal_time import FORMAL_FREEZE_AT_CN, resolve_effective_at
+@@ -601,23 +597,20 @@ def _make_signed_source_registry_type() -> type[object]:
+         "retry_base_seconds",
+         "retry_max_attempts",
+         "challenge_cooldown_seconds",
+         "registry_hash",
+         "exchange_scope",
+         "calendar_selector",
+         "bootstrap_calendar",
+     )
+     range_config_type = RangeConfig
+     parse_range_config = parse_range_entry
+-    range_request_type = _FormalRangeRequestV1
+-    range_request_snapshot = _range_request_snapshot
+-    range_config_to_dict = _range_config_to_dict
+     range_config_fields = (
+         "schema_version",
+         "capability",
+         "kind",
+         "anchor_descriptor_id",
+         "calendar_descriptor_id",
+         "source",
+         "dataset",
+         "endpoint_url",
+         "http_method",
+@@ -908,52 +901,44 @@ def _make_signed_source_registry_type() -> type[object]:
+             object.__setattr__(registry, "signature", signature_text)
+             object.__setattr__(registry, "key_id", key_text)
+             object.__setattr__(registry, "configs", configs)
+             object.__setattr__(registry, "range_configs", range_configs)
+             remember_verified(registry)
+             return registry
+ 
+         def select(self, request: OfficialRequest) -> SourceAdapterConfig:
+             return trusted_config_snapshot(self, request)
+ 
+-        def select_range(self, request) -> RangeConfig:
+-            try:
+-                if type(request) is not range_request_type:
+-                    raise ValueError("range request must have exact genuine type")
+-                wire, sealed_config, source_registry_hash = range_request_snapshot(request)
+-                if source_registry_hash != verified_record(self).registry_hash:
+-                    raise ValueError("range request source registry differs from this registry")
+-                matches = [
+-                    config for config in trusted_range_config_snapshots(self)
+-                    if config.kind == wire["kind"]
+-                    and config.source == wire["source"]
+-                    and config.dataset == wire["dataset"]
+-                    and config.exchange_scope == wire["exchange"]
+-                    and config.entry_id == wire["range_config_id"]
+-                    and config.anchor_descriptor_id == wire["anchor_descriptor_id"]
+-                    and config.calendar_descriptor_id == wire["calendar_descriptor_id"]
+-                ]
+-                if len(matches) != 1 or range_config_to_dict(matches[0]) != sealed_config:
+-                    raise ValueError("signed range config is absent, ambiguous, or differs from request")
+-                return matches[0]
+-            except FormalTerminalSourceError:
+-                raise
+-            except ValueError as error:
+-                raise FormalTerminalSourceError(str(error)) from error
+-
+     return SignedSourceRegistry
+ 
+ 
+ SignedSourceRegistry = _make_signed_source_registry_type()
+ del _make_signed_source_registry_type
+ 
+ 
++def _make_range_registry_authority():
++    """Keep genuine registry anchors independent of replaceable public aliases."""
++
++    registry_type = SignedSourceRegistry
++    require_verified = SignedSourceRegistry._require_verified
++    range_snapshots = SignedSourceRegistry._trusted_range_config_snapshots
++
++    def authority():
++        return registry_type, require_verified, range_snapshots
++
++    return authority
++
++
++_range_registry_authority = _make_range_registry_authority()
++del _make_range_registry_authority
++
++
+ def _validate_request(request: object) -> tuple[OfficialRequest, str | None]:
+     if type(request) is not OfficialRequest:
+         raise FormalTerminalSourceError("request must have exact type OfficialRequest")
+     try:
+         _require_source(request.source, "request source")
+         _require_trimmed_text(request.dataset, "request dataset", identifier=True)
+     except ValueError as error:
+         raise FormalTerminalSourceError(str(error)) from error
+     security_exchange: str | None = None
+     if request.security_id is not None:
+diff --git a/tests/test_formal_range_source.py b/tests/test_formal_range_source.py
+index da8b313..2f07f59 100644
+--- a/tests/test_formal_range_source.py
++++ b/tests/test_formal_range_source.py
+@@ -134,20 +134,59 @@ class FormalRangeSourceTests(unittest.TestCase):
+         for key, value in request.to_dict().items():
+             object.__setattr__(forged, key, value)
+         with self.assertRaises(FormalTerminalSourceError):
+             fixture.source.fetch_verified(forged)
+         with self.assertRaises(TypeError):
+             copy.copy(request)
+         object.__setattr__(request, "page_index", 2)
+         with self.assertRaises(FormalTerminalSourceError):
+             fixture.source.fetch_verified(request)
+ 
++    def test_module_private_mint_cannot_authorize_arbitrary_bounds_or_boolean_page(self):
++        import ashare_pipeline.formal_range_request as request_module
++
++        fixture = self.fixture()
++        config = fixture.binding.calendar_config
++        genuine = fixture.source.first_calendar_request(FREEZE)
++        wire = genuine.to_dict()
++        wire.update(
++            as_of_utc="9999-12-31T23:59:59+00:00",
++            start_date="0001-01-01",
++            end_date="9999-12-31",
++            page_index=True,
++        )
++        mint = getattr(request_module, "_mint_range_request", None)
++        if not callable(mint):
++            return
++        with self.assertRaises((ValueError, FormalTerminalSourceError)):
++            forged = mint(
++                wire,
++                config.to_dict(),
++                source_registry_hash=fixture.binding.source_registry_hash,
++                root_guard=lambda: True,
++            )
++            fixture.registry.select_range(forged)
++
++    def test_genuine_request_seal_rejects_every_out_of_contract_bound(self):
++        fixture = self.fixture()
++        mutations = (
++            ("page_index", True),
++            ("as_of_utc", "2026-09-01T07:00:00+00:00"),
++            ("start_date", "0001-01-01"),
++            ("end_date", "9999-12-31"),
++        )
++        for field, value in mutations:
++            request = fixture.source.first_calendar_request(FREEZE)
++            object.__setattr__(request, field, value)
++            with self.subTest(field=field), self.assertRaises(FormalTerminalSourceError):
++                fixture.source.fetch_verified(request)
++
+     def test_select_range_accepts_only_matching_genuine_request(self):
+         fixture = self.fixture()
+         request = fixture.source.first_calendar_request(FREEZE)
+         selected = fixture.registry.select_range(request)
+         self.assertEqual(selected.entry_id, request.to_dict()["range_config_id"])
+         self.assertEqual(selected.anchor_descriptor_id, request.to_dict()["anchor_descriptor_id"])
+         with self.assertRaises(FormalTerminalSourceError):
+             fixture.registry.select_range(object())
+ 
+     def test_select_range_rejects_different_config_and_root_identity(self):
+@@ -188,23 +227,67 @@ class FormalRangeSourceTests(unittest.TestCase):
+             documents["event"]["rules"]["event"]["evidence_kind"] = "fixture-event-v2"
+ 
+         other = self.fixture(mutate=changed_other_role)
+         self.assertNotEqual(
+             other.binding.registry_manifest_hash, fixture.binding.registry_manifest_hash
+         )
+         self.assertEqual(other.registry.registry_hash, fixture.registry.registry_hash)
+         selected = other.registry.select_range(request)
+         self.assertEqual(selected.entry_id, fixture.binding.calendar_config.entry_id)
+ 
++    def test_source_instance_rejects_other_manifest_root_even_for_shared_source_blob(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        fixture.reply(document_wire(request))
++        fetch = fixture.source.fetch_verified(request)
++
++        def changed_other_role(documents):
++            documents["event"]["rules"]["event"]["evidence_kind"] = "fixture-event-v2"
++
++        other = self.fixture(mutate=changed_other_role)
++        self.assertEqual(other.registry.registry_hash, fixture.registry.registry_hash)
++        other.reply(document_wire(request))
++        with self.subTest(operation="fetch"), self.assertRaises(FormalTerminalSourceError):
++            other.source.fetch_verified(request)
++        self.assertEqual(other.transport.requests, [])
++        with self.subTest(operation="replay"), self.assertRaises(FormalTerminalSourceError):
++            other.source.parse_verified_snapshot(
++                request, raw_bytes=fetch.raw_bytes, manifest=fetch.to_manifest()
++            )
++
++    def test_source_instance_rejects_other_complete_source_blob_with_same_selected_entry(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        fixture.reply(document_wire(request))
++        fetch = fixture.source.fetch_verified(request)
++
++        def changed_unrelated_entry(documents):
++            entry = next(item for item in documents["source"]["range_configs"]
++                         if item["kind"] == "calendar_range" and item["exchange_scope"] == "SZ")
++            entry["endpoint_url"] = "https://www.cninfo.com.cn/fixture/changed-sz.json"
++
++        other = self.fixture(mutate=changed_unrelated_entry)
++        self.assertEqual(other.binding.calendar_config.entry_id,
++                         fixture.binding.calendar_config.entry_id)
++        other.reply(document_wire(request))
++        with self.subTest(operation="fetch"), self.assertRaises(FormalTerminalSourceError):
++            other.source.fetch_verified(request)
++        self.assertEqual(other.transport.requests, [])
++        with self.subTest(operation="replay"), self.assertRaises(FormalTerminalSourceError):
++            other.source.parse_verified_snapshot(
++                request, raw_bytes=fetch.raw_bytes, manifest=fetch.to_manifest()
++            )
++
+     def test_import_orders_have_no_registration_hook_or_partial_cycle(self):
+         modules = (
+             "ashare_pipeline.formal_sources",
++            "ashare_pipeline.formal_range_request",
+             "ashare_pipeline.formal_range_source",
+             "ashare_pipeline.formal_range_contract",
+             "ashare_pipeline.formal_context_schema",
+             "ashare_pipeline.formal_registry_manifest",
+         )
+         for module in modules:
+             code = textwrap.dedent(f"""
+                 import {module}
+                 import ashare_pipeline.formal_sources as sources
+                 import ashare_pipeline.formal_range_source as ranges
+@@ -214,20 +297,55 @@ class FormalRangeSourceTests(unittest.TestCase):
+                     sources.SignedSourceRegistry.select_range(object(), forged)
+                 except Exception:
+                     pass
+                 else:
+                     raise AssertionError('forged request accepted')
+             """)
+             result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+             with self.subTest(first=module):
+                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+ 
++    def test_source_initialization_uses_genuine_registry_and_binding_anchors(self):
++        code = textwrap.dedent("""
++            import ashare_pipeline.formal_sources as sources
++            import ashare_pipeline.formal_range_contract as contract
++
++            genuine_registry = sources.SignedSourceRegistry
++            genuine_binding = contract.RangeBinding
++            sources.SignedSourceRegistry = type('FakeRegistry', (), {})
++            contract.RangeBinding = type('FakeBinding', (), {})
++            genuine_registry.select_range = lambda self, request: 'forged-selection'
++            genuine_binding.require_current = lambda self: None
++
++            import ashare_pipeline.formal_range_source
++
++            sources.SignedSourceRegistry = genuine_registry
++            contract.RangeBinding = genuine_binding
++            from tests.formal_range_fixtures import RangeSourceFixture
++            fixture = RangeSourceFixture()
++            try:
++                request = fixture.source.first_calendar_request(
++                    '2026-08-31T07:00:00+00:00')
++                selected = fixture.registry.select_range(request)
++                assert selected.entry_id == fixture.binding.calendar_config.entry_id
++                try:
++                    fixture.registry.select_range(object())
++                except Exception:
++                    pass
++                else:
++                    raise AssertionError('forged request accepted')
++            finally:
++                fixture.close()
++        """)
++        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
+     def test_transport_request_uses_only_new_placeholders_and_signed_bounds(self):
+         fixture = self.fixture()
+         request = fixture.source.first_calendar_request(FREEZE)
+         fixture.reply(document_wire(request))
+         fetch = fixture.source.fetch_verified(request)
+         sent = fixture.transport.requests[0]
+         self.assertEqual(
+             sent.url,
+             "https://www.cninfo.com.cn/fixture/range-calendar.json?end=2026-08-31&exchange=SH&page=1&start=2025-07-28",
+         )
+@@ -419,19 +537,59 @@ class FormalRangeSourceTests(unittest.TestCase):
+         original_parse = fixture.parser.parse
+ 
+         def mutating_parse(raw_bytes, *, request, config):
+             config["mapping_version"] = "unsigned-map"
+             return original_parse(raw_bytes, request=request, config=config)
+ 
+         fixture.parser.parse = mutating_parse
+         with self.assertRaises(FormalTerminalSourceError):
+             fixture.source.fetch_verified(request)
+ 
++    def test_instance_parse_shadow_cannot_bypass_registered_fetch_implementation(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        fixture.reply(document_wire(request))
++        fixture.source._parse = lambda *args, **kwargs: None
++        fetch = fixture.source.fetch_verified(request)
++        self.assertEqual(fetch.request_fingerprint, request.request_fingerprint)
++        self.assertEqual(len(fixture.parser.calls), 1)
++        self.assertEqual(len(fixture.normalizer.calls), 1)
++
++    def test_instance_parse_shadow_cannot_bypass_registered_replay_implementation(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        fixture.reply(document_wire(request))
++        fetch = fixture.source.fetch_verified(request)
++        fixture.parser.calls.clear()
++        fixture.normalizer.calls.clear()
++        fixture.source._parse = lambda *args, **kwargs: None
++        parsed = fixture.source.parse_verified_snapshot(
++            request, raw_bytes=fetch.raw_bytes, manifest=fetch.to_manifest()
++        )
++        self.assertEqual(parsed.to_dict(), document_wire(request))
++        self.assertEqual(len(fixture.parser.calls), 1)
++        self.assertEqual(len(fixture.normalizer.calls), 1)
++
+     def test_range_fetch_cannot_be_externally_minted(self):
++        import ashare_pipeline.formal_range_source as source_module
+         from ashare_pipeline.formal_range_source import RangeFetch
+ 
+         with self.assertRaises(ValueError):
+             RangeFetch()
++        self.assertFalse(callable(getattr(source_module, "_mint_fetch", None)))
++        self.assertFalse(
++            callable(getattr(source_module, "_mint_first_calendar_request", None))
++        )
++
++    def test_range_fetch_seal_distinguishes_boolean_from_every_integer_manifest_field(self):
++        fixture = self.fixture()
++        request = fixture.source.first_calendar_request(FREEZE)
++        fixture.reply(document_wire(request))
++        for field in ("record_count", "page_record_count", "page_count"):
++            fetch = fixture.source.fetch_verified(request)
++            object.__setattr__(fetch, field, True)
++            with self.subTest(field=field), self.assertRaises(ValueError):
++                fetch.to_manifest()
+ 
+ 
+ if __name__ == "__main__":
+     unittest.main()
+

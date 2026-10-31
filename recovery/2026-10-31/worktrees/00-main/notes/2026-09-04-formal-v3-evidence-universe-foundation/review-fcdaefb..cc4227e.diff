@@ -1,0 +1,186 @@
+# Review package: fcdaefb..cc4227e
+
+## Commits
+cc4227e fix: fail closed on formal snapshot identity tampering
+
+## Files changed
+ ashare_pipeline/state_store.py           | 16 +++-----
+ tests/test_formal_snapshot_repository.py | 65 ++++++++++++++++++++++++++++++++
+ 2 files changed, 70 insertions(+), 11 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index 485551f..8e81963 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -1904,27 +1904,25 @@ class StateStore:
+             raise ValueError("formal snapshot task generation mismatch")
+ 
+     def _formal_verified_snapshot_ref_from_connection(
+         self, connection: sqlite3.Connection, row: sqlite3.Row
+     ) -> OfficialSnapshotRef:
+         ref = self._formal_snapshot_row_to_ref(row)
+         self._require_formal_snapshot_receipt_lineage(connection, row, ref)
+         return ref
+ 
+     def _formal_repository_candidates_from_connection(
+-        self, connection: sqlite3.Connection, request_fingerprint: str
++        self, connection: sqlite3.Connection
+     ) -> list[OfficialSnapshotRef]:
+-        """Revalidate the fingerprint superset before any lookup-specific filtering."""
++        """Revalidate every snapshot before applying caller-owned lookup identity."""
+         rows = connection.execute(
+-            """SELECT * FROM formal_source_snapshot
+-            WHERE request_fingerprint = ? ORDER BY manifest_sha256""",
+-            (request_fingerprint,),
++            "SELECT * FROM formal_source_snapshot ORDER BY manifest_sha256"
+         ).fetchall()
+         return [
+             self._formal_verified_snapshot_ref_from_connection(connection, row)
+             for row in rows
+         ]
+ 
+     def _find_formal_snapshot_exact_verified(
+         self,
+         request: OfficialRequest,
+         *,
+@@ -1940,23 +1938,21 @@ class StateStore:
+         parser_id = self._require_formal_repository_identifier(parser_id, "parser_id")
+         parser_version = self._require_formal_repository_identifier(
+             parser_version, "parser_version"
+         )
+         mapping_version = self._require_formal_repository_identifier(
+             mapping_version, "mapping_version"
+         )
+         content_sha256 = _require_formal_sha256(content_sha256, "content hash")
+         manifest_sha256 = _require_formal_sha256(manifest_sha256, "manifest hash")
+         with self._transaction() as connection:
+-            candidates = self._formal_repository_candidates_from_connection(
+-                connection, request_fingerprint
+-            )
++            candidates = self._formal_repository_candidates_from_connection(connection)
+             matches = [
+                 ref
+                 for ref in candidates
+                 if self._formal_ref_matches_repository_request(
+                     ref, request, request_fingerprint
+                 )
+                 and ref.parser_id == parser_id
+                 and ref.parser_version == parser_version
+                 and ref.mapping_version == mapping_version
+                 and ref.content_sha256 == content_sha256
+@@ -1980,23 +1976,21 @@ class StateStore:
+         )
+         parser_id = self._require_formal_repository_identifier(parser_id, "parser_id")
+         parser_version = self._require_formal_repository_identifier(
+             parser_version, "parser_version"
+         )
+         mapping_version = self._require_formal_repository_identifier(
+             mapping_version, "mapping_version"
+         )
+         as_of_utc = self._require_formal_repository_as_of(as_of_utc)
+         with self._transaction() as connection:
+-            candidates = self._formal_repository_candidates_from_connection(
+-                connection, request_fingerprint
+-            )
++            candidates = self._formal_repository_candidates_from_connection(connection)
+             visible = [
+                 ref
+                 for ref in candidates
+                 if self._formal_ref_matches_repository_request(
+                     ref, request, request_fingerprint
+                 )
+                 and ref.parser_id == parser_id
+                 and ref.parser_version == parser_version
+                 and ref.mapping_version == mapping_version
+                 and is_visible_at(ref.effective_at_utc, as_of_utc)
+diff --git a/tests/test_formal_snapshot_repository.py b/tests/test_formal_snapshot_repository.py
+index dbb4d27..45174f3 100644
+--- a/tests/test_formal_snapshot_repository.py
++++ b/tests/test_formal_snapshot_repository.py
+@@ -691,20 +691,85 @@ class FormalSnapshotRepositoryTests(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             self.repository.find_exact_verified(
+                 historical.request,
+                 parser_id=historical.parser_id,
+                 parser_version=historical.parser_version,
+                 mapping_version=historical.mapping_version,
+                 content_sha256=historical.content_sha256,
+                 manifest_sha256=historical_ref.manifest_sha256,
+             )
+ 
++    def test_exact_lookup_does_not_fallback_when_newer_row_fingerprint_is_tampered(self) -> None:
++        """A mutable row fingerprint must not exclude corrupt newer evidence from validation."""
++        older = cninfo_fetch(
++            raw_bytes=b"older exact candidate", refresh_generation="exact-history-v1"
++        )
++        older_ref = self.repository.persist_verified(
++            older, verified(older), producing_task_id=None, worker_id=None
++        )
++        newer = cninfo_fetch(
++            raw_bytes=b"newer exact candidate",
++            refresh_generation="exact-history-v2",
++            published_at_utc="2026-08-21T08:00:00+00:00",
++        )
++        newer_ref = self.repository.persist_verified(
++            newer, verified(newer), producing_task_id=None, worker_id=None
++        )
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            connection.execute(
++                "UPDATE formal_source_snapshot SET request_fingerprint = ? WHERE id = ?",
++                ("0" * 64, newer_ref.snapshot_id),
++            )
++            connection.commit()
++
++        with self.assertRaisesRegex(ValueError, "request fingerprint"):
++            self.repository.find_exact_verified(
++                older.request,
++                parser_id=older.parser_id,
++                parser_version=older.parser_version,
++                mapping_version=older.mapping_version,
++                content_sha256=older.content_sha256,
++                manifest_sha256=older_ref.manifest_sha256,
++            )
++
++    def test_visible_lookup_does_not_fallback_when_newer_row_fingerprint_is_tampered(self) -> None:
++        """Point-in-time selection must validate a corrupt newest row before choosing history."""
++        older = cninfo_fetch(
++            raw_bytes=b"older visible candidate", refresh_generation="visible-history-v1"
++        )
++        self.repository.persist_verified(
++            older, verified(older), producing_task_id=None, worker_id=None
++        )
++        newer = cninfo_fetch(
++            raw_bytes=b"newer visible candidate",
++            refresh_generation="visible-history-v2",
++            published_at_utc="2026-08-21T08:00:00+00:00",
++        )
++        newer_ref = self.repository.persist_verified(
++            newer, verified(newer), producing_task_id=None, worker_id=None
++        )
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            connection.execute(
++                "UPDATE formal_source_snapshot SET request_fingerprint = ? WHERE id = ?",
++                ("0" * 64, newer_ref.snapshot_id),
++            )
++            connection.commit()
++
++        with self.assertRaisesRegex(ValueError, "request fingerprint"):
++            self.repository.find_visible_verified(
++                older.request,
++                parser_id=older.parser_id,
++                parser_version=older.parser_version,
++                mapping_version=older.mapping_version,
++                as_of_utc="2026-08-31T07:00:00+00:00",
++            )
++
+     def test_task_producer_requires_one_receipt_and_one_source_row(self) -> None:
+         """A task-produced ref cannot survive a missing receipt, generation drift, or extra row."""
+         task_id, fetch, ref = self.persist_leased_snapshot(
+             key="lineage-missing", generation="lineage-missing-v1"
+         )
+         with closing(sqlite3.connect(self.db_path)) as connection:
+             connection.execute(
+                 "DELETE FROM formal_task_snapshot_receipt WHERE task_id = ?", (task_id,)
+             )
+             connection.commit()

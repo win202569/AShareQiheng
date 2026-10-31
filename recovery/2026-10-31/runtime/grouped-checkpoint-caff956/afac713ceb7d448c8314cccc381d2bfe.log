@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_integration.GenuineFullChainTests.test_source_and_registry_row_tamper_reject_retained_manifest
+test_source_and_registry_row_tamper_reject_retained_manifest (test_formal_final_integration.GenuineFullChainTests.test_source_and_registry_row_tamper_reject_retained_manifest) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 6318.972s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_integration.GenuineFullChainTests.test_source_and_registry_row_tamper_reject_retained_manifest"], "passed": ["test_formal_final_integration.GenuineFullChainTests.test_source_and_registry_row_tamper_reject_retained_manifest"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

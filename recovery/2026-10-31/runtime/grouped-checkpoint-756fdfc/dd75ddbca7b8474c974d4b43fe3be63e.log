@@ -1,0 +1,14 @@
+TEST_STARTED test_financial_features.TradeCalendarTests.test_calendar_accepts_complete_shuffled_batch_and_sorts_sessions
+test_calendar_accepts_complete_shuffled_batch_and_sorts_sessions (test_financial_features.TradeCalendarTests.test_calendar_accepts_complete_shuffled_batch_and_sorts_sessions) ... ok
+TEST_STARTED test_financial_features.TradeCalendarTests.test_calendar_extracts_only_explicit_trading_days_sorted_and_deduplicated
+test_calendar_extracts_only_explicit_trading_days_sorted_and_deduplicated (test_financial_features.TradeCalendarTests.test_calendar_extracts_only_explicit_trading_days_sorted_and_deduplicated) ... ok
+TEST_STARTED test_financial_features.TradeCalendarTests.test_calendar_rejects_interior_hole_duplicate_and_missing_endpoint
+test_calendar_rejects_interior_hole_duplicate_and_missing_endpoint (test_financial_features.TradeCalendarTests.test_calendar_rejects_interior_hole_duplicate_and_missing_endpoint) ... ok
+TEST_STARTED test_financial_features.TradeCalendarTests.test_calendar_rejects_wrong_dataset_malformed_rows_flags_and_range
+test_calendar_rejects_wrong_dataset_malformed_rows_flags_and_range (test_financial_features.TradeCalendarTests.test_calendar_rejects_wrong_dataset_malformed_rows_flags_and_range) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.071s
+
+OK
+GROUP_SUMMARY {"ids": ["test_financial_features.TradeCalendarTests.test_calendar_accepts_complete_shuffled_batch_and_sorts_sessions", "test_financial_features.TradeCalendarTests.test_calendar_extracts_only_explicit_trading_days_sorted_and_deduplicated", "test_financial_features.TradeCalendarTests.test_calendar_rejects_interior_hole_duplicate_and_missing_endpoint", "test_financial_features.TradeCalendarTests.test_calendar_rejects_wrong_dataset_malformed_rows_flags_and_range"], "passed": ["test_financial_features.TradeCalendarTests.test_calendar_accepts_complete_shuffled_batch_and_sorts_sessions", "test_financial_features.TradeCalendarTests.test_calendar_extracts_only_explicit_trading_days_sorted_and_deduplicated", "test_financial_features.TradeCalendarTests.test_calendar_rejects_interior_hole_duplicate_and_missing_endpoint", "test_financial_features.TradeCalendarTests.test_calendar_rejects_wrong_dataset_malformed_rows_flags_and_range"], "tests_run": 4, "failures": 0, "errors": 0, "skipped": 0}

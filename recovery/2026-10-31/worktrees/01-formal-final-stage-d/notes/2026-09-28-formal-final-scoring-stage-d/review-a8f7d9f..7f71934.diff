@@ -1,0 +1,106 @@
+# Review package: a8f7d9f..7f71934
+
+## Commits
+7f71934 fix: allow pending pool trace rows
+
+## Files changed
+ ashare_pipeline/formal_pool.py   | 13 ++++++++-----
+ tests/test_formal_pool.py        | 10 ++++++++++
+ tests/test_formal_pool_guards.py | 10 ++++++++++
+ 3 files changed, 28 insertions(+), 5 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_pool.py b/ashare_pipeline/formal_pool.py
+index ad06a73..67b0347 100644
+--- a/ashare_pipeline/formal_pool.py
++++ b/ashare_pipeline/formal_pool.py
+@@ -46,25 +46,28 @@ def _validate_row(row, seen, source_hash=None):
+         raise ValueError("pool eligibility state is unknown")
+     if type(row["strong_qualified"]) is not bool or type(row["wait_qualified"]) is not bool:
+         raise ValueError("pool qualification flags must be bool")
+     if row["strong_qualified"] and row["wait_qualified"]:
+         raise ValueError("pool qualifications must be mutually exclusive")
+     industry = row["secondary_industry"]
+     if ((type(industry) is not str or not industry)
+             and (row["strong_qualified"] or row["wait_qualified"])):
+         raise ValueError("qualified pool member requires a nonempty secondary industry")
+     fields = row["sort_fields"]
+-    if (type(fields) is not dict or set(fields) != _SORT_KEYS):
+-        raise ValueError("pool sort fields are incomplete")
+-    for key, value in fields.items():
+-        if type(value) is not Decimal or not value.is_finite():
+-            raise ValueError("pool sort fields require finite exact Decimal values")
++    if row["strong_qualified"] or row["wait_qualified"]:
++        if (type(fields) is not dict or set(fields) != _SORT_KEYS):
++            raise ValueError("pool sort fields are incomplete")
++        for key, value in fields.items():
++            if type(value) is not Decimal or not value.is_finite():
++                raise ValueError("pool sort fields require finite exact Decimal values")
++    elif fields is not None and (type(fields) is not dict or set(fields) != _SORT_KEYS):
++        raise ValueError("non-qualified pool trace has malformed sort fields")
+     for key in ("eligibility_hash", "source_entry_hash", "source_batch_hash", "score_batch_hash"):
+         if type(row[key]) is not str or not row[key]:
+             raise ValueError("pool provenance hash is malformed")
+     if source_hash is not None and row["source_batch_hash"] != source_hash:
+         raise ValueError("pool rows come from different eligibility batches")
+     return row
+ 
+ 
+ def _select_detached_rows(rows, *, strong_industry_cap=4, wait_industry_cap=10,
+         strong_overall_cap=20, wait_overall_cap=50):
+diff --git a/tests/test_formal_pool.py b/tests/test_formal_pool.py
+index 9a877c0..0b36a5d 100644
+--- a/tests/test_formal_pool.py
++++ b/tests/test_formal_pool.py
+@@ -60,13 +60,23 @@ class FormalPoolSelectionTests(unittest.TestCase):
+         self.assertEqual(result.strong_decisions["SH000001"], "overall_capacity_reached")
+         self.assertEqual(result.wait_decisions["SH000001"], "not_qualified")
+ 
+     def test_pools_are_disjoint_and_every_candidate_has_decision_trace(self):
+         rows = [row("SH000001", strong=True), row("SH000002", wait=True), row("SH000003")]
+         result = _select_detached_rows(rows)
+         self.assertTrue(set(result.strong_ids).isdisjoint(result.wait_ids))
+         self.assertEqual(set(result.strong_decisions), {r["security_id"] for r in rows})
+         self.assertEqual(set(result.wait_decisions), {r["security_id"] for r in rows})
+ 
++    def test_pending_nonqualified_member_without_industry_or_sort_fields_is_trace_only(self):
++        pending = row("SH000004", industry=None, strong=False, wait=False)
++        pending["state"] = "pending_evidence"
++        pending["sort_fields"] = None
++        result = _select_detached_rows([row("SH000001", strong=True), pending])
++        self.assertEqual(result.strong_ids, ("SH000001",))
++        self.assertEqual(result.wait_ids, ())
++        self.assertEqual(result.strong_decisions["SH000004"], "not_qualified")
++        self.assertEqual(result.wait_decisions["SH000004"], "not_qualified")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_formal_pool_guards.py b/tests/test_formal_pool_guards.py
+index 97bf15a..d047c24 100644
+--- a/tests/test_formal_pool_guards.py
++++ b/tests/test_formal_pool_guards.py
+@@ -39,13 +39,23 @@ class FormalPoolGuardTests(unittest.TestCase):
+     def test_rejects_cross_batch_and_trace_hash_tampering(self):
+         base = {"security_id": "SH000001", "secondary_industry": "i", "state": "formal_scored",
+             "strong_qualified": True, "wait_qualified": False,
+             "sort_fields": {"Sc": Decimal("70"), "B": Decimal("65"), "C": Decimal(".75"), "R_safety": Decimal("45"), "V": Decimal("45")},
+             "eligibility_hash": "h", "source_entry_hash": "e", "source_batch_hash": "b", "score_batch_hash": "s"}
+         with self.assertRaises(ValueError):
+             _select_detached_rows([base, dict(base, security_id="SH000002", source_batch_hash="other")])
+         with self.assertRaises(ValueError):
+             _select_detached_rows([dict(base, eligibility_hash="")])
+ 
++    def test_qualified_member_still_requires_industry_and_sort_fields(self):
++        base = {"security_id": "SH000001", "secondary_industry": None, "state": "pending_evidence",
++            "strong_qualified": False, "wait_qualified": False, "sort_fields": None,
++            "eligibility_hash": "h", "source_entry_hash": "e", "source_batch_hash": "b", "score_batch_hash": "s"}
++        self.assertEqual(_select_detached_rows([base]).strong_ids, ())
++        with self.assertRaises(ValueError):
++            _select_detached_rows([dict(base, strong_qualified=True, secondary_industry="i")])
++        with self.assertRaises(ValueError):
++            _select_detached_rows([dict(base, secondary_industry="i", sort_fields={})])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

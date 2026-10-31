@@ -1,0 +1,773 @@
+# Task 2A final review artifact
+
+Base: fb6deda06ee4e9759cab60e35e6253de1c281bc1
+Head: reviewed uncommitted working-tree changes, exact three-file code/test allowlist.
+Original review: one Important finding. Scoped round-1 re-review: finding resolved, spec compliant, quality Approved.
+Full final diff follows. Original task-2a-review.diff is retained for the audit trail.
+
+diff --git a/ashare_pipeline/formal_feature_repository.py b/ashare_pipeline/formal_feature_repository.py
+index a8396ab..720e36e 100644
+--- a/ashare_pipeline/formal_feature_repository.py
++++ b/ashare_pipeline/formal_feature_repository.py
+@@ -9,11 +9,16 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ from datetime import datetime
++import hashlib
++import json
++import weakref
+ from typing import Protocol
+ 
+ from .formal_feature_contract import (
+     FormalEvidenceRef,
+     FormalFeatureBundle,
++    FormalFeatureSlot,
++    FormalFeatureValue,
+     SignedFormalFeatureRegistry,
+     _canonical_json_bytes,
+     _require_hash,
+@@ -25,7 +30,9 @@ from .formal_feature_contract import (
+ from .formal_feature_store import FormalFeatureBundleStore
+ from .formal_financial_features import build_formal_feature_bundle
+ from .formal_financial_schema import FormalFactIssue, FormalFinancialFact
++from .formal_metric_features import evaluate_selected_features
+ from .formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
++from .formal_snapshot_store import FormalSnapshotStore
+ from .formal_universe import canonical_security_id
+ from .state_store import StateStore
+ 
+@@ -142,11 +149,12 @@ class FormalFeatureRepository:
+             raise ValueError("formal feature metadata must be a detached dictionary")
+         return _snapshot_json(row, label="formal feature metadata")
+ 
+-    def _validate_signed_values(self, bundle: FormalFeatureBundle, registry: SignedFormalFeatureRegistry) -> None:
++    def _validate_signed_values(self, bundle: FormalFeatureBundle, registry: SignedFormalFeatureRegistry,
++                                *, require_complete: bool = True) -> None:
+         wire = bundle.to_dict()
+         if wire["feature_registry_hash"] != registry.registry_hash or wire["contract_version"] != registry.contract_version:
+             raise ValueError("formal feature registry header mismatch")
+-        if wire["blockers"]:
++        if require_complete and wire["blockers"]:
+             raise ValueError("formal feature bundle is blocked")
+         slots = registry.slots_for_template(wire["template_id"])
+         values = wire["values"]
+@@ -155,7 +163,7 @@ class FormalFeatureRepository:
+         for slot, value in zip(slots, values, strict=True):
+             if value["unit"] != slot.unit or value["formula_version"] != slot.formula_version:
+                 raise ValueError("formal feature signed unit or formula mismatch")
+-            if value["status"] not in {"derived", "missing"} or (slot.required and value["status"] != "derived"):
++            if require_complete and (value["status"] not in {"derived", "missing"} or (slot.required and value["status"] != "derived")):
+                 raise ValueError("formal feature slot is not score eligible")
+             # The exact FormalFeatureValue boundary already enforces null value,
+             # empty evidence and canonical missing reason for a missing slot.
+@@ -188,6 +196,10 @@ class FormalFeatureRepository:
+ 
+     def get_verified_formal_feature_bundle(self, *, input_hash: str) -> FormalFeatureBundle | None:
+         """Read an exact historical receipt; this does not rebuild historical inputs."""
++        return self._read_authenticated_bundle(input_hash=input_hash, require_complete=True)
++
++    def _read_authenticated_bundle(self, *, input_hash: str, require_complete: bool) -> FormalFeatureBundle | None:
++        """Authenticate every persisted byte; completeness is a separate read gate."""
+         _require_hash(input_hash, "formal feature input hash")
+         row = self._metadata(input_hash)
+         if row is None:
+@@ -214,7 +226,7 @@ class FormalFeatureRepository:
+                 or _canonical_json_bytes(expected) != before):
+             raise ValueError("formal feature database/file projection mismatch")
+         _, registry = self._registry(wire["registry_manifest_hash"])
+-        self._validate_signed_values(bundle, registry)
++        self._validate_signed_values(bundle, registry, require_complete=require_complete)
+         self._validate_evidence(bundle)
+         if _canonical_json_bytes(self._metadata(input_hash)) != before:
+             raise ValueError("formal feature metadata changed while reading")
+@@ -281,4 +293,226 @@ class FormalFeatureRepository:
+         return result
+ 
+ 
+-__all__ = ["FormalFeatureRepository", "FormalFeatureCurrentInput", "FormalFeatureCurrentInputProvider"]
++def _install_metric_projection():
++    """Close mint authority over the real repository path and instance registry."""
++    from . import formal_metric_features as metric_module
++    from . import formal_financial_features as financial_module
++    repository_type = FormalFeatureRepository
++    original_init = repository_type.__init__
++    read_bundle = repository_type._read_authenticated_bundle
++    read_registry = repository_type._registry
++    persisted_facts = repository_type._persisted_facts
++    snapshot_identity = repository_type._snapshot_identity
++    builder = build_formal_feature_bundle
++    evaluator = evaluate_selected_features
++    repositories, proofs = {}, {}
++    fields = ("security_id", "as_of_utc", "template_id", "registry_manifest_hash",
++        "feature_registry_hash", "input_hash", "bundle_hash", "required_feature_keys",
++        "slots", "values", "blockers", "fact_snapshot_hash", "issue_snapshot_hash",
++        "batch_id", "algorithm_version", "projection_hash")
++
++    def wire(item):
++        if type(item) is not VerifiedMetricFeatureProjection:
++            raise ValueError("metric projection requires exact proof type")
++        record = proofs.get(id(item))
++        if record is None or record[0]() is not item:
++            raise ValueError("metric projection has no repository proof")
++        try:
++            result = {field: getattr(item, field) for field in fields}
++            for field in ("required_feature_keys", "slots", "values", "blockers"):
++                if type(result[field]) is not tuple:
++                    raise ValueError("metric projection collections must be immutable tuples")
++                expected_type = FormalFeatureSlot if field == "slots" else FormalFeatureValue if field == "values" else str
++                if any(type(value) is not expected_type for value in result[field]):
++                    raise ValueError("metric projection collection members require exact types")
++                result[field] = [x.to_dict() for x in result[field]] if field in {"slots", "values"} else list(result[field])
++            if _canonical_json_bytes(result) != record[1]:
++                raise ValueError("metric projection proof was mutated")
++            return result
++        except (AttributeError, TypeError, RecursionError) as error:
++            raise ValueError("metric projection proof is malformed") from error
++
++    @dataclass(frozen=True, slots=True, weakref_slot=True, init=False)
++    class VerifiedMetricFeatureProjection:
++        """Each value has its own eligibility; blockers aggregate local reasons.
++
++        A blocked/missing sibling slot does not invalidate a derived value.
++        Consumers must recheck this seal before reading the requested slots.
++        """
++        security_id: str
++        as_of_utc: str
++        template_id: str
++        registry_manifest_hash: str
++        feature_registry_hash: str
++        input_hash: str
++        bundle_hash: str
++        required_feature_keys: tuple[str, ...]
++        slots: tuple[FormalFeatureSlot, ...]
++        values: tuple[FormalFeatureValue, ...]
++        blockers: tuple[str, ...]
++        fact_snapshot_hash: str
++        issue_snapshot_hash: str
++        batch_id: str
++        algorithm_version: str
++        projection_hash: str
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("metric projections are created only by verified current repository reads")
++
++        def to_dict(self):
++            return wire(self)
++
++        def canonical_bytes(self):
++            return _canonical_json_bytes(wire(self))
++
++        def require_verified(self):
++            wire(self)
++
++        def __copy__(self):
++            raise TypeError("metric projection proof cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("metric projection proof cannot be copied")
++
++    def dependency_state(self):
++        store, files = self._store, self._bundle_store
++        source = store._formal_snapshot_store
++        verifier = store._registry_signature_verifier
++        provider = self._current_input_provider
++        refs = (source, verifier, store._formal_feature_bundle_store)
++        methods = (getattr(self._verifier, "verify", None), getattr(verifier, "verify", None),
++            getattr(provider, "resolve_current_inputs", None))
++        method_ids = tuple((id(getattr(method, "__self__", None)), id(getattr(method, "__func__", method)))
++            for method in methods)
++        return (tuple(id(ref) for ref in refs), method_ids, str(store.db_path),
++            str(files._root), files._root_fingerprint, str(getattr(source, "root", None)))
++
++    def init(self, *args, **kwargs):
++        if id(self) in repositories:
++            raise ValueError("metric repository initialization may run only once")
++        original_init(self, *args, **kwargs)
++        identity = id(self)
++        dependencies = (self._store, self._bundle_store, self._verifier, self._current_input_provider)
++        repositories[identity] = (weakref.ref(self, lambda _, identity=identity: repositories.pop(identity, None)),
++            dependencies, dependency_state(self))
++
++    # Detect substituted public/private read paths as well as instance overrides.
++    # Captured real methods make fake exact repository objects insufficient proof.
++    checked_methods = tuple((cls, name, method)
++        for cls in (StateStore, FormalFeatureBundleStore, FormalSnapshotStore, repository_type)
++        for name, method in vars(cls).items()
++        if (callable(method) or isinstance(method, (staticmethod, classmethod))) and name != "__init__")
++    checked_calculations = tuple((module, name, value)
++        for module in (metric_module, financial_module)
++        for name, value in vars(module).items() if callable(value))
++
++    def dependencies(self):
++        record = repositories.get(id(self))
++        if type(self) is not repository_type or record is None or record[0]() is not self:
++            raise ValueError("metric repository was not safely initialized")
++        current = (self._store, self._bundle_store, self._verifier, self._current_input_provider)
++        if any(a is not b for a, b in zip(current, record[1], strict=True)):
++            raise ValueError("metric repository dependencies changed")
++        if dependency_state(self) != record[2]:
++            raise ValueError("metric repository storage trust dependencies changed")
++        source = self._store._formal_snapshot_store
++        if type(source) is not FormalSnapshotStore:
++            raise ValueError("metric repository requires an exact trusted source store")
++        for cls, name, method in checked_methods:
++            if vars(cls).get(name) is not method:
++                raise ValueError("metric repository read dependency changed")
++            for instance in (self, self._store, self._bundle_store, source):
++                if type(instance) is cls and name in getattr(instance, "__dict__", {}):
++                    raise ValueError("metric repository read dependency overridden")
++        if build_formal_feature_bundle is not builder or evaluate_selected_features is not evaluator:
++            raise ValueError("metric repository calculation dependency changed")
++        if any(vars(module).get(name) is not value for module, name, value in checked_calculations):
++            raise ValueError("metric repository calculation dependency changed")
++
++    def select(self, security_id: str, as_of_utc: str, *, template_id: str,
++               registry_manifest_hash: str, required_feature_keys: tuple[str, ...]) -> VerifiedMetricFeatureProjection | None:
++        """Authenticate a current stored bundle and project required signed V6 slots."""
++        request = _request(security_id, as_of_utc, template_id, registry_manifest_hash)
++        if as_of_utc != "2026-08-31T07:00:00+00:00":
++            raise ValueError("metric projection requires the exact frozen cutoff")
++        if (type(required_feature_keys) is not tuple or not required_feature_keys
++                or any(type(key) is not str for key in required_feature_keys)
++                or tuple(sorted(set(required_feature_keys))) != required_feature_keys):
++            raise ValueError("metric feature keys must be a nonempty sorted unique exact tuple")
++        dependencies(self)
++        provider = self._current_input_provider
++        if provider is None:
++            raise ValueError("formal feature current input provider is required")
++        graph, registry = read_registry(self, registry_manifest_hash)
++        slots_by_id = {slot.slot_id: slot for slot in registry.slots_for_template(template_id)}
++        if any(key not in slots_by_id or not slots_by_id[key].required for key in required_feature_keys):
++            raise ValueError("metric feature key is not an applicable required signed slot")
++        slots = tuple(FormalFeatureSlot.from_dict(slots_by_id[key].to_dict()) for key in required_feature_keys)
++        try:
++            supplied = provider.resolve_current_inputs(**request)
++        except Exception as error:
++            raise ValueError("formal feature current input provider failed") from error
++        identity = snapshot_identity(supplied, request)
++        facts, fact_records = _fact_snapshot(supplied.facts, security_id)
++        issues, issue_records = _issue_snapshot(supplied.issues)
++
++        def check_current():
++            dependencies(self)
++            if (snapshot_identity(supplied, request) != identity
++                    or _fact_snapshot(supplied.facts, security_id)[1] != fact_records
++                    or _issue_snapshot(supplied.issues)[1] != issue_records):
++                raise ValueError("metric feature current provider input changed")
++            if persisted_facts(self, security_id) != fact_records:
++                raise ValueError("metric feature persisted inputs changed or provider facts differ")
++
++        check_current()
++        expected = builder(security_id=security_id, as_of_utc=as_of_utc, template_id=template_id,
++            facts=facts, issues=issues, registry=registry, registry_manifest=graph.manifest)
++        if type(expected) is not FormalFeatureBundle:
++            raise ValueError("metric feature builder returned an invalid bundle")
++        expected_bytes = expected.canonical_bytes()
++        check_current()
++        stored = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
++        if stored is not None and stored.canonical_bytes() != expected_bytes:
++            raise ValueError("metric feature stored bundle differs from rebuilt inputs")
++        check_current()
++        if stored is None:
++            return None
++        values, blockers = evaluator(slots=slots, facts=facts, issues=issues, as_of_utc=as_of_utc)
++        # Re-read source lineage, root and the exact receipt after calculation:
++        # a correct early read cannot bless a late SQL/file/source mutation.
++        reread = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
++        if reread is None or reread.canonical_bytes() != expected_bytes:
++            raise ValueError("metric feature persisted receipt changed during projection")
++        check_current()
++        payload = dict(request, feature_registry_hash=registry.registry_hash,
++            input_hash=stored.input_hash, bundle_hash=stored.bundle_hash(),
++            required_feature_keys=list(required_feature_keys), slots=[slot.to_dict() for slot in slots],
++            values=[value.to_dict() for value in values], blockers=list(blockers),
++            fact_snapshot_hash=hashlib.sha256(_canonical_json_bytes([json.loads(record) for record in fact_records])).hexdigest(),
++            issue_snapshot_hash=hashlib.sha256(_canonical_json_bytes([json.loads(record) for record in issue_records])).hexdigest(),
++            batch_id=identity[-1], algorithm_version="formal-metric-feature-projection-v1")
++        payload["projection_hash"] = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
++        result = object.__new__(VerifiedMetricFeatureProjection)
++        for field in fields:
++            value = payload[field]
++            if field == "slots":
++                value = tuple(FormalFeatureSlot.from_dict(item) for item in value)
++            elif field == "values":
++                value = tuple(FormalFeatureValue.from_dict(item) for item in value)
++            elif field in {"required_feature_keys", "blockers"}:
++                value = tuple(value)
++            object.__setattr__(result, field, value)
++        proof_id = id(result)
++        proofs[proof_id] = (weakref.ref(result, lambda _, proof_id=proof_id: proofs.pop(proof_id, None)), _canonical_json_bytes(payload))
++        return result
++
++    repository_type.__init__ = init
++    repository_type.select_current_verified_metric_features = select
++    return VerifiedMetricFeatureProjection
++
++
++VerifiedMetricFeatureProjection = _install_metric_projection()
++del _install_metric_projection
++
++__all__ = ["FormalFeatureRepository", "FormalFeatureCurrentInput", "FormalFeatureCurrentInputProvider", "VerifiedMetricFeatureProjection"]
+
+diff --git a/ashare_pipeline/formal_metric_features.py b/ashare_pipeline/formal_metric_features.py
+new file mode 100644
+index 0000000..ef42426
+--- /dev/null
++++ b/ashare_pipeline/formal_metric_features.py
+@@ -0,0 +1,83 @@
++"""Pure selected V6 AST evaluation; this module never mints repository proof.
++
++Provider extraction issues have no authenticated universal period/source scope.
++Until signed mapping can prove exclusion, every such issue blocks projection.
++Calculations deliberately retain the original V6 float semantics.
++"""
++
++from .formal_feature_contract import FormalFeatureSlot, FormalFeatureValue
++from .formal_financial_features import (
++    derive_comparable_quarters, evaluate_formula, select_visible_formal_facts,
++)
++
++
++def _leaves(node):
++    if node.op == "fact":
++        return {(node.fact_key, node.period_key)}
++    children = node.items if node.op in {"median", "minimum"} else (node.left, node.right)
++    return set().union(*(_leaves(child) for child in children))
++
++
++def evaluate_selected_features(*, slots, facts, issues, as_of_utc):
++    """Return detached signed-slot values and explicit local blockers."""
++    output, all_blockers = [], set()
++    issue_blockers = {"formal_fact_issue_" + issue.to_dict()["code"] for issue in issues}
++    for supplied_slot in slots:
++        slot = FormalFeatureSlot.from_dict(supplied_slot.to_dict())
++        namespace, blockers = {}, set(issue_blockers)
++        for metric, period in sorted(_leaves(slot.formula)):
++            candidates = [fact for fact in facts if fact.metric_key == metric]
++            if len(period) == 6 and period.startswith("FY") and period[2:].isdigit():
++                end = period[2:] + "-12-31"
++                local = select_visible_formal_facts(
++                    (fact for fact in candidates if fact.period_kind == "FY" and fact.period_end == end),
++                    as_of_utc,
++                )
++                blockers.update(local.blockers)
++                derived = local.facts
++            elif len(period) == 6 and period[:4].isdigit() and period[4] == "Q" and period[5] in "1234":
++                year, quarter = period[:4], int(period[5])
++                ends = ("03-31", "06-30", "09-30", "12-31")
++                end = year + "-" + ends[quarter - 1]
++                predecessor = year + "-" + ends[quarter - 2] if quarter > 1 else None
++                local = select_visible_formal_facts(
++                    (fact for fact in candidates if fact.period_end == end
++                        or (fact.nature == "duration" and fact.period_end == predecessor)), as_of_utc,
++                )
++                blockers.update(local.blockers)
++                quarters = derive_comparable_quarters(local.facts)
++                derived = tuple(fact for fact in quarters.facts if fact.quarter_key == period)
++                local_blockers = set(quarters.blockers)
++                # Deriving Q4 also attempts Q3. Q3's absent H1 is immaterial
++                # only when every requested endpoint is covered by a Q4 proof.
++                requested_ids = {fact.id for fact in local.facts if fact.period_end == end}
++                covered_ids = {identity for fact in derived for identity in fact.component_fact_ids}
++                if requested_ids and requested_ids <= covered_ids:
++                    local_blockers.discard("quarter_missing_prerequisite")
++                blockers.update(local_blockers)
++            else:
++                # Signed V6 accepts arbitrary period identifiers; an unsupported
++                # identifier has no matching formula namespace, never a guessed FY.
++                derived = ()
++            if len(derived) > 1:
++                blockers.add("formula_fact_ambiguous")
++            elif derived:
++                namespace[(metric, period)] = derived[0]
++        if blockers:
++            value = FormalFeatureValue(slot.slot_id, None, slot.unit, "blocked",
++                slot.formula_version, (), sorted(blockers)[0])
++        else:
++            result = evaluate_formula(slot.formula, namespace)
++            reason = result.missing_reason
++            if reason is None and result.unit != slot.unit:
++                reason = "formula_unit_mismatch"
++            if reason is not None:
++                blockers.add(reason)
++                value = FormalFeatureValue(slot.slot_id, None, slot.unit, "missing",
++                    slot.formula_version, (), reason)
++            else:
++                value = FormalFeatureValue(slot.slot_id, result.value, slot.unit, "derived",
++                    slot.formula_version, result.evidence, None)
++        output.append(value)
++        all_blockers.update(blockers)
++    return tuple(output), tuple(sorted(all_blockers))
+
+diff --git a/tests/test_formal_metric_features.py b/tests/test_formal_metric_features.py
+new file mode 100644
+index 0000000..a8bfa30
+--- /dev/null
++++ b/tests/test_formal_metric_features.py
+@@ -0,0 +1,365 @@
++"""Metric projections use real signed graphs, source receipts and SQLite facts."""
++
++import copy
++import sys
++from pathlib import Path
++import unittest
++from unittest.mock import patch
++
++import tests.test_formal_feature_repository as fixtures
++from tests.test_formal_feature_contract import feature_registry_bytes, slot_wire, TEMPLATES
++from ashare_pipeline.formal_feature_contract import FormalFeatureBundle
++from ashare_pipeline.formal_financial_schema import FormalFactIssue
++import ashare_pipeline.formal_metric_features as metric_evaluation
++from ashare_pipeline.formal_financial_features import FormalFormulaResult
++from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore
++
++
++class MetricProjectionTests(unittest.TestCase):
++    # Reuse fixture operations, never inherit/import a TestCase into discovery.
++    setUp = fixtures.FormalFeatureRepositoryTests.setUp
++    install_fact = fixtures.FormalFeatureRepositoryTests.install_fact
++    install_eligible_bundle_facts = fixtures.FormalFeatureRepositoryTests.install_eligible_bundle_facts
++    install_registry = fixtures.FormalFeatureRepositoryTests.install_registry
++    repository = fixtures.FormalFeatureRepositoryTests.repository
++    build = fixtures.FormalFeatureRepositoryTests.build
++    snapshot = fixtures.FormalFeatureRepositoryTests.snapshot
++    sql = fixtures.FormalFeatureRepositoryTests.sql
++    correction = fixtures.FormalFeatureRepositoryTests.correction
++    persist_unchecked = fixtures.FormalFeatureRepositoryTests.persist_unchecked
++
++    def project(self, *, repo=None, snapshot=None, **changes):
++        self.assertTrue(callable(getattr(self.api.FormalFeatureRepository,
++            "select_current_verified_metric_features", None)), "metric projection endpoint is missing")
++        request = dict(security_id="SZ000001", as_of_utc="2026-08-31T07:00:00+00:00",
++            template_id="general_nonfinancial", registry_manifest_hash=self.manifest.manifest_hash,
++            required_feature_keys=("general_nonfinancial.growth",))
++        request.update(changes)
++        repo = repo or self.repository(fixtures.SnapshotProvider(snapshot or self.snapshot()))
++        return repo.select_current_verified_metric_features(**request)
++
++    def persist(self, *, issues=()):
++        bundle = self.build(issues=issues)
++        self.store.put_formal_feature_bundle(bundle, self.files.write(bundle))
++        return bundle
++
++    def configure(self, formula=None, unit="CNY", extra=False, required=True):
++        formula = formula or {"op": "fact", "fact_key": "revenue", "period_key": "FY2025"}
++        slots = [slot_wire(t, unit=unit, required=required, formula=formula) for t in TEMPLATES]
++        if extra:
++            slots.append(slot_wire("general_nonfinancial", suffix="other", unit="CNY",
++                formula={"op": "fact", "fact_key": "unobserved", "period_key": "FY2025"}))
++        def registry_bytes(**kwargs):
++            kwargs["slots"] = sorted(slots, key=lambda x: x["slot_id"])
++            return feature_registry_bytes(**kwargs)
++        with patch.object(fixtures, "feature_registry_bytes", side_effect=registry_bytes):
++            self.install_registry()
++
++    def only_periods(self, *periods):
++        marks = ",".join("?" for _ in periods)
++        self.sql(f"DELETE FROM formal_financial_fact WHERE period_end NOT IN ({marks})", periods)
++
++    def add_fact(self, **kwargs):
++        original = self.store
++        fact = self.install_fact(**kwargs)
++        self.store = original
++        self.store.insert_formal_financial_facts((fact,))
++        return fact
++
++    def test_valid_projection_is_deterministic_and_binds_receipt(self):
++        first, second = self.project(), self.project()
++        self.assertEqual(first.values[0].value, 100.0)
++        self.assertEqual(first.values[0].status, "derived")
++        self.assertEqual(first.input_hash, self.bundle.input_hash)
++        self.assertEqual(first.bundle_hash, self.bundle.bundle_hash())
++        self.assertEqual(first.canonical_bytes(), second.canonical_bytes())
++        self.assertEqual(len(first.projection_hash), 64)
++        self.assertEqual(first.required_feature_keys, ("general_nonfinancial.growth",))
++        self.assertEqual(first.slots[0].formula.period_key, "FY2025")
++        wire = first.to_dict()
++        wire["values"][0]["value"] = 999.0
++        self.assertEqual(first.values[0].value, 100.0)
++        self.assertEqual(self.repo.get_verified_formal_feature_bundle(input_hash=self.bundle.input_hash).canonical_bytes(), self.bundle.canonical_bytes())
++
++    def test_missing_other_required_slot_does_not_exclude_selected_metric(self):
++        self.configure(extra=True)
++        bundle = self.persist()
++        self.assertIn("feature_required_slot_missing", bundle.blockers)
++        self.assertEqual(self.project().values[0].value, 100.0)
++        with self.assertRaises(ValueError):
++            self.repository().get_verified_formal_feature_bundle(input_hash=bundle.input_hash)
++
++    def test_annual_only_survives_global_history_and_quarter_shortage(self):
++        self.only_periods("2025-12-31")
++        bundle = self.persist()
++        self.assertIn("pending_evidence/history_not_mature", bundle.blockers)
++        projection = self.project()
++        self.assertEqual(projection.values[0].value, 100.0)
++        self.assertEqual(len(projection.values[0].evidence), 1)
++        self.assertEqual(projection.blockers, ())
++        with self.assertRaises(ValueError):
++            self.repository().get_verified_formal_feature_bundle(input_hash=bundle.input_hash)
++
++    def test_requested_quarter_ignores_predecessors_own_missing_predecessor(self):
++        self.configure({"op": "fact", "fact_key": "revenue", "period_key": "2025Q4"})
++        self.only_periods("2025-09-30", "2025-12-31")
++        self.persist()
++        value = self.project().values[0]
++        self.assertEqual(value.value, 0.0)
++        self.assertEqual(value.status, "derived")
++        self.assertEqual(len(value.evidence), 2)
++
++    def test_required_fact_or_quarter_predecessor_missing_is_explicit(self):
++        self.only_periods("2024-12-31")
++        self.persist()
++        value = self.project().values[0]
++        self.assertIsNone(value.value)
++        self.assertEqual(value.missing_reason, "formula_fact_missing")
++        self.configure({"op": "fact", "fact_key": "revenue", "period_key": "2024Q4"})
++        self.persist()
++        value = self.project().values[0]
++        self.assertIsNone(value.value)
++        self.assertIn("quarter_missing_prerequisite", self.project().blockers)
++
++    def test_zero_denominator_unit_mismatch_and_negative_values(self):
++        leaf = {"op": "fact", "fact_key": "revenue", "period_key": "FY2025"}
++        zero = {"op": "subtract", "left": leaf, "right": leaf}
++        self.configure({"op": "divide", "left": leaf, "right": zero}, "ratio")
++        self.persist()
++        self.assertEqual(self.project().values[0].missing_reason, "formula_zero_denominator")
++        self.configure(leaf, "shares")
++        self.persist()
++        self.assertEqual(self.project().values[0].missing_reason, "formula_unit_mismatch")
++        self.configure({"op": "subtract", "left": zero, "right": leaf})
++        self.persist()
++        self.assertEqual(self.project().values[0].value, -100.0)
++
++    def test_unresolved_issue_cannot_be_hidden_by_claimed_scope(self):
++        issue = FormalFactIssue("unknown_source_field", None, "OTHER", {"period": "FY1900", "metric_key": "unrelated"})
++        self.persist(issues=(issue,))
++        projection = self.project(snapshot=self.snapshot(issues=(issue,)))
++        self.assertEqual(projection.values[0].status, "blocked")
++        self.assertIsNone(projection.values[0].value)
++        self.assertIn("formal_fact_issue_unknown_source_field", projection.blockers)
++
++    def test_missing_current_receipt_returns_none(self):
++        self.correction()
++        self.assertIsNone(self.project())
++
++    def test_proof_constructor_copy_and_low_level_mutation_reject(self):
++        original = self.project()
++        with self.assertRaises(TypeError):
++            type(original)()
++        fake = object.__new__(type(original))
++        with self.assertRaises(ValueError):
++            fake.to_dict()
++        for copier in (copy.copy, copy.deepcopy):
++            try:
++                clone = copier(original)
++            except (TypeError, ValueError):
++                continue
++            self.assertIsNot(clone, original)
++            with self.assertRaises(ValueError):
++                clone.to_dict()
++        object.__setattr__(original, "input_hash", "f" * 64)
++        with self.assertRaises(ValueError):
++            original.canonical_bytes()
++
++    def test_fake_repository_or_replaced_dependencies_cannot_mint(self):
++        real = self.repository(fixtures.SnapshotProvider(self.snapshot()))
++        fake = object.__new__(type(real))
++        fake.__dict__.update(real.__dict__)
++        with self.assertRaises(ValueError):
++            self.project(repo=fake)
++        real._store = self.repository()._store
++        real._bundle_store = object()
++        with self.assertRaises(ValueError):
++            self.project(repo=real)
++
++    def test_invalid_cutoff_template_security_root_and_keys_reject(self):
++        for changes in ({"as_of_utc": "2026-08-30T07:00:00+00:00"}, {"template_id": "bank"},
++                {"security_id": "000001"}, {"registry_manifest_hash": "f" * 64},
++                {"required_feature_keys": ()}, {"required_feature_keys": ["general_nonfinancial.growth"]},
++                {"required_feature_keys": ("general_nonfinancial.growth",) * 2},
++                {"required_feature_keys": ("general_nonfinancial.unknown",)},
++                {"required_feature_keys": ("bank.growth",)}):
++            with self.subTest(changes=changes), self.assertRaises(ValueError):
++                self.project(**changes)
++        self.configure(required=False)
++        self.persist()
++        with self.assertRaises(ValueError):
++            self.project()
++
++    def test_sql_bundle_and_raw_source_tamper_reject(self):
++        self.sql("UPDATE formal_feature_value SET value=999")
++        with self.assertRaises(ValueError):
++            self.project()
++        self.sql("UPDATE formal_feature_value SET value=100")
++        row = self.store.get_formal_feature_bundle_row(self.bundle.input_hash)
++        bundle_path = Path(row["bundle_path"])
++        original = bundle_path.read_bytes()
++        bundle_path.write_bytes(b"{}")
++        with self.assertRaises(ValueError):
++            self.project()
++        bundle_path.write_bytes(original)
++        ref = self.store.get_formal_snapshot(self.fact.source_snapshot_id)
++        Path(ref.content_path).write_bytes(b"tampered")
++        with self.assertRaises(ValueError):
++            self.project()
++
++    def test_replaced_evaluation_dependency_cannot_supply_numeric_override(self):
++        original = metric_evaluation.evaluate_formula
++        def forged(*args, **kwargs):
++            result = original(*args, **kwargs)
++            return FormalFormulaResult(999.0, result.unit, result.evidence, result.time_reliability, None)
++        with patch.object(metric_evaluation, "evaluate_formula", forged), self.assertRaises(ValueError):
++            self.project()
++
++    def test_store_trust_dependencies_cannot_be_replaced_after_repository_creation(self):
++        repo = self.repository(fixtures.SnapshotProvider(self.snapshot()))
++        self.store._registry_signature_verifier = fixtures.DigestVerifier()
++        with self.assertRaises(ValueError):
++            self.project(repo=repo)
++
++    def test_cached_source_readers_cannot_hide_actual_raw_file_tamper(self):
++        source = self.store._formal_snapshot_store
++        raw_reader, validator = source.read_verified_raw, source.validate_stored_snapshot
++        cached_raw, cached_validation = {}, {}
++        def capture_raw(stored, **kwargs):
++            result = raw_reader(stored, **kwargs)
++            cached_raw[stored.manifest_sha256] = result
++            return result
++        def capture_validation(fetch, stored, verification, **kwargs):
++            result = validator(fetch, stored, verification, **kwargs)
++            cached_validation[stored.manifest_sha256] = result
++            return result
++        with patch.object(source, "read_verified_raw", capture_raw), patch.object(source, "validate_stored_snapshot", capture_validation):
++            snapshot = self.snapshot()
++            ref = self.store.get_formal_snapshot(self.fact.source_snapshot_id)
++        repo = self.repository(fixtures.SnapshotProvider(snapshot))
++        Path(ref.content_path).write_bytes(b"corrupted after authentic source read")
++        def replay_raw(stored, **kwargs):
++            return cached_raw[stored.manifest_sha256]
++        def replay_validation(fetch, stored, verification, **kwargs):
++            return cached_validation[stored.manifest_sha256]
++        with patch.object(source, "read_verified_raw", replay_raw), patch.object(source, "validate_stored_snapshot", replay_validation):
++            with self.assertRaises(ValueError):
++                result = self.project(repo=repo, snapshot=snapshot)
++                result.require_verified()
++
++    def test_source_reader_class_and_classmethod_replacement_rejects(self):
++        snapshot = self.snapshot()
++        repo = self.repository(fixtures.SnapshotProvider(snapshot))
++        reader = FormalSnapshotStore.read_verified_raw
++        def replaced_reader(source, *args, **kwargs):
++            return reader(source, *args, **kwargs)
++        validator = FormalSnapshotStore._validate_formal_fetch_values
++        def replaced_class_validator(cls, *args, **kwargs):
++            return validator(*args, **kwargs)
++        for name, replacement in (("read_verified_raw", replaced_reader),
++                ("_validate_formal_fetch_values", classmethod(replaced_class_validator))):
++            with self.subTest(method=name), patch.object(FormalSnapshotStore, name, replacement):
++                with self.assertRaises(ValueError):
++                    self.project(repo=repo, snapshot=snapshot)
++
++    def test_complete_provider_identity_fact_and_issue_boundaries_are_enforced(self):
++        for changes in ({"complete": False}, {"batch_id": " "}, {"facts": ()},
++                {"facts": []}, {"issues": []}, {"issues": ({},)},
++                {"security_id": "SH600001"}, {"template_id": "bank"}):
++            with self.subTest(changes=changes), self.assertRaises(ValueError):
++                self.project(snapshot=self.snapshot(**changes))
++
++    def test_nested_proof_value_and_slot_mutation_invalidates_seal(self):
++        projection = self.project()
++        object.__setattr__(projection.slots[0].formula, "period_key", "FY2024")
++        with self.assertRaises(ValueError):
++            projection.require_verified()
++        projection = self.project()
++        object.__setattr__(projection.values[0], "value", 999.0)
++        with self.assertRaises(ValueError):
++            projection.require_verified()
++
++    def test_relevant_tie_mapping_and_annual_namespace_conflicts_are_pending(self):
++        for name, kwargs, expected in (
++            ("tie", {"value": 101.0}, "fact_selection_tie_conflict"),
++            ("mapping", {"source_overrides": {"mapping_version": "new-mapping"}}, "fact_mapping_version_conflict"),
++            ("basis", {"accounting_basis": "standalone"}, "formula_fact_ambiguous"),
++        ):
++            with self.subTest(name=name):
++                changed = self.add_fact(generation="conflict-" + name, **kwargs)
++                self.persist()
++                result = self.project()
++                self.assertIsNone(result.values[0].value)
++                self.assertIn(expected, result.blockers)
++                self.sql("DELETE FROM formal_financial_fact WHERE id=?", (changed.id,))
++
++    def test_quarter_accounting_conflict_is_not_dismissed_as_history_shortage(self):
++        self.configure({"op": "fact", "fact_key": "revenue", "period_key": "2025Q4"})
++        self.only_periods("2025-12-31")
++        self.add_fact(report_period="2025-09-30", accounting_basis="standalone", generation="basis-Q3")
++        self.persist()
++        result = self.project()
++        self.assertIsNone(result.values[0].value)
++        self.assertIn("quarter_accounting_basis_mismatch", result.blockers)
++
++    def test_after_freeze_fact_cannot_supply_missing_annual_leaf(self):
++        self.sql("DELETE FROM formal_financial_fact WHERE period_end='2025-12-31'")
++        self.add_fact(generation="future", source_overrides={"source_updated_at_utc": "2026-09-01T00:00:00+00:00"})
++        self.persist()
++        result = self.project()
++        self.assertIsNone(result.values[0].value)
++        self.assertEqual(result.values[0].missing_reason, "formula_fact_missing")
++
++    def test_correction_during_provider_build_receipt_or_derivation_rejects(self):
++        for index, phase in enumerate(("resolve_current_inputs", "build_formal_feature_bundle",
++                "_read_authenticated_bundle", "evaluate_selected_features")):
++            with self.subTest(phase=phase):
++                self.persist()
++                snapshot = self.snapshot()
++                fired = False
++                def profile(frame, event, arg):
++                    nonlocal fired
++                    if not fired and event == "return" and frame.f_code.co_name == phase:
++                        fired = True
++                        self.add_fact(value=200.0 + index, generation="race-" + str(index),
++                            source_overrides={"source_updated_at_utc": f"2026-04-{index+1:02d}T00:00:00+00:00"})
++                previous = sys.getprofile()
++                try:
++                    sys.setprofile(profile)
++                    with self.assertRaises(ValueError):
++                        self.project(snapshot=snapshot)
++                finally:
++                    sys.setprofile(previous)
++                self.assertTrue(fired, "race must occur during actual execution")
++
++    def test_late_provider_mutation_and_receipt_mutation_reject(self):
++        for target in ("provider", "receipt", "source"):
++            with self.subTest(target=target):
++                snapshot = self.snapshot()
++                source_path = Path(self.store.get_formal_snapshot(self.fact.source_snapshot_id).content_path)
++                original_source = source_path.read_bytes()
++                fired = False
++                def profile(frame, event, arg):
++                    nonlocal fired
++                    if not fired and event == "return" and frame.f_code.co_name == "evaluate_selected_features":
++                        fired = True
++                        if target == "provider":
++                            object.__setattr__(snapshot, "batch_id", "changed")
++                        elif target == "receipt":
++                            self.sql("UPDATE formal_feature_value SET value=999")
++                        else:
++                            source_path.write_bytes(b"corrupt-after-derivation")
++                previous = sys.getprofile()
++                try:
++                    sys.setprofile(profile)
++                    with self.assertRaises(ValueError):
++                        self.project(snapshot=snapshot)
++                finally:
++                    sys.setprofile(previous)
++                    self.sql("UPDATE formal_feature_value SET value=100")
++                    source_path.write_bytes(original_source)
++                self.assertTrue(fired)
++
++
++if __name__ == "__main__":
++    unittest.main()
+

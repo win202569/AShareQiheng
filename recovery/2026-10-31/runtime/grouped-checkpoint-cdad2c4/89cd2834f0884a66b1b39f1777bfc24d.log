@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_eligibility.ReadyCardProvenanceRegressionTests.test_genuine_ready_card_builds_eligibility_from_batch_score_hash
+test_genuine_ready_card_builds_eligibility_from_batch_score_hash (test_formal_final_eligibility.ReadyCardProvenanceRegressionTests.test_genuine_ready_card_builds_eligibility_from_batch_score_hash) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 1044.761s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_eligibility.ReadyCardProvenanceRegressionTests.test_genuine_ready_card_builds_eligibility_from_batch_score_hash"], "passed": ["test_formal_final_eligibility.ReadyCardProvenanceRegressionTests.test_genuine_ready_card_builds_eligibility_from_batch_score_hash"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

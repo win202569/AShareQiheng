@@ -1,0 +1,727 @@
+# Review package: 3152ad8..438900f
+
+## Commits
+438900f feat: add formal v5 schema migration
+
+## Files changed
+ ashare_pipeline/state_store.py | 175 +++++++++++++++++++++++++++++++++++++++--
+ tests/fixtures/schema_v4.sql   | 125 +++++++++++++++++++++++++++++
+ tests/test_state_store.py      | 115 ++++++++++++++++++++++++---
+ 3 files changed, 399 insertions(+), 16 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index e883486..5708ac6 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -37,21 +37,21 @@ from ashare_pipeline.financial_schema import (
+     balance_equation_blockers,
+     raw_financial_slot_descriptor,
+ )
+ 
+ 
+ JOB_STATES = {"pending", "running", "succeeded", "retryable_failed", "terminal_failed"}
+ SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
+ SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
+ RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
+ _OWNED_JOB_KINDS = frozenset({"deep_financial", "deep_statement", "feature_build"})
+-SCHEMA_VERSION = 4
++SCHEMA_VERSION = 5
+ _EVIDENCE_QUERY_BATCH_SIZE = 256
+ _STATEMENT_DATASETS = ("balance_sheet", "profit_sheet", "cash_flow_sheet")
+ _SHANGHAI = timezone(timedelta(hours=8))
+ _RECONCILIATION_PRE_MIDNIGHT_WINDOW = timedelta(minutes=5)
+ _RECONCILIATION_CROSS_MIDNIGHT_GRACE = timedelta(seconds=15)
+ _RECONCILIATION_STATEMENT_PAYLOAD_KEYS = frozenset(
+     {
+         "security_id",
+         "dataset",
+         "report_period",
+@@ -271,20 +271,138 @@ _V3_INDEX_DDL = {
+ _V4_TABLE_DDL = {
+     "quality_issue_binding": """CREATE TABLE IF NOT EXISTS quality_issue_binding(
+         issue_id TEXT PRIMARY KEY REFERENCES quality_issue(id),
+         job_id TEXT NOT NULL REFERENCES job(id),
+         source_snapshot_id TEXT NOT NULL REFERENCES source_snapshot(id)
+     )""",
+ }
+ 
+ _V4_INDEX_DDL: dict[str, str] = {}
+ 
++_V5_TABLE_DDL = {
++    "formal_collection_task": """CREATE TABLE IF NOT EXISTS formal_collection_task(
++        id TEXT PRIMARY KEY,
++        kind TEXT NOT NULL,
++        idempotency_key TEXT NOT NULL UNIQUE,
++        refresh_generation TEXT NOT NULL CHECK(refresh_generation<>''),
++        payload_json TEXT NOT NULL,
++        payload_sha256 TEXT NOT NULL,
++        status TEXT NOT NULL CHECK(status IN(
++            'pending','leased','verified','retryable_failed','terminal_failed','superseded'
++        )),
++        lease_worker TEXT,
++        lease_expires_at TEXT,
++        next_retry_at TEXT,
++        result_json TEXT,
++        error_json TEXT,
++        created_at TEXT NOT NULL,
++        updated_at TEXT NOT NULL
++    )""",
++    "formal_source_snapshot": """CREATE TABLE IF NOT EXISTS formal_source_snapshot(
++        id TEXT PRIMARY KEY,
++        source TEXT NOT NULL,
++        dataset TEXT NOT NULL,
++        request_json TEXT NOT NULL,
++        request_fingerprint TEXT NOT NULL,
++        content_sha256 TEXT NOT NULL,
++        manifest_sha256 TEXT NOT NULL UNIQUE,
++        content_path TEXT NOT NULL,
++        manifest_path TEXT NOT NULL,
++        original_url TEXT NOT NULL,
++        published_at_utc TEXT NOT NULL,
++        published_precision TEXT NOT NULL CHECK(published_precision IN('timestamp','date_only')),
++        source_updated_at_utc TEXT,
++        captured_at_utc TEXT NOT NULL,
++        effective_at_utc TEXT NOT NULL,
++        effective_time_evidence_hash TEXT,
++        parser_id TEXT NOT NULL,
++        parser_version TEXT NOT NULL,
++        mapping_version TEXT NOT NULL,
++        refresh_generation TEXT NOT NULL CHECK(refresh_generation<>''),
++        producing_task_id TEXT REFERENCES formal_collection_task(id),
++        verification_json TEXT NOT NULL,
++        created_at TEXT NOT NULL
++    )""",
++    "formal_task_snapshot_receipt": """CREATE TABLE IF NOT EXISTS formal_task_snapshot_receipt(
++        task_id TEXT PRIMARY KEY REFERENCES formal_collection_task(id),
++        snapshot_id TEXT NOT NULL UNIQUE REFERENCES formal_source_snapshot(id),
++        manifest_sha256 TEXT NOT NULL UNIQUE,
++        refresh_generation TEXT NOT NULL CHECK(refresh_generation<>''),
++        recorded_at TEXT NOT NULL
++    )""",
++    "formal_universe_snapshot": """CREATE TABLE IF NOT EXISTS formal_universe_snapshot(
++        id TEXT PRIMARY KEY,
++        as_of_utc TEXT NOT NULL,
++        registry_manifest_hash TEXT NOT NULL,
++        universe_hash TEXT NOT NULL,
++        source_audit_hash TEXT NOT NULL,
++        frozen_input_hash TEXT NOT NULL UNIQUE,
++        created_at TEXT NOT NULL
++    )""",
++    "formal_universe_source": """CREATE TABLE IF NOT EXISTS formal_universe_source(
++        universe_snapshot_id TEXT NOT NULL REFERENCES formal_universe_snapshot(id),
++        exchange TEXT NOT NULL CHECK(exchange IN('SH','SZ','BJ')),
++        source_snapshot_id TEXT NOT NULL REFERENCES formal_source_snapshot(id),
++        manifest_sha256 TEXT NOT NULL,
++        source_content_sha256 TEXT NOT NULL,
++        parser_id TEXT NOT NULL,
++        parser_version TEXT NOT NULL,
++        extraction_audit_hash TEXT NOT NULL,
++        extraction_json TEXT NOT NULL,
++        created_at TEXT NOT NULL,
++        PRIMARY KEY(universe_snapshot_id,exchange)
++    )""",
++    "formal_universe_member": """CREATE TABLE IF NOT EXISTS formal_universe_member(
++        snapshot_id TEXT NOT NULL REFERENCES formal_universe_snapshot(id),
++        security_id TEXT NOT NULL,
++        exchange TEXT NOT NULL CHECK(exchange IN('SH','SZ','BJ')),
++        code6 TEXT NOT NULL,
++        security_type TEXT NOT NULL,
++        listing_status TEXT NOT NULL,
++        raw_json TEXT NOT NULL,
++        PRIMARY KEY(snapshot_id,security_id)
++    )""",
++    "formal_universe_status": """CREATE TABLE IF NOT EXISTS formal_universe_status(
++        snapshot_id TEXT NOT NULL,
++        security_id TEXT NOT NULL,
++        status TEXT NOT NULL CHECK(status IN(
++            'out_of_scope','pending_evidence','pool_vetoed','formal_scored'
++        )),
++        reasons_json TEXT NOT NULL,
++        veto_flags_json TEXT NOT NULL,
++        evidence_hash TEXT NOT NULL,
++        updated_at TEXT NOT NULL,
++        PRIMARY KEY(snapshot_id,security_id),
++        FOREIGN KEY(snapshot_id,security_id)
++            REFERENCES formal_universe_member(snapshot_id,security_id)
++    )""",
++    "formal_collection_task_dependency": """CREATE TABLE IF NOT EXISTS formal_collection_task_dependency(
++        task_id TEXT NOT NULL REFERENCES formal_collection_task(id),
++        prerequisite_task_id TEXT NOT NULL REFERENCES formal_collection_task(id),
++        created_at TEXT NOT NULL,
++        PRIMARY KEY(task_id,prerequisite_task_id)
++    )""",
++}
++
++_V5_INDEX_DDL = {
++    "formal_source_snapshot_lineage_idx": """CREATE UNIQUE INDEX IF NOT EXISTS
++        formal_source_snapshot_lineage_idx ON formal_source_snapshot(
++            request_fingerprint,
++            refresh_generation,
++            COALESCE(producing_task_id,'bootstrap')
++        )""",
++    "formal_source_snapshot_exact_request_idx": """CREATE INDEX IF NOT EXISTS
++        formal_source_snapshot_exact_request_idx ON formal_source_snapshot(
++            source,dataset,request_fingerprint,refresh_generation,created_at DESC
++        )""",
++}
++
+ 
+ class FinalizationBlocked(RuntimeError):
+     """The final publication gate has not yet been satisfied."""
+ 
+ 
+ @dataclass(frozen=True)
+ class JobSpec:
+     kind: str
+     idempotency_key: str
+     _payload_json: str = field(init=False, repr=False)
+@@ -947,83 +1065,113 @@ class StateStore:
+             tables = self._user_tables(connection)
+             if not tables:
+                 self._create_v2_schema(connection)
+                 connection.execute(_MIGRATION_TABLE_DDL)
+                 connection.execute(
+                     "INSERT INTO schema_migration(version, applied_at) VALUES (2, ?)",
+                     (_utc_now(),),
+                 )
+                 self._apply_v3_migration(connection)
+                 self._apply_v4_migration(connection)
++                self._apply_v5_migration(connection)
+             elif "schema_migration" not in tables:
+                 if tables != set(_V2_TABLE_DDL):
+                     raise RuntimeError("database does not match the complete v2 schema")
+                 self._assert_v2_schema(connection)
+                 connection.execute(_MIGRATION_TABLE_DDL)
+                 connection.execute(
+                     "INSERT INTO schema_migration(version, applied_at) VALUES (2, ?)",
+                     (_utc_now(),),
+                 )
+                 self._apply_v3_migration(connection)
+                 self._apply_v4_migration(connection)
++                self._apply_v5_migration(connection)
+             else:
+                 self._assert_schema_ddl(
+                     connection,
+                     {"schema_migration": _MIGRATION_TABLE_DDL},
+                     {},
+                     "migration ledger",
+                 )
+                 versions = {
+                     int(row[0])
+                     for row in connection.execute("SELECT version FROM schema_migration")
+                 }
+-                if versions not in ({2}, {2, 3}, {2, 3, 4}):
++                if versions not in ({2}, {2, 3}, {2, 3, 4}, {2, 3, 4, 5}):
+                     raise RuntimeError(f"unsupported migration versions: {sorted(versions)}")
+                 self._assert_v2_schema(connection)
+                 if versions == {2}:
+                     later_tables = tables & (
+-                        set(_V3_TABLE_DDL) | set(_V4_TABLE_DDL)
++                        set(_V3_TABLE_DDL) | set(_V4_TABLE_DDL) | set(_V5_TABLE_DDL)
+                     )
+                     if later_tables:
+                         raise RuntimeError(
+                             "version-2 ledger has unexpected later tables: "
+                             f"{sorted(later_tables)}"
+                         )
+                     self._apply_v3_migration(connection)
+                     self._apply_v4_migration(connection)
++                    self._apply_v5_migration(connection)
+                 elif versions == {2, 3}:
+                     self._assert_schema_ddl(
+                         connection,
+                         _V3_TABLE_DDL,
+                         _V3_INDEX_DDL,
+                         "v3 schema",
+                     )
+-                    partial_v4_tables = tables & set(_V4_TABLE_DDL)
+-                    if partial_v4_tables:
++                    later_tables = tables & (set(_V4_TABLE_DDL) | set(_V5_TABLE_DDL))
++                    if later_tables:
+                         raise RuntimeError(
+                             "version-3 ledger has unexpected v4 tables: "
+-                            f"{sorted(partial_v4_tables)}"
++                            f"{sorted(later_tables)}"
+                         )
+                     self._apply_v4_migration(connection)
++                    self._apply_v5_migration(connection)
++                elif versions == {2, 3, 4}:
++                    self._assert_schema_ddl(
++                        connection,
++                        _V3_TABLE_DDL,
++                        _V3_INDEX_DDL,
++                        "v3 schema",
++                    )
++                    self._assert_schema_ddl(
++                        connection,
++                        _V4_TABLE_DDL,
++                        _V4_INDEX_DDL,
++                        "v4 schema",
++                    )
++                    partial_v5_tables = tables & set(_V5_TABLE_DDL)
++                    if partial_v5_tables:
++                        raise RuntimeError(
++                            "version-4 ledger has unexpected v5 tables: "
++                            f"{sorted(partial_v5_tables)}"
++                        )
++                    self._apply_v5_migration(connection)
+                 else:
+                     self._assert_schema_ddl(
+                         connection,
+                         _V3_TABLE_DDL,
+                         _V3_INDEX_DDL,
+                         "v3 schema",
+                     )
+                     self._assert_schema_ddl(
+                         connection,
+                         _V4_TABLE_DDL,
+                         _V4_INDEX_DDL,
+                         "v4 schema",
+                     )
++                    self._assert_schema_ddl(
++                        connection,
++                        _V5_TABLE_DDL,
++                        _V5_INDEX_DDL,
++                        "v5 schema",
++                    )
+             connection.commit()
+         except BaseException:
+             connection.rollback()
+             raise
+         finally:
+             connection.close()
+ 
+     @contextmanager
+     def owned_job_transaction(
+         self,
+@@ -1153,20 +1301,35 @@ class StateStore:
+             connection,
+             _V4_TABLE_DDL,
+             _V4_INDEX_DDL,
+             "v4 schema",
+         )
+         connection.execute(
+             "INSERT INTO schema_migration(version, applied_at) VALUES (4, ?)",
+             (_utc_now(),),
+         )
+ 
++    @classmethod
++    def _apply_v5_migration(cls, connection: sqlite3.Connection) -> None:
++        for statement in (*_V5_TABLE_DDL.values(), *_V5_INDEX_DDL.values()):
++            connection.execute(statement)
++        cls._assert_schema_ddl(
++            connection,
++            _V5_TABLE_DDL,
++            _V5_INDEX_DDL,
++            "v5 schema",
++        )
++        connection.execute(
++            "INSERT INTO schema_migration(version, applied_at) VALUES (5, ?)",
++            (_utc_now(),),
++        )
++
+     def start_run(self, mode: str, as_of_cn: str, params: dict) -> str:
+         run_id = str(uuid.uuid4())
+         with self._transaction() as connection:
+             connection.execute(
+                 "INSERT INTO run VALUES (?, ?, ?, ?, 'running', NULL, ?, NULL)",
+                 (run_id, mode, _utc_iso(as_of_cn), _json(params), _utc_now()),
+             )
+         return run_id
+ 
+     def finish_run(self, run_id: str, status: str, error: str | None = None) -> None:
+diff --git a/tests/fixtures/schema_v4.sql b/tests/fixtures/schema_v4.sql
+new file mode 100644
+index 0000000..934930a
+--- /dev/null
++++ b/tests/fixtures/schema_v4.sql
+@@ -0,0 +1,125 @@
++CREATE TABLE run (
++    id TEXT PRIMARY KEY, mode TEXT NOT NULL, as_of_cn TEXT NOT NULL,
++    params_json TEXT NOT NULL, status TEXT NOT NULL,
++    error TEXT, started_at TEXT NOT NULL, finished_at TEXT
++);
++CREATE TABLE job (
++    id TEXT PRIMARY KEY, kind TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
++    payload_json TEXT NOT NULL, status TEXT NOT NULL,
++    lease_worker TEXT, lease_expires_at TEXT, next_retry_at TEXT,
++    result_json TEXT, last_error_json TEXT,
++    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
++    CHECK (status IN ('pending','running','succeeded','retryable_failed','terminal_failed'))
++);
++CREATE INDEX job_lease_idx ON job(kind, status, next_retry_at);
++CREATE TABLE artifact (
++    id TEXT PRIMARY KEY, run_id TEXT REFERENCES run(id), kind TEXT NOT NULL,
++    payload_hash TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL,
++    UNIQUE(run_id, kind, payload_hash)
++);
++CREATE TABLE source_snapshot (
++    id TEXT PRIMARY KEY, source TEXT NOT NULL, dataset TEXT NOT NULL,
++    request_fingerprint TEXT NOT NULL, payload_hash TEXT NOT NULL,
++    payload_path TEXT NOT NULL, row_count INTEGER NOT NULL, fetched_at TEXT NOT NULL,
++    created_at TEXT NOT NULL,
++    UNIQUE(source, dataset, request_fingerprint, payload_hash)
++);
++CREATE TABLE score_run (
++    id TEXT PRIMARY KEY, report_period TEXT NOT NULL, as_of_cn TEXT NOT NULL,
++    ruleset_hash TEXT NOT NULL, universe_hash TEXT NOT NULL, mode TEXT NOT NULL,
++    status TEXT NOT NULL, created_at TEXT NOT NULL, finalized_at TEXT,
++    cutoff_utc TEXT, market_ready INTEGER, quality_passed INTEGER,
++    market_evidence_json TEXT, quality_evidence_json TEXT,
++    CHECK (status IN ('provisional','final','invalidated'))
++);
++CREATE TABLE score_item (
++    score_run_id TEXT NOT NULL REFERENCES score_run(id), security_id TEXT NOT NULL,
++    state TEXT NOT NULL, coverage REAL NOT NULL, input_hash TEXT NOT NULL,
++    scores_json TEXT, reasons_json TEXT NOT NULL, updated_at TEXT NOT NULL,
++    PRIMARY KEY(score_run_id, security_id),
++    CHECK (state IN ('pending','partial','ready','blocked','final')),
++    CHECK (coverage >= 0 AND coverage <= 1)
++);
++CREATE TABLE quality_issue (
++    id TEXT PRIMARY KEY, run_id TEXT REFERENCES run(id), score_run_id TEXT REFERENCES score_run(id),
++    severity TEXT NOT NULL, code TEXT NOT NULL, details_json TEXT NOT NULL,
++    created_at TEXT NOT NULL
++);
++CREATE TABLE financial_fact(
++    id TEXT PRIMARY KEY,
++    security_id TEXT NOT NULL,
++    statement TEXT NOT NULL CHECK(statement IN('income','balance','cash_flow')),
++    metric_key TEXT NOT NULL,
++    period_start TEXT,
++    period_end TEXT NOT NULL,
++    period_kind TEXT NOT NULL CHECK(period_kind IN('FY','H1','Q1','Q3','OTHER')),
++    value REAL NOT NULL CHECK(value BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308),
++    unit TEXT NOT NULL CHECK(unit IN('CNY','shares','ratio','CNY_per_share')),
++    nature TEXT NOT NULL CHECK(nature IN('instant','duration')),
++    announced_at_utc TEXT NOT NULL,
++    effective_at_utc TEXT NOT NULL,
++    source_updated_at_utc TEXT,
++    source_snapshot_id TEXT NOT NULL REFERENCES source_snapshot(id),
++    source_field TEXT NOT NULL,
++    raw_row_hash TEXT NOT NULL,
++    mapping_version TEXT NOT NULL,
++    created_at TEXT NOT NULL,
++    CHECK((nature='instant' AND period_start IS NULL) OR
++          (nature='duration' AND period_start IS NOT NULL))
++);
++CREATE TABLE feature_set(
++    id TEXT PRIMARY KEY,
++    security_id TEXT NOT NULL,
++    report_period TEXT NOT NULL,
++    as_of_utc TEXT NOT NULL,
++    candidate_set_hash TEXT NOT NULL,
++    template_id TEXT NOT NULL,
++    template_version TEXT NOT NULL,
++    contract_version TEXT NOT NULL,
++    input_hash TEXT NOT NULL,
++    status TEXT NOT NULL CHECK(status IN('partial','financial_ready','blocked')),
++    financial_coverage REAL NOT NULL CHECK(financial_coverage>=0 AND financial_coverage<=1),
++    dimension_status_json TEXT NOT NULL,
++    confidence_inputs_json TEXT NOT NULL,
++    blockers_json TEXT NOT NULL,
++    bundle_hash TEXT NOT NULL UNIQUE,
++    bundle_path TEXT NOT NULL,
++    missing_json TEXT NOT NULL,
++    created_at TEXT NOT NULL,
++    UNIQUE(security_id,report_period,as_of_utc,input_hash)
++);
++CREATE TABLE feature_value(
++    feature_set_id TEXT NOT NULL REFERENCES feature_set(id) ON DELETE CASCADE,
++    dimension TEXT NOT NULL CHECK(dimension IN('G','V','M','EQ','FS','CA','T')),
++    feature_key TEXT NOT NULL,
++    period_key TEXT NOT NULL,
++    value REAL,
++    unit TEXT NOT NULL,
++    status TEXT NOT NULL CHECK(status IN('observed','derived','missing','not_applicable','blocked')),
++    formula_version TEXT NOT NULL,
++    evidence_json TEXT NOT NULL,
++    missing_reason TEXT,
++    PRIMARY KEY(feature_set_id,dimension,feature_key,period_key),
++    CHECK(value IS NULL OR value BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308),
++    CHECK((status IN('observed','derived') AND value IS NOT NULL AND missing_reason IS NULL)
++       OR (status IN('missing','not_applicable','blocked') AND value IS NULL AND missing_reason IS NOT NULL))
++);
++CREATE INDEX financial_fact_lookup_idx
++    ON financial_fact(security_id,metric_key,period_end,effective_at_utc);
++CREATE INDEX financial_fact_snapshot_idx
++    ON financial_fact(source_snapshot_id);
++CREATE INDEX feature_set_latest_idx
++    ON feature_set(security_id,report_period,contract_version,as_of_utc DESC,created_at DESC);
++CREATE TABLE quality_issue_binding(
++    issue_id TEXT PRIMARY KEY REFERENCES quality_issue(id),
++    job_id TEXT NOT NULL REFERENCES job(id),
++    source_snapshot_id TEXT NOT NULL REFERENCES source_snapshot(id)
++);
++CREATE TABLE schema_migration(
++    version INTEGER PRIMARY KEY,
++    applied_at TEXT NOT NULL
++);
++INSERT INTO schema_migration(version, applied_at) VALUES
++    (2, '2026-08-01T00:00:02+00:00'),
++    (3, '2026-08-01T00:00:03+00:00'),
++    (4, '2026-08-01T00:00:04+00:00');
+diff --git a/tests/test_state_store.py b/tests/test_state_store.py
+index fb2a716..0291dbe 100644
+--- a/tests/test_state_store.py
++++ b/tests/test_state_store.py
+@@ -600,21 +600,21 @@ class StateStoreTestCase(unittest.TestCase):
+                 "{}",
+                 "{}",
+                 "[]",
+                 f"bundle-{feature_set_id}",
+                 f"data/curated/formal_features/{feature_set_id}.json",
+                 "[]",
+                 utc_at(1),
+             ),
+         )
+ 
+-    def test_initialize_migrates_literal_v2_database_to_v4_without_changing_existing_rows(self) -> None:
++    def test_initialize_migrates_literal_v2_database_to_v5_without_changing_existing_rows(self) -> None:
+         legacy_path = Path(self.tempdir.name) / "legacy.sqlite3"
+         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
+         ordered_tables = {
+             "run": "id",
+             "source_snapshot": "id",
+             "job": "id",
+             "score_run": "id",
+             "score_item": "score_run_id, security_id",
+             "quality_issue": "id",
+             "artifact": "id",
+@@ -660,21 +660,21 @@ class StateStoreTestCase(unittest.TestCase):
+ 
+         with closing(sqlite3.connect(legacy_path)) as connection:
+             for table, order_by in ordered_tables.items():
+                 self.assertEqual(
+                     connection.execute(f"SELECT * FROM {table} ORDER BY {order_by}").fetchall(),
+                     before[table],
+                     table,
+                 )
+             self.assertEqual(
+                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
+-                [(2,), (3,), (4,)],
++                [(2,), (3,), (4,), (5,)],
+             )
+             tables = {
+                 row[0]
+                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+             }
+         self.assertTrue(
+             {
+                 "financial_fact",
+                 "feature_set",
+                 "feature_value",
+@@ -688,27 +688,122 @@ class StateStoreTestCase(unittest.TestCase):
+                 "score-1", "SH600001", "ready", 1.0, "changed", {"total": 91}, []
+             )
+         with closing(sqlite3.connect(legacy_path)) as connection:
+             self.assertEqual(
+                 connection.execute(
+                     "SELECT * FROM score_item ORDER BY score_run_id, security_id"
+                 ).fetchall(),
+                 before["score_item"],
+             )
+ 
+-    def test_initialize_twice_keeps_one_complete_v4_schema_and_ledger(self) -> None:
++    def test_initialize_migrates_literal_v4_database_to_v5_without_changing_legacy_rows(self) -> None:
++        legacy_path = Path(self.tempdir.name) / "legacy-v4.sqlite3"
++        schema_sql = Path("tests/fixtures/schema_v4.sql").read_text(encoding="utf-8")
++        with closing(sqlite3.connect(legacy_path)) as connection:
++            connection.execute("PRAGMA foreign_keys = ON")
++            connection.executescript(schema_sql)
++            connection.execute(
++                "INSERT INTO source_snapshot VALUES (?,?,?,?,?,?,?,?,?)",
++                (
++                    "legacy-snapshot",
++                    "provider",
++                    "daily",
++                    "legacy-request",
++                    "legacy-payload",
++                    "raw/legacy.json",
++                    1,
++                    utc_at(0),
++                    utc_at(1),
++                ),
++            )
++            connection.execute(
++                "INSERT INTO score_run VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
++                (
++                    "legacy-score",
++                    "2026-06-30",
++                    utc_at(0),
++                    "rules-v4",
++                    "universe-v4",
++                    "incremental",
++                    "final",
++                    utc_at(0),
++                    utc_at(1),
++                    utc_at(0),
++                    1,
++                    1,
++                    "{}",
++                    "{}",
++                ),
++            )
++            connection.commit()
++            before_snapshot = connection.execute(
++                "SELECT * FROM source_snapshot"
++            ).fetchall()
++            before_score_run = connection.execute("SELECT * FROM score_run").fetchall()
++
++        StateStore(legacy_path).initialize()
++
++        with closing(sqlite3.connect(legacy_path)) as connection:
++            self.assertEqual(
++                connection.execute(
++                    "SELECT version FROM schema_migration ORDER BY version"
++                ).fetchall(),
++                [(2,), (3,), (4,), (5,)],
++            )
++            self.assertEqual(
++                connection.execute("SELECT * FROM source_snapshot").fetchall(),
++                before_snapshot,
++            )
++            self.assertEqual(
++                connection.execute("SELECT * FROM score_run").fetchall(),
++                before_score_run,
++            )
++            tables = {
++                row[0]
++                for row in connection.execute(
++                    "SELECT name FROM sqlite_master WHERE type='table'"
++                )
++            }
++            self.assertTrue(
++                {
++                    "formal_source_snapshot",
++                    "formal_universe_source",
++                    "formal_universe_status",
++                    "formal_collection_task",
++                }
++                <= tables
++            )
++            snapshot_columns = {
++                row[1] for row in connection.execute("PRAGMA table_info(formal_source_snapshot)")
++            }
++            self.assertIn("request_fingerprint", snapshot_columns)
++            self.assertEqual(
++                connection.execute("SELECT * FROM formal_source_snapshot").fetchall(),
++                [],
++            )
++
++        discontinuous_path = Path(self.tempdir.name) / "discontinuous-v4.sqlite3"
++        with closing(sqlite3.connect(discontinuous_path)) as connection:
++            connection.executescript(schema_sql)
++            connection.execute("DELETE FROM schema_migration WHERE version = 3")
++            connection.commit()
++
++        with self.assertRaisesRegex(RuntimeError, "migration versions"):
++            StateStore(discontinuous_path).initialize()
++
++    def test_initialize_twice_keeps_one_complete_v5_schema_and_ledger(self) -> None:
+         self.store.initialize()
+ 
+         with closing(sqlite3.connect(self.db_path)) as connection:
+             self.assertEqual(
+                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
+-                [(2,), (3,), (4,)],
++                [(2,), (3,), (4,), (5,)],
+             )
+             counts = dict(
+                 connection.execute(
+                     """SELECT name, COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name IN (
+                         'financial_fact','feature_set','feature_value','quality_issue_binding'
+                     )
+                     GROUP BY name"""
+                 )
+             )
+@@ -768,59 +863,59 @@ class StateStoreTestCase(unittest.TestCase):
+ 
+         self.assertEqual(
+             StateStore._normalized_ddl(canonical),
+             StateStore._normalized_ddl(outside_case_and_spacing),
+         )
+         self.assertNotEqual(
+             StateStore._normalized_ddl(canonical),
+             StateStore._normalized_ddl(changed_literal),
+         )
+ 
+-    def test_initialize_rejects_migration_ledgers_outside_contiguous_v2_to_v4(self) -> None:
++    def test_initialize_rejects_migration_ledgers_outside_contiguous_v2_to_v5(self) -> None:
+         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
+-        for index, versions in enumerate(((3,), (2, 4), (2, 3, 5), (2, 3, 4, 5))):
++        for index, versions in enumerate(((3,), (2, 4), (2, 3, 5), (2, 3, 4, 6))):
+             with self.subTest(versions=versions):
+                 legacy_path = Path(self.tempdir.name) / f"invalid-ledger-{index}.sqlite3"
+                 with closing(sqlite3.connect(legacy_path)) as connection:
+                     connection.executescript(schema_sql)
+                     connection.execute(
+                         "CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+                     )
+                     connection.executemany(
+                         "INSERT INTO schema_migration VALUES (?, ?)",
+                         ((version, utc_at(version)) for version in versions),
+                     )
+                     connection.commit()
+ 
+                 with self.assertRaisesRegex(RuntimeError, "migration versions"):
+                     StateStore(legacy_path).initialize()
+ 
+-    def test_initialize_applies_v3_and_v4_when_migration_ledger_contains_only_v2(self) -> None:
++    def test_initialize_applies_v3_through_v5_when_migration_ledger_contains_only_v2(self) -> None:
+         legacy_path = Path(self.tempdir.name) / "ledger-v2.sqlite3"
+         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
+         with closing(sqlite3.connect(legacy_path)) as connection:
+             connection.executescript(schema_sql)
+             connection.execute(
+                 "CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+             )
+             connection.execute("INSERT INTO schema_migration VALUES (2, ?)", (utc_at(2),))
+             connection.commit()
+ 
+         StateStore(legacy_path).initialize()
+ 
+         with closing(sqlite3.connect(legacy_path)) as connection:
+             self.assertEqual(
+                 connection.execute("SELECT version FROM schema_migration ORDER BY version").fetchall(),
+-                [(2,), (3,), (4,)],
++                [(2,), (3,), (4,), (5,)],
+             )
+ 
+-    def test_initialize_migrates_complete_v3_database_to_v4_preserving_issues(self) -> None:
++    def test_initialize_migrates_complete_v3_database_to_v5_preserving_issues(self) -> None:
+         legacy_path = Path(self.tempdir.name) / "ledger-v3.sqlite3"
+         schema_sql = Path("tests/fixtures/schema_v2.sql").read_text(encoding="utf-8")
+         with closing(sqlite3.connect(legacy_path)) as connection:
+             connection.execute("PRAGMA foreign_keys = ON")
+             connection.executescript(schema_sql)
+             connection.execute(
+                 "CREATE TABLE schema_migration(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+             )
+             connection.execute("INSERT INTO schema_migration VALUES (2, ?)", (utc_at(2),))
+             StateStore._apply_v3_migration(connection)
+@@ -830,21 +925,21 @@ class StateStoreTestCase(unittest.TestCase):
+             )
+             connection.commit()
+ 
+         StateStore(legacy_path).initialize()
+ 
+         with closing(sqlite3.connect(legacy_path)) as connection:
+             self.assertEqual(
+                 connection.execute(
+                     "SELECT version FROM schema_migration ORDER BY version"
+                 ).fetchall(),
+-                [(2,), (3,), (4,)],
++                [(2,), (3,), (4,), (5,)],
+             )
+             self.assertEqual(
+                 connection.execute("SELECT * FROM quality_issue").fetchall(),
+                 [("legacy-issue", None, None, "error", "legacy", "{}", utc_at(3))],
+             )
+             self.assertEqual(
+                 connection.execute("SELECT * FROM quality_issue_binding").fetchall(),
+                 [],
+             )
+ 

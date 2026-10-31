@@ -1,0 +1,829 @@
+# Review package: 16c8b64e3739d1248073cda529c724f866585a87..b3d0c0ce4ad669ad9499bf5a14b94f7de9673c89
+
+## Commits
+b3d0c0c fix: reject nonfinite persisted json
+cd43906 feat: persist financial facts and feature bundles
+
+## Files changed
+ ashare_pipeline/state_store.py | 345 ++++++++++++++++++++++++++++++++++++++++-
+ tests/test_state_store.py      | 324 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 665 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index 39fc999..1f7be92 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -1,29 +1,83 @@
+ """SQLite-backed state transitions for resumable pipeline work."""
+ 
+ from __future__ import annotations
+ 
+ import json
+ import sqlite3
+ import uuid
+-from contextlib import contextmanager
++from contextlib import closing, contextmanager
+ from datetime import datetime, timezone
+-from pathlib import Path
+-from typing import Iterator
++from pathlib import Path, PurePosixPath, PureWindowsPath
++from typing import Iterable, Iterator, Mapping, Sequence
++
++from ashare_pipeline.feature_contract import DIMENSIONS, FeatureBundle
++from ashare_pipeline.financial_schema import FinancialFact
+ 
+ 
+ JOB_STATES = {"pending", "running", "succeeded", "retryable_failed", "terminal_failed"}
+ SCORE_RUN_STATES = {"provisional", "final", "invalidated"}
+ SCORE_ITEM_STATES = {"pending", "partial", "ready", "blocked", "final"}
+ RUN_STATES = {"running", "succeeded", "failed", "cancelled"}
+ SCHEMA_VERSION = 3
+ 
++FINANCIAL_FACT_COLUMNS = (
++    "id",
++    "security_id",
++    "statement",
++    "metric_key",
++    "period_start",
++    "period_end",
++    "period_kind",
++    "value",
++    "unit",
++    "nature",
++    "announced_at_utc",
++    "effective_at_utc",
++    "source_updated_at_utc",
++    "source_snapshot_id",
++    "source_field",
++    "raw_row_hash",
++    "mapping_version",
++    "created_at",
++)
++
++_FEATURE_SET_CONTENT_COLUMNS = (
++    "security_id",
++    "report_period",
++    "as_of_utc",
++    "candidate_set_hash",
++    "template_id",
++    "template_version",
++    "contract_version",
++    "input_hash",
++    "status",
++    "financial_coverage",
++    "dimension_status_json",
++    "confidence_inputs_json",
++    "blockers_json",
++    "bundle_hash",
++    "missing_json",
++)
++
++_FEATURE_VALUE_CONTENT_COLUMNS = (
++    "dimension",
++    "feature_key",
++    "period_key",
++    "value",
++    "unit",
++    "status",
++    "formula_version",
++    "evidence_json",
++    "missing_reason",
++)
++
+ _V2_TABLE_DDL = {
+     "run": """CREATE TABLE IF NOT EXISTS run (
+         id TEXT PRIMARY KEY, mode TEXT NOT NULL, as_of_cn TEXT NOT NULL,
+         params_json TEXT NOT NULL, status TEXT NOT NULL,
+         error TEXT, started_at TEXT NOT NULL, finished_at TEXT
+     )""",
+     "job": """CREATE TABLE IF NOT EXISTS job (
+         id TEXT PRIMARY KEY, kind TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+         payload_json TEXT NOT NULL, status TEXT NOT NULL,
+         lease_worker TEXT, lease_expires_at TEXT, next_retry_at TEXT,
+@@ -159,21 +213,27 @@ def _utc_iso(value: str | None) -> str:
+     if value is None:
+         return _utc_now()
+     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+     parsed = datetime.fromisoformat(normalized)
+     if parsed.tzinfo is None:
+         raise ValueError("timestamps must include a timezone offset")
+     return parsed.astimezone(timezone.utc).isoformat()
+ 
+ 
+ def _json(value: object) -> str:
+-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
++    return json.dumps(
++        value,
++        ensure_ascii=False,
++        separators=(",", ":"),
++        sort_keys=True,
++        allow_nan=False,
++    )
+ 
+ 
+ class StateStore:
+     def __init__(self, db_path: str | Path):
+         self.db_path = Path(db_path)
+ 
+     def _connect(self) -> sqlite3.Connection:
+         connection = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
+         connection.row_factory = sqlite3.Row
+         connection.execute("PRAGMA foreign_keys = ON")
+@@ -488,20 +548,188 @@ class StateStore:
+             ).fetchone()
+             if existing:
+                 return str(existing["id"]), False
+             connection.execute(
+                 "INSERT INTO source_snapshot VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (snapshot_id, source, dataset, request_fingerprint, payload_hash, payload_path,
+                  row_count, _utc_iso(fetched_at), _utc_now()),
+             )
+         return snapshot_id, True
+ 
++    def insert_financial_facts(
++        self,
++        facts: Iterable[FinancialFact],
++    ) -> tuple[int, int]:
++        records = tuple(facts)
++        inserted = 0
++        with self._transaction(immediate=True) as connection:
++            for fact in records:
++                record = fact.to_record()
++                cursor = connection.execute(
++                    """INSERT OR IGNORE INTO financial_fact
++                    (id,security_id,statement,metric_key,period_start,period_end,period_kind,
++                     value,unit,nature,announced_at_utc,effective_at_utc,source_updated_at_utc,
++                     source_snapshot_id,source_field,raw_row_hash,mapping_version,created_at)
++                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
++                    tuple(record[key] for key in FINANCIAL_FACT_COLUMNS),
++                )
++                inserted += cursor.rowcount
++        return inserted, len(records) - inserted
++
++    def list_financial_facts(
++        self,
++        security_id: str,
++        *,
++        effective_at_or_before: str | None = None,
++        source_snapshot_ids: Sequence[str] | None = None,
++    ) -> list[FinancialFact]:
++        query = "SELECT * FROM financial_fact WHERE security_id = ?"
++        parameters: list[object] = [security_id]
++        if effective_at_or_before is not None:
++            query += " AND effective_at_utc <= ?"
++            parameters.append(_utc_iso(effective_at_or_before))
++        if source_snapshot_ids is not None:
++            if not source_snapshot_ids:
++                return []
++            marks = ",".join("?" for _ in source_snapshot_ids)
++            query += f" AND source_snapshot_id IN ({marks})"
++            parameters.extend(source_snapshot_ids)
++        query += " ORDER BY metric_key,period_end,effective_at_utc,id"
++        with closing(self._connect()) as connection:
++            return [
++                FinancialFact.from_record(dict(row))
++                for row in connection.execute(query, parameters)
++            ]
++
++    def put_feature_bundle(
++        self,
++        bundle: FeatureBundle,
++        *,
++        bundle_path: str,
++        bundle_hash: str,
++    ) -> tuple[str, bool]:
++        bundle.validate()
++        if bundle_hash != bundle.bundle_hash():
++            raise ValueError("bundle_hash does not match canonical bundle hash")
++        self._validate_feature_bundle_path(bundle_path)
++        header, values = self._feature_bundle_content(bundle, bundle_hash)
++
++        with self._transaction(immediate=True) as connection:
++            existing = connection.execute(
++                """SELECT * FROM feature_set
++                WHERE security_id = ? AND report_period = ? AND as_of_utc = ? AND input_hash = ?""",
++                (
++                    header["security_id"],
++                    header["report_period"],
++                    header["as_of_utc"],
++                    header["input_hash"],
++                ),
++            ).fetchone()
++            if existing is not None:
++                if not self._stored_feature_content_matches(
++                    connection, existing, header, values
++                ):
++                    raise ValueError("non-deterministic feature conflict")
++                return str(existing["id"]), False
++
++            feature_set_id = bundle_hash
++            connection.execute(
++                """INSERT INTO feature_set
++                (id,security_id,report_period,as_of_utc,candidate_set_hash,
++                 template_id,template_version,contract_version,input_hash,status,
++                 financial_coverage,dimension_status_json,confidence_inputs_json,
++                 blockers_json,bundle_hash,bundle_path,missing_json,created_at)
++                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
++                (
++                    feature_set_id,
++                    *(header[column] for column in _FEATURE_SET_CONTENT_COLUMNS[:-2]),
++                    header["bundle_hash"],
++                    bundle_path,
++                    header["missing_json"],
++                    _utc_now(),
++                ),
++            )
++            for value in values:
++                connection.execute(
++                    """INSERT INTO feature_value
++                    (feature_set_id,dimension,feature_key,period_key,value,unit,status,
++                     formula_version,evidence_json,missing_reason)
++                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
++                    (
++                        feature_set_id,
++                        *(value[column] for column in _FEATURE_VALUE_CONTENT_COLUMNS),
++                    ),
++                )
++        return feature_set_id, True
++
++    def get_feature_bundle_row(
++        self,
++        security_id: str,
++        report_period: str,
++        input_hash: str,
++    ) -> dict | None:
++        with closing(self._connect()) as connection:
++            row = connection.execute(
++                """SELECT * FROM feature_set
++                WHERE security_id = ? AND report_period = ? AND input_hash = ?
++                ORDER BY as_of_utc DESC, created_at DESC, id DESC LIMIT 1""",
++                (security_id, report_period, input_hash),
++            ).fetchone()
++        return self._feature_set_public(row) if row is not None else None
++
++    def latest_feature_set(
++        self,
++        security_id: str,
++        report_period: str,
++        contract_version: str | None = None,
++        as_of_utc: str | None = None,
++    ) -> dict | None:
++        query = "SELECT * FROM feature_set WHERE security_id = ? AND report_period = ?"
++        parameters: list[object] = [security_id, report_period]
++        if contract_version is not None:
++            query += " AND contract_version = ?"
++            parameters.append(contract_version)
++        if as_of_utc is not None:
++            query += " AND as_of_utc = ?"
++            parameters.append(_utc_iso(as_of_utc))
++        query += " ORDER BY as_of_utc DESC, created_at DESC, id DESC LIMIT 1"
++        with closing(self._connect()) as connection:
++            row = connection.execute(query, parameters).fetchone()
++        return self._feature_set_public(row) if row is not None else None
++
++    def record_quality_issue(
++        self,
++        *,
++        run_id: str | None,
++        score_run_id: str | None,
++        severity: str,
++        code: str,
++        details: Mapping[str, object],
++    ) -> str:
++        issue_id = str(uuid.uuid4())
++        with self._transaction() as connection:
++            connection.execute(
++                """INSERT INTO quality_issue
++                (id,run_id,score_run_id,severity,code,details_json,created_at)
++                VALUES (?,?,?,?,?,?,?)""",
++                (
++                    issue_id,
++                    run_id,
++                    score_run_id,
++                    severity,
++                    code,
++                    _json(dict(details)),
++                    _utc_now(),
++                ),
++            )
++        return issue_id
++
+     def create_score_run(
+         self, report_period: str, as_of_cn: str, ruleset_hash: str, universe_hash: str, mode: str
+     ) -> str:
+         score_run_id = str(uuid.uuid4())
+         with self._transaction() as connection:
+             connection.execute(
+                 """INSERT INTO score_run (id, report_period, as_of_cn, ruleset_hash, universe_hash, mode, status, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'provisional', ?)""",
+                 (score_run_id, report_period, _utc_iso(as_of_cn), ruleset_hash, universe_hash, mode, _utc_now()),
+             )
+@@ -588,20 +816,129 @@ class StateStore:
+             connection.close()
+         return {
+             "schema_version": SCHEMA_VERSION,
+             "job_counts": job_counts,
+             "score_item_counts": score_counts,
+             "score_run_counts": score_run_counts,
+             "recent_run": dict(recent) if recent else None,
+             "updated_at": max(update_values, default=_utc_now()),
+         }
+ 
++    @staticmethod
++    def _validate_feature_bundle_path(bundle_path: str) -> None:
++        prefix_parts = ("data", "curated", "formal_features")
++        if not isinstance(bundle_path, str) or not bundle_path or "\\" in bundle_path:
++            raise ValueError("bundle_path must be a forward-slash project-relative path")
++        raw_parts = bundle_path.split("/")
++        path = PurePosixPath(bundle_path)
++        if (
++            path.is_absolute()
++            or PureWindowsPath(bundle_path).is_absolute()
++            or tuple(raw_parts[:3]) != prefix_parts
++            or len(raw_parts) == len(prefix_parts)
++            or any(part in {"", ".", ".."} for part in raw_parts)
++        ):
++            raise ValueError(
++                "bundle_path must begin with data/curated/formal_features/ and stay within it"
++            )
++
++    @staticmethod
++    def _feature_bundle_content(
++        bundle: FeatureBundle,
++        bundle_hash: str,
++    ) -> tuple[dict[str, object], list[dict[str, object]]]:
++        payload = bundle.to_dict()
++        dimension_status = {
++            dimension: payload["dimension_inputs"][dimension]["status"]
++            for dimension in DIMENSIONS
++        }
++        values: list[dict[str, object]] = []
++        missing: list[dict[str, object]] = []
++        for dimension in DIMENSIONS:
++            for value in payload["dimension_inputs"][dimension]["values"]:
++                values.append(
++                    {
++                        "dimension": dimension,
++                        "feature_key": value["key"],
++                        "period_key": value["period_key"],
++                        "value": value["value"],
++                        "unit": value["unit"],
++                        "status": value["status"],
++                        "formula_version": value["formula_version"],
++                        "evidence_json": _json(value["evidence"]),
++                        "missing_reason": value["missing_reason"],
++                    }
++                )
++                if value["status"] in {"missing", "not_applicable", "blocked"}:
++                    missing.append(
++                        {
++                            "dimension": dimension,
++                            "feature_key": value["key"],
++                            "period_key": value["period_key"],
++                            "reason": value["missing_reason"],
++                        }
++                    )
++        header: dict[str, object] = {
++            "security_id": payload["security_id"],
++            "report_period": payload["report_period"],
++            "as_of_utc": payload["as_of_utc"],
++            "candidate_set_hash": payload["candidate_set_hash"],
++            "template_id": payload["industry"]["template_id"],
++            "template_version": payload["industry"]["template_version"],
++            "contract_version": payload["contract_version"],
++            "input_hash": payload["input_hash"],
++            "status": payload["financial_status"],
++            "financial_coverage": payload["financial_coverage"],
++            "dimension_status_json": _json(dimension_status),
++            "confidence_inputs_json": _json(payload["confidence_inputs"]),
++            "blockers_json": _json(payload["blockers"]),
++            "bundle_hash": bundle_hash,
++            "missing_json": _json(missing),
++        }
++        return header, values
++
++    @staticmethod
++    def _stored_feature_content_matches(
++        connection: sqlite3.Connection,
++        existing: sqlite3.Row,
++        header: Mapping[str, object],
++        values: Sequence[Mapping[str, object]],
++    ) -> bool:
++        if any(existing[column] != header[column] for column in _FEATURE_SET_CONTENT_COLUMNS):
++            return False
++        stored_values = connection.execute(
++            """SELECT dimension,feature_key,period_key,value,unit,status,
++            formula_version,evidence_json,missing_reason FROM feature_value
++            WHERE feature_set_id = ? ORDER BY dimension,feature_key,period_key""",
++            (existing["id"],),
++        ).fetchall()
++        expected = sorted(
++            (
++                tuple(value[column] for column in _FEATURE_VALUE_CONTENT_COLUMNS)
++                for value in values
++            ),
++            key=lambda value: (value[0], value[1], value[2]),
++        )
++        return [tuple(row) for row in stored_values] == expected
++
++    @staticmethod
++    def _feature_set_public(row: sqlite3.Row) -> dict:
++        result = dict(row)
++        for stored_name, public_name in (
++            ("dimension_status_json", "dimension_status"),
++            ("confidence_inputs_json", "confidence_inputs"),
++            ("blockers_json", "blockers"),
++            ("missing_json", "missing"),
++        ):
++            result[public_name] = json.loads(result.pop(stored_name))
++        return result
++
+     @staticmethod
+     def _job_public(row: sqlite3.Row) -> dict:
+         return {
+             "id": row["id"], "kind": row["kind"], "idempotency_key": row["idempotency_key"],
+             "status": row["status"], "lease_worker": row["lease_worker"],
+             "lease_expires_at": row["lease_expires_at"], "payload": json.loads(row["payload_json"]),
+             "result": json.loads(row["result_json"]) if row["result_json"] else None,
+             "error": json.loads(row["last_error_json"]) if row["last_error_json"] else None,
+             "next_retry_at": row["next_retry_at"],
+         }
+diff --git a/tests/test_state_store.py b/tests/test_state_store.py
+index adfa8a8..63d4c6d 100644
+--- a/tests/test_state_store.py
++++ b/tests/test_state_store.py
+@@ -1,28 +1,122 @@
++import math
+ import sqlite3
+ import tempfile
+ import threading
+ import unittest
+ from contextlib import closing
++from dataclasses import replace
+ from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+ 
++from ashare_pipeline.feature_contract import (
++    CONTRACT_VERSION,
++    DIMENSIONS,
++    ConfidenceInputs,
++    DimensionInput,
++    EvidenceRef,
++    FeatureBundle,
++    FeatureValue,
++    IndustryContext,
++)
++from ashare_pipeline.financial_schema import MAPPING_VERSION, FinancialFact
+ from ashare_pipeline.state_store import FinalizationBlocked, StateStore
+ 
+ 
+ UTC = timezone.utc
+ 
+ 
+ def utc_at(seconds: int) -> str:
+     return (datetime(2026, 8, 31, tzinfo=UTC) + timedelta(seconds=seconds)).isoformat()
+ 
+ 
++def financial_fact(
++    *, snapshot_id: str, raw_row_hash: str = "1" * 64, value: float = 100.0,
++    effective_at_utc: str = "2026-08-21T07:00:00+00:00",
++) -> FinancialFact:
++    return FinancialFact.create(
++        security_id="SH600001",
++        statement="income",
++        metric_key="revenue",
++        period_start="2026-01-01",
++        period_end="2026-06-30",
++        period_kind="H1",
++        value=value,
++        unit="CNY",
++        nature="duration",
++        announced_at_utc="2026-08-20T15:59:59+00:00",
++        effective_at_utc=effective_at_utc,
++        source_updated_at_utc=None,
++        source_snapshot_id=snapshot_id,
++        source_field="TOTAL_OPERATE_INCOME",
++        raw_row_hash=raw_row_hash,
++        mapping_version=MAPPING_VERSION,
++        created_at="2026-08-29T00:00:00+00:00",
++    )
++
++
++def valid_feature_bundle(
++    *, input_hash: str = "b" * 64,
++    as_of_utc: str = "2026-08-29T16:00:00+00:00",
++    blockers: tuple[str, ...] = ("formal_industry_mapping_missing",),
++) -> FeatureBundle:
++    evidence = EvidenceRef(
++        "fact-a",
++        "snapshot-a",
++        "TOTAL_ASSETS",
++        "a" * 64,
++        "2026-08-20T15:59:59+00:00",
++        "2026-08-21T07:00:00+00:00",
++    )
++    dimensions = {
++        dimension: DimensionInput(
++            "partial",
++            (
++                FeatureValue(
++                    f"{dimension.lower()}.sample",
++                    0.0,
++                    "ratio",
++                    "2026H1",
++                    "observed",
++                    "observed-v1",
++                    (evidence,),
++                    None,
++                ),
++            ),
++        )
++        for dimension in DIMENSIONS
++    }
++    return FeatureBundle(
++        1,
++        CONTRACT_VERSION,
++        "SH600001",
++        "2026-06-30",
++        as_of_utc,
++        "c" * 64,
++        IndustryContext(
++            "eastmoney-provisional",
++            None,
++            "包装印刷",
++            "general_nonfinancial",
++            "template-registry-v1",
++            False,
++        ),
++        input_hash,
++        "partial",
++        0.5,
++        ConfidenceInputs(0.5, {"timestamp": 0, "date_only": 1}, 3, True, None),
++        dimensions,
++        blockers,
++        False,
++    )
++
++
+ class StateStoreTestCase(unittest.TestCase):
+     """Each test guards a durable public state-transition contract."""
+ 
+     def setUp(self) -> None:
+         self.tempdir = tempfile.TemporaryDirectory()
+         self.db_path = Path(self.tempdir.name) / "state.sqlite3"
+         self.store = StateStore(self.db_path)
+         self.store.initialize()
+ 
+     def tearDown(self) -> None:
+@@ -328,20 +422,250 @@ class StateStoreTestCase(unittest.TestCase):
+         with closing(sqlite3.connect(self.db_path)) as connection:
+             for index, coverage in enumerate((-0.01, 1.01)):
+                 with self.subTest(coverage=coverage):
+                     with self.assertRaises(sqlite3.IntegrityError):
+                         self.insert_feature_set(
+                             connection,
+                             feature_set_id=f"coverage-{index}",
+                             coverage=coverage,
+                         )
+ 
++    def test_insert_financial_facts_is_idempotent_and_preserves_revision(self) -> None:
++        snapshot_id, _ = self.store.record_snapshot(
++            "akshare", "balance_sheet", "request-a", "a" * 64,
++            "data/raw/a.json", 1, utc_at(0),
++        )
++        first = financial_fact(snapshot_id=snapshot_id, raw_row_hash="1" * 64, value=100.0)
++        revised = financial_fact(snapshot_id=snapshot_id, raw_row_hash="2" * 64, value=101.0)
++
++        self.assertEqual(self.store.insert_financial_facts([first, first]), (1, 1))
++        self.assertEqual(self.store.insert_financial_facts([revised]), (1, 0))
++        stored = self.store.list_financial_facts("SH600001")
++        self.assertEqual(len(stored), 2)
++        self.assertEqual({fact.raw_row_hash for fact in stored}, {"1" * 64, "2" * 64})
++
++    def test_list_financial_facts_applies_exact_snapshot_and_effective_filters(self) -> None:
++        first_snapshot, _ = self.store.record_snapshot(
++            "akshare", "profit_sheet", "request-a", "a" * 64,
++            "data/raw/a.json", 1, utc_at(0),
++        )
++        second_snapshot, _ = self.store.record_snapshot(
++            "akshare", "profit_sheet", "request-b", "b" * 64,
++            "data/raw/b.json", 1, utc_at(1),
++        )
++        first = financial_fact(snapshot_id=first_snapshot, raw_row_hash="1" * 64)
++        second = financial_fact(
++            snapshot_id=second_snapshot,
++            raw_row_hash="2" * 64,
++            effective_at_utc="2026-08-22T07:00:00+00:00",
++        )
++        self.store.insert_financial_facts([first, second])
++
++        self.assertEqual(
++            self.store.list_financial_facts(
++                "SH600001", source_snapshot_ids=[first_snapshot]
++            ),
++            [first],
++        )
++        self.assertEqual(
++            self.store.list_financial_facts(
++                "SH600001", effective_at_or_before="2026-08-21T07:00:00Z"
++            ),
++            [first],
++        )
++        self.assertEqual(
++            self.store.list_financial_facts("SH600001", source_snapshot_ids=[]), []
++        )
++
++    def test_put_feature_bundle_is_atomic_and_rejects_nondeterministic_conflict(self) -> None:
++        bundle = valid_feature_bundle(input_hash="b" * 64)
++        feature_id, created = self.store.put_feature_bundle(
++            bundle,
++            bundle_path="data/curated/formal_features/2026-06-30/SH600001/b.json",
++            bundle_hash=bundle.bundle_hash(),
++        )
++        self.assertTrue(created)
++        self.assertEqual(feature_id, bundle.bundle_hash())
++        self.assertEqual(
++            self.store.put_feature_bundle(
++                bundle,
++                bundle_path="data/curated/formal_features/2026-06-30/SH600001/b.json",
++                bundle_hash=bundle.bundle_hash(),
++            ),
++            (feature_id, False),
++        )
++        conflicting = replace(bundle, blockers=("changed-without-input-hash",))
++        with self.assertRaisesRegex(ValueError, "non-deterministic feature conflict"):
++            self.store.put_feature_bundle(
++                conflicting,
++                bundle_path="data/curated/formal_features/2026-06-30/SH600001/c.json",
++                bundle_hash=conflicting.bundle_hash(),
++            )
++        stored = self.store.get_feature_bundle_row("SH600001", "2026-06-30", "b" * 64)
++        self.assertEqual(stored["bundle_hash"], bundle.bundle_hash())
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0], 7
++            )
++
++    def test_put_feature_bundle_rolls_back_header_and_values_when_one_value_aborts(self) -> None:
++        bundle = valid_feature_bundle()
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            connection.executescript(
++                """CREATE TRIGGER abort_fs_feature_value
++                BEFORE INSERT ON feature_value WHEN NEW.dimension = 'FS'
++                BEGIN SELECT RAISE(ABORT, 'forced feature value failure'); END;"""
++            )
++
++        with self.assertRaisesRegex(sqlite3.IntegrityError, "forced feature value failure"):
++            self.store.put_feature_bundle(
++                bundle,
++                bundle_path="data/curated/formal_features/2026-06-30/SH600001/b.json",
++                bundle_hash=bundle.bundle_hash(),
++            )
++
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0], 0)
++            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_value").fetchone()[0], 0)
++
++    def test_put_feature_bundle_rejects_hash_mismatch_and_unsafe_paths(self) -> None:
++        bundle = valid_feature_bundle()
++        invalid_paths = (
++            "/data/curated/formal_features/b.json",
++            "C:/data/curated/formal_features/b.json",
++            "data\\curated\\formal_features\\b.json",
++            "data/curated/formal_features/../outside.json",
++            "data/curated/formal_features",
++            "data/curated/other/b.json",
++        )
++        for invalid_path in invalid_paths:
++            with self.subTest(path=invalid_path), self.assertRaisesRegex(
++                ValueError, "bundle_path"
++            ):
++                self.store.put_feature_bundle(
++                    bundle, bundle_path=invalid_path, bundle_hash=bundle.bundle_hash()
++                )
++        with self.assertRaisesRegex(ValueError, "bundle_hash"):
++            self.store.put_feature_bundle(
++                bundle,
++                bundle_path="data/curated/formal_features/b.json",
++                bundle_hash="0" * 64,
++            )
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            self.assertEqual(connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0], 0)
++
++    def test_latest_feature_set_filters_exactly_orders_and_parses_json(self) -> None:
++        older = valid_feature_bundle(
++            input_hash="1" * 64, as_of_utc="2026-08-28T16:00:00+00:00"
++        )
++        newer = valid_feature_bundle(
++            input_hash="2" * 64,
++            as_of_utc="2026-08-29T16:00:00+00:00",
++            blockers=("z-blocker", "a-blocker"),
++        )
++        for label, bundle in (("older", older), ("newer", newer)):
++            self.store.put_feature_bundle(
++                bundle,
++                bundle_path=f"data/curated/formal_features/{label}.json",
++                bundle_hash=bundle.bundle_hash(),
++            )
++
++        latest = self.store.latest_feature_set("SH600001", "2026-06-30")
++        self.assertEqual(latest["id"], newer.bundle_hash())
++        self.assertEqual(latest["dimension_status"], {key: "partial" for key in DIMENSIONS})
++        self.assertEqual(latest["confidence_inputs"]["history_years_present"], 3)
++        self.assertEqual(latest["blockers"], ["a-blocker", "z-blocker"])
++        self.assertEqual(latest["missing"], [])
++        self.assertNotIn("dimension_status_json", latest)
++        self.assertNotIn("value", latest)
++        self.assertEqual(
++            self.store.latest_feature_set(
++                "SH600001", "2026-06-30", as_of_utc=older.as_of_utc
++            )["id"],
++            older.bundle_hash(),
++        )
++        self.assertIsNone(
++            self.store.latest_feature_set(
++                "SH600001", "2026-06-30", contract_version="other-contract"
++            )
++        )
++        self.assertIsNone(
++            self.store.latest_feature_set(
++                "SH600001", "2026-06-30", as_of_utc="2026-08-28T16:00:01+00:00"
++            )
++        )
++
++    def test_latest_feature_set_breaks_as_of_ties_by_created_at_then_id(self) -> None:
++        bundles = (
++            valid_feature_bundle(input_hash="3" * 64),
++            valid_feature_bundle(input_hash="4" * 64),
++        )
++        for index, bundle in enumerate(bundles):
++            self.store.put_feature_bundle(
++                bundle,
++                bundle_path=f"data/curated/formal_features/tie-{index}.json",
++                bundle_hash=bundle.bundle_hash(),
++            )
++        low_id, high_id = sorted(bundle.bundle_hash() for bundle in bundles)
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            connection.execute(
++                "UPDATE feature_set SET created_at = ? WHERE id = ?", (utc_at(1), high_id)
++            )
++            connection.execute(
++                "UPDATE feature_set SET created_at = ? WHERE id = ?", (utc_at(2), low_id)
++            )
++            connection.commit()
++        self.assertEqual(
++            self.store.latest_feature_set("SH600001", "2026-06-30")["id"], low_id
++        )
++
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            connection.execute("UPDATE feature_set SET created_at = ?", (utc_at(3),))
++            connection.commit()
++        self.assertEqual(
++            self.store.latest_feature_set("SH600001", "2026-06-30")["id"], high_id
++        )
++
++    def test_record_quality_issue_stores_canonical_details_json(self) -> None:
++        issue_id = self.store.record_quality_issue(
++            run_id=None,
++            score_run_id=None,
++            severity="warning",
++            code="mapping_gap",
++            details={"z": 1, "message": "缺失", "a": [2, 1]},
++        )
++
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            row = connection.execute(
++                "SELECT id, run_id, score_run_id, severity, code, details_json FROM quality_issue"
++            ).fetchone()
++        self.assertEqual(
++            row,
++            (issue_id, None, None, "warning", "mapping_gap", '{"a":[2,1],"message":"缺失","z":1}'),
++        )
++
++    def test_record_quality_issue_rejects_nonfinite_details_without_rows(self) -> None:
++        for invalid in (math.nan, math.inf, -math.inf):
++            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
++                self.store.record_quality_issue(
++                    run_id=None,
++                    score_run_id=None,
++                    severity="warning",
++                    code="nonfinite_observation",
++                    details={"observed": invalid},
++                )
++
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM quality_issue").fetchone()[0], 0
++            )
++
+     def test_duplicate_enqueue_returns_original_job_without_second_row(self) -> None:
+         job_id = self.store.enqueue_job("fetch", "source:000001", {"request": "first"})
+         repeated_id = self.store.enqueue_job("fetch", "source:000001", {"request": "changed"})
+ 
+         self.assertEqual(job_id, repeated_id)
+         with closing(sqlite3.connect(self.db_path)) as connection:
+             self.assertEqual(connection.execute("SELECT COUNT(*) FROM job").fetchone()[0], 1)
+ 
+     def test_leasing_claims_one_pending_job_exclusively(self) -> None:
+         job_id = self.store.enqueue_job("fetch", "lease:one", {"x": 1})

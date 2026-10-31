@@ -1,0 +1,695 @@
+# Review package: d5df5cc..8a73af8
+
+## Commits
+8a73af8 Seal market tickets before selector return and bind range parent token
+
+## Files changed
+ ashare_pipeline/formal_policy_market.py   | 106 +++++++++++++++++++++++-------
+ ashare_pipeline/formal_range_store.py     |  53 +++++++++------
+ tests/test_formal_policy_market_ticket.py |  69 ++++++++++++++++++-
+ tests/test_formal_range_absence_ticket.py |  24 +++++++
+ 4 files changed, 206 insertions(+), 46 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_policy_market.py b/ashare_pipeline/formal_policy_market.py
+index e04f5a2..275aa4a 100644
+--- a/ashare_pipeline/formal_policy_market.py
++++ b/ashare_pipeline/formal_policy_market.py
+@@ -227,20 +227,21 @@ def _build_proof_types():
+             raise RuntimeError("market proof owner is already installed")
+         installed = True
+         if type(dependencies) is not tuple or len(dependencies) != 13:
+             raise RuntimeError("market repository dependencies are invalid")
+         (store_type, resolve_binding, select_current, first_calendar_request,
+          next_page, previous_calendar_request, market_requests, observation_to_dict,
+          observation_require_current, implementation_page_group, implementation_select_calendar,
+          implementation_select_market, selection_types) = dependencies
+         calendar_selection_type, market_selection_type = selection_types
+         batch_capture = ContextVar("policy_market_batch_capture", default=None)
++        selection_records = {}
+         anchored_binding_identity = _binding_identity
+         anchored_read_binding = _read_binding
+         anchored_canonical = canonical_bytes
+ 
+         @dataclass(frozen=True)
+         class _RepositoryRecord:
+             reference: weakref.ReferenceType
+             range_store: object
+             resolve_binding: object
+             select_current: object
+@@ -297,72 +298,129 @@ def _build_proof_types():
+ 
+         def calendar_for_market(sealed, binding, as_of_utc):
+             capture = batch_capture.get()
+             if capture is None:
+                 return assemble_calendar(sealed, binding, as_of_utc)
+             ticket = capture["owner"].select_calendar_batch_ticket(
+                 capture["journal"], binding, as_of_utc)
+             capture["calendar_ticket"] = ticket
+             return ticket.selected()
+ 
++        def seal_selection(kind, selected, sealed, binding, as_of_utc, security_id):
++            capture = batch_capture.get()
++            if capture is None:
++                return selected
++            owner = capture["owner"]
++            if repository_record(owner) is not sealed:
++                raise ValueError("market selection ticket owner changed")
++            proof = selected.coverage if kind == "calendar" else selected.window
++            proof_bytes = None if proof is None else proof.canonical_bytes()
++            binding_identity = _binding_identity(binding)
++            if proof is not None:
++                proof_seal = record(proof,
++                    VerifiedCalendarCoverageV1 if kind == "calendar" else VerifiedMarketWindowV1,
++                    calendar_records if kind == "calendar" else window_records)
++                if (proof_seal.range_store is not sealed.range_store
++                        or proof_seal.binding_identity != binding_identity
++                        or proof_seal.wire_bytes != proof_bytes):
++                    raise ValueError("market selection proof owner changed")
++            fields = (selected.pending, selected.lineage, selected.selection_hash)
++            identity = id(selected)
++            reference = weakref.ref(selected, lambda ref, key=identity:
++                selection_records.pop(key, None)
++                if selection_records.get(key) is not None
++                and selection_records[key][0] is ref else None)
++            selection_records[identity] = (reference, owner, kind, fields, proof,
++                proof_bytes, binding, canonical_bytes(binding_identity), sealed.range_store,
++                tuple(capture["tickets"]), capture.get("calendar_ticket"),
++                (security_id, as_of_utc, binding_identity["binding_hash"]))
++            capture["sealed_selection"] = selected
++            return selected
++
++        def selection_record(owner, selected, kind, capture=None):
++            saved = selection_records.get(id(selected))
++            if (saved is None or saved[0]() is not selected or saved[1] is not owner
++                    or saved[2] != kind or type(selected) is not
++                    (calendar_selection_type if kind == "calendar" else market_selection_type)
++                    or (selected.pending, selected.lineage, selected.selection_hash) != saved[3]
++                    or (selected.coverage if kind == "calendar" else selected.window) is not saved[4]
++                    or (None if saved[4] is None else saved[4].canonical_bytes()) != saved[5]):
++                raise ValueError("market or calendar selection changed after owner seal")
++            if capture is not None and (capture.get("sealed_selection") is not selected
++                    or tuple(capture["tickets"]) != saved[9]
++                    or capture.get("calendar_ticket") is not saved[10]):
++                raise ValueError("market selection token changed")
++            return saved
++
+         def assemble_calendar(sealed, binding, as_of_utc):
+             def owner_mint(wire, owned_binding, recheck):
+                 return mint_calendar(wire, owned_binding, sealed.range_store, recheck)
++            def owner_seal(selected):
++                return seal_selection("calendar", selected, sealed, binding, as_of_utc,
++                                      _binding_identity(binding)["exchange"])
+             return implementation_select_calendar(
+                 sealed, binding, as_of_utc, _mint_calendar=owner_mint,
+                 _page_group=owner_page_group,
+                 _select_calendar=assemble_calendar,
+                 _calendar_selection_type=calendar_selection_type,
++                _seal_selection=owner_seal,
+             )
+ 
+         def assemble_market(sealed, security_id, as_of_utc, *, binding):
+             def owner_mint(wire, owned_binding, recheck):
+                 return mint_window(wire, owned_binding, sealed.range_store, recheck)
++            def owner_seal(selected):
++                return seal_selection("market", selected, sealed, binding, as_of_utc,
++                                      security_id)
+             return implementation_select_market(
+                 sealed, security_id, as_of_utc, binding=binding,
+                 _mint_window=owner_mint, _page_group=owner_page_group,
+                 _select_calendar=calendar_for_market, _select_market=assemble_market,
+                 _market_selection_type=market_selection_type,
++                _seal_selection=owner_seal,
+             )
+ 
+         def ticket_evidence(owner, journal, kind, selected, binding, as_of_utc,
+                             security_id, capture):
+             from .formal_batch_read_journal import _issue_current_ticket, _require_current_ticket
+             sealed = repository_record(owner)
+-            lower = tuple(capture["tickets"])
++            saved = selection_record(owner, selected, kind, capture)
++            (_, _, _, fields, proof, proof_bytes, sealed_binding, binding_bytes,
++             range_store, lower, sealed_calendar_ticket, request) = saved
++            if (sealed_binding is not binding or range_store is not sealed.range_store
++                    or request[0:2] != (security_id, as_of_utc)):
++                raise ValueError("market ticket request differs from sealed selection")
+             baselines = tuple(_require_current_ticket(journal, ticket, sealed.range_store,
+                                                        "range")[1] for ticket in lower)
+             for ticket in lower:
+                 sealed.range_store._batch_recheck_ticket(_require_current_ticket(
+                     journal, ticket, sealed.range_store, "range")[2])
+-            calendar_ticket = capture.get("calendar_ticket")
++            calendar_ticket = sealed_calendar_ticket
+             if calendar_ticket is not None:
+                 calendar_selected, calendar_baseline, calendar_evidence = _require_current_ticket(
+                     journal, calendar_ticket, owner, "calendar")
+                 for ticket in calendar_evidence[9]:
+                     sealed.range_store._batch_recheck_ticket(_require_current_ticket(
+                         journal, ticket, sealed.range_store, "range")[2])
+             else:
+                 calendar_selected, calendar_baseline = None, None
+             binding_identity = _binding_identity(binding)
+-            proof = selected.coverage if kind == "calendar" else selected.window
+-            proof_bytes = None if proof is None else proof.canonical_bytes()
+-            fields = (selected.pending, selected.lineage, selected.selection_hash)
+-            request = (security_id, as_of_utc, binding_identity["binding_hash"])
++            if canonical_bytes(binding_identity) != binding_bytes:
++                raise ValueError("market ticket binding changed after selection")
+             baseline = canonical_bytes(dict(kind=kind, request=request,
+                 fields=[list(fields[0]), list(fields[1]), fields[2]],
+                 proof=None if proof_bytes is None else proof_bytes.decode(),
+                 binding=binding_identity,
+                 range=[value.decode() for value in baselines],
+                 calendar=None if calendar_baseline is None else calendar_baseline.decode()))
+             evidence = (kind, selected, fields, proof_bytes, proof, binding,
+-                canonical_bytes(binding_identity), sealed.range_store, journal, lower,
++                binding_bytes, sealed.range_store, journal, lower,
+                 calendar_ticket, calendar_selected, request)
+             coverage = () if kind == "calendar" else ((security_id,),)
+             return _issue_current_ticket(journal, owner, kind, request, baseline,
+                                          evidence, coverage, selected)
+ 
+         class FormalPolicyMarketRepository(metaclass=_RepositoryMeta):
+             __slots__ = ("__weakref__",)
+ 
+             def __init__(self, range_store):
+                 if type(self) is not FormalPolicyMarketRepository or type(range_store) is not store_type:
+@@ -428,20 +486,21 @@ def _build_proof_types():
+                 return ticket_evidence(self, journal, "market", selected, binding,
+                                        as_of_utc, security_id, capture)
+ 
+             def _batch_recheck_ticket(self, evidence):
+                 from .formal_batch_read_journal import _require_current_ticket
+                 (kind, selected, fields, proof_bytes, proof, binding, binding_bytes,
+                  range_store, journal, lower, calendar_ticket, calendar_selected,
+                  request) = evidence
+                 sealed = repository_record(self)
+                 if (range_store is not sealed.range_store
++                        or selection_record(self, selected, kind)[3] != fields
+                         or canonical_bytes(_binding_identity(binding)) != binding_bytes
+                         or type(selected) is not (calendar_selection_type if kind == "calendar"
+                                                     else market_selection_type)
+                         or (selected.pending, selected.lineage, selected.selection_hash) != fields
+                         or (selected.coverage if kind == "calendar" else selected.window) is not proof
+                         or (None if proof is None else proof.canonical_bytes()) != proof_bytes):
+                     raise ValueError("market or calendar ticket selection changed")
+                 if kind == "market":
+                     if calendar_ticket is None or _require_current_ticket(
+                             journal, calendar_ticket, self, "calendar")[0] is not calendar_selected:
+@@ -553,33 +612,33 @@ def evaluate_window(trading_days: tuple[str, ...], daily_rows: dict[str, dict])
+                           price_date=day, stale_days=stale)
+             return result
+     if len(days) == 250:
+         result.update(price_state="confirmed_no_price_250", stale_at_least=250)
+         pending.append("market_evidence_missing")
+     else:
+         pending.append("calendar_coverage_missing")
+     return result
+ 
+ 
+-@dataclass(frozen=True, slots=True)
++@dataclass(frozen=True, slots=True, weakref_slot=True)
+ class CalendarSelection:
+     coverage: VerifiedCalendarCoverageV1 | None
+     pending: tuple[str, ...]
+     lineage: tuple[str, ...]
+     selection_hash: str
+     _check: object
+ 
+     def recheck(self):
+         self._check()
+ 
+ 
+-@dataclass(frozen=True, slots=True)
++@dataclass(frozen=True, slots=True, weakref_slot=True)
+ class MarketSelection:
+     window: VerifiedMarketWindowV1 | None
+     pending: tuple[str, ...]
+     lineage: tuple[str, ...]
+     selection_hash: str
+     _check: object
+ 
+     def recheck(self):
+         self._check()
+ 
+@@ -612,21 +671,22 @@ class _MarketRepositoryImplementation:
+         while request is not None:
+             observation = sealed.select_current(
+                 sealed.range_store, request.request_fingerprint)
+             if observation is None:
+                 return tuple(observations), request
+             observations.append(observation)
+             request = sealed.next_page(source, observation)
+         return tuple(observations), None
+ 
+     def select_calendar(sealed, binding, as_of_utc, *, _mint_calendar, _page_group,
+-                        _select_calendar, _calendar_selection_type) -> CalendarSelection:
++                        _select_calendar, _calendar_selection_type,
++                        _seal_selection) -> CalendarSelection:
+         if type(binding) is not _binding_type:
+             raise ValueError("calendar selection requires a genuine range binding")
+         as_of = _aware(as_of_utc, "calendar as_of_utc")
+         if as_of_utc != _FREEZE_UTC:
+             raise ValueError("calendar selection requires the formal freeze")
+         owned_binding, source = sealed.resolve_binding(sealed.range_store, binding)
+         request = sealed.first_calendar_request(source, as_of_utc)
+         groups = []
+         missing = None
+         current_request = request
+@@ -648,22 +708,22 @@ class _MarketRepositoryImplementation:
+         observations = tuple(item for _, group in groups for item in group)
+         if not groups:
+             pending = ("calendar_coverage_missing",)
+             identity = hashlib.sha256(canonical_bytes({"pending": list(pending),
+                 "request": request.to_dict()})).hexdigest()
+             def check_missing():
+                 sealed.resolve_binding(sealed.range_store, owned_binding)
+                 if (missing is not None and sealed.select_current(
+                         sealed.range_store, missing.request_fingerprint) is not None):
+                     raise ValueError("calendar selection changed")
+-            return _calendar_selection_type(None, pending,
+-                (), identity, check_missing)
++            return _seal_selection(_calendar_selection_type(None, pending,
++                (), identity, check_missing))
+ 
+         documents = []
+         coverage_ranges = []
+         coverage_generations = []
+         request_ranges = []
+         rows = []
+         for group_request, group in groups:
+             group_wires = [sealed.observation_to_dict(item) for item in group]
+             group_documents = [item["document"] for item in group_wires]
+             first = group_documents[0]
+@@ -713,33 +773,33 @@ class _MarketRepositoryImplementation:
+         if len(expected_dates) != len(set(expected_dates)):
+             raise ValueError("calendar coverage intervals overlap")
+         if set(by_date) - set(expected_dates):
+             raise ValueError("calendar coverage contains a date outside its declaration")
+         if set(expected_dates) - set(by_date):
+             pending = ("calendar_coverage_missing",)
+             lineage = tuple(sealed.observation_to_dict(item)["observation_hash"]
+                             for item in observations)
+             identity = hashlib.sha256(canonical_bytes({"pending": list(pending),
+                 "lineage": list(lineage)})).hexdigest()
+-            return _calendar_selection_type(None, pending, lineage, identity,
++            return _seal_selection(_calendar_selection_type(None, pending, lineage, identity,
+                 lambda: tuple(sealed.observation_require_current(item)
+-                              for item in observations))
++                              for item in observations)))
+         if visibility_missing or not all(_visible(document, as_of) for document in documents):
+             pending = ("visibility_unproven",)
+             identity = hashlib.sha256(canonical_bytes({"pending": list(pending),
+                 "lineage": [sealed.observation_to_dict(item)["observation_hash"]
+                             for item in observations]})).hexdigest()
+-            return _calendar_selection_type(None, pending,
++            return _seal_selection(_calendar_selection_type(None, pending,
+                 tuple(sealed.observation_to_dict(item)["observation_hash"]
+                       for item in observations), identity,
+                 lambda: tuple(sealed.observation_require_current(item)
+-                              for item in observations))
++                              for item in observations)))
+         if as_of.date().isoformat() not in by_date or by_date[as_of.date().isoformat()]["is_open"] is not True:
+             raise ValueError("formal freeze is not proven as a trading day")
+         trading = tuple(day for day in expected_dates if by_date[day]["is_open"])[-250:]
+         config = _read_binding(owned_binding)["calendar_config"]
+         lineage = tuple(sealed.observation_to_dict(item)["observation_hash"]
+                         for item in observations)
+         wire = {
+             "schema_version": "formal-calendar-coverage-v1",
+             "registry_manifest_hash": _read_binding(owned_binding)["registry_manifest_hash"],
+             "source_registry_hash": _read_binding(owned_binding)["source_registry_hash"],
+@@ -768,33 +828,33 @@ class _MarketRepositoryImplementation:
+         }
+         expected_proof_wire = dict(wire,
+             coverage_hash=hashlib.sha256(canonical_bytes(wire)).hexdigest())
+         def recheck():
+             current = _select_calendar(sealed, owned_binding, as_of_utc)
+             if (current.coverage is None
+                     or current.coverage.canonical_bytes() != canonical_bytes(expected_proof_wire)):
+                 raise ValueError("calendar coverage selection changed")
+         proof = _mint_calendar(wire, owned_binding, recheck)
+         selection_hash = hashlib.sha256(proof.canonical_bytes()).hexdigest()
+-        return _calendar_selection_type(
+-            proof, (), lineage, selection_hash, proof.require_current)
++        return _seal_selection(_calendar_selection_type(
++            proof, (), lineage, selection_hash, proof.require_current))
+ 
+     def select(sealed, security_id, as_of_utc, *, binding, _mint_window, _page_group,
+                _select_calendar, _select_market,
+-               _market_selection_type) -> MarketSelection:
++               _market_selection_type, _seal_selection) -> MarketSelection:
+         if type(security_id) is not str or _SECURITY.fullmatch(security_id) is None:
+             raise ValueError("market selection security_id is invalid")
+         owned_binding, source = sealed.resolve_binding(sealed.range_store, binding)
+         calendar = _select_calendar(sealed, owned_binding, as_of_utc)
+         if calendar.coverage is None:
+-            return _market_selection_type(None, calendar.pending, calendar.lineage,
+-                calendar.selection_hash, calendar.recheck)
++            return _seal_selection(_market_selection_type(None, calendar.pending,
++                calendar.lineage, calendar.selection_hash, calendar.recheck))
+         coverage_payload = calendar.coverage.to_dict()
+         days = tuple(coverage_payload["trading_days"])[-250:]
+         requests = sealed.market_requests(
+             source, security_id, calendar_coverage=calendar.coverage)
+         observations = []
+         missing_reasons = {}
+         rows = {}
+         seen_dates = set()
+         for request in requests:
+             group, missing = _page_group(sealed, source, request)
+@@ -905,22 +965,22 @@ class _MarketRepositoryImplementation:
+         }
+         expected_window_wire = dict(wire,
+             window_hash=hashlib.sha256(canonical_bytes(wire)).hexdigest())
+         def recheck():
+             current = _select_market(
+                 sealed, security_id, as_of_utc, binding=owned_binding)
+             if (current.window is None
+                     or current.window.canonical_bytes() != canonical_bytes(expected_window_wire)):
+                 raise ValueError("market window selection changed")
+         window = _mint_window(wire, owned_binding, recheck)
+-        return _market_selection_type(window, tuple(sorted(pending)), lineage,
+-            hashlib.sha256(window.canonical_bytes()).hexdigest(), window.require_current)
++        return _seal_selection(_market_selection_type(window, tuple(sorted(pending)), lineage,
++            hashlib.sha256(window.canonical_bytes()).hexdigest(), window.require_current))
+ 
+ 
+ FormalPolicyMarketRepository = _install_market_proof_owner((
+     FormalRangeStore,
+     FormalRangeStore.resolve_planning_binding,
+     FormalRangeStore.select_current,
+     FormalRangeSource.first_calendar_request,
+     FormalRangeSource.next_page,
+     FormalRangeSource.previous_calendar_request,
+     FormalRangeSource.market_requests,
+diff --git a/ashare_pipeline/formal_range_store.py b/ashare_pipeline/formal_range_store.py
+index b89bd97..a502523 100644
+--- a/ashare_pipeline/formal_range_store.py
++++ b/ashare_pipeline/formal_range_store.py
+@@ -1,15 +1,16 @@
+ """Append-only range evidence, fenced producer attempts, and authenticated rereads."""
+ from __future__ import annotations
+ 
+ import hashlib
+ import json
++from contextvars import ContextVar
+ from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+ import uuid
+ import weakref
+ 
+ 
+ def _utc_now():
+     return datetime.now(timezone.utc).isoformat()
+ 
+ 
+@@ -93,20 +94,21 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
+     from .formal_scoring_registry import load_formal_registry, RegistryApproval
+     from .formal_policy_registry import load_formal_policy_registry
+     from .formal_range_contract import (
+         load_policy_range_bindings,
+         _range_binding_planning_authority,
+     )
+     from .formal_range_format import _canonical as canonical_range, _range_config_to_dict
+ 
+     StateStore, transaction, insert, schema_check, connect = _range_state_store_authority()
+     records = {}
++    parent_ticket_capture = ContextVar("range_absence_parent_ticket_capture", default=None)
+ 
+     def record(store):
+         value = records.get(id(store))
+         if type(store) is not FormalRangeStore or value is None or value[0]() is not store:
+             raise ValueError("range store is forged or copied")
+         _, state, path, root, verifier, verify_anchor, factory, cache = value
+         _require_repository_initialization(state)
+         if (type(state) is not StateStore or state.db_path.resolve() != path
+                 or getattr(state._connect, "__func__", None) is not connect):
+             raise ValueError("range StateStore identity changed")
+@@ -365,23 +367,37 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
+             qualify_current(store, parent_wire, parent_hash, snapshots)
+ 
+     def qualify_current(store, wire, digest, snapshots):
+         leading, token = current_candidates(store, _digest(wire["request"]))
+         snapshots.append(token)
+         if digest not in [observation_wire(item)[1] for item in leading]:
+             raise ValueError("range observation superseded")
+         require_parent_chain(store, wire, snapshots)
+ 
+     def require_current(store, wire, digest):
++        capture = parent_ticket_capture.get()
++        authenticated = []
++        if capture is not None:
++            reread = read(store, wire["task"]["id"], evidence=authenticated)
++            if observation_wire(reread)[1] != digest:
++                raise ValueError("range parent source changed before current check")
+         snapshots = []
+         qualify_current(store, wire, digest, snapshots)
+-        finish_current_check(store, snapshots)
++        if capture is None:
++            finish_current_check(store, snapshots)
++        else:
++            state, root, _, _, _ = record(store)
++            with transaction(state) as connection:
++                check_candidate_snapshots(connection, snapshots)
++                for item in authenticated:
++                    check_read_evidence(connection, root, item)
++            capture.append((tuple(snapshots), tuple(authenticated), digest))
+ 
+     def parent_candidate_snapshots(connection, task):
+         snapshots, seen = [], {task["id"]}
+         parent = task_payload(task)["parent"]
+         while parent is not None:
+             if type(parent) is not dict or set(parent) != {"task_id", "observation_hash", "mode"}:
+                 raise ValueError("range parent identity invalid")
+             if parent["task_id"] in seen:
+                 raise ValueError("range parent chain is cyclic")
+             seen.add(parent["task_id"])
+@@ -594,46 +610,43 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
+ 
+             fingerprint = _text(request_fingerprint)
+             selected, snapshots = self._select_current_with_token(fingerprint)
+             if selected is None:
+                 if request is None:
+                     raise ValueError("range absence needs a bound request before ticket issuance")
+                 request_description = describe_request(request)
+                 request_wire = request_description["request"]
+                 if _digest(request_wire) != fingerprint:
+                     raise ValueError("range absence request fingerprint differs")
+-                require_execution(request, self)
++                parent_tokens = []
++                reset = parent_ticket_capture.set(parent_tokens)
++                try:
++                    require_execution(request, self)
++                finally:
++                    parent_ticket_capture.reset(reset)
+                 _require_current_scope(journal, self,
+                     root=request_wire["registry_manifest_hash"],
+                     as_of_utc=request_wire["as_of_utc"], population=(fingerprint,))
+-                authenticated = []
++                authenticated = ()
+                 parent = request_description["parent"]
+                 if parent is not None:
+-                    previous = read(self, parent["task_id"], evidence=authenticated)
+-                    if observation_wire(previous)[1] != parent["observation_hash"]:
+-                        raise ValueError("range absence parent changed")
+-                    state, root, _, _, _ = record(self)
+-                    with transaction(state) as connection:
+-                        row = connection.execute("SELECT * FROM formal_range_task WHERE id=?",
+-                                                 (parent["task_id"],)).fetchone()
+-                        if row is None:
+-                            raise ValueError("range absence parent disappeared")
+-                        snapshots = (*snapshots,
+-                            (row["request_fingerprint"], candidate_snapshot(connection,
+-                                row["request_fingerprint"])),
+-                            *parent_candidate_snapshots(connection, row))
+-                        check_candidate_snapshots(connection, snapshots)
+-                        for item in authenticated:
+-                            check_read_evidence(connection, root, item)
+-                state, _, _, _, _ = record(self)
++                    if len(parent_tokens) != 1 or parent_tokens[0][2] != parent["observation_hash"]:
++                        raise ValueError("range absence parent current token is missing")
++                    parent_snapshots, authenticated, _ = parent_tokens[0]
++                    snapshots = (*snapshots, *parent_snapshots)
++                elif parent_tokens:
++                    raise ValueError("range absence has an unexpected parent token")
++                state, root, _, _, _ = record(self)
+                 with transaction(state) as connection:
+                     check_candidate_snapshots(connection, snapshots)
++                    for item in authenticated:
++                        check_read_evidence(connection, root, item)
+                 baseline = _canonical(dict(fingerprint=fingerprint, request=request_description,
+                     selected_hash=None,
+                     candidates=[(key, [row.decode() for row in rows]) for key, rows in snapshots],
+                     sources=[[_canonical(value).decode() if type(value) is dict else value.hex()
+                               for value in item] for item in authenticated]))
+                 evidence = (fingerprint, None, tuple(authenticated), snapshots, request,
+                             _canonical(request_description))
+                 return _issue_current_ticket(journal, self, "range", (fingerprint,),
+                     baseline, evidence, ((fingerprint,),), None)
+             wire, digest = observation_wire(selected)
+diff --git a/tests/test_formal_policy_market_ticket.py b/tests/test_formal_policy_market_ticket.py
+index 683c9ef..20662dd 100644
+--- a/tests/test_formal_policy_market_ticket.py
++++ b/tests/test_formal_policy_market_ticket.py
+@@ -18,24 +18,40 @@ class MarketTicketTests(unittest.TestCase):
+         self.fixture = RangeStoreFixture()
+         self.addCleanup(self.fixture.close)
+ 
+     def test_absent_calendar_is_bound_without_reselection_at_checkpoint(self):
+         fixture = self.fixture
+         repository = FormalPolicyMarketRepository(fixture.range_store)
+         root = fixture.graph.manifest.manifest_hash
+         journal = FormalBatchReadJournal.open(repository, registry_manifest_hash=root,
+             as_of_utc=FREEZE, population=("SH600000",),
+             required_keys=(("SH600000",),))
+-        ticket = repository.select_current_batch_ticket(journal, "SH600000", FREEZE,
+-            binding=fixture.binding)
++        implementation_codes = set()
++        def capture_implementation(frame, event, arg):
++            if event == "call" and frame.f_code.co_filename.endswith("formal_policy_market.py"):
++                if (frame.f_code.co_name == "select_calendar"
++                        and "_calendar_selection_type" in frame.f_locals):
++                    implementation_codes.add(frame.f_code)
++                if (frame.f_code.co_name == "select"
++                        and "_market_selection_type" in frame.f_locals):
++                    implementation_codes.add(frame.f_code)
++        sys.setprofile(capture_implementation)
++        try:
++            ticket = repository.select_current_batch_ticket(journal, "SH600000", FREEZE,
++                binding=fixture.binding)
++        finally:
++            sys.setprofile(None)
+         self.assertIsNone(ticket.selected().window)
+-        banned = {type(repository).select.__code__, type(repository).select_calendar.__code__,
++        self.assertEqual({code.co_name for code in implementation_codes},
++                         {"select", "select_calendar"})
++        banned = implementation_codes | {type(repository).select.__code__,
++                  type(repository).select_calendar.__code__,
+                   type(fixture.range_store)._select_current_with_token.__code__,
+                   type(fixture.parser).parse.__code__,
+                   type(fixture.market_parser).parse.__code__}
+         calls = []
+         def profile(frame, event, arg):
+             if event == "call" and frame.f_code in banned:
+                 calls.append(frame.f_code.co_name)
+         sys.setprofile(profile)
+         try:
+             journal.checkpoint()
+@@ -95,13 +111,60 @@ class MarketTicketTests(unittest.TestCase):
+         ticket = repository.select_current_batch_ticket(journal, "SH600000", FREEZE,
+             binding=fixture.binding)
+         self.assertIsNotNone(ticket.selected().window)
+         journal.checkpoint()
+         raw = Path(observations[0].snapshot["content_path"])
+         raw.write_bytes(raw.read_bytes() + b" ")
+         journal.next_phase()
+         with self.assertRaises(ValueError):
+             journal.checkpoint()
+ 
++    def test_calendar_result_mutated_at_implementation_return_is_rejected(self):
++        fixture = self.fixture
++        repository = FormalPolicyMarketRepository(fixture.range_store)
++        root = fixture.graph.manifest.manifest_hash
++        journal = FormalBatchReadJournal.open(repository, registry_manifest_hash=root,
++            as_of_utc=FREEZE, population=("SH600000",),
++            required_keys=(("SH600000",),))
++        mutated = []
++        def inject(frame, event, arg):
++            if (event == "return" and frame.f_code.co_name == "select_calendar"
++                    and "_calendar_selection_type" in frame.f_locals):
++                sys.setprofile(None)
++                object.__setattr__(arg, "pending", ("forged-calendar",))
++                object.__setattr__(arg, "selection_hash", "0" * 64)
++                mutated.append(arg)
++        sys.setprofile(inject)
++        try:
++            with self.assertRaises(ValueError):
++                repository.select_calendar_batch_ticket(journal, fixture.binding, FREEZE)
++        finally:
++            sys.setprofile(None)
++        self.assertEqual(len(mutated), 1)
++
++    def test_market_result_mutated_at_implementation_return_is_rejected(self):
++        fixture = self.fixture
++        repository = FormalPolicyMarketRepository(fixture.range_store)
++        root = fixture.graph.manifest.manifest_hash
++        journal = FormalBatchReadJournal.open(repository, registry_manifest_hash=root,
++            as_of_utc=FREEZE, population=("SH600000",),
++            required_keys=(("SH600000",),))
++        mutated = []
++        def inject(frame, event, arg):
++            if (event == "return" and frame.f_code.co_name == "select"
++                    and "_market_selection_type" in frame.f_locals):
++                sys.setprofile(None)
++                object.__setattr__(arg, "pending", ("forged-market",))
++                object.__setattr__(arg, "selection_hash", "0" * 64)
++                mutated.append(arg)
++        sys.setprofile(inject)
++        try:
++            with self.assertRaises(ValueError):
++                repository.select_current_batch_ticket(journal, "SH600000", FREEZE,
++                    binding=fixture.binding)
++        finally:
++            sys.setprofile(None)
++        self.assertEqual(len(mutated), 1)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_formal_range_absence_ticket.py b/tests/test_formal_range_absence_ticket.py
+index ee02288..4590e19 100644
+--- a/tests/test_formal_range_absence_ticket.py
++++ b/tests/test_formal_range_absence_ticket.py
+@@ -1,13 +1,14 @@
+ """Current range absence must remain tied to its genuine request."""
+ 
+ import unittest
++import sys
+ 
+ from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+ from tests.formal_range_fixtures import RangeStoreFixture
+ 
+ 
+ FREEZE = "2026-08-31T07:00:00+00:00"
+ 
+ 
+ class RangeAbsenceTicketTests(unittest.TestCase):
+     def setUp(self):
+@@ -40,13 +41,36 @@ class RangeAbsenceTicketTests(unittest.TestCase):
+             population=(fingerprint,), required_keys=((fingerprint,),))
+         ticket = fixture.range_store.select_current_batch_ticket(journal, fingerprint,
+             request=request)
+         self.assertIsNone(ticket.selected())
+         journal.checkpoint()
+         fixture.produce_calendar(days={"2026-08-31": True}, generation="g2")
+         journal.next_phase()
+         with self.assertRaises(ValueError):
+             journal.checkpoint()
+ 
++    def test_parent_conflict_at_execution_return_cannot_become_absence_baseline(self):
++        fixture = self.fixture
++        parent = fixture.produce_calendar(days={"2026-08-31": True}, generation="g1")[0]
++        request = fixture.source.previous_calendar_request(parent)
++        fingerprint = request.request_fingerprint
++        journal = FormalBatchReadJournal.open(fixture.range_store,
++            registry_manifest_hash=request.registry_manifest_hash, as_of_utc=FREEZE,
++            population=(fingerprint,), required_keys=((fingerprint,),))
++        def inject(frame, event, arg):
++            if (event == "return" and frame.f_code.co_name == "require_execution"
++                    and frame.f_code.co_filename.endswith("formal_range_source.py")):
++                sys.setprofile(None)
++                fixture.produce_calendar(days={"2026-08-31": False}, generation="g2")
++        sys.setprofile(inject)
++        try:
++            with self.assertRaises(ValueError):
++                fixture.range_store.select_current_batch_ticket(journal, fingerprint,
++                    request=request)
++        finally:
++            sys.setprofile(None)
++        with self.assertRaises(ValueError):
++            parent.require_current()
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

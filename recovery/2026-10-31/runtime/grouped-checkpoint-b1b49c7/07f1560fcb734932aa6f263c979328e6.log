@@ -1,0 +1,16 @@
+TEST_STARTED test_formal_final_runner.RunnerIdentityTests.test_changed_naive_or_malformed_freeze_is_rejected
+test_changed_naive_or_malformed_freeze_is_rejected (test_formal_final_runner.RunnerIdentityTests.test_changed_naive_or_malformed_freeze_is_rejected) ... ok
+TEST_STARTED test_formal_final_runner.RunnerIdentityTests.test_d1_identity_matches_only_exact_fields
+test_d1_identity_matches_only_exact_fields (test_formal_final_runner.RunnerIdentityTests.test_d1_identity_matches_only_exact_fields) ... ok
+TEST_STARTED test_formal_final_runner.RunnerIdentityTests.test_d1_retains_canonical_utc_and_lists_multiple_mismatches_in_field_order
+test_d1_retains_canonical_utc_and_lists_multiple_mismatches_in_field_order (test_formal_final_runner.RunnerIdentityTests.test_d1_retains_canonical_utc_and_lists_multiple_mismatches_in_field_order) ... ok
+TEST_STARTED test_formal_final_runner.RunnerIdentityTests.test_d1_security_order_and_membership_cannot_be_normalized_away
+test_d1_security_order_and_membership_cannot_be_normalized_away (test_formal_final_runner.RunnerIdentityTests.test_d1_security_order_and_membership_cannot_be_normalized_away) ... ok
+TEST_STARTED test_formal_final_runner.RunnerIdentityTests.test_frozen_time_representations_close_to_the_same_fixed_utc_instant
+test_frozen_time_representations_close_to_the_same_fixed_utc_instant (test_formal_final_runner.RunnerIdentityTests.test_frozen_time_representations_close_to_the_same_fixed_utc_instant) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.001s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_runner.RunnerIdentityTests.test_changed_naive_or_malformed_freeze_is_rejected", "test_formal_final_runner.RunnerIdentityTests.test_d1_identity_matches_only_exact_fields", "test_formal_final_runner.RunnerIdentityTests.test_d1_retains_canonical_utc_and_lists_multiple_mismatches_in_field_order", "test_formal_final_runner.RunnerIdentityTests.test_d1_security_order_and_membership_cannot_be_normalized_away", "test_formal_final_runner.RunnerIdentityTests.test_frozen_time_representations_close_to_the_same_fixed_utc_instant"], "passed": ["test_formal_final_runner.RunnerIdentityTests.test_changed_naive_or_malformed_freeze_is_rejected", "test_formal_final_runner.RunnerIdentityTests.test_d1_identity_matches_only_exact_fields", "test_formal_final_runner.RunnerIdentityTests.test_d1_retains_canonical_utc_and_lists_multiple_mismatches_in_field_order", "test_formal_final_runner.RunnerIdentityTests.test_d1_security_order_and_membership_cannot_be_normalized_away", "test_formal_final_runner.RunnerIdentityTests.test_frozen_time_representations_close_to_the_same_fixed_utc_instant"], "tests_run": 5, "failures": 0, "errors": 0, "skipped": 0}

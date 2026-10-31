@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_integration.GenuineFullChainTests.test_official_candidate_is_still_preview_ready_and_never_v9_published
+test_official_candidate_is_still_preview_ready_and_never_v9_published (test_formal_final_integration.GenuineFullChainTests.test_official_candidate_is_still_preview_ready_and_never_v9_published) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 4363.945s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_integration.GenuineFullChainTests.test_official_candidate_is_still_preview_ready_and_never_v9_published"], "passed": ["test_formal_final_integration.GenuineFullChainTests.test_official_candidate_is_still_preview_ready_and_never_v9_published"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

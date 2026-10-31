@@ -1,0 +1,1053 @@
+# Task 2B review package
+
+Base: 9d5c6d1a449a82209a9169b3c326252d2c1c81ab
+Head: uncommitted frozen working-tree changes; no commits in this slice yet.
+Scope: 7 code/test files — 3 production, 4 test/helper files. No data or migrations.
+
+diff --git a/ashare_pipeline/formal_context_repository.py b/ashare_pipeline/formal_context_repository.py
+index 820aaa1..50d9494 100644
+--- a/ashare_pipeline/formal_context_repository.py
++++ b/ashare_pipeline/formal_context_repository.py
+@@ -1,17 +1,19 @@
+ """Fail-closed verified Context persistence and point-in-time selection."""
+ 
+ from dataclasses import asdict
+ from datetime import datetime, date, time
+ import weakref
++from types import MappingProxyType
+ 
+ from .formal_context_schema import (FormalContextFact, FormalContextNormalization, FormalContextRegistry,
++    CONTEXT_KINDS,
+     FormalContextVersionView, SignedContextRequestResolver, _canonical, _load, _verify_context_fact,
+     _timestamp, _selector, _security, _text, _exchange, _hash)
+ from .formal_evidence import VerifiedCalendarBinding
+ from .formal_snapshot_repository import FormalSnapshotRepository
+ from .formal_snapshot_store import FormalStoredSnapshot
+ from .formal_sources import CalendarSelector
+ from .formal_time import formal_version_sort_key, SHANGHAI
+ from .state_store import StateStore
+ 
+ 
+@@ -353,20 +355,71 @@ class FormalContextRepository:
+         if tuple(fact.canonical_bytes() for fact in before) != tuple(fact.canonical_bytes() for fact in after):
+             raise ValueError("Context correction race during verification")
+         return FormalContextFact.from_dict(ordered[0].to_dict())
+ 
+     def get_verified(self, kind, scope_key, security_id, as_of_utc, registry_manifest_hash):
+         if kind == "trading_calendar":
+             self._load(registry_manifest_hash)
+             raise ValueError("trading calendars require an exchange selector")
+         return self._select(kind, scope_key, security_id, as_of_utc, registry_manifest_hash)
+ 
++    def get_verified_many(self, kind, scope_key, security_ids, as_of_utc, registry_manifest_hash):
++        """Verify a complete scope twice, selecting each requested security once.
++
++        None denotes actual absence; malformed evidence and selection races raise.
++        This detached snapshot does not promise indefinite latest-state validity.
++        """
++        if type(kind) is not str or kind not in CONTEXT_KINDS:
++            raise ValueError("invalid Context kind")
++        if kind == "trading_calendar":
++            raise ValueError("trading calendars require an exchange selector")
++        if (type(security_ids) is not tuple or not security_ids
++                or any(type(item) is not str for item in security_ids)
++                or tuple(sorted(set(security_ids))) != security_ids):
++            raise ValueError("Context batch requires a nonempty sorted unique exact tuple")
++        for security_id in security_ids:
++            _security(security_id)
++        _timestamp(as_of_utc)
++        _text(scope_key)
++        _hash(registry_manifest_hash)
++        self._load(registry_manifest_hash)
++        def snapshot():
++            return self._state_store.list_formal_context_facts(registry_manifest_hash=registry_manifest_hash,
++                context_kind=kind, scope_key=scope_key, as_of_utc=as_of_utc)
++        before = snapshot()
++        grouped = {security_id: [] for security_id in security_ids}
++        for fact in before:
++            if fact.security_id in grouped:
++                grouped[fact.security_id].append(fact)
++        selected = {}
++        for security_id, candidates in grouped.items():
++            if not candidates:
++                selected[security_id] = None
++                continue
++            for fact in candidates:
++                with self._state_store._transaction() as connection:
++                    _validate_stored_fact(self._state_store, connection, fact, self._verifier,
++                        snapshot_repository=self._snapshots)
++                for field in ("published_at_utc", "effective_at_utc", "source_updated_at_utc"):
++                    if getattr(fact, field) is not None and _timestamp(getattr(fact, field)) > _timestamp(as_of_utc):
++                        raise ValueError("Context future source time")
++            ordered = sorted(candidates, key=lambda fact: formal_version_sort_key(FormalContextVersionView.from_fact(fact)))
++            key = formal_version_sort_key(FormalContextVersionView.from_fact(ordered[0]))
++            if sum(formal_version_sort_key(FormalContextVersionView.from_fact(fact)) == key for fact in candidates) != 1:
++                raise ValueError("multiple equal leading Context versions")
++            selected[security_id] = FormalContextFact.from_dict(ordered[0].to_dict())
++        self._load(registry_manifest_hash)
++        after = snapshot()
++        if tuple(fact.canonical_bytes() for fact in before) != tuple(fact.canonical_bytes() for fact in after):
++            raise ValueError("Context correction race during verification")
++        return MappingProxyType(selected)
++
+     def resolve_verified_calendar_binding(self, selector, exchange, as_of_utc, registry_manifest_hash):
+         self._load(registry_manifest_hash)
+         if type(selector) is not CalendarSelector:
+             raise ValueError("exact signed calendar selector required")
+         selector_wire = asdict(selector)
+         copied = _selector(selector_wire)
+         if copied.exchange != _exchange(exchange):
+             raise ValueError("calendar selector exchange mismatch")
+         fact = self._select("trading_calendar", copied.scope_key, None, as_of_utc, registry_manifest_hash, exchange)
+         ref = self._state_store.get_formal_snapshot(fact.source_snapshot_id)
+@@ -377,20 +430,51 @@ class FormalContextRepository:
+         if asdict(selector) != selector_wire:
+             raise ValueError("calendar selector mutated during verification")
+         after = self._select("trading_calendar", copied.scope_key, None, as_of_utc, registry_manifest_hash, exchange)
+         if after.id != fact.id:
+             raise ValueError("calendar correction race during source verification")
+         return VerifiedCalendarBinding(snapshot_id=ref.snapshot_id, manifest_sha256=ref.manifest_sha256,
+             exchange=exchange, freeze_at_utc=as_of_utc, registry_manifest_hash=registry_manifest_hash,
+             selector_hash=copied.selector_hash, prerequisite_task_id=ref.producing_task_id)
+ 
+ 
++def _context_repository_identity():
++    """Only genuine constructor calls register Context dependencies for metrics.
++
++    Existing single-Context read semantics remain unchanged. Copies have no
++    registration and cannot become a metric prerequisite merely by copying fields.
++    """
++    initialized = {}
++    original_init = FormalContextRepository.__init__
++
++    def init(self, *args, **kwargs):
++        original_init(self, *args, **kwargs)
++        identity = id(self)
++        initialized[identity] = (weakref.ref(self, lambda _: initialized.pop(identity, None)),
++            self._state_store, self._snapshots, self._verifier)
++
++    def require(repository):
++        record = initialized.get(id(repository))
++        if type(repository) is not FormalContextRepository or record is None or record[0]() is not repository:
++            raise ValueError("Context repository is uninitialized or copied")
++        if any(actual is not expected for actual, expected in zip(
++                (repository._state_store, repository._snapshots, repository._verifier), record[1:], strict=True)):
++            raise ValueError("Context repository initialized dependencies changed")
++
++    FormalContextRepository.__init__ = init
++    return require
++
++
++_require_authentic_context_repository = _context_repository_identity()
++del _context_repository_identity
++
++
+ def build_effective_time_resolver(repository):
+     if type(repository) is not FormalContextRepository:
+         raise ValueError("effective-time resolver requires exact Context repository")
+ 
+     class Resolver:
+         def next_exchange_close(self, exchange, disclosure_date_cn, calendar_binding):
+             if type(calendar_binding) is not VerifiedCalendarBinding:
+                 raise ValueError("exact verified calendar binding required")
+             wire = asdict(calendar_binding)
+             root = wire["registry_manifest_hash"]
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index 55453f2..7dd3330 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -3592,20 +3592,36 @@ class StateStore:
+             row = connection.execute(
+                 """SELECT * FROM formal_universe_snapshot
+                 WHERE frozen_input_hash = ?""",
+                 (frozen_input_hash,),
+             ).fetchone()
+             if row is None:
+                 return None
+             self._formal_universe_from_connection(connection, row)
+             return dict(row)
+ 
++    def get_verified_formal_frozen_universe(
++        self, frozen_input_hash: str
++    ) -> FormalFrozenUniverseInput | None:
++        """Replay the entire persisted source/member/status graph in one read."""
++        self._require_formal_snapshot_store()
++        _require_formal_sha256(frozen_input_hash, "universe frozen input hash")
++        with self._transaction() as connection:
++            row = connection.execute(
++                "SELECT * FROM formal_universe_snapshot WHERE frozen_input_hash = ?",
++                (frozen_input_hash,),
++            ).fetchone()
++            if row is None:
++                return None
++            frozen, _ = self._formal_universe_from_connection(connection, row)
++            return frozen
++
+     def list_formal_universe_sources(
+         self, universe_snapshot_id: str
+     ) -> list[dict[str, object]]:
+         self._require_formal_snapshot_store()
+         if type(universe_snapshot_id) is not str or not universe_snapshot_id.strip():
+             raise ValueError("universe_snapshot_id must be a nonempty string")
+         with self._transaction() as connection:
+             row = connection.execute(
+                 "SELECT * FROM formal_universe_snapshot WHERE id = ?",
+                 (universe_snapshot_id,),
+diff --git a/tests/test_formal_context_repository.py b/tests/test_formal_context_repository.py
+index 92130e5..ecc3dab 100644
+--- a/tests/test_formal_context_repository.py
++++ b/tests/test_formal_context_repository.py
+@@ -209,20 +209,66 @@ class ContextIntegrationTests(unittest.TestCase):
+         self.store.put_formal_context_facts(receipt)
+         self.store.complete_formal_task(ref.producing_task_id, "fixture-worker", {"snapshot": ref.snapshot_id})
+         return receipt.facts[0], ref, receipt
+ 
+     def get(self, **changes):
+         args = dict(kind="security_state", scope_key="fixture-state", security_id="SZ000001", as_of_utc=FREEZE,
+             registry_manifest_hash=self.manifest.manifest_hash)
+         args.update(changes)
+         return self.repo.get_verified(**args)
+ 
++    def test_batch_selection_preserves_single_result_and_actual_absence(self):
++        self.assertTrue(callable(getattr(self.repo, "get_verified_many", None)), "verified batch selection is required")
++        fact, _, _ = self.put()
++        result = self.repo.get_verified_many("security_state", "fixture-state",
++            ("SH600000", "SZ000001"), FREEZE, self.manifest.manifest_hash)
++        self.assertEqual(tuple(result), ("SH600000", "SZ000001"))
++        self.assertIsNone(result["SH600000"])
++        self.assertEqual(result["SZ000001"].canonical_bytes(), self.get().canonical_bytes())
++        self.assertEqual(result["SZ000001"].id, fact.id)
++        with self.assertRaises(TypeError):
++            result["SH600000"] = fact
++
++    def test_batch_rejects_invalid_identity_instead_of_absence(self):
++        for ids in ((), ["SZ000001"], (None,), ("sz000001",), ("SZ000001", "SH600000"),
++                ("SZ000001", "SZ000001")):
++            with self.subTest(ids=ids), self.assertRaises(ValueError):
++                self.repo.get_verified_many("security_state", "fixture-state", ids, FREEZE, self.manifest.manifest_hash)
++        for kind in ("trading_calendar", "unknown", None):
++            with self.subTest(kind=kind), self.assertRaises(ValueError):
++                self.repo.get_verified_many(kind, "fixture-state", ("SZ000001",), FREEZE, self.manifest.manifest_hash)
++
++    def test_batch_corruption_does_not_become_absence(self):
++        _, ref, _ = self.put()
++        self.sql("DELETE FROM formal_task_snapshot_receipt WHERE task_id=?", (ref.producing_task_id,))
++        with self.assertRaises(ValueError):
++            self.repo.get_verified_many("security_state", "fixture-state", ("SZ000001",), FREEZE, self.manifest.manifest_hash)
++
++    def test_batch_detects_correction_between_scope_snapshots(self):
++        self.put()
++        original = self.store.list_formal_context_facts
++        calls = []
++        def read(**kwargs):
++            result = original(**kwargs)
++            calls.append(1)
++            if len(calls) == 1:
++                self.put(request=self.request(upstream_generation="correction"), published="2026-08-25T07:00:00+00:00")
++            return result
++        with patch.object(self.store, "list_formal_context_facts", read), self.assertRaisesRegex(ValueError, "race"):
++            self.repo.get_verified_many("security_state", "fixture-state", ("SZ000001",), FREEZE, self.manifest.manifest_hash)
++
++    def test_batch_preserves_leading_tie_failure(self):
++        self.put()
++        self.put(request=self.request(upstream_generation="batch-tie"))
++        with self.assertRaisesRegex(ValueError, "leading"):
++            self.repo.get_verified_many("security_state", "fixture-state", ("SZ000001",), FREEZE, self.manifest.manifest_hash)
++
+     def test_signed_descriptor_exact_identity_and_no_direct_trust_minting(self):
+         request = self.request()
+         self.assertEqual(request.official_request.period_or_date, "2026-08-31")
+         self.assertEqual(request.official_request.exchange, "SZ")
+         self.assertEqual(request.descriptor_id, hashlib.sha256(canonical(descriptor())).hexdigest())
+         self.assertEqual(request.evidence["normalizer_version"], "fixture-normalizer-v1")
+         self.assertEqual(request.request_version, "formal-context-request-v1")
+         self.assertEqual(len(request.refresh_generation), 64)
+         self.assertEqual(request.refresh_generation, self.request().refresh_generation)
+         for cls in (self.schema.FormalContextRegistry, self.schema.FormalContextRequest, self.schema.FormalContextNormalization):
+diff --git a/tests/test_state_store.py b/tests/test_state_store.py
+index a678933..c29edda 100644
+--- a/tests/test_state_store.py
++++ b/tests/test_state_store.py
+@@ -1047,29 +1047,34 @@ class StateStoreTestCase(unittest.TestCase):
+             fetch,
+             stored,
+             verification,
+         )
+ 
+     def task_backed_frozen_universe(
+         self,
+         *,
+         label: str = "universe",
+         db_path: Path | None = None,
++        registry_manifest_hash: str = "7" * 64,
++        source_registry_hash: str = "8" * 64,
++        registry_signature_verifier=None,
++        formal_snapshot_store=None,
++        exchange_rows=None,
+     ) -> tuple[StateStore, FormalFrozenUniverseInput, dict[str, str]]:
+         path = db_path or self.db_path
+         if path != self.db_path:
+             StateStore(path).initialize()
+-        raw_store = FormalSnapshotStore(
++        raw_store = formal_snapshot_store or FormalSnapshotStore(
+             Path(self.tempdir.name) / f"formal-universe-raw-{label}"
+         )
+-        store = StateStore(path, formal_snapshot_store=raw_store)
+-        registry_manifest_hash = "7" * 64
++        store = StateStore(path, formal_snapshot_store=raw_store,
++            registry_signature_verifier=registry_signature_verifier)
+         as_of_utc = "2026-08-31T15:00:00+08:00"
+         exchange_values = {
+             "BJ": ("bse", "https://www.bse.cn/listing", "430001"),
+             "SH": ("sse", "https://www.sse.com.cn/listing", "600000"),
+             "SZ": ("szse", "https://www.szse.cn/listing", "000001"),
+         }
+         policies = {
+             "bse": SourcePolicy.bse(),
+             "sse": SourcePolicy.sse(),
+             "szse": SourcePolicy.szse(),
+@@ -1091,21 +1096,21 @@ class StateStoreTestCase(unittest.TestCase):
+             payload = {
+                 "as_of_utc": as_of_utc,
+                 "calendar_binding": None,
+                 "calendar_prerequisite_task_id": None,
+                 "exchange": exchange,
+                 "official_request": json.loads(
+                     request.canonical_json_bytes().decode("utf-8")
+                 ),
+                 "refresh_generation": generation,
+                 "registry_manifest_hash": registry_manifest_hash,
+-                "relevant_registry_hashes": [["source_registry", "8" * 64]],
++                "relevant_registry_hashes": [["source_registry", source_registry_hash]],
+                 "request_version": "universe-listing-v1",
+                 "source": source,
+                 "upstream_generation": "9" * 64,
+             }
+             task_id = store.enqueue_formal_task(
+                 "formal_universe_source",
+                 f"formal-universe-source:{label}:{exchange}",
+                 generation,
+                 payload,
+             )
+@@ -1121,20 +1126,22 @@ class StateStoreTestCase(unittest.TestCase):
+                 },
+                 "security_id": exchange + code6,
+                 "security_type": "ordinary_a",
+             },)
+             if exchange == "BJ":
+                 rows += ({
+                     "listing_status": "listed",
+                     "security_id": "BJ899001",
+                     "security_type": "bond",
+                 },)
++            if exchange_rows is not None:
++                rows = tuple(exchange_rows[exchange])
+             raw_bytes = json.dumps(
+                 list(rows),
+                 ensure_ascii=False,
+                 sort_keys=True,
+                 separators=(",", ":"),
+             ).encode("utf-8")
+             fetch = OfficialFetch(
+                 request=request,
+                 raw_bytes=raw_bytes,
+                 original_url=original_url,
+
+diff --git a/ashare_pipeline/formal_metric_context.py b/ashare_pipeline/formal_metric_context.py
+new file mode 100644
+index 0000000..a3a3d7d
+--- /dev/null
++++ b/ashare_pipeline/formal_metric_context.py
+@@ -0,0 +1,298 @@
++"""Authenticated frozen population and signed industry Context prerequisites.
++
++Proofs capture evidence, not indefinite latest-state validity. A metric factory
++must call recheck_batch after reading every member's features and before use.
++"""
++
++from datetime import date, datetime
++import hashlib
++from types import MappingProxyType
++import weakref
++
++from . import formal_context_repository as context_module
++from .formal_context_repository import FormalContextRepository
++from .formal_context_schema import FormalContextFact, FormalContextRegistry, SignedContextRequestResolver, _canonical, _load
++from .formal_registry_manifest import FormalRegistryBundleLoader, FormalRegistryManifest, VerifiedRegistryBundle
++from .formal_scoring_registry import FormalScoringRegistry
++from .formal_snapshot_repository import FormalSnapshotRepository
++from .formal_snapshot_store import FormalSnapshotStore
++from .formal_universe import canonical_security_id
++from .state_store import StateStore, _formal_frozen_universe_payload, _plain_formal_universe_json
++
++
++_FREEZE = "2026-08-31T07:00:00+00:00"
++
++
++def _text(value):
++    if type(value) is not str or not value or value != value.strip():
++        raise ValueError("industry requires trimmed nonempty strings")
++    return value
++
++
++def _industry(bundle, scoring):
++    if type(bundle) is not VerifiedRegistryBundle or type(scoring) is not FormalScoringRegistry:
++        raise ValueError("industry requires exact verified registry types")
++    bundle.require_official()
++    scoring.require_official(bundle)
++    wire = _load(bundle.blob("industry").canonical_json)
++    if set(wire) != set("registry_role schema_version purpose classification_system source_version effective_date context_scope_key memberships mapping_sha256".split()):
++        raise ValueError("industry registry has missing or extra fields")
++    if (wire["registry_role"] != "industry" or wire["schema_version"] != "formal-industry-registry-v1"
++            or wire["purpose"] != "official" or wire["classification_system"] != "SW2021"):
++        raise ValueError("industry registry role/version/purpose/classification mismatch")
++    _text(wire["source_version"])
++    _text(wire["context_scope_key"])
++    effective = wire["effective_date"]
++    if type(effective) is not str or date.fromisoformat(effective).isoformat() != effective or effective > "2026-08-31":
++        raise ValueError("industry effective date is invalid or future")
++    memberships = wire["memberships"]
++    if type(memberships) is not list or not memberships:
++        raise ValueError("industry memberships must be a nonempty array")
++    ids = []
++    for member in memberships:
++        if type(member) is not dict or set(member) != {"security_id", "template_id", "primary_industry", "secondary_industry"}:
++            raise ValueError("industry member has missing or extra fields")
++        ids.append(canonical_security_id(member["security_id"]))
++        scoring.template_for(_text(member["template_id"]))
++        _text(member["primary_industry"])
++        _text(member["secondary_industry"])
++    if ids != sorted(set(ids)):
++        raise ValueError("industry members must be canonical sorted unique securities")
++    mapping = {key: wire[key] for key in ("classification_system", "source_version", "effective_date", "memberships")}
++    if wire["mapping_sha256"] != hashlib.sha256(_canonical(mapping)).hexdigest():
++        raise ValueError("industry mapping digest mismatch")
++    return wire
++
++
++def _immutable(value):
++    if type(value) is dict:
++        return MappingProxyType({key: _immutable(item) for key, item in value.items()})
++    if type(value) is list:
++        return tuple(_immutable(item) for item in value)
++    return value
++
++
++def _metric_context_types():
++    """Keep mint authority and all proof state outside publicly writable slots."""
++    repositories, proofs = {}, {}
++    reader = StateStore.get_verified_formal_frozen_universe
++    batch_reader = FormalContextRepository.get_verified_many
++    loader = FormalRegistryBundleLoader.load
++    parse_industry = _industry
++    serialize_universe = _formal_frozen_universe_payload
++    require_context = context_module._require_authentic_context_repository
++    # Only paths consumed by universe, registry and Context/raw verification.
++    paths = {
++        StateStore: "_connect _transaction _require_registry_verifier _formal_token _verify_formal_signature _formal_blob_snapshot _formal_blob_from_connection _formal_root_snapshot _formal_root_from_connection get_formal_registry_blob get_formal_registry_manifest _require_formal_snapshot_store _configured_formal_snapshot_store_for_repository get_verified_formal_frozen_universe _formal_universe_from_connection _formal_universe_extraction_from_payload _require_formal_universe_source_lineage _formal_snapshot_row_to_ref _formal_verified_snapshot_ref_from_connection _require_formal_snapshot_receipt_lineage _formal_task_snapshot_receipt_from_connection get_formal_task_snapshot_receipt _formal_task_public _require_formal_verified_task_state _get_formal_snapshot_verified_by_manifest _formal_ref_matches_projection list_formal_context_facts get_formal_snapshot".split(),
++        FormalContextRepository: "__init__ _load _candidates _select get_verified_many resolve_verified_calendar_binding".split(),
++        FormalSnapshotRepository: "__init__ get_verified_by_manifest read_verified_raw".split(),
++        FormalSnapshotStore: "__init__ read_verified_raw validate_stored_snapshot _validate_inspection_inputs _validate_formal_fetch_values _validate_request_values _require_version_identifier _require_recomputed_verification _read_calendar_binding _resolve_calendar_binding _require_calendar_binding_identity _official_request_from_manifest _require_exact_manifest_payload _validate_content_file _read_manifest _require_sha256 _safe_path_component _path_inside_root _require_target_within_root".split(),
++        FormalRegistryBundleLoader: ["__init__", "load"],
++        VerifiedRegistryBundle: ["require_official", "blob"],
++        FormalRegistryManifest: ["from_signed_bytes", "require_official", "assert_member_hashes"],
++        FormalScoringRegistry: ["require_official", "template_for"],
++        FormalContextRegistry: ["load", "descriptor_for"],
++        SignedContextRequestResolver: ["__init__", "resolve", "_resolve", "_resolve_historical"],
++        FormalContextFact: ["from_dict", "to_dict", "canonical_bytes"],
++    }
++    checked = tuple((cls, name, vars(cls)[name]) for cls, names in paths.items() for name in names)
++    context_functions = tuple((name, getattr(context_module, name)) for name in
++        ("_validate_stored_fact", "_list_context_facts", "_row_fact", "_require_context_producer", "_prove_historical_calendar"))
++
++    def method_identity(method):
++        return (id(getattr(method, "__self__", None)), id(getattr(method, "__func__", method)))
++
++    def state(store, context, verifier):
++        try:
++            require_context(context)
++            snapshots = context._snapshots
++            raw = store._formal_snapshot_store
++            if (type(store) is not StateStore or type(context) is not FormalContextRepository
++                    or type(snapshots) is not FormalSnapshotRepository or type(raw) is not FormalSnapshotStore
++                    or context._state_store is not store or snapshots._state_store is not store
++                    or snapshots._raw_store is not raw or context._verifier is not verifier
++                    or store._registry_signature_verifier is not verifier
++                    or snapshots.root != raw.root or not callable(getattr(verifier, "verify", None))):
++                raise ValueError("metric Context requires exact matching stores, repositories and verifier")
++            for cls, name, method in checked:
++                if vars(cls).get(name) is not method:
++                    raise ValueError("metric Context validation dependency changed")
++                for instance in (store, context, snapshots, raw, verifier):
++                    if type(instance) is cls and name in vars(instance):
++                        raise ValueError("metric Context read dependency overridden")
++            if any(getattr(context_module, name) is not function for name, function in context_functions):
++                raise ValueError("metric Context source validation dependency changed")
++            if _industry is not parse_industry or _formal_frozen_universe_payload is not serialize_universe:
++                raise ValueError("metric Context contract dependency changed")
++            return (id(store), id(context), id(verifier), id(snapshots), id(raw), str(store.db_path),
++                str(raw.root), str(snapshots.root), method_identity(verifier.verify),
++                method_identity(getattr(raw, "_calendar_binding_resolver", None)))
++        except (AttributeError, TypeError) as error:
++            raise ValueError("metric Context trust dependencies are uninitialized") from error
++
++    def dependencies(repository):
++        record = repositories.get(id(repository))
++        if type(repository) is not FormalMetricContextRepository or record is None or record[0]() is not repository:
++            raise ValueError("metric Context repository is uninitialized or copied")
++        store, context, verifier, snapshot = record[1:]
++        if state(store, context, verifier) != snapshot:
++            raise ValueError("metric Context trust dependencies changed")
++        return store, context, verifier
++
++    def proof_record(proof, cls, repository=None):
++        record = proofs.get(id(proof))
++        if type(proof) is not cls or record is None or record[0]() is not proof:
++            raise ValueError("metric Context proof is forged or copied")
++        if repository is not None and record[1]() is not repository:
++            raise ValueError("metric Context proof belongs to another repository")
++        return record
++
++    class Proof:
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("metric Context proofs require authenticated repository reads")
++
++        def __getattr__(self, name):
++            wire = _load(proof_record(self, type(self))[2])
++            if name not in wire:
++                raise AttributeError(name)
++            return _immutable(wire[name])
++
++        def to_dict(self):
++            return _load(proof_record(self, type(self))[2])
++
++        def canonical_bytes(self):
++            return proof_record(self, type(self))[2]
++
++        def require_verified(self):
++            proof_record(self, type(self))
++
++        def __copy__(self):
++            raise TypeError("metric Context proof cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("metric Context proof cannot be copied")
++
++    class VerifiedMetricUniverse(Proof):
++        __slots__ = ()
++
++    class VerifiedMetricIndustryBatch(Proof):
++        __slots__ = ()
++
++    def mint(repository, cls, payload, scoring=None):
++        proof = object.__new__(cls)
++        identity = id(proof)
++        proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)), weakref.ref(repository),
++            _canonical(payload), scoring)
++        return proof
++
++    def read_universe(repository, frozen_input_hash, scoring):
++        store, _, verifier = dependencies(repository)
++        frozen = reader(store, frozen_input_hash)
++        if frozen is None:
++            dependencies(repository)
++            return None
++        if datetime.fromisoformat(frozen.as_of_utc) != datetime.fromisoformat(_FREEZE):
++            raise ValueError("metric universe requires the fixed freeze instant")
++        graph = loader(FormalRegistryBundleLoader(store, verifier), frozen.registry_manifest_hash)
++        industry = parse_industry(graph, scoring)
++        payload = dict(schema_version="formal-metric-universe-v1", as_of_utc=_FREEZE,
++            frozen_as_of_utc=frozen.as_of_utc, registry_manifest_hash=frozen.registry_manifest_hash,
++            frozen_input_hash=frozen.frozen_input_hash, universe_hash=frozen.universe_hash,
++            source_audit_hash=frozen.source_audit_hash,
++            industry_registry_hash=graph.manifest.industry_registry_hash,
++            mapping_sha256=industry["mapping_sha256"], industry=industry,
++            security_ids=[member.security_id for member in frozen.members],
++            frozen_universe=_plain_formal_universe_json(serialize_universe(frozen)),
++            source_receipts=[store.get_formal_task_snapshot_receipt(source.snapshot.producing_task_id) for source in frozen.sources])
++        payload["population_hash"] = hashlib.sha256(_canonical(payload["security_ids"])).hexdigest()
++        dependencies(repository)
++        return payload
++
++    def resolve_payload(repository, universe):
++        _, context, _ = dependencies(repository)
++        signed = universe["industry"]
++        ids = tuple(universe["security_ids"])
++        facts = batch_reader(context, "industry_snapshot", signed["context_scope_key"], ids,
++            _FREEZE, universe["registry_manifest_hash"])
++        members = {member["security_id"]: member for member in signed["memberships"]}
++        entries, selected = {}, {}
++        for sid in ids:
++            member, fact = members.get(sid), facts[sid]
++            selected[sid] = None if fact is None else dict(id=fact.id, canonical_fact=_load(fact.canonical_bytes()))
++            base = dict(security_id=sid, registry_manifest_hash=universe["registry_manifest_hash"],
++                universe_hash=universe["universe_hash"], frozen_input_hash=universe["frozen_input_hash"])
++            reason = None
++            if member is None:
++                reason = "signed_membership_absent"
++            elif fact is None:
++                reason = "context_absent"
++            else:
++                expected = {key: signed[key] for key in ("classification_system", "source_version", "effective_date", "mapping_sha256")}
++                expected.update({key: member[key] for key in ("primary_industry", "secondary_industry")})
++                if dict(fact.value) != expected:
++                    reason = "context_membership_mismatch"
++            if reason is not None:
++                entries[sid] = dict(base, status="pending", pending_reason=reason)
++            else:
++                entries[sid] = dict(base, status="assigned", pending_reason=None,
++                    template_id=member["template_id"], primary_industry=member["primary_industry"],
++                    secondary_industry=member["secondary_industry"], context_fact_id=fact.id,
++                    context_canonical_sha256=hashlib.sha256(fact.canonical_bytes()).hexdigest())
++        payload = dict(schema_version="formal-metric-industry-batch-v1", registry_manifest_hash=universe["registry_manifest_hash"],
++            frozen_input_hash=universe["frozen_input_hash"], universe_hash=universe["universe_hash"],
++            universe_proof_sha256=hashlib.sha256(_canonical(universe)).hexdigest(),
++            population_hash=universe["population_hash"], mapping_sha256=universe["mapping_sha256"],
++            industry_registry_hash=universe["industry_registry_hash"], entries=entries, selected_context=selected)
++        payload["batch_hash"] = hashlib.sha256(_canonical(payload)).hexdigest()
++        dependencies(repository)
++        return payload
++
++    class FormalMetricContextRepository:
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, state_store, context_repository, *, registry_signature_verifier):
++            if type(self) is not FormalMetricContextRepository or id(self) in repositories:
++                raise ValueError("metric Context repository initialization is exact and single-use")
++            snapshot = state(state_store, context_repository, registry_signature_verifier)
++            identity = id(self)
++            repositories[identity] = (weakref.ref(self, lambda _: repositories.pop(identity, None)),
++                state_store, context_repository, registry_signature_verifier, snapshot)
++
++        def load_universe(self, frozen_input_hash, *, scoring_registry):
++            payload = read_universe(self, frozen_input_hash, scoring_registry)
++            return None if payload is None else mint(self, VerifiedMetricUniverse, payload, scoring_registry)
++
++        def resolve_industries(self, universe_proof):
++            dependencies(self)
++            record = proof_record(universe_proof, VerifiedMetricUniverse, self)
++            payload = resolve_payload(self, _load(record[2]))
++            return mint(self, VerifiedMetricIndustryBatch, payload)
++
++        def recheck_batch(self, universe_proof, industry_batch):
++            """Final full-population closure check, once after all feature reads."""
++            dependencies(self)
++            universe_record = proof_record(universe_proof, VerifiedMetricUniverse, self)
++            batch_record = proof_record(industry_batch, VerifiedMetricIndustryBatch, self)
++            universe = _load(universe_record[2])
++            current = read_universe(self, universe["frozen_input_hash"], universe_record[3])
++            if current is None or _canonical(current) != universe_record[2]:
++                raise ValueError("metric universe or signed mapping changed during batch")
++            if _canonical(resolve_payload(self, current)) != batch_record[2]:
++                raise ValueError("metric industry Context correction or absence changed during batch")
++            dependencies(self)
++
++        def __copy__(self):
++            raise TypeError("metric Context repository cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("metric Context repository cannot be copied")
++
++    return FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch
++
++
++FormalMetricContextRepository, VerifiedMetricUniverse, VerifiedMetricIndustryBatch = _metric_context_types()
++del _metric_context_types
++
++__all__ = ["FormalMetricContextRepository", "VerifiedMetricUniverse", "VerifiedMetricIndustryBatch"]
+
+diff --git a/tests/formal_metric_fixtures.py b/tests/formal_metric_fixtures.py
+new file mode 100644
+index 0000000..db805ac
+--- /dev/null
++++ b/tests/formal_metric_fixtures.py
+@@ -0,0 +1,111 @@
++"""Real combined signed graph and producer-backed universe/Context fixtures."""
++
++from contextlib import closing
++import hashlib
++import sqlite3
++import tempfile
++from pathlib import Path
++
++from ashare_pipeline.formal_context_repository import FormalContextRepository
++from ashare_pipeline.formal_context_schema import FormalContextRegistry, SignedContextRequestResolver
++from ashare_pipeline.formal_evidence import OfficialFetch, SourcePolicy, verify_official_fetch
++from ashare_pipeline.formal_scoring_registry import RegistryApproval, load_formal_registry
++from ashare_pipeline.formal_snapshot_repository import FormalSnapshotRepository
++from ashare_pipeline.formal_snapshot_store import FormalSnapshotStore
++from ashare_pipeline.state_store import StateStore
++from tests import test_state_store
++from tests.test_formal_context_repository import FixtureNormalizer, descriptor
++from tests.test_formal_scoring_registry import canonical, signed_graph
++from tests.test_formal_sources import config
++
++FREEZE = "2026-08-31T07:00:00+00:00"
++IDS = ("BJ430001", "SH600000", "SZ000001")
++
++
++def industry_document():
++    memberships = [dict(security_id=s, template_id=t, primary_industry=p, secondary_industry=q)
++        for s, t, p, q in (("BJ430001", "general_nonfinancial", "manufacturing", "machinery"),
++            ("SH600000", "bank", "banks", "joint-stock-banks"), ("SZ000001", "bank", "banks", "joint-stock-banks"))]
++    mapping = dict(classification_system="SW2021", source_version="2026.08", effective_date="2026-08-28", memberships=memberships)
++    return dict(registry_role="industry", schema_version="formal-industry-registry-v1", purpose="official",
++        context_scope_key="fixture-industry", mapping_sha256=hashlib.sha256(canonical(mapping)).hexdigest(), **mapping)
++
++
++def update_mapping_digest(doc):
++    doc["mapping_sha256"] = hashlib.sha256(canonical({k: doc[k] for k in
++        ("classification_system", "source_version", "effective_date", "memberships")})).hexdigest()
++
++
++class MetricFixture:
++    """A plain helper; no imported/inherited TestCase can duplicate suite discovery."""
++
++    def __init__(self, *, mutate=None, exchange_rows=None):
++        self.tempdir = tempfile.TemporaryDirectory()
++        self.root = Path(self.tempdir.name)
++        self.db_path = self.root / "metric.sqlite"
++        StateStore(self.db_path).initialize()
++        self.raw = FormalSnapshotStore(self.root / "raw")
++        def configure(docs):
++            docs["industry"] = industry_document()
++            docs["scoring"]["descriptors"] = [descriptor("industry_snapshot", scope_key="fixture-industry",
++                dataset="fixture-industry", referenced_roles=["industry", "scoring", "source"])]
++            docs["source"]["configs"] = [config(dataset="fixture-industry", exchange_scope=e) for e in ("BJ", "SH", "SZ")]
++            docs["feature"]["source_registry_hash"] = hashlib.sha256(canonical(docs["source"])).hexdigest()
++            if mutate:
++                mutate(docs)
++        self.bundle, vocabulary, graph, self.verifier = signed_graph(mutate=configure)
++        self.industry = __import__("json").loads(self.bundle.blob("industry").canonical_json)
++        self.store, self.frozen, self.task_ids = test_state_store.StateStoreTestCase.task_backed_frozen_universe(
++            self, registry_manifest_hash=self.bundle.manifest.manifest_hash,
++            source_registry_hash=self.bundle.manifest.source_registry_hash,
++            registry_signature_verifier=self.verifier, formal_snapshot_store=self.raw, exchange_rows=exchange_rows)
++        for blob in graph.blobs.values():
++            self.store.put_formal_registry_blob(blob)
++        self.store.put_formal_registry_manifest(graph.manifest)
++        self.snapshot_id = self.store.put_formal_universe_snapshot(self.frozen)
++        self.scoring = load_formal_registry(self.bundle, RegistryApproval("official",
++            self.bundle.manifest.scoring_registry_hash, self.bundle.manifest.approval_id), feature_registry=vocabulary)
++        self.snapshots = FormalSnapshotRepository(self.raw.root, self.store)
++        self.context = FormalContextRepository(self.store, self.snapshots, self.verifier)
++        self.resolver = SignedContextRequestResolver(self.store, self.verifier)
++
++    def assertEqual(self, actual, expected):
++        if actual != expected:
++            raise AssertionError((actual, expected))
++
++    def close(self):
++        self.tempdir.cleanup()
++
++    def sql(self, sql, args=()):
++        with closing(sqlite3.connect(self.db_path)) as conn:
++            conn.execute(sql, args)
++            conn.commit()
++
++    def put_industry(self, security_id, *, changes=None, generation="initial", published="2026-08-28T07:00:00+00:00"):
++        doc = self.industry
++        member = next((m for m in doc["memberships"] if m["security_id"] == security_id),
++            dict(primary_industry="other", secondary_industry="other"))
++        value = {k: doc[k] for k in ("classification_system", "source_version", "effective_date", "mapping_sha256")}
++        value.update({k: member[k] for k in ("primary_industry", "secondary_industry")})
++        value.update(changes or {})
++        request = self.resolver.resolve(context_kind="industry_snapshot", scope_key="fixture-industry",
++            security_id=security_id, as_of_utc=FREEZE, registry_manifest_hash=self.bundle.manifest.manifest_hash,
++            upstream_generation=generation)
++        task = self.store.enqueue_formal_task("formal_context", security_id + generation, request.refresh_generation, {})
++        self.store.lease_next_formal_task(("formal_context",), "metric-fixture", 300)
++        raw = canonical(dict(value=value, no_coverage=False))
++        fetch = OfficialFetch(request=request.official_request, raw_bytes=raw,
++            original_url="https://www.cninfo.com.cn/fixture/context.json", published_at_utc=published,
++            published_precision="timestamp", source_updated_at_utc=None,
++            captured_at_utc="2026-09-04T07:00:00+00:00", effective_at_utc=published,
++            effective_time_evidence_hash=None, refresh_generation=request.refresh_generation,
++            parser_id=request.parser_id, parser_version=request.parser_version, mapping_version=request.mapping_version,
++            declared_security_id=security_id, declared_period=request.official_request.period_or_date)
++        verified = verify_official_fetch(fetch, SourcePolicy.cninfo())
++        self.assertEqual(verified.status, "verified")
++        ref = self.snapshots.persist_verified(fetch, verified, producing_task_id=task, worker_id="metric-fixture")
++        receipt = FormalContextRegistry.load(self.store, self.verifier, self.bundle.manifest.manifest_hash).normalize_verified(
++            request, ref, raw, FixtureNormalizer(), task_id=task, worker_id="metric-fixture")
++        self.store.put_formal_context_facts(receipt)
++        self.store.complete_formal_task(task, "metric-fixture", {"snapshot": ref.snapshot_id})
++        return receipt.facts[0], ref
+
+diff --git a/tests/test_formal_metric_context.py b/tests/test_formal_metric_context.py
+new file mode 100644
+index 0000000..3a3b229
+--- /dev/null
++++ b/tests/test_formal_metric_context.py
+@@ -0,0 +1,268 @@
++"""Authenticated complete-universe industry prerequisites; no metric arithmetic."""
++
++import copy
++import hashlib
++import importlib
++import importlib.util
++import json
++import sys
++import unittest
++from unittest.mock import patch
++
++from tests.formal_metric_fixtures import FREEZE, IDS, MetricFixture, update_mapping_digest
++
++
++class FormalMetricContextTests(unittest.TestCase):
++    def fixture(self, **kwargs):
++        fixture = MetricFixture(**kwargs)
++        self.addCleanup(fixture.close)
++        return fixture
++
++    def api(self):
++        self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_metric_context"),
++            "authenticated metric context repository is required")
++        return importlib.import_module("ashare_pipeline.formal_metric_context")
++
++    def repo(self, f):
++        return self.api().FormalMetricContextRepository(f.store, f.context, registry_signature_verifier=f.verifier)
++
++    def test_verified_universe_getter_preserves_original_cn_bytes_and_header(self):
++        f = self.fixture()
++        before = f.store.get_formal_universe_snapshot_by_input_hash(f.frozen.frozen_input_hash)
++        self.assertTrue(callable(getattr(f.store, "get_verified_formal_frozen_universe", None)), "verified universe getter is required")
++        frozen = f.store.get_verified_formal_frozen_universe(f.frozen.frozen_input_hash)
++        self.assertEqual(frozen.as_of_utc, "2026-08-31T15:00:00+08:00")
++        self.assertEqual(frozen.frozen_input_hash, f.frozen.frozen_input_hash)
++        self.assertEqual(tuple(m.security_id for m in frozen.members), IDS)
++        self.assertEqual(f.store.get_formal_universe_snapshot_by_input_hash(f.frozen.frozen_input_hash), before)
++        self.assertIsNone(f.store.get_verified_formal_frozen_universe("0" * 64))
++
++    def test_complete_signed_industries_preserve_all_exchanges_and_late_capture(self):
++        f = self.fixture()
++        facts = {sid: f.put_industry(sid)[0] for sid in IDS}
++        repo = self.repo(f)
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        batch = repo.resolve_industries(universe)
++        self.assertEqual(universe.security_ids, IDS)
++        self.assertEqual(universe.as_of_utc, FREEZE)
++        self.assertEqual(universe.frozen_as_of_utc, "2026-08-31T15:00:00+08:00")
++        self.assertEqual(tuple(batch.entries), IDS)
++        for sid in IDS:
++            entry = batch.entries[sid]
++            self.assertEqual(entry["status"], "assigned")
++            self.assertEqual(entry["context_fact_id"], facts[sid].id)
++            self.assertEqual(entry["context_canonical_sha256"], hashlib.sha256(facts[sid].canonical_bytes()).hexdigest())
++            self.assertEqual(entry["universe_hash"], universe.universe_hash)
++        self.assertEqual(batch.entries["SH600000"]["template_id"], "bank")
++        self.assertEqual(batch.entries["BJ430001"]["secondary_industry"], "machinery")
++        self.assertIsNone(repo.recheck_batch(universe, batch))
++
++    def test_pending_distinguishes_missing_mapping_context_and_authentic_mismatch(self):
++        def mutate(docs):
++            docs["industry"]["memberships"] = docs["industry"]["memberships"][1:]
++            update_mapping_digest(docs["industry"])
++        f = self.fixture(mutate=mutate)
++        f.put_industry("SZ000001", changes={"secondary_industry": "different"})
++        repo = self.repo(f)
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        batch = repo.resolve_industries(universe)
++        self.assertEqual([batch.entries[s]["pending_reason"] for s in IDS],
++            ["signed_membership_absent", "context_absent", "context_membership_mismatch"])
++        self.assertTrue(all(batch.entries[s]["status"] == "pending" for s in IDS))
++        self.assertIsNone(repo.recheck_batch(universe, batch))
++
++    def test_invalid_signed_industry_is_fatal(self):
++        mutations = (
++            lambda d: d.update(mapping_sha256="0" * 64),
++            lambda d: d.update(schema_version="formal-industry-registry-v2"),
++            lambda d: d.update(purpose="test"),
++            lambda d: d.update(effective_date="2026-09-01"),
++            lambda d: d.update(extra=True),
++            lambda d: d["memberships"][0].update(template_id="unknown"),
++            lambda d: d["memberships"].reverse(),
++            lambda d: d["memberships"].append(dict(d["memberships"][0])),
++            lambda d: d["memberships"][0].update(extra=True),
++            lambda d: d.update(source_version=" "),
++            lambda d: d["memberships"][0].update(security_id="bj430001"),
++        )
++        for mutate in mutations:
++            with self.subTest(mutation=mutate):
++                f = self.fixture(mutate=lambda docs: mutate(docs["industry"]))
++                repo = self.repo(f)
++                with self.assertRaises(ValueError):
++                    repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++
++    def test_universe_missing_source_member_status_receipt_or_raw_is_fatal(self):
++        mutations = (
++            lambda f: f.sql("DELETE FROM formal_universe_source WHERE exchange='BJ'"),
++            lambda f: f.sql("DELETE FROM formal_universe_member WHERE security_id='SH600000'"),
++            lambda f: f.sql("DELETE FROM formal_universe_status WHERE security_id='SZ000001'"),
++            lambda f: f.sql("DELETE FROM formal_task_snapshot_receipt WHERE task_id=?", (f.task_ids["BJ"],)),
++            lambda f: (__import__("pathlib").Path(f.frozen.sources[0].snapshot.content_path)).unlink(),
++        )
++        for mutate in mutations:
++            with self.subTest(mutation=mutate):
++                f = self.fixture()
++                repo = self.repo(f)
++                mutate(f)
++                with self.assertRaises((ValueError, OSError)):
++                    repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++
++    def test_extra_signed_member_cannot_join_the_frozen_population(self):
++        def mutate(docs):
++            docs["industry"]["memberships"].append(dict(security_id="SZ000002", template_id="bank",
++                primary_industry="banks", secondary_industry="joint-stock-banks"))
++            update_mapping_digest(docs["industry"])
++        f = self.fixture(mutate=mutate)
++        f.put_industry("SZ000002")
++        repo = self.repo(f)
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        self.assertEqual(tuple(repo.resolve_industries(universe).entries), IDS)
++
++    def test_final_recheck_detects_earlier_member_correction_and_absence_change(self):
++        f = self.fixture()
++        f.put_industry("BJ430001")
++        repo = self.repo(f)
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        batch = repo.resolve_industries(universe)
++        # Represents a correction to A after A's inputs were read, while later
++        # members' feature work happens outside this Context prerequisite slice.
++        f.put_industry("BJ430001", generation="correction", published="2026-08-29T07:00:00+00:00")
++        with self.assertRaises(ValueError):
++            repo.recheck_batch(universe, batch)
++        current = repo.resolve_industries(universe)
++        f.put_industry("SH600000")
++        with self.assertRaises(ValueError):
++            repo.recheck_batch(universe, current)
++
++    def test_foreign_forged_copied_and_mutated_capabilities_fail(self):
++        f = self.fixture()
++        repo = self.repo(f)
++        api = self.api()
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        batch = repo.resolve_industries(universe)
++        for cls in (api.VerifiedMetricUniverse, api.VerifiedMetricIndustryBatch):
++            with self.assertRaises((ValueError, TypeError)):
++                cls()
++        for proof in (universe, batch):
++            for copier in (copy.copy, copy.deepcopy):
++                with self.assertRaises((ValueError, TypeError)):
++                    copier(proof)
++            with self.assertRaises((ValueError, TypeError, AttributeError)):
++                object.__setattr__(proof, "universe_hash", "0" * 64)
++        with self.assertRaises(ValueError):
++            repo.resolve_industries(object.__new__(api.VerifiedMetricUniverse))
++        with self.assertRaises(ValueError):
++            self.repo(f).resolve_industries(universe)
++        wire = batch.to_dict()
++        wire["entries"]["BJ430001"]["status"] = "assigned"
++        self.assertEqual(batch.entries["BJ430001"]["status"], "pending")
++        with self.assertRaises(TypeError):
++            batch.entries["BJ430001"]["status"] = "assigned"
++        with self.assertRaises(ValueError):
++            object.__new__(api.FormalMetricContextRepository).resolve_industries(universe)
++
++    def test_changed_real_read_dependencies_cannot_mint_or_recheck(self):
++        f = self.fixture()
++        repo = self.repo(f)
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        batch = repo.resolve_industries(universe)
++        for owner, method, replacement in (
++            (f.store, "get_verified_formal_frozen_universe", lambda _: f.frozen),
++            (f.context, "get_verified_many", lambda *args: {s: None for s in IDS}),
++            (f.snapshots, "read_verified_raw", lambda *args, **kwargs: b"cached"),
++            (f.raw, "read_verified_raw", lambda *args, **kwargs: b"cached"),
++            (f.raw, "validate_stored_snapshot", lambda *args, **kwargs: None),
++        ):
++            with self.subTest(method=method), patch.object(owner, method, replacement), self.assertRaises(ValueError):
++                repo.recheck_batch(universe, batch)
++
++    def test_context_corruption_propagates_even_without_signed_membership(self):
++        def mutate(docs):
++            docs["industry"]["memberships"] = docs["industry"]["memberships"][1:]
++            update_mapping_digest(docs["industry"])
++        f = self.fixture(mutate=mutate)
++        _, ref = f.put_industry("BJ430001")
++        repo = self.repo(f)
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        f.sql("DELETE FROM formal_task_snapshot_receipt WHERE task_id=?", (ref.producing_task_id,))
++        with self.assertRaises(ValueError):
++            repo.resolve_industries(universe)
++
++    def test_copied_context_repository_cannot_supply_provenance(self):
++        f = self.fixture()
++        api = self.api()
++        copied = copy.copy(f.context)
++        with self.assertRaises(ValueError):
++            api.FormalMetricContextRepository(f.store, copied, registry_signature_verifier=f.verifier)
++
++    def test_every_context_metadata_mismatch_is_explicit_pending(self):
++        f = self.fixture()
++        repo = self.repo(f)
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        for index, (field, value) in enumerate((
++            ("primary_industry", "other"), ("source_version", "different-v2"),
++            ("effective_date", "2026-08-27"), ("mapping_sha256", "0" * 64))):
++            f.put_industry("BJ430001", changes={field: value}, generation=f"metadata-{index}",
++                published=f"2026-08-{20 + index:02d}T07:00:00+00:00")
++            batch = repo.resolve_industries(universe)
++            self.assertEqual(batch.entries["BJ430001"]["pending_reason"], "context_membership_mismatch")
++
++    def test_signed_industry_digest_uses_canonical_bytes_and_full_membership(self):
++        f = self.fixture()
++        repo = self.repo(f)
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        wire = universe.to_dict()
++        mapping = {k: wire["industry"][k] for k in ("classification_system", "source_version", "effective_date", "memberships")}
++        expected = json.dumps(mapping, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
++        self.assertEqual(universe.mapping_sha256, hashlib.sha256(expected).hexdigest())
++        self.assertEqual(universe.population_hash, hashlib.sha256(b'["BJ430001","SH600000","SZ000001"]').hexdigest())
++        self.assertEqual(universe.canonical_bytes(), json.dumps(wire, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
++
++    def test_full_universe_includes_multiple_members_of_one_exchange(self):
++        rows = {exchange: [dict(security_id=sid, security_type="ordinary_a", listing_status="listed")]
++            for exchange, sid in zip(("BJ", "SH", "SZ"), IDS)}
++        rows["SH"].append(dict(security_id="SH600001", security_type="ordinary_a", listing_status="listed"))
++        f = self.fixture(exchange_rows=rows)
++        repo = self.repo(f)
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        self.assertEqual(universe.security_ids, ("BJ430001", "SH600000", "SH600001", "SZ000001"))
++        batch = repo.resolve_industries(universe)
++        self.assertEqual(batch.entries["SH600001"]["pending_reason"], "signed_membership_absent")
++
++    def test_global_signature_or_scoring_root_failure_is_fatal(self):
++        f = self.fixture()
++        repo = self.repo(f)
++        other = self.fixture(mutate=lambda docs: docs["industry"].update(source_version="other"))
++        with self.assertRaises(ValueError):
++            repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=other.scoring)
++        with self.assertRaises(ValueError):
++            repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=copy.copy(f.scoring))
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        batch = repo.resolve_industries(universe)
++        f.sql("UPDATE formal_registry_blob SET signature='invalid' WHERE registry_hash=?", (f.bundle.manifest.industry_registry_hash,))
++        with self.assertRaises(ValueError):
++            repo.recheck_batch(universe, batch)
++
++    def test_final_recheck_uses_one_universe_graph_and_one_batch(self):
++        f = self.fixture()
++        for sid in IDS:
++            f.put_industry(sid)
++        repo = self.repo(f)
++        universe = repo.load_universe(f.frozen.frozen_input_hash, scoring_registry=f.scoring)
++        batch = repo.resolve_industries(universe)
++        # Observe actual Python calls without replacing any trusted read path.
++        codes = {f.store.get_verified_formal_frozen_universe.__func__.__code__: "universe",
++            f.context.get_verified_many.__func__.__code__: "batch",
++            f.store.list_formal_context_facts.__func__.__code__: "scope"}
++        counts = dict(universe=0, batch=0, scope=0)
++        def profile(frame, event, arg):
++            if event == "call" and frame.f_code in codes:
++                counts[codes[frame.f_code]] += 1
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            repo.recheck_batch(universe, batch)
++        finally:
++            sys.setprofile(previous)
++        self.assertEqual(counts, dict(universe=1, batch=1, scope=2))
+

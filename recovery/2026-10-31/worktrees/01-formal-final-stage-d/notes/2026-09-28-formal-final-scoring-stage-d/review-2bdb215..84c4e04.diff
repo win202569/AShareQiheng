@@ -1,0 +1,149 @@
+# Review package: 2bdb215..84c4e04
+
+## Commits
+84c4e04 fix: require complete formal invalidation evidence
+
+## Files changed
+ ashare_pipeline/formal_final_invalidation.py | 26 +++++++++---
+ tests/test_formal_final_invalidation.py      | 60 ++++++++++++++++++++++++++++
+ 2 files changed, 80 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_final_invalidation.py b/ashare_pipeline/formal_final_invalidation.py
+index e0fccce..c82518a 100644
+--- a/ashare_pipeline/formal_final_invalidation.py
++++ b/ashare_pipeline/formal_final_invalidation.py
+@@ -251,28 +251,42 @@ def _derive_plan(*, prior_inputs, current_inputs, prior_coverage, current_covera
+         global_change("coverage_context_changed")
+ 
+     # Aggregate seals bind whole source batches. They cannot identify which
+     # omitted pending input changed; do not invent member IDs in that case.
+     previous_aggregates = {row["source_id"]: row["source_hash"] for row in dependencies
+         if row["security_id"] is None and _aggregate_key(row["source_kind"])
+         and row["source_kind"] != "batch_hash"}
+     current_aggregates = {row["source_id"]: row["source_hash"] for row in current_dependencies
+         if row["security_id"] is None and _aggregate_key(row["source_kind"])
+         and row["source_kind"] != "batch_hash"}
+-    # Stage C seals include both base and policy batches, even when their
+-    # changes do not affect numeric V inputs (for example a policy cap).
+-    if localized_sources & {"base", "policy"}:
+-        localized_sources.add("valuation")
++    # A visible difference proves only that *some* source evidence changed.
++    # D1's authenticated ready contract retains all 22 base and three Stage C
++    # slots. Pending rows can omit original metrics and adjusted inputs, so
++    # neither their own nor a downstream aggregate can be fully attributed
++    # to the visible differences. Require completeness on BOTH sides before
++    # using any family-local diff as an explanation of a whole-batch seal.
++    complete_population = bool(old) and set(old) == set(new) and all(
++        row.get("status") == "ready" and bool(row.get("slots"))
++        for members in (old, new) for row in members.values())
++    localized_aggregates = localized_sources.copy() if complete_population else set()
++    # Stage C seals include both base and policy batches, even when complete
++    # retained V inputs show no numeric change (for example a policy cap).
++    if localized_aggregates & {"base", "policy"}:
++        localized_aggregates.add("valuation")
++    aggregate_sources = {"batch." + source + suffix: source
++        for source in ("base", "policy", "valuation")
++        for suffix in ("_batch_hash", "_batch_canonical_sha256")}
+     for path in previous_aggregates.keys() | current_aggregates.keys():
+         if previous_aggregates.get(path) != current_aggregates.get(path):
+-            source = path.removeprefix("batch.").split("_", 1)[0]
+-            if source not in localized_sources:
++            # Prefix similarity is not provenance: an unknown/nested batch
++            # source is not covered by a known source's retained evidence.
++            if aggregate_sources.get(path) not in localized_aggregates:
+                 global_change("unlocalizable_upstream_change")
+     if full:
+         d1.update(new)
+         d2.update(new)
+         eligibility.update(new)
+     # Departed members explain invalidation but are not current build targets.
+     d1.intersection_update(new)
+     d2.intersection_update(new)
+     eligibility.intersection_update(new)
+     expanded = d1 | d2 | eligibility
+diff --git a/tests/test_formal_final_invalidation.py b/tests/test_formal_final_invalidation.py
+index c0e8575..382cc4b 100644
+--- a/tests/test_formal_final_invalidation.py
++++ b/tests/test_formal_final_invalidation.py
+@@ -182,20 +182,80 @@ class FormalInvalidationScopeTests(unittest.TestCase):
+             row["entry_hash"] += "-new"
+         self.assertEqual(self.plan().expanded_security_ids, IDS[:1])
+ 
+     def test_local_policy_change_cannot_hide_unlocalizable_base_change(self):
+         self.new["inputs"][0]["policy_result"]["dimension_caps"] = {"T": "55"}
+         self.new["base_batch_hash"] = "unrelated-correction"
+         plan = self.plan()
+         self.assertTrue(plan.full_rebuild)
+         self.assertIn("unlocalizable_upstream_change", plan.reason_codes)
+ 
++    def test_local_base_change_cannot_hide_omitted_pending_base_evidence(self):
++        self.old["inputs"][2].update(status="pending_evidence", slots={})
++        self.new = copy.deepcopy(self.old)
++        self.new["inputs"][0]["consensus_context"]["content_sha256"] = "visible-correction"
++        self.new["base_batch_hash"] = "visible-and-hidden-corrections"
++        plan = self.plan()
++        self.assertTrue(plan.full_rebuild)
++        self.assertEqual(plan.direct_security_ids, IDS[:1])
++        self.assertEqual(plan.d1_rebuild_ids, IDS)
++        self.assertEqual(plan.d2_rebuild_ids, IDS)
++        self.assertEqual(plan.eligibility_rebuild_ids, IDS)
++        self.assertIn("unlocalizable_upstream_change", plan.reason_codes)
++
++    def test_local_cap_cannot_hide_omitted_pending_valuation_evidence(self):
++        self.old["inputs"][2].update(status="pending_evidence", slots={})
++        self.new = copy.deepcopy(self.old)
++        self.new["inputs"][0]["policy_result"]["dimension_caps"] = {"T": "55"}
++        self.new["policy_batch_hash"] = "visible-cap"
++        self.new["valuation_batch_hash"] = "cap-and-hidden-valuation-correction"
++        plan = self.plan()
++        self.assertTrue(plan.full_rebuild)
++        self.assertEqual(plan.direct_security_ids, IDS[:1])
++        self.assertEqual(plan.d1_rebuild_ids, IDS)
++        self.assertEqual(plan.d2_rebuild_ids, IDS)
++        self.assertEqual(plan.eligibility_rebuild_ids, IDS)
++        self.assertIn("unlocalizable_upstream_change", plan.reason_codes)
++
++    def test_aggregate_localization_requires_exact_known_source_path(self):
++        for nested in (False, True):
++            with self.subTest(nested=nested):
++                self.old, self.coverage, self.identity = manifests()
++                target = self.old.setdefault("base_extra", {}) if nested else self.old
++                key = "base_batch_hash" if nested else "base_extra_batch_hash"
++                target[key] = "old-opaque-source"
++                self.new = copy.deepcopy(self.old)
++                target = self.new["base_extra"] if nested else self.new
++                target[key] = "new-opaque-source"
++                self.new["inputs"][0]["consensus_context"]["content_sha256"] = "visible-correction"
++                plan = self.plan()
++                self.assertTrue(plan.full_rebuild)
++                self.assertIn("unlocalizable_upstream_change", plan.reason_codes)
++
++    def test_complete_retained_evidence_localizes_cap_and_downstream_valuation_seals(self):
++        self.new["inputs"][0]["policy_result"]["dimension_caps"] = {"T": "55"}
++        for family in ("policy", "valuation"):
++            for suffix in ("_batch_hash", "_batch_canonical_sha256"):
++                key = family + suffix
++                self.old[key] = "old-" + key
++                self.new[key] = "corrected-" + key
++                for row in self.old["inputs"]:
++                    row[key] = self.old[key]
++                for row in self.new["inputs"]:
++                    row[key] = self.new[key]
++        plan = self.plan()
++        self.assertFalse(plan.full_rebuild)
++        self.assertEqual(plan.d1_rebuild_ids, IDS[:1])
++        self.assertEqual(plan.d2_rebuild_ids, IDS[:1])
++        self.assertEqual(plan.eligibility_rebuild_ids, IDS[:1])
++        self.assertEqual(plan.cohort_keys, ())
++
+     def test_nested_industry_manifest_change_forces_full_rebuild(self):
+         self.old["inputs"][0]["slots"][VMID]["valuation_input"]["industry_batch_hash"] = "old-industry"
+         self.new = copy.deepcopy(self.old)
+         self.new["inputs"][0]["slots"][VMID]["valuation_input"]["industry_batch_hash"] = "new-industry"
+         self.assertTrue(self.plan().full_rebuild)
+ 
+     def test_policy_copy_inside_valuation_input_does_not_turn_cap_into_cohort_change(self):
+         for row in self.old["inputs"]:
+             row["slots"][VMID]["valuation_input"]["policy_result"] = copy.deepcopy(row["policy_result"])
+         self.new = copy.deepcopy(self.old)

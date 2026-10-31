@@ -1,0 +1,17 @@
+# C4 perf-2: RangeBindings source snapshot
+
+`load_policy_range_bindings` still performs the complete first graph derivation for every active market rule and SH/SZ/BJ. It now records the exact signed manifest bytes/root, every actual child role's bytes/hash (including the v2 valuation adapter), and canonical policy bytes/hash in a closure-private snapshot. A second capture before publication rejects changes during construction.
+
+`require_current` and the owner reader still invoke the original bundle, scoring, and policy source verifiers on every call, then compare the complete snapshot. They no longer reparse source ranges or scoring descriptors, rebuild M/C/Bx definitions, or recompute a definitions fingerprint. Local child configuration integrity and weak-reference ownership checks remain in place. Source dependency identities are checked before first derivation and on later reads; public `RangeBinding` property replacement remains compatible with the owner reader.
+
+TDD evidence: the new profiler test first failed with four `_derive_graph` calls across two `require_current` and two owner reads, then passed with zero `_derive_graph`, `_range_catalog_from_source`, `parse_range_entry`, and `_definitions_fingerprint` calls; bundle/scoring verifiers and policy `canonical_bytes` were still called. The method-replacement test first failed, then passed after the dependency guard was added. The v2 test first exposed a role comparison failure; policy binds nine roles while the manifest additionally binds the valuation adapter, so the full snapshot retains all ten roles while comparing the policy's nine.
+
+Verification: `python -m unittest tests.test_formal_range_contract` plus the three adjacent store planning/root/tamper tests completed with **24 tests passing**. The full store module was started but stopped after it continued into long fixtures; no full 263-test suite or C4 long fixture was run. `git diff --check` reported no whitespace errors. No store code was changed.
+
+## Independent review fix
+
+Static audit of `formal_range_format` found that `_range_config_to_dict` calls recursive `_thaw`, while `parse_range_entry` calls `_bridge`, then `_context_selector`. The same call chains use `Mapping`, `MappingProxyType`, `json.dumps`, `math.isfinite`, and `re.fullmatch`; these identities now join the existing module/helper inventory. A replaced helper is rejected before first load and after warmup, including when a replaced `_thaw` would hide a mutated `market_config.dataset` from both `require_current` and the owner reader. The three new tests first failed in four expected assertions, then passed. The original scoped group plus new tests completed with **27 tests passing**. No long suite was run.
+
+## Second review fix
+
+Static enumeration of `_range_catalog_from_source` found two direct module-global reads: `_load_canonical_object` and `_LEGACY_CONFIG_FIELDS`. Its other authority-bearing references are the closure-captured `parse_range_entry`, `RangeConfig`, and `_range_config_to_dict`; their module aliases were already inventoried. Builtins used by the function are `set`, `type`, `list`, `dict`, `any`, and `tuple`. The immutable legacy-field set is now checked by identity before first derivation and on warm reads; preserving equal contents under a different object cannot evade the check. Both new tests failed before the fix and passed afterward. The scoped range contract plus three adjacent store tests completed with **29 tests passing**. No long suite was run.

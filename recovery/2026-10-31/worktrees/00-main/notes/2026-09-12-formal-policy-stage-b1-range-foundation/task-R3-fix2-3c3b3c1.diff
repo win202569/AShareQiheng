@@ -1,0 +1,55 @@
+3c3b3c12a6a5f8f6c98d054131e4a097cad710c4
+3c3b3c1 fix: preserve typed range request rejection boundary
+ ashare_pipeline/formal_range_source.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+diff --git a/ashare_pipeline/formal_range_source.py b/ashare_pipeline/formal_range_source.py
+index 6923dc0..60d388f 100644
+--- a/ashare_pipeline/formal_range_source.py
++++ b/ashare_pipeline/formal_range_source.py
+@@ -955,41 +955,44 @@ def _build_source_type():
+                 "normalizer_version": config.normalizer_version,
+                 "request_version": config.request_version, "page_index": request_wire["page_index"],
+             }
+             if any(type(wire[key]) is not type(value) or wire[key] != value for key, value in expected.items()):
+                 raise FormalTerminalSourceError("parsed range document identity differs from request or config")
+             if config.pagination == "single_response_v1":
+                 if wire["page_index"] != 1 or wire["page_count"] != 1:
+                     raise FormalTerminalSourceError("single-response range document claims pagination")
+                 if wire["pagination_evidence"] != "signed_single_response_v1":
+                     raise FormalTerminalSourceError("single-response pagination evidence is invalid")
+                 if wire["record_count"] != wire["page_record_count"]:
+                     raise FormalTerminalSourceError("single-response total differs from page rows")
+             elif wire["page_count"] > config.max_pages:
+                 raise FormalTerminalSourceError("range document pagination exceeds signed budget")
+             elif wire["pagination_evidence"] != "source_declared_numbered_pages_v1":
+                 raise FormalTerminalSourceError("numbered pagination lacks source declaration")
+             return document
+ 
+         def fetch_verified(self, request: FormalRangeRequestV1) -> RangeFetch:
+             record = source_record(self)
+-            previous = request_record(request).previous
++            try:
++                previous = request_record(request).previous
++            except ValueError as error:
++                raise FormalTerminalSourceError(str(error)) from error
+             if previous is not None:
+                 require_observation(previous, current=True)
+             try:
+                 request_wire, request_config, request_source_hash = (
+                     request_snapshot(request)
+                 )
+             except ValueError as error:
+                 raise FormalTerminalSourceError(str(error)) from error
+             config = calendar_config_get(record.binding)
+             if (
+                 request_wire["registry_manifest_hash"] != manifest_hash_get(record.binding)
+                 or request_source_hash != source_hash_get(record.binding)
+                 or request_config != record.config_wire
+                 or request_config != _range_config_to_dict(config)
+             ):
+                 raise FormalTerminalSourceError("range request config differs from sealed source")
+             sent = _transport_request(config, request_wire)
+             try:
+                 response = record.transport.send(sent)
+             except (FormalRetryableSourceError, FormalSourceBlocked):
+

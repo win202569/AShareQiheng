@@ -1,0 +1,16 @@
+Task 9 minimal fixture: signed three-member root
+Task 9 minimal fixture: D1
+Task 9 minimal fixture: D2
+Task 9 minimal fixture: D3 and pools
+TEST_STARTED test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_old_run_bytes_never_change_after_new_rebuild
+test_old_run_bytes_never_change_after_new_rebuild (test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_old_run_bytes_never_change_after_new_rebuild) ... ok
+TEST_STARTED test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_restart_selects_prior_exact_manifest_not_later_correction
+test_restart_selects_prior_exact_manifest_not_later_correction (test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_restart_selects_prior_exact_manifest_not_later_correction) ... ok
+TEST_STARTED test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_reuse_requires_current_hash_and_capability_revalidation
+test_reuse_requires_current_hash_and_capability_revalidation (test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_reuse_requires_current_hash_and_capability_revalidation) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 116.530s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_old_run_bytes_never_change_after_new_rebuild", "test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_restart_selects_prior_exact_manifest_not_later_correction", "test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_reuse_requires_current_hash_and_capability_revalidation"], "passed": ["test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_old_run_bytes_never_change_after_new_rebuild", "test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_restart_selects_prior_exact_manifest_not_later_correction", "test_formal_final_invalidation.FormalInvalidationRepositoryTests.test_reuse_requires_current_hash_and_capability_revalidation"], "tests_run": 3, "failures": 0, "errors": 0, "skipped": 0}

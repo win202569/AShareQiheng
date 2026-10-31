@@ -1,0 +1,1124 @@
+# Task 2C task-scoped review package
+
+Base/HEAD: dbf075dd5764c4dcd0ed3cba5074cc6ec330f49a
+Review head: staged six-file implementation; no Task 2C commit yet.
+The staged index is a frozen review baseline. Review fixes, if required, remain unstaged until scoped review is approved. No data, SQLite, WAL/SHM, progress or unrelated temp files included.
+
+ ashare_pipeline/formal_feature_repository.py |  84 +++++-
+ ashare_pipeline/formal_metric_engine.py      | 376 +++++++++++++++++++++++++++
+ tests/formal_metric_feature_fixtures.py      | 108 ++++++++
+ tests/formal_metric_fixtures.py              |   4 +-
+ tests/test_formal_metric_engine.py           | 301 +++++++++++++++++++++
+ tests/test_formal_metric_features.py         |  65 +++++
+ 6 files changed, 930 insertions(+), 8 deletions(-)
+diff --git a/ashare_pipeline/formal_feature_repository.py b/ashare_pipeline/formal_feature_repository.py
+index 720e36e..16a2cd0 100644
+--- a/ashare_pipeline/formal_feature_repository.py
++++ b/ashare_pipeline/formal_feature_repository.py
+@@ -299,20 +299,21 @@ def _install_metric_projection():
+     from . import formal_financial_features as financial_module
+     repository_type = FormalFeatureRepository
+     original_init = repository_type.__init__
+     read_bundle = repository_type._read_authenticated_bundle
+     read_registry = repository_type._registry
+     persisted_facts = repository_type._persisted_facts
+     snapshot_identity = repository_type._snapshot_identity
+     builder = build_formal_feature_bundle
+     evaluator = evaluate_selected_features
+     repositories, proofs = {}, {}
++    absences = {}
+     fields = ("security_id", "as_of_utc", "template_id", "registry_manifest_hash",
+         "feature_registry_hash", "input_hash", "bundle_hash", "required_feature_keys",
+         "slots", "values", "blockers", "fact_snapshot_hash", "issue_snapshot_hash",
+         "batch_id", "algorithm_version", "projection_hash")
+ 
+     def wire(item):
+         if type(item) is not VerifiedMetricFeatureProjection:
+             raise ValueError("metric projection requires exact proof type")
+         record = proofs.get(id(item))
+         if record is None or record[0]() is not item:
+@@ -367,20 +368,52 @@ def _install_metric_projection():
+ 
+         def require_verified(self):
+             wire(self)
+ 
+         def __copy__(self):
+             raise TypeError("metric projection proof cannot be copied")
+ 
+         def __deepcopy__(self, memo):
+             raise TypeError("metric projection proof cannot be copied")
+ 
++    class VerifiedMetricFeatureAbsence:
++        """Authenticated current inputs whose exact expected receipt is absent."""
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("metric absence requires verified current repository reads")
++
++        def canonical_bytes(self):
++            record = absences.get(id(self))
++            if type(self) is not VerifiedMetricFeatureAbsence or record is None or record[0]() is not self:
++                raise ValueError("metric absence proof is forged or copied")
++            return record[1]
++
++        def require_verified(self):
++            self.canonical_bytes()
++
++        def to_dict(self):
++            return json.loads(self.canonical_bytes())
++
++        def __getattr__(self, name):
++            payload = self.to_dict()
++            if name not in payload:
++                raise AttributeError(name)
++            value = payload[name]
++            return tuple(value) if type(value) is list else value
++
++        def __copy__(self):
++            raise TypeError("metric absence proof cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("metric absence proof cannot be copied")
++
+     def dependency_state(self):
+         store, files = self._store, self._bundle_store
+         source = store._formal_snapshot_store
+         verifier = store._registry_signature_verifier
+         provider = self._current_input_provider
+         refs = (source, verifier, store._formal_feature_bundle_store)
+         methods = (getattr(self._verifier, "verify", None), getattr(verifier, "verify", None),
+             getattr(provider, "resolve_current_inputs", None))
+         method_ids = tuple((id(getattr(method, "__self__", None)), id(getattr(method, "__func__", method)))
+             for method in methods)
+@@ -422,22 +455,22 @@ def _install_metric_projection():
+             if vars(cls).get(name) is not method:
+                 raise ValueError("metric repository read dependency changed")
+             for instance in (self, self._store, self._bundle_store, source):
+                 if type(instance) is cls and name in getattr(instance, "__dict__", {}):
+                     raise ValueError("metric repository read dependency overridden")
+         if build_formal_feature_bundle is not builder or evaluate_selected_features is not evaluator:
+             raise ValueError("metric repository calculation dependency changed")
+         if any(vars(module).get(name) is not value for module, name, value in checked_calculations):
+             raise ValueError("metric repository calculation dependency changed")
+ 
+-    def select(self, security_id: str, as_of_utc: str, *, template_id: str,
+-               registry_manifest_hash: str, required_feature_keys: tuple[str, ...]) -> VerifiedMetricFeatureProjection | None:
++    def select_state(self, security_id: str, as_of_utc: str, *, template_id: str,
++               registry_manifest_hash: str, required_feature_keys: tuple[str, ...]):
+         """Authenticate a current stored bundle and project required signed V6 slots."""
+         request = _request(security_id, as_of_utc, template_id, registry_manifest_hash)
+         if as_of_utc != "2026-08-31T07:00:00+00:00":
+             raise ValueError("metric projection requires the exact frozen cutoff")
+         if (type(required_feature_keys) is not tuple or not required_feature_keys
+                 or any(type(key) is not str for key in required_feature_keys)
+                 or tuple(sorted(set(required_feature_keys))) != required_feature_keys):
+             raise ValueError("metric feature keys must be a nonempty sorted unique exact tuple")
+         dependencies(self)
+         provider = self._current_input_provider
+@@ -470,21 +503,52 @@ def _install_metric_projection():
+             facts=facts, issues=issues, registry=registry, registry_manifest=graph.manifest)
+         if type(expected) is not FormalFeatureBundle:
+             raise ValueError("metric feature builder returned an invalid bundle")
+         expected_bytes = expected.canonical_bytes()
+         check_current()
+         stored = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+         if stored is not None and stored.canonical_bytes() != expected_bytes:
+             raise ValueError("metric feature stored bundle differs from rebuilt inputs")
+         check_current()
+         if stored is None:
+-            return None
++            # A bare None cannot distinguish two unpersisted generations. Recheck
++            # the provider's logical generation, full source facts and signed root
++            # before sealing an explicit marker for these exact current inputs.
++            graph_after, registry_after = read_registry(self, registry_manifest_hash)
++            if (graph_after.manifest.manifest_hash != graph.manifest.manifest_hash
++                    or registry_after.registry_hash != registry.registry_hash):
++                raise ValueError("metric absence registry changed during selection")
++            try:
++                current = provider.resolve_current_inputs(**request)
++            except Exception as error:
++                raise ValueError("formal feature current input provider failed") from error
++            if (snapshot_identity(current, request) != identity
++                    or _fact_snapshot(current.facts, security_id)[1] != fact_records
++                    or _issue_snapshot(current.issues)[1] != issue_records):
++                raise ValueError("metric absence provider generation changed during selection")
++            check_current()
++            if read_bundle(self, input_hash=expected.input_hash, require_complete=False) is not None:
++                raise ValueError("metric absence receipt appeared during selection")
++            check_current()
++            payload = dict(request, feature_registry_hash=registry.registry_hash,
++                input_hash=expected.input_hash, bundle_hash=expected.bundle_hash(),
++                required_feature_keys=list(required_feature_keys),
++                fact_snapshot_hash=hashlib.sha256(_canonical_json_bytes([json.loads(r) for r in fact_records])).hexdigest(),
++                issue_snapshot_hash=hashlib.sha256(_canonical_json_bytes([json.loads(r) for r in issue_records])).hexdigest(),
++                batch_id=identity[-1], status="current_receipt_absent",
++                algorithm_version="formal-metric-feature-absence-v1")
++            payload["absence_hash"] = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
++            result = object.__new__(VerifiedMetricFeatureAbsence)
++            proof_id = id(result)
++            absences[proof_id] = (weakref.ref(result, lambda _, proof_id=proof_id: absences.pop(proof_id, None)),
++                _canonical_json_bytes(payload))
++            return result
+         values, blockers = evaluator(slots=slots, facts=facts, issues=issues, as_of_utc=as_of_utc)
+         # Re-read source lineage, root and the exact receipt after calculation:
+         # a correct early read cannot bless a late SQL/file/source mutation.
+         reread = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+         if reread is None or reread.canonical_bytes() != expected_bytes:
+             raise ValueError("metric feature persisted receipt changed during projection")
+         check_current()
+         payload = dict(request, feature_registry_hash=registry.registry_hash,
+             input_hash=stored.input_hash, bundle_hash=stored.bundle_hash(),
+             required_feature_keys=list(required_feature_keys), slots=[slot.to_dict() for slot in slots],
+@@ -500,19 +564,27 @@ def _install_metric_projection():
+                 value = tuple(FormalFeatureSlot.from_dict(item) for item in value)
+             elif field == "values":
+                 value = tuple(FormalFeatureValue.from_dict(item) for item in value)
+             elif field in {"required_feature_keys", "blockers"}:
+                 value = tuple(value)
+             object.__setattr__(result, field, value)
+         proof_id = id(result)
+         proofs[proof_id] = (weakref.ref(result, lambda _, proof_id=proof_id: proofs.pop(proof_id, None)), _canonical_json_bytes(payload))
+         return result
+ 
++    def select(self, *args, **kwargs):
++        result = select_state(self, *args, **kwargs)
++        return None if type(result) is VerifiedMetricFeatureAbsence else result
++
+     repository_type.__init__ = init
+     repository_type.select_current_verified_metric_features = select
+-    return VerifiedMetricFeatureProjection
++    repository_type.select_current_verified_metric_feature_state = select_state
++    checked_methods += ((repository_type, "select_current_verified_metric_features", select),
++        (repository_type, "select_current_verified_metric_feature_state", select_state))
++    return VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence, dependencies
+ 
+ 
+-VerifiedMetricFeatureProjection = _install_metric_projection()
++(VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence,
++ _require_authentic_metric_feature_repository) = _install_metric_projection()
+ del _install_metric_projection
+ 
+-__all__ = ["FormalFeatureRepository", "FormalFeatureCurrentInput", "FormalFeatureCurrentInputProvider", "VerifiedMetricFeatureProjection"]
++__all__ = ["FormalFeatureRepository", "FormalFeatureCurrentInput", "FormalFeatureCurrentInputProvider", "VerifiedMetricFeatureProjection", "VerifiedMetricFeatureAbsence"]
+diff --git a/ashare_pipeline/formal_metric_engine.py b/ashare_pipeline/formal_metric_engine.py
+new file mode 100644
+index 0000000..ff64674
+--- /dev/null
++++ b/ashare_pipeline/formal_metric_engine.py
+@@ -0,0 +1,376 @@
++"""Deterministic metric percentiles; raw arithmetic cannot mint formal proofs."""
++
++from decimal import Context, Decimal, DivisionByZero, InvalidOperation, Overflow, ROUND_HALF_EVEN, localcontext
++from dataclasses import fields
++import hashlib
++import json
++from types import MappingProxyType
++import weakref
++
++from .formal_context_repository import FormalContextRepository
++from .formal_feature_repository import FormalFeatureRepository, VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence
++from .formal_feature_repository import _require_authentic_metric_feature_repository
++from .formal_metric_context import FormalMetricContextRepository
++from .formal_registry_manifest import FormalRegistryBundleLoader
++from .formal_scoring_registry import FormalScoringRegistry
++
++
++def _arithmetic_context():
++    # Explicit every context option: neither getcontext nor DefaultContext is
++    # authoritative. Recurring division retains 50 deterministic significant
++    # digits, without display quantization; it is not claimed to be exact.
++    return Context(prec=50, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999,
++        capitals=1, clamp=0, flags=[], traps=[InvalidOperation, DivisionByZero, Overflow])
++
++
++def percentile_rank(raw_value, values, *, direction):
++    """Return (average ascending rank, directional percentile), never a proof."""
++    if (type(raw_value) is not Decimal or not raw_value.is_finite()
++            or type(values) is not tuple or not values
++            or any(type(value) is not Decimal or not value.is_finite() for value in values)
++            or raw_value not in values or direction not in ("higher", "lower")):
++        raise ValueError("percentile requires finite Decimal peers, their focal value and a signed direction")
++    with localcontext(_arithmetic_context()):
++        below = sum(value < raw_value for value in values)
++        tied = sum(value == raw_value for value in values)
++        rank = Decimal(below) + (Decimal(tied) + 1) / 2
++        percentile = 100 * (rank - Decimal("0.5")) / len(values)
++        return rank, 100 - percentile if direction == "lower" else percentile
++
++
++def _plain(value):
++    if isinstance(value, (dict, MappingProxyType)):
++        return {key: _plain(item) for key, item in value.items()}
++    if type(value) in (tuple, list):
++        return [_plain(item) for item in value]
++    return str(value) if type(value) is Decimal else value
++
++
++def _canonical(value):
++    return json.dumps(_plain(value), sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
++
++
++def _digest(value):
++    return hashlib.sha256(_canonical(value)).hexdigest()
++
++
++def _freeze(value):
++    if type(value) is dict:
++        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
++    if type(value) in (tuple, list):
++        result = tuple(_freeze(item) for item in value)
++        return value if type(value) is tuple and all(a is b for a, b in zip(value, result, strict=True)) else result
++    return value
++
++
++def _install_engine():
++    repositories, proofs = {}, {}
++    context_type = FormalMetricContextRepository
++    feature_read = FormalFeatureRepository.select_current_verified_metric_feature_state
++    require_feature = _require_authentic_metric_feature_repository
++    load_root = FormalRegistryBundleLoader.load
++    decimal_context = _arithmetic_context
++    encode, digest, freeze = _canonical, _digest, _freeze
++    checked = tuple((cls, name, method) for cls in (context_type, FormalFeatureRepository,
++        FormalContextRepository, FormalRegistryBundleLoader, FormalScoringRegistry)
++        for name, method in vars(cls).items() if callable(method) or isinstance(method, (staticmethod, classmethod)))
++
++    def state(feature, context, verifier):
++        require_feature(feature)
++        if (type(feature) is not FormalFeatureRepository or type(context) is not FormalContextRepository
++                or feature._store is not context._state_store or feature._verifier is not verifier
++                or context._verifier is not verifier):
++            raise ValueError("metric input repository requires exact same-store repositories and verifier")
++        for cls, name, method in checked:
++            if vars(cls).get(name) is not method:
++                raise ValueError("metric input read or registry dependency changed")
++            for instance in (feature, context):
++                if type(instance) is cls and name in vars(instance):
++                    raise ValueError("metric input repository reader overridden")
++        return (id(feature), id(context), id(verifier), id(feature._store), id(feature._bundle_store),
++            id(feature._current_input_provider), id(context._snapshots))
++
++    def dependencies(repo):
++        record = repositories.get(id(repo))
++        if type(repo) is not FormalMetricInputRepository or record is None or record[0]() is not repo:
++            raise ValueError("metric input repository is uninitialized or copied")
++        feature, context, verifier, metric_context, initial = record[1:]
++        if state(feature, context, verifier) != initial:
++            raise ValueError("metric input repository trust dependencies changed")
++        return feature, context, verifier, metric_context
++
++    def record(proof, cls):
++        found = proofs.get(id(proof))
++        if type(proof) is not cls or found is None or found[0]() is not proof:
++            raise ValueError("metric proof is forged or copied")
++        return found
++
++    class Proof:
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("metric proofs are produced only by authenticated complete batches")
++
++        def __getattr__(self, name):
++            data = record(self, type(self))[1]
++            if name not in data:
++                raise AttributeError(name)
++            return data[name]
++
++        def require_verified(self):
++            record(self, type(self))
++
++        def canonical_bytes(self):
++            return record(self, type(self))[2]
++
++        def to_dict(self):
++            return json.loads(record(self, type(self))[2])
++
++        def __copy__(self):
++            raise TypeError("metric proof cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("metric proof cannot be copied")
++
++    class MetricInput(Proof):
++        __slots__ = ()
++
++    class MetricInputBatch(Proof):
++        __slots__ = ()
++
++        def input_for(self, security_id, metric_id):
++            result = record(self, MetricInputBatch)[3]["index"].get((security_id, metric_id))
++            if result is None:
++                raise ValueError("security or qualified metric is outside this complete batch")
++            return result
++
++    class MetricPeerContext(Proof):
++        __slots__ = ()
++
++    class MetricScore(Proof):
++        __slots__ = ()
++
++    def mint(cls, payload, *, attributes=None, private=None):
++        proof = object.__new__(cls)
++        identity = id(proof)
++        data = dict(payload)
++        data.update(attributes or {})
++        proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)), freeze(data), encode(payload), private)
++        return proof
++
++    def definitions(scoring):
++        result = {}
++        for tid in scoring.templates:
++            template = scoring.template_for(tid)
++            result[tid] = {}
++            for dimension, metrics in template.metrics.items():
++                for metric in metrics:
++                    key = dimension + "." + metric.metric_id
++                    definition = {field.name: _plain(getattr(metric, field.name)) for field in fields(metric)}
++                    payload = dict(template_id=tid, metric_id=key, definition=definition,
++                        registry_manifest_hash=scoring.registry_manifest_hash,
++                        scoring_registry_hash=scoring.content_sha256, feature_registry_hash=scoring.role_hashes["feature"])
++                    payload["definition_hash"] = digest(payload)
++                    result[tid][key] = payload
++        return result
++
++    def build(repo, frozen_input_hash, scoring, metric_ids):
++        feature, _, verifier, context = dependencies(repo)
++        universe = context.load_universe(frozen_input_hash, scoring_registry=scoring)
++        if universe is None:
++            return None
++        universe.require_verified()
++        root = load_root(FormalRegistryBundleLoader(feature._store, verifier), universe.registry_manifest_hash)
++        scoring.require_official(root)
++        defs = definitions(scoring)
++        known = set().union(*(set(items) for items in defs.values()))
++        selected = tuple(sorted(known)) if metric_ids is None else metric_ids
++        if (type(selected) is not tuple or not selected or any(type(mid) is not str for mid in selected)
++                or selected != tuple(sorted(set(selected))) or any(mid not in known for mid in selected)):
++            raise ValueError("metric IDs must be nonempty sorted unique registered dimension.metric_id strings")
++        industry = context.resolve_industries(universe)
++        industry.require_verified()
++        common = dict(registry_manifest_hash=universe.registry_manifest_hash,
++            frozen_input_hash=universe.frozen_input_hash, universe_hash=universe.universe_hash,
++            population_hash=universe.population_hash, as_of_utc=universe.as_of_utc,
++            industry_batch_hash=industry.batch_hash, registry_hashes=dict(scoring.role_hashes),
++            universe_proof_hash=hashlib.sha256(universe.canonical_bytes()).hexdigest())
++        rows, markers, requests = [], {}, {}
++        for sid in universe.security_ids:
++            assignment = industry.entries[sid]
++            signed_member = next((m for m in universe.industry["memberships"] if m["security_id"] == sid), None)
++            tid = None if signed_member is None else signed_member["template_id"]
++            marker = None
++            if tid is not None:
++                keys = tuple(sorted({key for mid in selected for key in defs[tid][mid]["definition"]["required_feature_keys"]}))
++                request = dict(security_id=sid, as_of_utc=universe.as_of_utc, template_id=tid,
++                    registry_manifest_hash=universe.registry_manifest_hash, required_feature_keys=keys)
++                marker = feature_read(feature, **request)
++                if type(marker) not in (VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence):
++                    raise ValueError("metric feature current state requires a genuine present or absence proof")
++                marker.require_verified()
++                requests[sid] = request
++                markers[sid] = marker.canonical_bytes()
++            for mid in selected:
++                binding = None if tid is None else defs[tid][mid]
++                reason = "invalid_template" if tid is None else assignment["pending_reason"]
++                value, refs, projection_hash = None, (), None
++                if reason is None:
++                    if type(marker) is VerifiedMetricFeatureAbsence:
++                        reason = "current_receipt_absent"
++                    else:
++                        projection_hash = marker.projection_hash
++                        definition = binding["definition"]
++                        by_id = {item.slot_id: item for item in marker.values}
++                        chosen = tuple(by_id[key] for key in definition["required_feature_keys"])
++                        for item in chosen:
++                            if item.status != "derived":
++                                reason = item.missing_reason or "missing_verified_fact"
++                                break
++                            if item.unit != definition["unit_rule"]:
++                                reason = "unsupported_unit"
++                                break
++                        if reason is None:
++                            value = Decimal(str(by_id[definition["field_map"]["value"]].value))
++                            if not value.is_finite():
++                                raise ValueError("verified metric feature value is not finite")
++                            refs = tuple(sorted({e.formal_fact_id for item in chosen for e in item.evidence}))
++                            if not refs:
++                                raise ValueError("derived metric has no verified evidence")
++                payload = dict(common, security_id=sid, metric_id=mid, template_id=tid,
++                    primary_industry=assignment.get("primary_industry"), secondary_industry=assignment.get("secondary_industry"),
++                    definition_hash=None if binding is None else binding["definition_hash"],
++                    direction=None if binding is None else binding["definition"]["direction"],
++                    unit=None if binding is None else binding["definition"]["unit_rule"],
++                    raw_value=value, verified_feature_refs=refs, invalid_reason=reason,
++                    status="eligible" if reason is None else "pending_evidence", projection_hash=projection_hash,
++                    feature_state_hash=None if marker is None else hashlib.sha256(markers[sid]).hexdigest())
++                payload["input_hash"] = digest(payload)
++                rows.append(payload)
++        # Cross-member closure: every current state is re-read after the first
++        # pass; both absence transitions and numeric corrections invalidate all.
++        for sid, request in requests.items():
++            current = feature_read(feature, **request)
++            current.require_verified()
++            if current.canonical_bytes() != markers[sid]:
++                raise ValueError("metric feature correction or absence changed during complete batch")
++        context.recheck_batch(universe, industry)
++        scoring.require_official(root)
++        dependencies(repo)
++        payload = dict(common, schema_version="formal-metric-input-batch-v1", metric_ids=selected,
++            security_ids=tuple(universe.security_ids), definitions=defs, inputs=rows,
++            feature_states={sid: json.loads(wire) for sid, wire in markers.items()})
++        payload["batch_hash"] = digest(payload)
++        inputs = tuple(mint(MetricInput, dict(row, batch_hash=payload["batch_hash"])) for row in rows)
++        index = {(item.security_id, item.metric_id): item for item in inputs}
++        return mint(MetricInputBatch, payload, attributes=dict(inputs=inputs), private=dict(index=index,
++            groups=None, ranks={}, contexts={}))
++
++    class FormalMetricInputRepository:
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, feature_repository, context_repository, *, registry_signature_verifier):
++            if type(self) is not FormalMetricInputRepository or id(self) in repositories:
++                raise ValueError("metric input repository initialization must be exact and single-use")
++            snapshot = state(feature_repository, context_repository, registry_signature_verifier)
++            context = context_type(feature_repository._store, context_repository,
++                registry_signature_verifier=registry_signature_verifier)
++            identity = id(self)
++            repositories[identity] = (weakref.ref(self, lambda _: repositories.pop(identity, None)),
++                feature_repository, context_repository, registry_signature_verifier, context, snapshot)
++
++        def build_batch(self, frozen_input_hash, *, scoring_registry, metric_ids=None):
++            return build(self, frozen_input_hash, scoring_registry, metric_ids)
++
++        def __copy__(self):
++            raise TypeError("metric input repository cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("metric input repository cannot be copied")
++
++    def eligible(item):
++        return record(item, MetricInput)[1]["invalid_reason"] is None
++
++    def peer_context(batch, *, metric_id, security_id):
++        data, private = record(batch, MetricInputBatch)[1], record(batch, MetricInputBatch)[3]
++        focal = private["index"].get((security_id, metric_id))
++        if focal is None:
++            raise ValueError("security or qualified metric is outside this complete batch")
++        key = (security_id, metric_id)
++        if key in private["contexts"]:
++            return private["contexts"][key]
++        if private["groups"] is None:
++            groups = {}
++            for item in data["inputs"]:
++                if eligible(item):
++                    for scope, industry_id in (("template_secondary_industry", item.secondary_industry),
++                            ("template_primary_industry", item.primary_industry)):
++                        group = (item.metric_id, item.template_id, scope, industry_id)
++                        groups.setdefault(group, []).append(item.security_id)
++            private["groups"] = {group: tuple(sorted(ids)) for group, ids in groups.items()}
++        reason, scope, peers = focal.invalid_reason, None, ()
++        if reason is None:
++            for candidate_scope, industry_id in (("template_secondary_industry", focal.secondary_industry),
++                    ("template_primary_industry", focal.primary_industry)):
++                peers = private["groups"].get((metric_id, focal.template_id, candidate_scope, industry_id), ())
++                if len(peers) >= 20:
++                    scope = candidate_scope
++                    break
++            if scope is None:
++                reason = "peer_count_below_20"
++        payload = dict(schema_version="formal-metric-peer-context-v1", batch_hash=data["batch_hash"],
++            registry_manifest_hash=data["registry_manifest_hash"], frozen_input_hash=data["frozen_input_hash"],
++            universe_hash=data["universe_hash"], metric_id=metric_id, security_id=security_id,
++            definition_hash=focal.definition_hash, direction=focal.direction, scope=scope,
++            peer_security_ids=peers, peer_count=len(peers), reason=reason)
++        payload["cohort_hash"] = digest(dict(batch_hash=data["batch_hash"], metric_id=metric_id,
++            definition_hash=focal.definition_hash, direction=focal.direction, scope=scope, peer_security_ids=peers))
++        payload["context_hash"] = digest(payload)
++        result = mint(MetricPeerContext, payload, attributes=dict(peer_security_ids=peers), private=batch)
++        private["contexts"][key] = result
++        return result
++
++    def score(batch, context):
++        batch_record = record(batch, MetricInputBatch)
++        context_record = record(context, MetricPeerContext)
++        if context_record[3] is not batch:
++            raise ValueError("metric peer context belongs to another complete batch")
++        c, private = context_record[1], batch_record[3]
++        if c["reason"] is not None:
++            return None
++        if c["peer_count"] < 20:
++            raise ValueError("formal percentile requires at least twenty peers")
++        cohort = c["cohort_hash"]
++        if cohort not in private["ranks"]:
++            values = sorted(private["index"][(sid, c["metric_id"])].raw_value for sid in c["peer_security_ids"])
++            ranks = {}
++            with localcontext(decimal_context()):
++                first = 0
++                while first < len(values):
++                    last = first + 1
++                    while last < len(values) and values[last] == values[first]:
++                        last += 1
++                    rank = (Decimal(first + 1) + Decimal(last)) / 2
++                    percentile = 100 * (rank - Decimal("0.5")) / len(values)
++                    ranks[values[first]] = (rank, 100 - percentile if c["direction"] == "lower" else percentile)
++                    first = last
++            private["ranks"][cohort] = ranks
++        focal = private["index"][(c["security_id"], c["metric_id"])]
++        rank, percentile = private["ranks"][cohort][focal.raw_value]
++        payload = dict(schema_version="formal-metric-score-v1", batch_hash=batch.batch_hash,
++            registry_manifest_hash=batch.registry_manifest_hash, frozen_input_hash=batch.frozen_input_hash,
++            universe_hash=batch.universe_hash, metric_id=focal.metric_id, security_id=focal.security_id,
++            definition_hash=focal.definition_hash, input_hash=focal.input_hash, raw_value=focal.raw_value,
++            average_rank=rank, percentile=percentile, peer_count=c["peer_count"], peer_context=context.to_dict())
++        payload["score_hash"] = digest(payload)
++        return mint(MetricScore, payload, attributes=dict(peer_context=context))
++
++    return FormalMetricInputRepository, MetricInput, MetricInputBatch, MetricPeerContext, MetricScore, eligible, peer_context, score
++
++
++(FormalMetricInputRepository, MetricInput, MetricInputBatch, MetricPeerContext, MetricScore,
++ metric_peer_eligible, build_metric_peer_context, score_metric_percentile) = _install_engine()
++del _install_engine
++
++__all__ = ["FormalMetricInputRepository", "MetricInput", "MetricInputBatch", "MetricPeerContext", "MetricScore",
++    "metric_peer_eligible", "build_metric_peer_context", "score_metric_percentile", "percentile_rank"]
+diff --git a/tests/formal_metric_feature_fixtures.py b/tests/formal_metric_feature_fixtures.py
+new file mode 100644
+index 0000000..13b15c7
+--- /dev/null
++++ b/tests/formal_metric_feature_fixtures.py
+@@ -0,0 +1,108 @@
++"""Same-store, member-specific financial receipts for metric engine tests."""
++
++import hashlib
++
++from ashare_pipeline.formal_evidence import OfficialFetch, OfficialRequest, SourcePolicy, verify_official_fetch
++from ashare_pipeline.formal_feature_contract import load_signed_feature_registry
++from ashare_pipeline.formal_feature_repository import FormalFeatureCurrentInput, FormalFeatureRepository
++from ashare_pipeline.formal_feature_store import FormalFeatureBundleStore
++from ashare_pipeline.formal_financial_features import build_formal_feature_bundle
++from tests.formal_metric_fixtures import MetricFixture, FREEZE, update_mapping_digest
++from tests.test_formal_feature_contract import formal_fact
++from tests.test_formal_feature_store import project_temporary_directory
++from tests.test_formal_scoring_registry import canonical
++
++METRICS = ("G.operating_profit_per_share_cagr_3y", "G.operating_profit_per_share_yoy",
++    "G.operating_revenue_cagr_3y", "G.operating_revenue_yoy")
++
++
++def configuration(docs):
++    for template in docs["scoring"]["scoring"]["templates"].values():
++        for metrics in template["metrics"].values():
++            for metric in metrics:
++                metric.update(period_rule=["FY2025"], unit_rule="CNY")
++                if metric["metric_id"] == "operating_revenue_yoy":
++                    metric["direction"] = "lower"
++    for slot in docs["feature"]["slots"]:
++        leaf = ".".join(slot["slot_id"].split(".")[1:])
++        slot.update(unit="CNY", formula=dict(op="fact", fact_key=leaf, period_key="FY2025"))
++
++
++class FinancialFixture(MetricFixture):
++    def __init__(self, *, population=False, missing_memberships=False):
++        rows = None
++        def configure(docs):
++            configuration(docs)
++            if missing_memberships:
++                docs["industry"]["memberships"] = [dict(security_id="SH600099", template_id="bank",
++                    primary_industry="banks", secondary_industry="banks")]
++                update_mapping_digest(docs["industry"])
++            if population:
++                ids = ["BJ430001"] + [f"SH{600000 + i}" for i in range(20)] + ["SZ000001"]
++                docs["industry"]["memberships"] = [dict(security_id=sid,
++                    template_id="bank" if sid == "SZ000001" else "general_nonfinancial",
++                    primary_industry="manufacturing", secondary_industry="other" if sid == "SH600019" else "machinery")
++                    for sid in sorted(ids)]
++                update_mapping_digest(docs["industry"])
++        if population:
++            rows = {exchange: [dict(security_id=sid, listing_status="listed", security_type="ordinary_a") for sid in ids]
++                for exchange, ids in {"BJ": ["BJ430001"], "SH": [f"SH{600000+i}" for i in range(20)], "SZ": ["SZ000001"]}.items()}
++        super().__init__(mutate=configure, exchange_rows=rows, tempdir=project_temporary_directory())
++        self.files = FormalFeatureBundleStore(self.root / "features")
++        self.store._formal_feature_bundle_store = self.files
++        self.issues = {}
++        self.generations = {}
++        child = self.bundle.blob("feature")
++        self.vocabulary = load_signed_feature_registry(child.canonical_json, child.signature, child.key_id,
++            self.verifier, registry_manifest=self.bundle.manifest)
++        self.feature_repository = FormalFeatureRepository(self.store, self.files,
++            registry_signature_verifier=self.verifier, current_input_provider=self)
++
++    def resolve_current_inputs(self, **request):
++        sid = request["security_id"]
++        return FormalFeatureCurrentInput(**request, batch_id=self.generations.get(sid, "generation-1"),
++            facts=self.store.list_formal_financial_facts(security_id=sid), issues=self.issues.get(sid, ()), complete=True)
++
++    def put_financial(self, sid, values, *, generation="financial-1", updated=None):
++        raw = canonical(values)
++        task = self.store.enqueue_formal_task("formal_statement", sid + generation, generation, {})
++        leased = self.store.lease_next_formal_task(("formal_statement",), "financial-fixture", 300)
++        self.assertEqual(leased["id"], task)
++        fetch = OfficialFetch(request=OfficialRequest("cninfo", "annual_report", sid, "2025-12-31", sid[:2]),
++            raw_bytes=raw, original_url="https://www.cninfo.com.cn/fixture/annual.json",
++            published_at_utc="2026-03-20T08:00:00+00:00", published_precision="timestamp",
++            source_updated_at_utc=updated, captured_at_utc="2026-09-04T07:00:00+00:00",
++            effective_at_utc="2026-03-20T08:00:00+00:00", effective_time_evidence_hash=None,
++            refresh_generation=generation, parser_id="fixture-annual", parser_version="fixture-annual-v1",
++            mapping_version="fixture-annual-map-v1", declared_security_id=sid, declared_period="2025-12-31")
++        verification = verify_official_fetch(fetch, SourcePolicy.cninfo())
++        ref = self.snapshots.persist_verified(fetch, verification, producing_task_id=task, worker_id="financial-fixture")
++        facts = tuple(formal_fact(security_id=sid, metric_key=key, value=float(value), source_field=key,
++            raw_value_sha256=hashlib.sha256(canonical(value)).hexdigest(), source_snapshot_id=ref.snapshot_id,
++            source_content_sha256=ref.content_sha256, source_refresh_generation=ref.refresh_generation,
++            source_producing_task_id=ref.producing_task_id, parser_id=ref.parser_id, parser_version=ref.parser_version,
++            mapping_version=ref.mapping_version, source_updated_at_utc=ref.source_updated_at_utc,
++            captured_at_utc=ref.captured_at_utc) for key, value in values.items())
++        self.store.insert_formal_financial_facts(facts)
++        self.store.complete_formal_task(task, "financial-fixture", {"snapshot": ref.snapshot_id})
++        return ref
++
++    def persist_features(self, sid):
++        member = next(m for m in self.industry["memberships"] if m["security_id"] == sid)
++        bundle = build_formal_feature_bundle(security_id=sid, as_of_utc=FREEZE, template_id=member["template_id"],
++            facts=self.store.list_formal_financial_facts(security_id=sid), issues=self.issues.get(sid, ()),
++            registry=self.vocabulary, registry_manifest=self.bundle.manifest)
++        self.store.put_formal_feature_bundle(bundle, self.files.write(bundle))
++        return bundle
++
++    def populate(self):
++        for index, member in enumerate(self.industry["memberships"]):
++            sid = member["security_id"]
++            self.put_industry(sid)
++            values = {METRICS[0]: index - 1, METRICS[3]: index - 1}
++            if sid != "SH600018":
++                values[METRICS[1]] = index - 1  # 19 secondary, 20 primary.
++            if sid not in ("SH600018", "SH600019"):
++                values[METRICS[2]] = index - 1  # Only 19 in this template.
++            self.put_financial(sid, values)
++            self.persist_features(sid)
+diff --git a/tests/formal_metric_fixtures.py b/tests/formal_metric_fixtures.py
+index db805ac..9f8df86 100644
+--- a/tests/formal_metric_fixtures.py
++++ b/tests/formal_metric_fixtures.py
+@@ -32,22 +32,22 @@ def industry_document():
+ 
+ 
+ def update_mapping_digest(doc):
+     doc["mapping_sha256"] = hashlib.sha256(canonical({k: doc[k] for k in
+         ("classification_system", "source_version", "effective_date", "memberships")})).hexdigest()
+ 
+ 
+ class MetricFixture:
+     """A plain helper; no imported/inherited TestCase can duplicate suite discovery."""
+ 
+-    def __init__(self, *, mutate=None, exchange_rows=None):
+-        self.tempdir = tempfile.TemporaryDirectory()
++    def __init__(self, *, mutate=None, exchange_rows=None, tempdir=None):
++        self.tempdir = tempdir or tempfile.TemporaryDirectory()
+         self.root = Path(self.tempdir.name)
+         self.db_path = self.root / "metric.sqlite"
+         StateStore(self.db_path).initialize()
+         self.raw = FormalSnapshotStore(self.root / "raw")
+         def configure(docs):
+             docs["industry"] = industry_document()
+             docs["scoring"]["descriptors"] = [descriptor("industry_snapshot", scope_key="fixture-industry",
+                 dataset="fixture-industry", referenced_roles=["industry", "scoring", "source"])]
+             docs["source"]["configs"] = [config(dataset="fixture-industry", exchange_scope=e) for e in ("BJ", "SH", "SZ")]
+             docs["feature"]["source_registry_hash"] = hashlib.sha256(canonical(docs["source"])).hexdigest()
+diff --git a/tests/test_formal_metric_engine.py b/tests/test_formal_metric_engine.py
+new file mode 100644
+index 0000000..da2b6b5
+--- /dev/null
++++ b/tests/test_formal_metric_engine.py
+@@ -0,0 +1,301 @@
++"""Arithmetic and whole-population proofs use independent literal expectations."""
++
++import copy
++import hashlib
++from decimal import Decimal, DefaultContext, getcontext, setcontext
++import importlib
++import sys
++import unittest
++from unittest.mock import patch
++from ashare_pipeline.formal_financial_schema import FormalFactIssue
++from ashare_pipeline.formal_universe import FormalUniverseDecision
++from tests.formal_metric_feature_fixtures import FinancialFixture, METRICS
++
++
++class PercentileArithmeticTests(unittest.TestCase):
++    def setUp(self):
++        self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_metric_engine"),
++            "metric engine is missing")
++        self.api = importlib.import_module("ashare_pipeline.formal_metric_engine")
++
++    def test_ties_use_midpoint_average_rank_and_lower_reverses_only_percentile(self):
++        rank, percentile = self.api.percentile_rank(Decimal("2"), tuple(map(Decimal, ("1", "2", "2", "4"))), direction="higher")
++        self.assertEqual((rank, percentile), (Decimal("2.5"), Decimal("50")))
++        self.assertEqual(self.api.percentile_rank(Decimal("1"), (Decimal("1"), Decimal("3")), direction="lower"),
++            (Decimal("1"), Decimal("75")))
++
++    def test_negative_zero_and_all_equal_values_are_valid(self):
++        self.assertEqual(self.api.percentile_rank(Decimal("0"), tuple(map(Decimal, ("-1", "0", "1"))), direction="higher"),
++            (Decimal("2"), Decimal("50")))
++        self.assertEqual(self.api.percentile_rank(Decimal("-2"), (Decimal("-2"),) * 4, direction="lower"),
++            (Decimal("2.5"), Decimal("50")))
++
++    def test_arithmetic_rejects_empty_nonfinite_and_focal_substitution(self):
++        for focal, values, direction in ((Decimal("1"), (), "higher"), (Decimal("NaN"), (Decimal("1"),), "higher"),
++                (Decimal("1"), (Decimal("Infinity"),), "higher"), (Decimal("2"), (Decimal("1"),), "higher"),
++                (Decimal("1"), (1,), "higher"), (Decimal("1"), (Decimal("1"),), "wrong")):
++            with self.subTest(focal=focal, values=values), self.assertRaises(ValueError):
++                self.api.percentile_rank(focal, values, direction=direction)
++
++    def test_decimal_precision_rounding_exponents_and_traps_are_locally_fixed(self):
++        saved, default = getcontext().copy(), DefaultContext.copy()
++        try:
++            getcontext().prec = 2
++            getcontext().Emax = 1
++            getcontext().Emin = -1
++            DefaultContext.prec = 3
++            for signal in getcontext().traps:
++                getcontext().traps[signal] = True
++                DefaultContext.traps[signal] = True
++            self.assertEqual(self.api.percentile_rank(Decimal("1"), tuple(map(Decimal, ("1", "2", "3"))), direction="higher"),
++                (Decimal("1"), Decimal("16.666666666666666666666666666666666666666666666667")))
++            self.assertEqual(getcontext().prec, 2)
++        finally:
++            setcontext(saved)
++            for field in ("prec", "rounding", "Emin", "Emax", "capitals", "clamp"):
++                setattr(DefaultContext, field, getattr(default, field))
++            DefaultContext.traps = default.traps.copy()
++
++
++class CompleteMetricBatchTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.api = importlib.import_module("ashare_pipeline.formal_metric_engine")
++        if not hasattr(cls.api, "FormalMetricInputRepository"):
++            return
++        cls.fixture = FinancialFixture(population=True)
++        cls.addClassCleanup(cls.fixture.close)
++        cls.fixture.populate()
++        cls.repo = cls.api.FormalMetricInputRepository(cls.fixture.feature_repository, cls.fixture.context,
++            registry_signature_verifier=cls.fixture.verifier)
++        cls.batch = cls.repo.build_batch(cls.fixture.frozen.frozen_input_hash,
++            scoring_registry=cls.fixture.scoring, metric_ids=METRICS)
++
++    def setUp(self):
++        self.assertTrue(hasattr(self.api, "FormalMetricInputRepository"), "complete metric factory is missing")
++
++    def test_complete_batch_enumerates_every_frozen_member_and_preserves_metric_local_pending(self):
++        self.assertEqual(len(self.batch.security_ids), 22)
++        self.assertEqual(len(self.batch.inputs), 88)
++        self.assertEqual(self.batch.metric_ids, METRICS)
++        good = self.batch.input_for("SH600018", METRICS[0])
++        missing = self.batch.input_for("SH600018", METRICS[1])
++        self.assertTrue(self.api.metric_peer_eligible(good))
++        self.assertEqual(good.raw_value, Decimal("18.0"))
++        self.assertFalse(self.api.metric_peer_eligible(missing))
++        self.assertEqual(missing.invalid_reason, "formula_fact_missing")
++        self.assertTrue(good.verified_feature_refs)
++        self.assertTrue(self.api.metric_peer_eligible(self.batch.input_for("BJ430001", METRICS[0])))
++
++    def test_twenty_secondary_qualifies_nineteen_falls_back_and_nineteen_primary_fails(self):
++        contexts = [self.api.build_metric_peer_context(self.batch, metric_id=m, security_id="BJ430001") for m in METRICS[:3]]
++        self.assertEqual((contexts[0].scope, contexts[0].peer_count), ("template_secondary_industry", 20))
++        self.assertEqual((contexts[1].scope, contexts[1].peer_count), ("template_primary_industry", 20))
++        self.assertEqual((contexts[2].reason, contexts[2].peer_count), ("peer_count_below_20", 19))
++        self.assertNotIn("SZ000001", contexts[0].peer_security_ids)
++        invalid = self.api.build_metric_peer_context(self.batch, metric_id=METRICS[1], security_id="SH600018")
++        self.assertEqual(invalid.reason, "formula_fact_missing")
++        self.assertIsNone(self.api.score_metric_percentile(self.batch, invalid))
++
++    def test_formal_score_binds_focal_value_exact_cohort_direction_and_all_proof_hashes(self):
++        context = self.api.build_metric_peer_context(self.batch, metric_id=METRICS[0], security_id="BJ430001")
++        score = self.api.score_metric_percentile(self.batch, context)
++        self.assertEqual((score.raw_value, score.average_rank, score.percentile), (Decimal("-1.0"), Decimal("1"), Decimal("2.5")))
++        self.assertEqual(score.peer_context, context)
++        self.assertEqual(score.batch_hash, self.batch.batch_hash)
++        self.assertEqual(score.definition_hash, self.batch.input_for("BJ430001", METRICS[0]).definition_hash)
++        lower = self.api.build_metric_peer_context(self.batch, metric_id=METRICS[3], security_id="BJ430001")
++        self.assertEqual(self.api.score_metric_percentile(self.batch, lower).percentile, Decimal("97.5"))
++        score.require_verified()
++        self.assertEqual(self.api.score_metric_percentile(self.batch, context).canonical_bytes(), score.canonical_bytes())
++
++    def test_proofs_reject_construction_copy_mutation_subsets_and_replaced_identities(self):
++        context = self.api.build_metric_peer_context(self.batch, metric_id=METRICS[0], security_id="BJ430001")
++        score = self.api.score_metric_percentile(self.batch, context)
++        for proof in (self.batch, self.batch.inputs[0], context, score):
++            with self.assertRaises(TypeError):
++                type(proof)()
++            with self.assertRaises(ValueError):
++                object.__new__(type(proof)).require_verified()
++            for copier in (copy.copy, copy.deepcopy):
++                with self.assertRaises((TypeError, ValueError)):
++                    copier(proof)
++            with self.assertRaises((TypeError, AttributeError, ValueError)):
++                object.__setattr__(proof, "security_id", "SH600019")
++        with self.assertRaises((TypeError, ValueError)):
++            self.api.build_metric_peer_context(self.batch.inputs[:20], metric_id=METRICS[0], security_id="BJ430001")
++        for sid, mid in (("BJ899001", METRICS[0]), ("BJ430001", "operating_profit_per_share_cagr_3y")):
++            with self.assertRaises(ValueError):
++                self.api.build_metric_peer_context(self.batch, metric_id=mid, security_id=sid)
++        with self.assertRaises(TypeError):
++            self.api.score_metric_percentile(self.batch, context, direction="lower")
++
++    def test_factory_rejects_subset_selectors_unqualified_ids_and_copied_repository(self):
++        for selected in ((), [METRICS[0]], (METRICS[0], METRICS[0]), ("return_persistence",), ("G.unknown",)):
++            with self.assertRaises(ValueError):
++                self.repo.build_batch(self.fixture.frozen.frozen_input_hash, scoring_registry=self.fixture.scoring, metric_ids=selected)
++        with self.assertRaises(TypeError):
++            self.repo.build_batch(self.fixture.frozen.frozen_input_hash, scoring_registry=self.fixture.scoring, security_ids=("BJ430001",))
++        with self.assertRaises((TypeError, ValueError)):
++            copy.copy(self.repo)
++
++class MetricClosureTests(unittest.TestCase):
++    def setUp(self):
++        self.api = importlib.import_module("ashare_pipeline.formal_metric_engine")
++        self.fixture = FinancialFixture()
++        self.addCleanup(self.fixture.close)
++        for sid in ("BJ430001", "SH600000", "SZ000001"):
++            self.fixture.put_industry(sid)
++        self.repo = self.api.FormalMetricInputRepository(self.fixture.feature_repository, self.fixture.context,
++            registry_signature_verifier=self.fixture.verifier)
++
++    def build(self, **kwargs):
++        return self.repo.build_batch(self.fixture.frozen.frozen_input_hash,
++            scoring_registry=self.fixture.scoring, **kwargs)
++
++    def test_identical_cohorts_share_the_immutable_membership_tuple(self):
++        for sid in ("SH600000", "SZ000001"):
++            self.fixture.put_financial(sid, {METRICS[0]: 1})
++            self.fixture.persist_features(sid)
++        batch = self.build(metric_ids=(METRICS[0],))
++        first = self.api.build_metric_peer_context(batch, metric_id=METRICS[0], security_id="SH600000")
++        second = self.api.build_metric_peer_context(batch, metric_id=METRICS[0], security_id="SZ000001")
++        self.assertEqual(first.peer_security_ids, ("SH600000", "SZ000001"))
++        self.assertIs(first.peer_security_ids, second.peer_security_ids)
++
++    def test_missing_receipts_are_authenticated_pending_for_the_complete_population(self):
++        batch = self.build(metric_ids=(METRICS[0],))
++        self.assertEqual(batch.security_ids, ("BJ430001", "SH600000", "SZ000001"))
++        self.assertEqual(tuple(row.invalid_reason for row in batch.inputs), ("current_receipt_absent",) * 3)
++        self.assertEqual(set(batch.feature_states), set(batch.security_ids))
++        self.assertEqual(batch.canonical_bytes(), self.build(metric_ids=(METRICS[0],)).canonical_bytes())
++        batch.to_dict()["inputs"][0]["raw_value"] = "999"
++        self.assertIsNone(batch.inputs[0].raw_value)
++
++    def test_vetoed_unscored_company_still_supplies_a_complete_metric(self):
++        ref = self.fixture.put_financial("BJ430001", {METRICS[0]: 0})
++        bundle = self.fixture.persist_features("BJ430001")
++        self.assertTrue(bundle.blockers)  # Other dimensions and history are incomplete.
++        statuses = self.fixture.store.list_formal_universe_statuses(self.fixture.snapshot_id)
++        decisions = tuple(FormalUniverseDecision(row["security_id"],
++            "pool_vetoed" if row["security_id"] == "BJ430001" else row["status"],
++            () if row["security_id"] == "BJ430001" else tuple(row["reasons"]),
++            ("fixture_veto",) if row["security_id"] == "BJ430001" else tuple(row["veto_flags"]),
++            ref.content_sha256 if row["security_id"] == "BJ430001" else row["evidence_hash"])
++            for row in statuses)
++        self.fixture.store.replace_formal_universe_statuses(self.fixture.snapshot_id, decisions)
++        batch = self.build(metric_ids=(METRICS[0],))
++        self.assertTrue(self.api.metric_peer_eligible(batch.input_for("BJ430001", METRICS[0])))
++        self.assertEqual(batch.input_for("BJ430001", METRICS[0]).raw_value, Decimal("0.0"))
++
++    def test_industry_correction_during_feature_reads_is_rechecked_for_the_whole_population(self):
++        fired = False
++        def profile(frame, event, arg):
++            nonlocal fired
++            if (not fired and event == "return" and frame.f_code.co_name == "resolve_current_inputs"
++                    and getattr(arg, "security_id", None) == "SZ000001"):
++                fired = True
++                self.fixture.put_industry("BJ430001", changes={"secondary_industry": "corrected"},
++                    generation="corrected", published="2026-08-29T07:00:00+00:00")
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            with self.assertRaisesRegex(ValueError, "industry Context correction or absence changed"):
++                self.build(metric_ids=(METRICS[0],))
++        finally:
++            sys.setprofile(previous)
++        self.assertTrue(fired)
++
++    def test_default_selection_preserves_both_return_persistence_definitions(self):
++        batch = self.build()
++        self.assertEqual(len(batch.metric_ids), 25)
++        self.assertIn("M.return_persistence", batch.metric_ids)
++        self.assertIn("CA.return_persistence", batch.metric_ids)
++        first = batch.input_for("BJ430001", "M.return_persistence")
++        second = batch.input_for("BJ430001", "CA.return_persistence")
++        self.assertNotEqual(first.definition_hash, second.definition_hash)
++
++    def test_cross_member_still_absent_fact_issue_and_provider_corrections_fail_closure(self):
++        for mutation in ("facts", "issues", "provider", "receipt"):
++            fired = False
++            def profile(frame, event, arg):
++                nonlocal fired
++                if (not fired and event == "return" and frame.f_code.co_name == "resolve_current_inputs"
++                        and getattr(arg, "security_id", None) == "SH600000"):
++                    fired = True
++                    if mutation == "facts":
++                        self.fixture.put_financial("BJ430001", {METRICS[0]: 1}, generation="correction")
++                    elif mutation == "issues":
++                        self.fixture.issues["BJ430001"] = (FormalFactIssue("unknown_source_field", None, "OTHER", {}),)
++                    elif mutation == "provider":
++                        self.fixture.generations["BJ430001"] = "changed-provider"
++                    else:
++                        self.fixture.persist_features("BJ430001")
++            previous = sys.getprofile()
++            try:
++                sys.setprofile(profile)
++                with self.subTest(mutation=mutation), self.assertRaisesRegex(ValueError, "changed during complete batch"):
++                    self.build(metric_ids=(METRICS[0],))
++            finally:
++                sys.setprofile(previous)
++            self.assertTrue(fired)
++
++    def test_present_receipt_becoming_absent_during_later_member_read_fails(self):
++        self.fixture.put_financial("BJ430001", {METRICS[0]: 1})
++        self.fixture.persist_features("BJ430001")
++        fired = False
++        def profile(frame, event, arg):
++            nonlocal fired
++            if (not fired and event == "return" and frame.f_code.co_name == "resolve_current_inputs"
++                    and getattr(arg, "security_id", None) == "SH600000"):
++                fired = True
++                self.fixture.put_financial("BJ430001", {METRICS[0]: 2}, generation="correction",
++                    updated="2026-04-01T00:00:00+00:00")
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(profile)
++            with self.assertRaisesRegex(ValueError, "changed during complete batch"):
++                self.build(metric_ids=(METRICS[0],))
++        finally:
++            sys.setprofile(previous)
++        self.assertTrue(fired)
++
++    def test_replaced_reader_copied_repository_wrong_root_or_definition_cannot_mint(self):
++        feature = self.fixture.feature_repository
++        real_reader = feature.select_current_verified_metric_feature_state
++        with patch.object(feature, "select_current_verified_metric_feature_state", real_reader), self.assertRaises(ValueError):
++            self.build(metric_ids=(METRICS[0],))
++        fake = object.__new__(type(feature))
++        fake.__dict__.update(feature.__dict__)
++        with self.assertRaises(ValueError):
++            self.api.FormalMetricInputRepository(fake, self.fixture.context,
++                registry_signature_verifier=self.fixture.verifier)
++        metric = self.fixture.scoring.template_for("general_nonfinancial").metrics["G"][0]
++        for field, changed in (("direction", "lower"), ("unit_rule", "shares"), ("metric_id", "different")):
++            original = getattr(metric, field)
++            try:
++                object.__setattr__(metric, field, changed)
++                with self.subTest(field=field), self.assertRaises(ValueError):
++                    self.build(metric_ids=(METRICS[0],))
++            finally:
++                object.__setattr__(metric, field, original)
++        self.assertIsNone(self.repo.build_batch("f" * 64, scoring_registry=self.fixture.scoring, metric_ids=(METRICS[0],)))
++
++
++class AllPendingRepositoryTests(unittest.TestCase):
++    def test_all_missing_memberships_do_not_allow_a_copied_feature_repository(self):
++        api = importlib.import_module("ashare_pipeline.formal_metric_engine")
++        fixture = FinancialFixture(missing_memberships=True)
++        self.addCleanup(fixture.close)
++        genuine = api.FormalMetricInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier)
++        batch = genuine.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring, metric_ids=(METRICS[0],))
++        self.assertEqual(tuple(item.invalid_reason for item in batch.inputs), ("invalid_template",) * 3)
++        fake = object.__new__(type(fixture.feature_repository))
++        fake.__dict__.update(fixture.feature_repository.__dict__)
++        with self.assertRaises(ValueError):
++            api.FormalMetricInputRepository(fake, fixture.context, registry_signature_verifier=fixture.verifier)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_formal_metric_features.py b/tests/test_formal_metric_features.py
+index a8bfa30..c20fa4f 100644
+--- a/tests/test_formal_metric_features.py
++++ b/tests/test_formal_metric_features.py
+@@ -139,20 +139,85 @@ class MetricProjectionTests(unittest.TestCase):
+         self.persist(issues=(issue,))
+         projection = self.project(snapshot=self.snapshot(issues=(issue,)))
+         self.assertEqual(projection.values[0].status, "blocked")
+         self.assertIsNone(projection.values[0].value)
+         self.assertIn("formal_fact_issue_unknown_source_field", projection.blockers)
+ 
+     def test_missing_current_receipt_returns_none(self):
+         self.correction()
+         self.assertIsNone(self.project())
+ 
++    def state(self, *, snapshot=None):
++        repo = self.repository(fixtures.SnapshotProvider(snapshot or self.snapshot()))
++        endpoint = getattr(repo, "select_current_verified_metric_feature_state", None)
++        self.assertTrue(callable(endpoint), "authenticated absence endpoint is missing")
++        return endpoint("SZ000001", "2026-08-31T07:00:00+00:00",
++            template_id="general_nonfinancial", registry_manifest_hash=self.manifest.manifest_hash,
++            required_feature_keys=("general_nonfinancial.growth",))
++
++    def test_still_unpersisted_inputs_need_distinct_authenticated_markers(self):
++        self.correction()
++        self.assertIsNone(self.project())
++        first = self.state()
++        first.require_verified()
++        self.assertEqual(first.status, "current_receipt_absent")
++        self.assertEqual(first.canonical_bytes(), self.state().canonical_bytes())
++        self.add_fact(value=300.0, generation="later-absent",
++            source_overrides={"source_updated_at_utc": "2026-05-01T00:00:00+00:00"})
++        self.assertIsNone(self.project())  # Bare None equality misses the correction.
++        second = self.state()
++        self.assertNotEqual(first.absence_hash, second.absence_hash)
++        self.assertNotEqual(first.fact_snapshot_hash, second.fact_snapshot_hash)
++
++    def test_absence_binds_issues_and_logical_provider_identity(self):
++        self.correction()
++        first = self.state()
++        issue = FormalFactIssue("unknown_source_field", None, "OTHER", {})
++        self.assertNotEqual(first.absence_hash, self.state(snapshot=self.snapshot(issues=(issue,))).absence_hash)
++        self.assertNotEqual(first.absence_hash, self.state(snapshot=self.snapshot(batch_id="next-batch")).absence_hash)
++
++    def test_absent_receipt_becomes_present_without_changing_projection_bytes(self):
++        self.correction()
++        self.assertEqual(self.state().status, "current_receipt_absent")
++        self.persist()
++        self.assertEqual(self.state().canonical_bytes(), self.project().canonical_bytes())
++
++    def test_absence_proof_cannot_be_constructed_copied_or_mutated(self):
++        self.correction()
++        proof = self.state()
++        with self.assertRaises(TypeError):
++            type(proof)()
++        for copier in (copy.copy, copy.deepcopy):
++            with self.assertRaises((TypeError, ValueError)):
++                copier(proof)
++        with self.assertRaises((AttributeError, TypeError, ValueError)):
++            object.__setattr__(proof, "input_hash", "f" * 64)
++        with self.assertRaises(ValueError):
++            object.__new__(type(proof)).require_verified()
++
++    def test_absence_does_not_hide_invalid_provider_or_raw_source(self):
++        self.correction()
++        with self.assertRaises(ValueError):
++            self.state(snapshot=self.snapshot(complete=False))
++        captured = self.snapshot()
++        path = Path(self.store.get_formal_snapshot(self.fact.source_snapshot_id).content_path)
++        path.write_bytes(b"invalid absence source")
++        with self.assertRaises(ValueError):
++            self.state(snapshot=captured)
++
++    def test_absence_rejects_invalid_child_signature(self):
++        self.correction()
++        captured = self.snapshot()
++        self.sql("UPDATE formal_registry_blob SET signature='invalid' WHERE registry_role='feature'")
++        with self.assertRaises(ValueError):
++            self.state(snapshot=captured)
++
+     def test_proof_constructor_copy_and_low_level_mutation_reject(self):
+         original = self.project()
+         with self.assertRaises(TypeError):
+             type(original)()
+         fake = object.__new__(type(original))
+         with self.assertRaises(ValueError):
+             fake.to_dict()
+         for copier in (copy.copy, copy.deepcopy):
+             try:
+                 clone = copier(original)

@@ -1,0 +1,546 @@
+# Review package: c91dac09292de22c31e525f6a67ffd245101f4f3..1a10a41aff3116b49ee2cba972f4e461050fc195
+
+## Commits
+1a10a41 feat: compose policy-adjusted final score inputs
+
+## Files changed
+ ashare_pipeline/formal_final_score_inputs.py | 365 +++++++++++++++++++++++++++
+ tests/test_formal_final_score_inputs.py      | 158 ++++++++++++
+ 2 files changed, 523 insertions(+)
+
+## Diff
+diff --git a/ashare_pipeline/formal_final_score_inputs.py b/ashare_pipeline/formal_final_score_inputs.py
+new file mode 100644
+index 0000000..337d50f
+--- /dev/null
++++ b/ashare_pipeline/formal_final_score_inputs.py
+@@ -0,0 +1,365 @@
++"""Complete frozen-universe inputs with Stage C valuation score provenance.
++
++Only this repository can publish D1 proofs. Business gaps remain authenticated
++entries; identity mismatches abort the whole publication.
++"""
++
++import hashlib
++import json
++import weakref
++from types import MappingProxyType
++
++from .formal_metric_batch_guard import _metric_batch_guard
++from .formal_metric_engine import _canonical, _digest, _freeze
++from .formal_policy_registry import FormalPolicyRegistry
++from .formal_policy_repository import FormalPolicyRepository, VerifiedPolicyResultBatch, PolicyResult
++from .formal_registry_manifest import FormalRegistryBundleLoader
++from .formal_score_inputs import FormalScoreInputRepository, FormalScoreInputBatch, FormalScoreInput
++from .formal_scoring_registry import FormalScoringRegistry
++from .formal_valuation_adapter_contract import FormalValuationAdapterRegistry
++from .formal_valuation_engine import (
++    FormalValuationRepository, PolicyAdjustedValuationBatch,
++    PolicyAdjustedValuationScore, PolicyAdjustedValuationPeerContext,
++    build_valuation_peer_context, score_valuation_percentile,
++)
++
++
++def _install_final_inputs():
++    repositories, proofs = {}, {}
++    encode, digest, freeze = _canonical, _digest, _freeze
++    decode, sha256, reference = json.loads, hashlib.sha256, weakref.ref
++    guard_factory, load_root = _metric_batch_guard, FormalRegistryBundleLoader.load
++    base_build = FormalScoreInputRepository.build_batch
++    policy_build = FormalPolicyRepository.build_batch
++    valuation_build = FormalValuationRepository.build_batch
++    peer_context, percentile = build_valuation_peer_context, score_valuation_percentile
++    v_metrics = ("V.enterprise_value_or_sustainable_roe", "V.normalized_earnings_yield",
++                 "V.normalized_free_cash_flow_yield")
++    source_types = (FormalScoreInputBatch, VerifiedPolicyResultBatch, PolicyAdjustedValuationBatch)
++    owner = globals()
++    captured = tuple((name, value) for name, value in owner.items()
++        if callable(value) and name != "_install_final_inputs")
++    classes = {base for cls in (*source_types, FormalScoreInput, PolicyResult,
++        PolicyAdjustedValuationScore, PolicyAdjustedValuationPeerContext,
++        FormalScoreInputRepository, FormalPolicyRepository, FormalValuationRepository,
++        FormalScoringRegistry, FormalPolicyRegistry, FormalValuationAdapterRegistry,
++        FormalRegistryBundleLoader) for base in cls.__mro__ if base is not object}
++    checked = tuple((cls, name, value) for cls in classes for name, value in vars(cls).items()
++        if callable(value) or isinstance(value, (staticmethod, classmethod)))
++
++    def interfaces():
++        if (any(owner.get(name) is not value for name, value in captured)
++                or any(vars(cls).get(name) is not value for cls, name, value in checked)
++                or any(tuple(vars(cls).items()) != members for cls, members in own_members)):
++            raise ValueError("final score authority dependency changed")
++
++    def dependencies(repository):
++        interfaces()
++        saved = repositories.get(id(repository))
++        if (type(repository) is not FormalFinalScoreInputRepository or saved is None
++                or saved[0]() is not repository):
++            raise ValueError("final score repository is forged or copied")
++        feature, context, ranges, verifier, base, policy, valuation, identity = saved[1:]
++        current = (id(feature._store), id(feature._bundle_store),
++            id(feature._current_input_provider), id(context._snapshots))
++        if (current != identity or feature._store is not context._state_store
++                or feature._verifier is not verifier or context._verifier is not verifier):
++            raise ValueError("final score repository graph changed")
++        return feature, context, ranges, verifier, base, policy, valuation
++
++    def record(proof, cls):
++        interfaces()
++        saved = proofs.get(id(proof))
++        if (type(proof) is not cls or saved is None or saved[0]() is not proof
++                or not saved[4][0] or saved[6] is not cls):
++            raise ValueError("final score proof is forged, copied, unpublished or revoked")
++        return saved
++
++    class SealedMeta(type):
++        def __setattr__(cls, name, value):
++            raise TypeError("final score authority types are immutable")
++
++        def __delattr__(cls, name):
++            raise TypeError("final score authority types are immutable")
++
++    class Proof(metaclass=SealedMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("final score proofs require an authenticated complete batch")
++
++        def __getattr__(self, name):
++            data = record(self, type(self))[1]
++            if name not in data:
++                raise AttributeError(name)
++            return data[name]
++
++        def require_verified(self):
++            record(self, type(self))
++
++        def canonical_bytes(self):
++            return record(self, type(self))[2]
++
++        def to_dict(self):
++            return decode(record(self, type(self))[2])
++
++        def __copy__(self):
++            raise TypeError("final score proofs cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("final score proofs cannot be copied")
++
++        def __reduce_ex__(self, protocol):
++            raise TypeError("final score proofs cannot be reconstructed")
++
++    class PolicyAdjustedScoreInput(Proof):
++        __slots__ = ()
++
++    class PolicyAdjustedScoreInputBatch(Proof):
++        __slots__ = ()
++
++        def input_for(self, security_id):
++            saved = record(self, PolicyAdjustedScoreInputBatch)
++            if type(security_id) is not str or security_id not in saved[3]:
++                raise ValueError("final score selector is outside the canonical universe")
++            return saved[3][security_id]
++
++    def mint(cls, payload, publication, retention, *, attributes=None, index=None):
++        result = object.__new__(cls)
++        key = id(result)
++        data = dict(payload)
++        data.update(attributes or {})
++        proofs[key] = (reference(result, lambda _: proofs.pop(key, None)), freeze(data),
++            encode(payload), index, publication, retention, cls)
++        return result
++
++    def verify_sources(sources):
++        for source, cls in zip(sources, source_types, strict=True):
++            if type(source) is not cls:
++                raise ValueError("final score requires three genuine source batches")
++            source.require_verified()
++        return tuple(source.canonical_bytes() for source in sources)
++
++    def registry_snapshot(feature, verifier, root, scoring, policy, adapter):
++        bundle = load_root(FormalRegistryBundleLoader(feature._store, verifier), root)
++        if bundle.manifest.schema_version != "formal-registry-manifest-v2":
++            raise ValueError("final score requires an authenticated v2 root")
++        scoring.require_official(bundle)
++        policy.require_verified()
++        adapter.require_current_bundle(bundle)
++        if (policy.registry_manifest_hash != root or any(
++                policy.role_hashes[role] != sha256(bundle.blob(role).canonical_json).hexdigest()
++                for role in policy.role_hashes)):
++            raise ValueError("final score registries have incompatible roots")
++        return bundle, (bundle.manifest.canonical_json,
++            tuple((role, bundle.blob(role).canonical_json) for role in bundle.roles),
++            policy.canonical_bytes(), encode(adapter.to_dict()))
++
++    def close_identity(frozen, frozen_hash, sources, bundle, policy_registry):
++        base, policy, valuation = sources
++        ids = tuple(sorted(member.security_id for member in frozen.members))
++        if len(ids) != len(set(ids)):
++            raise ValueError("final score frozen membership is duplicated")
++        for source in sources:
++            if (source.registry_manifest_hash != frozen.registry_manifest_hash
++                    or source.frozen_input_hash != frozen_hash
++                    or source.universe_hash != frozen.universe_hash
++                    or source.as_of_utc != "2026-08-31T07:00:00+00:00"
++                    or tuple(source.security_ids) != ids):
++                raise ValueError("final score source batch identity or membership mismatch")
++        if (base.population_hash != valuation.population_hash
++                or policy.policy_contract_hash != policy_registry.contract_hash
++                or valuation.policy_contract_hash != policy.policy_contract_hash
++                or valuation.policy_batch_hash != policy.batch_hash
++                or valuation.policy_batch_canonical_sha256 != sha256(policy.canonical_bytes()).hexdigest()
++                or valuation.scoring_registry_hash != bundle.manifest.scoring_registry_hash
++                or valuation.valuation_adapter_registry_hash != bundle.manifest.valuation_adapter_registry_hash
++                or base.metric_batch["industry_batch_hash"] != valuation.industry_batch_hash
++                or policy.evidence_batch.industry["batch_hash"] != valuation.industry_batch_hash
++                or tuple(row.security_id for row in policy.results) != ids
++                or tuple(valuation.metric_ids) != v_metrics
++                or tuple((row.security_id, row.metric_id) for row in valuation.inputs)
++                    != tuple((sid, mid) for sid in ids for mid in v_metrics)):
++            raise ValueError("final score source policy, industry or valuation closure mismatch")
++        ready_ids = tuple(row.security_id for row in base.inputs)
++        if (len(ready_ids) != len(set(ready_ids)) or ready_ids != tuple(sorted(ready_ids))
++                or set(ready_ids) & set(base.pending_reasons)
++                or set(ready_ids) | set(base.pending_reasons) != set(ids)):
++            raise ValueError("final score base batch membership is incomplete")
++        return ids
++
++    class FormalFinalScoreInputRepository(metaclass=SealedMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, feature_repository, context_repository, range_store,
++                     *, registry_signature_verifier):
++            if type(self) is not FormalFinalScoreInputRepository or id(self) in repositories:
++                raise ValueError("final score repository initialization is exact and single-use")
++            interfaces()
++            verifier = registry_signature_verifier
++            base = FormalScoreInputRepository(feature_repository, context_repository,
++                registry_signature_verifier=verifier)
++            policy = FormalPolicyRepository(feature_repository, context_repository, range_store,
++                registry_signature_verifier=verifier)
++            valuation = FormalValuationRepository(feature_repository, context_repository, range_store,
++                registry_signature_verifier=verifier)
++            key = id(self)
++            repositories[key] = (reference(self, lambda _: repositories.pop(key, None)),
++                feature_repository, context_repository, range_store, verifier, base, policy, valuation,
++                (id(feature_repository._store), id(feature_repository._bundle_store),
++                 id(feature_repository._current_input_provider), id(context_repository._snapshots)))
++            dependencies(self)
++
++        def build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry,
++                        valuation_adapter_registry):
++            feature, _, _, verifier, base_repo, policy_repo, valuation_repo = dependencies(self)
++            if (type(frozen_input_hash) is not str or type(scoring_registry) is not FormalScoringRegistry
++                    or type(policy_registry) is not FormalPolicyRegistry
++                    or type(valuation_adapter_registry) is not FormalValuationAdapterRegistry):
++                raise ValueError("final score publication requires exact authenticated inputs")
++            publication = [False]
++            try:
++                with guard_factory(feature._current_input_provider, feature._store) as guard:
++                    frozen = feature._store.get_verified_formal_frozen_universe(frozen_input_hash)
++                    if frozen is None:
++                        raise ValueError("final score frozen input is absent")
++                    sources = (
++                        base_build(base_repo, frozen_input_hash, scoring_registry=scoring_registry),
++                        policy_build(policy_repo, frozen_input_hash, scoring_registry=scoring_registry,
++                            policy_registry=policy_registry),
++                        valuation_build(valuation_repo, frozen_input_hash, scoring_registry=scoring_registry,
++                            policy_registry=policy_registry, valuation_adapter_registry=valuation_adapter_registry),
++                    )
++                    source_bytes = verify_sources(sources)
++                    base, policy, valuation = sources
++                    bundle, registry_bytes = registry_snapshot(feature, verifier, frozen.registry_manifest_hash,
++                        scoring_registry, policy_registry, valuation_adapter_registry)
++                    ids = close_identity(frozen, frozen_input_hash, sources, bundle, policy_registry)
++                    common = dict(registry_manifest_hash=frozen.registry_manifest_hash,
++                        frozen_input_hash=frozen_input_hash, universe_hash=frozen.universe_hash,
++                        population_hash=base.population_hash, as_of_utc=base.as_of_utc,
++                        scoring_registry_hash=bundle.manifest.scoring_registry_hash,
++                        policy_contract_hash=policy.policy_contract_hash,
++                        valuation_adapter_registry_hash=valuation.valuation_adapter_registry_hash)
++                    for prefix, source, raw in zip(("base", "policy", "valuation"), sources, source_bytes, strict=True):
++                        common[prefix + "_batch_hash"] = source.batch_hash
++                        common[prefix + "_batch_canonical_sha256"] = sha256(raw).hexdigest()
++                    rows, derived = [], []
++                    for sid, policy_result in zip(ids, policy.results, strict=True):
++                        policy_result.require_verified()
++                        original = base.input_for(sid)
++                        base_reasons = tuple(base.pending_reasons.get(sid, ()))
++                        reasons = {"base:" + reason for reason in base_reasons}
++                        policy_pending = policy_result.to_dict()["pending_requirements"]
++                        if policy_result.evidence_state == "pending_evidence" or policy_pending:
++                            reasons.add("policy:pending_evidence")
++                        valuation_reasons, adjusted_slots = {}, {}
++                        if original is not None:
++                            if type(original) is not FormalScoreInput or original.security_id != sid:
++                                raise ValueError("final score base entry identity mismatch")
++                            original.require_verified()
++                        for mid in v_metrics:
++                            adjusted = valuation.input_for(sid, mid)
++                            context = peer_context(valuation, metric_id=mid, security_id=sid)
++                            context.require_verified()
++                            if adjusted.adjustment["policy_result_hash"] != policy_result.result_hash:
++                                raise ValueError("final score valuation policy result mismatch")
++                            score = percentile(valuation, context)
++                            derived.append(context)
++                            if score is None:
++                                if context.reason is None:
++                                    raise ValueError("final score valuation score absent without a reason")
++                                valuation_reasons[mid] = context.reason
++                                reasons.add("valuation:" + mid + ":" + context.reason)
++                                continue
++                            if type(score) is not PolicyAdjustedValuationScore:
++                                raise ValueError("final score requires genuine Stage C scores")
++                            score.require_verified()
++                            if (score.security_id != sid or score.metric_id != mid
++                                    or score.batch_hash != valuation.batch_hash
++                                    or score.adjusted_input_hash != adjusted.input_hash
++                                    or score.peer_context is not context):
++                                raise ValueError("final score Stage C score identity mismatch")
++                            derived.append(score)
++                            if original is not None:
++                                slot = dict(original.slots[mid])
++                                slot.update(value=score.percentile, evidence_kind="policy_adjusted_valuation",
++                                    metric_score=None, valuation_score=score.to_dict(),
++                                    valuation_context=context.to_dict(), valuation_input=adjusted.to_dict(),
++                                    valuation_score_hash=score.score_hash,
++                                    valuation_context_hash=context.context_hash)
++                                adjusted_slots[mid] = slot
++                        slots = {} if original is None else dict(original.slots)
++                        # A pending row must never expose an unadjusted V score as final.
++                        for mid in v_metrics:
++                            slots.pop(mid, None)
++                        slots.update(adjusted_slots)
++                        if not reasons and (original is None or len(slots) != 25
++                                or len(set(slots) - set(v_metrics)) != 22 or len(adjusted_slots) != 3):
++                            raise ValueError("ready final score requires 22 base and three Stage C slots")
++                        payload = {} if original is None else original.to_dict()
++                        payload.pop("batch_hash", None)
++                        payload.pop("input_hash", None)
++                        payload.update(common, schema_version="policy-adjusted-score-input-v1",
++                            security_id=sid, status="pending_evidence" if reasons else "ready",
++                            reasons=tuple(sorted(reasons)), slots=slots,
++                            base_input_hash=None if original is None else original.input_hash,
++                            base_pending_reasons=base_reasons, policy_result=policy_result.to_dict(),
++                            policy_result_hash=policy_result.result_hash,
++                            policy_pending_requirements=policy_pending,
++                            valuation_pending_reasons=valuation_reasons)
++                        payload["entry_hash"] = digest(payload)
++                        rows.append(payload)
++                    payload = dict(common, schema_version="policy-adjusted-score-input-batch-v1",
++                        security_ids=ids, inputs=rows)
++                    payload["batch_hash"] = digest(payload)
++                    # Keep genuine source chains alive, including Stage C's repository owner.
++                    retention = (self, sources, tuple(derived))
++                    children = tuple(mint(PolicyAdjustedScoreInput,
++                        dict(row, batch_hash=payload["batch_hash"]), publication, retention) for row in rows)
++                    index = MappingProxyType(dict(zip(ids, children, strict=True)))
++                    prepared = mint(PolicyAdjustedScoreInputBatch, payload, publication, retention,
++                        attributes={"inputs": children}, index=index)
++
++                    def publish():
++                        dependencies(self)
++                        if verify_sources(sources) != source_bytes:
++                            raise ValueError("final score source canonical bytes changed")
++                        _, current_registry_bytes = registry_snapshot(feature, verifier,
++                            frozen.registry_manifest_hash, scoring_registry, policy_registry,
++                            valuation_adapter_registry)
++                        if current_registry_bytes != registry_bytes:
++                            raise ValueError("final score registry bytes changed")
++                        close_identity(frozen, frozen_input_hash, sources, bundle, policy_registry)
++                        for item in derived:
++                            item.require_verified()
++                        if (proofs[id(prepared)][2] != encode(payload)
++                                or any(proofs[id(child)][2] != encode(dict(row,
++                                    batch_hash=payload["batch_hash"]))
++                                    for child, row in zip(children, rows, strict=True))):
++                            raise ValueError("final score prepared canonical bytes changed")
++                        publication[0] = True
++                        return prepared
++
++                    result = guard.finalize(publish)
++                dependencies(self)
++                return result
++            except BaseException:
++                publication[0] = False
++                raise
++
++        def __copy__(self):
++            raise TypeError("final score repositories cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("final score repositories cannot be copied")
++
++    own_members = tuple((cls, tuple(vars(cls).items())) for cls in
++        (Proof, PolicyAdjustedScoreInput, PolicyAdjustedScoreInputBatch, FormalFinalScoreInputRepository))
++    return FormalFinalScoreInputRepository, PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput
++
++
++FormalFinalScoreInputRepository, PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput = _install_final_inputs()
++del _install_final_inputs
++
++__all__ = ["FormalFinalScoreInputRepository", "PolicyAdjustedScoreInputBatch", "PolicyAdjustedScoreInput"]
+diff --git a/tests/test_formal_final_score_inputs.py b/tests/test_formal_final_score_inputs.py
+new file mode 100644
+index 0000000..a357862
+--- /dev/null
++++ b/tests/test_formal_final_score_inputs.py
+@@ -0,0 +1,158 @@
++"""D1 composition over genuine, signed repository outputs."""
++
++from decimal import Decimal
++import hashlib
++import unittest
++
++from ashare_pipeline.formal_final_score_inputs import (
++    FormalFinalScoreInputRepository, PolicyAdjustedScoreInput,
++)
++from ashare_pipeline.formal_valuation_engine import (
++    build_valuation_peer_context, score_valuation_percentile,
++)
++from tests.formal_final_scoring_fixtures import FinalScoringFixture, FOCAL
++
++
++V_METRICS = (
++    "V.enterprise_value_or_sustainable_roe", "V.normalized_earnings_yield",
++    "V.normalized_free_cash_flow_yield",
++)
++
++
++def build(fixture):
++    repository = FormalFinalScoreInputRepository(fixture.feature_repository,
++        fixture.context, fixture.range_store, registry_signature_verifier=fixture.verifier)
++    return repository.build_batch(fixture.frozen.frozen_input_hash,
++        scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry,
++        valuation_adapter_registry=fixture.valuation_registry)
++
++
++class FinalScoreInputContractTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture = FinalScoringFixture()
++        cls.addClassCleanup(cls.fixture.close)
++        cls.fixture.populate_final_inputs()
++        cls.sources = cls.fixture.build_d1_sources()
++        cls.batch = build(cls.fixture)
++
++    def test_batch_enumerates_every_frozen_member_in_canonical_order(self):
++        expected = ("BJ430001", "SH600000", "SZ000001")
++        self.assertEqual(self.batch.security_ids, expected)
++        self.assertEqual(tuple(row.security_id for row in self.batch.inputs), expected)
++        for sid in expected:
++            self.assertIsInstance(self.batch.input_for(sid), PolicyAdjustedScoreInput)
++            self.assertEqual(self.batch.input_for(sid).security_id, sid)
++        with self.assertRaises(ValueError):
++            self.batch.input_for("SH999999")
++
++    def test_member_business_gaps_become_explicit_pending_entries_not_none(self):
++        policy = {row.security_id: row for row in self.sources.policy.results}
++        for sid in self.batch.security_ids:
++            row = self.batch.input_for(sid)
++            self.assertIsInstance(row, PolicyAdjustedScoreInput)
++            row.require_verified()
++            self.assertEqual(row.status, "pending_evidence")
++            self.assertEqual(len(row.entry_hash), 64)
++            self.assertTrue(row.reasons)
++            self.assertEqual(row.base_pending_reasons, self.sources.base.pending_reasons[sid])
++            self.assertEqual(row.policy_result_hash, policy[sid].result_hash)
++            self.assertEqual(row.to_dict()["policy_pending_requirements"],
++                policy[sid].to_dict()["pending_requirements"])
++        self.assertTrue(self.batch.input_for("SH600000").policy_pending_requirements)
++        self.assertTrue(self.batch.input_for(FOCAL).valuation_pending_reasons)
++
++    def test_batch_binds_root_frozen_universe_policy_and_valuation_hashes(self):
++        batch, sources = self.batch, self.sources
++        self.assertEqual(batch.registry_manifest_hash, self.fixture.bundle.manifest.manifest_hash)
++        self.assertEqual(batch.frozen_input_hash, self.fixture.frozen.frozen_input_hash)
++        self.assertEqual(batch.universe_hash, sources.base.universe_hash)
++        for prefix, source in zip(("base", "policy", "valuation"), sources):
++            self.assertEqual(getattr(batch, prefix + "_batch_hash"), source.batch_hash)
++            self.assertEqual(getattr(batch, prefix + "_batch_canonical_sha256"),
++                hashlib.sha256(source.canonical_bytes()).hexdigest())
++        self.assertEqual(batch.policy_contract_hash, sources.policy.policy_contract_hash)
++        self.assertEqual(batch.valuation_adapter_registry_hash,
++            sources.valuation.valuation_adapter_registry_hash)
++        for row in batch.inputs:
++            self.assertEqual(row.batch_hash, batch.batch_hash)
++            self.assertEqual(row.registry_manifest_hash, batch.registry_manifest_hash)
++            self.assertEqual(row.frozen_input_hash, batch.frozen_input_hash)
++            self.assertEqual(row.universe_hash, batch.universe_hash)
++
++    def test_identical_inputs_replay_to_identical_canonical_bytes_and_hash(self):
++        replay = build(self.fixture)
++        self.assertEqual(replay.canonical_bytes(), self.batch.canonical_bytes())
++        self.assertEqual(replay.batch_hash, self.batch.batch_hash)
++        for sid in replay.security_ids:
++            self.assertEqual(replay.input_for(sid).canonical_bytes(),
++                self.batch.input_for(sid).canonical_bytes())
++            self.assertEqual(replay.input_for(sid).entry_hash, self.batch.input_for(sid).entry_hash)
++
++
++class FinalScoreInputReadyTests(unittest.TestCase):
++    def test_ready_input_contains_22_base_slots_and_exactly_three_stage_c_scores(self):
++        fixture = FinalScoringFixture(peer_count=20)
++        self.addCleanup(fixture.close)
++        fixture.populate_final_inputs()
++        sources = fixture.build_d1_sources()
++        batch = build(fixture)
++        self.assertEqual(batch.security_ids, tuple(sorted(fixture.templates)))
++        self.assertEqual(len(batch.security_ids), 20)
++        for sid in batch.security_ids:
++            if sid != FOCAL:
++                peer = batch.input_for(sid)
++                self.assertEqual(peer.status, "pending_evidence")
++                self.assertTrue(peer.policy_pending_requirements)
++        for value in sources.valuation.inputs:
++            if value.security_id != FOCAL:
++                self.assertEqual(value.status, "passthrough_not_applicable")
++        row = batch.input_for(FOCAL)
++        self.assertEqual(row.status, "ready")
++        self.assertEqual(row.reasons, ())
++        self.assertEqual(len(row.slots), 25)
++        base = sources.base.input_for(FOCAL)
++        non_v = set(row.slots) - set(V_METRICS)
++        self.assertEqual(len(non_v), 22)
++        for mid in non_v:
++            self.assertEqual(row.slots[mid], base.slots[mid])
++        for mid in V_METRICS:
++            context = build_valuation_peer_context(sources.valuation, metric_id=mid, security_id=FOCAL)
++            score = score_valuation_percentile(sources.valuation, context)
++            self.assertIsNotNone(score)
++            self.assertEqual(score.peer_count, 20)
++            slot = row.slots[mid]
++            self.assertEqual(slot["evidence_kind"], "policy_adjusted_valuation")
++            self.assertEqual(slot["value"], score.percentile)
++            self.assertEqual(row.to_dict()["slots"][mid]["valuation_score"], score.to_dict())
++            self.assertEqual(row.to_dict()["slots"][mid]["valuation_context"], context.to_dict())
++            self.assertEqual(slot["valuation_score_hash"], score.score_hash)
++            self.assertEqual(slot["valuation_context_hash"], context.context_hash)
++            self.assertIsNone(slot["metric_score"])
++        earnings = row.slots["V.normalized_earnings_yield"]
++        # 0.20 * median(4, 5, 6, 7, 8) / 10 = 0.12, still above
++        # the nineteen peers (0.101 through 0.119): rank 20 => 97.5.
++        self.assertEqual(Decimal(earnings["valuation_score"]["adjusted_value"]), Decimal("0.12"))
++        self.assertEqual(earnings["value"], Decimal("97.5"))
++
++
++class FinalScoreInputTypeSealTests(unittest.TestCase):
++    def test_minted_entry_relabelled_as_batch_is_rejected(self):
++        fixture = FinalScoringFixture()
++        self.addCleanup(fixture.close)
++        fixture.populate_final_inputs()
++        batch = build(fixture)
++        proof = batch.input_for(FOCAL)
++        proof.require_verified()
++        minted_type = type(proof)
++        object.__setattr__(proof, "__class__", type(batch))
++        try:
++            with self.assertRaises(ValueError):
++                proof.require_verified()
++        finally:
++            object.__setattr__(proof, "__class__", minted_type)
++        proof.require_verified()
++
++
++if __name__ == "__main__":
++    unittest.main()

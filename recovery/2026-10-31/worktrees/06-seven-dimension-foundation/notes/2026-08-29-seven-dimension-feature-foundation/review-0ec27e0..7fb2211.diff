@@ -1,0 +1,275 @@
+# Review package: 0ec27e0544112e5a1eaa8ae8fe12b655ea326d8b..7fb2211365d43af62445e083817174965dbd6af7
+
+## Commits
+7fb2211 feat: expose isolated financial statement fetches
+
+## Files changed
+ ashare_pipeline/sources.py | 65 ++++++++++++++++++++++++++++++----------
+ tests/test_pilot.py        |  1 +
+ tests/test_sources.py      | 74 ++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 125 insertions(+), 15 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/sources.py b/ashare_pipeline/sources.py
+index e026aa8..33e302b 100644
+--- a/ashare_pipeline/sources.py
++++ b/ashare_pipeline/sources.py
+@@ -3,21 +3,21 @@
+ from __future__ import annotations
+ 
+ import hashlib
+ import importlib
+ import json
+ import math
+ import re
+ import time
+ from dataclasses import dataclass
+ from datetime import date, datetime, timezone
+-from typing import Any, Callable
++from typing import Any, Callable, Protocol
+ 
+ 
+ class SourceError(RuntimeError):
+     """A source could not provide a valid batch."""
+ 
+ 
+ class RetryableSourceError(SourceError):
+     """A temporary source problem; callers may schedule a retry."""
+ 
+ 
+@@ -80,20 +80,30 @@ class FetchBatch:
+             "request": self.request,
+             "records": self.records,
+             "source_version": self.source_version,
+             "metadata": self.metadata,
+         })
+ 
+     def sha256(self) -> str:
+         return hashlib.sha256(self.canonical_bytes()).hexdigest()
+ 
+ 
++class FinancialStatementSource(Protocol):
++    def fetch_financial_statement(
++        self,
++        symbol: str,
++        dataset: str,
++        report_period: str = "2026-06-30",
++    ) -> FetchBatch:
++        raise NotImplementedError
++
++
+ _HTTP_STATUS = re.compile(r"(?<!\d)(?:http\s*)?(?:403|429)(?!\d)", re.IGNORECASE)
+ _HTTP_CHALLENGE = re.compile(r"(?:http\s*403|429\s+(?:too\s+many\s+)?requests?)", re.IGNORECASE)
+ 
+ 
+ def _is_access_error(value: object) -> bool:
+     """Only inspect error contexts, where a bare HTTP status is meaningful."""
+     text = str(value)
+     lowered = text.lower()
+     return bool(_HTTP_STATUS.search(text)) or any(marker in lowered for marker in ("验证码", "captcha", "<html", "<!doctype"))
+ 
+@@ -238,35 +248,60 @@ class AKShareSource:
+         }
+         available = set(batch.records[0]) if batch.records else set()
+         missing = [source for source in source_mapping.values() if source not in available]
+         if missing:
+             raise TerminalSourceError(f"performance report missing required columns: {', '.join(missing)}")
+         records = [{stable: record[source] for stable, source in source_mapping.items()} for record in batch.records]
+         metadata = dict(batch.metadata)
+         metadata["source_column_mapping"] = source_mapping
+         return FetchBatch(batch.source, batch.dataset, batch.request, records, batch.fetched_at_utc, batch.source_version, metadata)
+ 
+-    def fetch_financial_statements(self, symbol: str, report_period: str = "2026-06-30") -> dict[str, FetchBatch]:
+-        specifications = {
++    def fetch_financial_statement(
++        self,
++        symbol: str,
++        dataset: str,
++        report_period: str = "2026-06-30",
++    ) -> FetchBatch:
++        methods = {
+             "balance_sheet": "stock_balance_sheet_by_report_em",
+             "profit_sheet": "stock_profit_sheet_by_report_em",
+             "cash_flow_sheet": "stock_cash_flow_sheet_by_report_em",
+         }
+-        batches: dict[str, FetchBatch] = {}
+-        for dataset, method_name in specifications.items():
+-            request = {"symbol": symbol, "report_period": report_period}
+-            def collect(module: Any, name: str = method_name) -> Any:
+-                return getattr(module, name)(symbol=symbol)
+-            batch = self._batch(dataset, request, collect)
+-            matches = sum(str(row.get("REPORT_DATE", ""))[:10] == report_period for row in batch.records)
+-            metadata = {"report_period_match_count": matches, "column_count": len(batch.records[0]) if batch.records else 0,
+-                        "NOTICE_DATE": [row.get("NOTICE_DATE") for row in batch.records if row.get("NOTICE_DATE") is not None],
+-                        "UPDATE_DATE": [row.get("UPDATE_DATE") for row in batch.records if row.get("UPDATE_DATE") is not None]}
+-            batches[dataset] = FetchBatch(batch.source, batch.dataset, batch.request, batch.records, batch.fetched_at_utc, batch.source_version, metadata)
+-        return batches
++        if dataset not in methods:
++            raise ValueError(f"unsupported financial dataset: {dataset}")
++        request = {"symbol": symbol, "report_period": report_period}
++        method_name = methods[dataset]
++        batch = self._batch(
++            dataset,
++            request,
++            lambda module: getattr(module, method_name)(symbol=symbol),
++            require_rows=True,
++        )
++        matches = sum(str(row.get("REPORT_DATE", ""))[:10] == report_period for row in batch.records)
++        metadata = {
++            "report_period_match_count": matches,
++            "column_count": len(batch.records[0]) if batch.records else 0,
++            "NOTICE_DATE": [row.get("NOTICE_DATE") for row in batch.records if row.get("NOTICE_DATE") is not None],
++            "UPDATE_DATE": [row.get("UPDATE_DATE") for row in batch.records if row.get("UPDATE_DATE") is not None],
++        }
++        return FetchBatch(
++            batch.source,
++            batch.dataset,
++            batch.request,
++            batch.records,
++            batch.fetched_at_utc,
++            batch.source_version,
++            metadata,
++        )
++
++    def fetch_financial_statements(self, symbol: str, report_period: str = "2026-06-30") -> dict[str, FetchBatch]:
++        return {
++            dataset: self.fetch_financial_statement(symbol, dataset, report_period)
++            for dataset in ("balance_sheet", "profit_sheet", "cash_flow_sheet")
++        }
+ 
+     def fetch_cninfo_halfyear_disclosures(self, symbol: str, start_date: str = "20260701", end_date: str = "20260831") -> FetchBatch:
+         request = {"symbol": symbol, "market": "沪深京", "category": "半年报", "start_date": start_date, "end_date": end_date}
+         return self._batch("cninfo_halfyear_disclosures", request, lambda module: module.stock_zh_a_disclosure_report_cninfo(**request))
+ 
+     def fetch_spot_snapshot(self) -> FetchBatch:
+         return self._batch("spot_snapshot", {}, lambda module: module.stock_zh_a_spot_em(), require_rows=True)
+diff --git a/tests/test_pilot.py b/tests/test_pilot.py
+index 3f5b55b..2c0e457 100644
+--- a/tests/test_pilot.py
++++ b/tests/test_pilot.py
+@@ -245,20 +245,21 @@ class PilotTestCase(unittest.TestCase):
+         with tempfile.TemporaryDirectory() as directory:
+             root, db = Path(directory) / "data", Path(directory) / "state.sqlite3"
+             calls = {"daily": 0, "financial": 0}
+             class Bao:
+                 def fetch_security_master(self): return FetchBatch("fake", "security_master", {}, [], "2026-08-28T00:00:00+00:00", "v", {})
+                 def fetch_trade_dates(self, *_): raise RetryableSourceError("calendar temporary")
+                 def fetch_daily(self, *_): calls["daily"] += 1
+             class AK:
+                 def fetch_disclosure_schedule(self): return FetchBatch("fake", "disclosure_schedule", {}, [], "2026-08-28T00:00:00+00:00", "v", {})
+                 def fetch_performance_report(self): return FetchBatch("fake", "performance_report", {}, [], "2026-08-28T00:00:00+00:00", "v", {})
++                def fetch_financial_statement(self, *_): raise AssertionError("pilot must keep using the compatibility wrapper")
+                 def fetch_financial_statements(self, _): calls["financial"] += 1; return {}
+                 def fetch_spot_snapshot(self): return FetchBatch("fake", "spot_snapshot", {}, [], "2026-08-28T00:00:00+00:00", "v", {})
+             store = StateStore(db); store.initialize()
+             with patch("ashare_pipeline.sources.BaoStockSource", Bao), patch("ashare_pipeline.sources.AKShareSource", AK):
+                 pilot._run_online(root, store, ["SH600000"], now=datetime(2026, 8, 28, 16, tzinfo=pilot.SHANGHAI))
+             self.assertEqual(calls["daily"], 0)
+             self.assertEqual(calls["financial"], 1)
+ 
+     def test_pilot_kind_running_lease_is_reported_then_recovered_and_completed(self):
+         with tempfile.TemporaryDirectory() as directory:
+diff --git a/tests/test_sources.py b/tests/test_sources.py
+index d8780b0..09d2ab4 100644
+--- a/tests/test_sources.py
++++ b/tests/test_sources.py
+@@ -149,25 +149,99 @@ class SourcesTestCase(unittest.TestCase):
+         self.assertEqual(batch.records[0]["code"], "sh.600000")
+         self.assertEqual(module.daily_kwargs["frequency"], "d")
+         self.assertEqual(module.daily_kwargs["adjustflag"], "3")
+         self.assertEqual(module.daily_kwargs["fields"], ",".join(fields))
+ 
+     def test_akshare_financial_batches_record_target_period_metadata_and_normalize_frame_values(self):
+         module = FakeAKShare()
+         batches = AKShareSource(module=module, clock=lambda: "2026-08-25T00:00:00+00:00").fetch_financial_statements("SH600000")
+ 
+         self.assertEqual(set(batches), {"balance_sheet", "profit_sheet", "cash_flow_sheet"})
++        self.assertEqual([name for name, _ in module.calls], ["balance", "profit", "cash"])
+         self.assertEqual(batches["balance_sheet"].metadata["report_period_match_count"], 1)
+         self.assertEqual(batches["balance_sheet"].metadata["column_count"], 4)
+         self.assertIsNone(batches["balance_sheet"].records[0]["VALUE"])
+         self.assertEqual(batches["balance_sheet"].records[0]["NOTICE_DATE"], "2026-08-20")
+ 
++    def test_fetch_financial_statement_calls_exactly_one_requested_method(self):
++        for dataset, expected_call in (
++            ("balance_sheet", "balance"),
++            ("profit_sheet", "profit"),
++            ("cash_flow_sheet", "cash"),
++        ):
++            with self.subTest(dataset=dataset):
++                module = FakeAKShare()
++                batch = AKShareSource(module=module).fetch_financial_statement(
++                    "SH600000", dataset, "2026-06-30"
++                )
++
++                self.assertEqual([name for name, _ in module.calls], [expected_call])
++                self.assertEqual(batch.dataset, dataset)
++                self.assertEqual(batch.request, {
++                    "symbol": "SH600000",
++                    "report_period": "2026-06-30",
++                })
++                self.assertEqual(batch.metadata["report_period_match_count"], 1)
++
++    def test_fetch_financial_statement_rejects_unknown_dataset_before_module_access(self):
++        module = FakeAKShare()
++
++        class GuardedAKShareSource(AKShareSource):
++            def _module(self):
++                raise AssertionError("module access")
++
++        with self.assertRaisesRegex(ValueError, "unsupported financial dataset"):
++            GuardedAKShareSource(module=module).fetch_financial_statement(
++                "SH600000", "unknown_sheet", "2026-06-30"
++            )
++
++        self.assertEqual(module.calls, [])
++
++    def test_fetch_financial_statement_retries_empty_result(self):
++        module = FakeAKShare()
++        module.statement = FakeFrame([], [])
++
++        with self.assertRaises(RetryableSourceError):
++            AKShareSource(module=module).fetch_financial_statement(
++                "SH600000", "balance_sheet", "2026-06-30"
++            )
++
++        self.assertEqual([name for name, _ in module.calls], ["balance"])
++
++    def test_financial_statements_wrapper_reuses_single_statement_method_in_fixed_order(self):
++        class RecordingSource(AKShareSource):
++            def __init__(self):
++                super().__init__(module=FakeAKShare())
++                self.statement_requests = []
++
++            def fetch_financial_statement(self, symbol, dataset, report_period="2026-06-30"):
++                self.statement_requests.append((symbol, dataset, report_period))
++                return FetchBatch(
++                    "akshare",
++                    dataset,
++                    {"symbol": symbol, "report_period": report_period},
++                    [{"REPORT_DATE": report_period}],
++                    "2026-08-25T00:00:00+00:00",
++                    "test",
++                    {"report_period_match_count": 1},
++                )
++
++        source = RecordingSource()
++        batches = source.fetch_financial_statements("SH600000", "2026-06-30")
++
++        self.assertEqual(list(batches), ["balance_sheet", "profit_sheet", "cash_flow_sheet"])
++        self.assertEqual(source.statement_requests, [
++            ("SH600000", "balance_sheet", "2026-06-30"),
++            ("SH600000", "profit_sheet", "2026-06-30"),
++            ("SH600000", "cash_flow_sheet", "2026-06-30"),
++        ])
++
+     def test_akshare_spot_blocks_access_control_and_retries_empty_structure(self):
+         module = FakeAKShare()
+         module.spot = FakeFrame(["html"], [["<html>403 forbidden</html>"]])
+         with self.assertRaises(SourceBlocked):
+             AKShareSource(module=module).fetch_spot_snapshot()
+ 
+         module.spot = FakeFrame([], [])
+         with self.assertRaises(RetryableSourceError):
+             AKShareSource(module=module).fetch_spot_snapshot()
+ 

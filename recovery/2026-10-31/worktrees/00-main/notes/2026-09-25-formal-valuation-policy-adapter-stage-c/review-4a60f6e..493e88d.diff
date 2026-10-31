@@ -1,0 +1,2042 @@
+# Review package: 4a60f6e..493e88d
+
+## Commits
+493e88d Implement authenticated Stage C valuation batch publication
+
+## Files changed
+ ashare_pipeline/formal_batch_read_journal.py       |  56 ++-
+ ashare_pipeline/formal_feature_repository.py       |  12 +-
+ ashare_pipeline/formal_financial_features.py       |   4 +-
+ ashare_pipeline/formal_metric_engine.py            |  79 +++-
+ .../formal_valuation_adapter_contract.py           |  23 +-
+ ashare_pipeline/formal_valuation_engine.py         | 367 ++++++++++++++++
+ ashare_pipeline/state_store.py                     |   6 +-
+ tests/formal_metric_feature_fixtures.py            |   6 +-
+ tests/formal_metric_fixtures.py                    |   6 +-
+ tests/formal_policy_runtime_fixtures.py            |  75 ++--
+ tests/formal_valuation_fixtures.py                 |  65 +++
+ tests/test_formal_valuation_adapter_contract.py    |  22 +
+ tests/test_formal_valuation_batch.py               |  65 +++
+ tests/test_formal_valuation_batch_guards.py        | 473 +++++++++++++++++++++
+ 14 files changed, 1194 insertions(+), 65 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_batch_read_journal.py b/ashare_pipeline/formal_batch_read_journal.py
+index 0ababa4..384f81b 100644
+--- a/ashare_pipeline/formal_batch_read_journal.py
++++ b/ashare_pipeline/formal_batch_read_journal.py
+@@ -31,41 +31,52 @@ def _install_journal():
+             return "context", owner._state_store, (owner._snapshots, owner._verifier)
+         if type(owner) is FormalFeatureRepository:
+             _require_authentic_metric_feature_repository(owner)
+             return "feature", owner._store, (owner._bundle_store, owner._verifier, owner._current_input_provider)
+         if type(owner) is FormalRangeStore:
+             return "range", *_require_range_batch_journal_owner(owner)
+         from .formal_policy_state import FormalPolicyStateRepository
+         from .formal_policy_financial import FormalPolicyFinancialRepository
+         from .formal_policy_market import FormalPolicyMarketRepository
+         from .formal_policy_repository import FormalPolicyRepository
++        from .formal_metric_engine import FormalMetricInputRepository
++        from .formal_valuation_engine import FormalValuationRepository
++        if type(owner) is FormalValuationRepository:
++            state, children = owner._batch_journal_identity()
++            return "valuation", state, children
++        if type(owner) is FormalMetricInputRepository:
++            state, children = owner._batch_journal_identity()
++            return "metric", state, children
+         if type(owner) is FormalPolicyRepository:
+             state, children = owner._batch_journal_identity()
+             return "policy", state, children
+         for owner_type, kind in ((FormalPolicyStateRepository, "state"),
+                                  (FormalPolicyFinancialRepository, "financial"),
+                                  (FormalPolicyMarketRepository, "market")):
+             if type(owner) is owner_type:
+                 state, child = owner._batch_journal_identity()
+                 return kind, state, (child,)
+         raise ValueError("batch journal requires a fixed genuine owner type")
+ 
+     def _chain(owner):
+         kind, state, refs = _owner_state(owner)
+-        if kind == "policy":
++        if kind in {"policy", "metric", "valuation"}:
+             allowed = {kind: owner}
+             expanded = []
+             for child in refs:
+                 child_kind, child_state, child_refs, child_allowed = _chain(child)
+                 if child_state is not state:
+-                    raise ValueError("policy batch scope children have different StateStores")
+-                allowed.update(child_allowed)
++                    raise ValueError("batch scope children have different StateStores")
++                for key, value in child_allowed.items():
++                    if key in allowed and allowed[key] is not value:
++                        raise ValueError("batch scope has conflicting owner dependencies")
++                    allowed[key] = value
+                 expanded.extend((child, *child_refs))
+             unique = tuple(dict.fromkeys((*refs, *expanded)))
+             return kind, state, unique, allowed
+         children = tuple(item for item in refs if item is not None
+                          and type(item).__name__ in {
+                              "FormalContextRepository", "FormalFeatureRepository", "FormalRangeStore"})
+         expanded = tuple(reference for child in children
+                          for reference in _owner_state(child)[2])
+         allowed = {kind: owner, **{_owner_state(child)[0]: child for child in children}}
+         if kind == "financial" and "feature" in allowed:
+@@ -130,51 +141,62 @@ def _install_journal():
+         def __init__(self, *args, **kwargs):
+             raise TypeError("batch scopes require the checked factory")
+ 
+         def __copy__(self):
+             raise TypeError("batch scope cannot be copied")
+ 
+         def __deepcopy__(self, memo):
+             raise TypeError("batch scope cannot be copied")
+ 
+         @classmethod
+-        def open(cls, owner, *, registry_manifest_hash, as_of_utc, population, required_keys):
++        def open(cls, owner, *, registry_manifest_hash, as_of_utc, population, required_keys,
++                 frozen_input_hash=None):
+             if cls is not FormalBatchReadJournal:
+                 raise ValueError("batch scope type must be exact")
+             if (globals().get("_issue_current_ticket") is not issue
+                     or globals().get("_require_current_scope") is not require_scope
+                     or globals().get("_require_current_ticket") is not require_ticket):
+                 raise ValueError("batch journal issuing authority changed")
+             if (type(registry_manifest_hash) is not str or len(registry_manifest_hash) != 64
+                     or any(c not in "0123456789abcdef" for c in registry_manifest_hash)):
+                 raise ValueError("batch scope requires canonical signed root hash")
+             if type(as_of_utc) is not str or not as_of_utc:
+                 raise ValueError("batch scope requires a frozen cutoff")
+             if (type(population) is not tuple or not population
+                     or any(type(x) is not str for x in population)
+                     or tuple(sorted(set(population))) != population):
+                 raise ValueError("batch scope requires sorted unique population")
+             if (type(required_keys) is not tuple
+                     or any(type(x) is not tuple or not x for x in required_keys)
+                     or len(set(required_keys)) != len(required_keys)):
+                 raise ValueError("batch scope requires exact mandatory coverage")
+             kind, state, refs, allowed = _chain(owner)
++            if kind == "valuation":
++                if (type(frozen_input_hash) is not str or len(frozen_input_hash) != 64
++                        or any(c not in "0123456789abcdef" for c in frozen_input_hash)):
++                    raise ValueError("valuation scope requires an exact frozen input hash")
++            elif frozen_input_hash is not None:
++                raise ValueError("frozen input binding is reserved for the valuation owner")
+             if not required_keys and kind != "policy":
+                 raise ValueError("batch scope requires mandatory coverage")
++            if kind == "valuation":
++                from .formal_valuation_engine import FormalValuationRepository
++                if sys._getframe(1).f_code is not vars(FormalValuationRepository)["build_batch"].__code__:
++                    raise ValueError("valuation scope opens only inside its authentic owner build")
+             signatures = tuple(item for instance in (owner, state, *refs) if instance is not None
+                                for item in _methods(instance))
+             result = object.__new__(FormalBatchReadJournal)
+             scope_id = id(result)
+             scopes[scope_id] = [weakref.ref(result, lambda _, key=scope_id: scopes.pop(key, None)),
+                 "active", threading.get_ident(), owner, kind, state, refs, signatures,
+                 str(state.db_path.resolve()), registry_manifest_hash, as_of_utc, population,
+-                frozenset(required_keys), {}, 0, {}, allowed]
++                frozenset(required_keys), {}, 0, {}, allowed, frozen_input_hash]
+             return result
+ 
+         def checkpoint(self):
+             record = _scope(self)
+             phase = record[14]
+             try:
+                 for ticket in tuple(record[13].values()):
+                     ticket_record = _ticket(ticket, self)
+                     if record[15].get(id(ticket)) == phase:
+                         continue
+@@ -223,40 +245,45 @@ def _install_journal():
+             raise ValueError("current read ticket is forged, copied, or cross-scope")
+         return record
+ 
+     def issue(scope, owner, kind, key, baseline, evidence, coverage, selection):
+         record = _scope(scope)
+         if record[16].get(kind) is not owner:
+             raise ValueError("current ticket owner mismatch")
+         issuer_name = {"context": "select_current_batch_ticket",
+                        "feature": "select_current_metric_batch_ticket",
+                        "policy_feature": "select_current_policy_batch_ticket",
++                       "metric": "_build_batch_in_owner_scope",
++                       "valuation": "build_batch",
+                        "range": "select_current_batch_ticket",
+                        "state": "select_current_batch_ticket",
+                        "financial": "select_current_batch_ticket",
+                        "policy": "_build_batch_in_owner_scope",
+                        "calendar": "select_calendar_batch_ticket",
+                        "market": "select_current_batch_ticket"}[kind]
+         caller = sys._getframe(1)
+         if caller.f_code is not vars(type(owner))[issuer_name].__code__:
+             if (kind not in {"calendar", "market"}
+                     or caller.f_code.co_name != "ticket_evidence"
+                     or sys._getframe(2).f_code is not vars(type(owner))[issuer_name].__code__):
+                 raise ValueError("current ticket must be issued by the fixed owner selector")
+         if type(key) is not tuple or type(baseline) is not bytes or type(coverage) is not tuple:
+             raise ValueError("current ticket evidence shape invalid")
++        if record[4] == "valuation" and kind in {"metric", "policy", "valuation"} and (
++                not key or key[0] != record[17]):
++            raise ValueError("current batch ticket has a different frozen input")
+         member_index = 2 if kind == "context" else 0
+-        expected_length = 3 if kind in {"context", "feature", "policy_feature"} else 1
++        expected_length = 3 if kind in {"context", "feature", "policy_feature"} else (2 if kind == "metric" else 1)
+         if any(type(item) is not tuple or len(item) != expected_length
+                or type(item[member_index]) is not str
+                or (item[member_index] not in record[11]
+-                   and not (record[4] in {"market", "policy"}
++                   and not (record[4] in {"market", "policy", "valuation"}
+                             and (kind == "range" or
+                                  (kind == "calendar" and item[member_index] in {"SH", "SZ", "BJ"}))))
+                for item in coverage):
+             raise ValueError("current ticket coverage is outside frozen population")
+         identity = (id(owner), kind, key)
+         previous = record[13].get(identity)
+         if previous is not None:
+             prior = _ticket(previous, scope)
+             if prior[3] != baseline:
+                 raise ValueError("same current key has a different baseline")
+@@ -267,26 +294,29 @@ def _install_journal():
+             weakref.ref(scope), identity, baseline, evidence, coverage, selection)
+         record[13][identity] = ticket
+         return ticket
+ 
+     def require_scope(scope, owner, *, root, as_of_utc, population):
+         record = _scope(scope)
+         if (type(population) is not tuple or not population
+                 or any(type(item) is not str for item in population)
+                 or tuple(sorted(set(population))) != population):
+             raise ValueError("current read population must be a sorted nonempty subset")
+-        if (record[16].get(_owner_state(owner)[0]) is not owner
+-                or root != record[9] or as_of_utc != record[10]
+-                or (not set(population) <= set(record[11])
+-                    and not (record[4] in {"market", "policy"} and (type(owner).__name__ == "FormalRangeStore"
+-                                                           or set(population) <= {"SH", "SZ", "BJ"})))):
+-            raise ValueError("current read does not match owner build scope")
++        if record[16].get(_owner_state(owner)[0]) is not owner:
++            raise ValueError("current read owner does not match build scope")
++        if root != record[9] or as_of_utc != record[10]:
++            raise ValueError("current read root or cutoff does not match build scope")
++        if (not set(population) <= set(record[11])
++                and not (record[4] in {"market", "policy", "valuation"}
++                         and (type(owner).__name__ == "FormalRangeStore"
++                              or set(population) <= {"SH", "SZ", "BJ"}))):
++            raise ValueError("current read population does not match build scope")
+ 
+     def require_ticket(scope, ticket, owner, kind):
+         record = _scope(scope)
+         saved = _ticket(ticket, scope)
+         if record[16].get(kind) is not owner or saved[2][0:2] != (id(owner), kind):
+             raise ValueError("current read ticket belongs to another owner")
+         return saved[6], saved[3], saved[4]
+ 
+     return FormalBatchReadJournal, CurrentReadTicket, issue, require_scope, require_ticket
+ 
+diff --git a/ashare_pipeline/formal_feature_repository.py b/ashare_pipeline/formal_feature_repository.py
+index 8afa2e8..2715e3b 100644
+--- a/ashare_pipeline/formal_feature_repository.py
++++ b/ashare_pipeline/formal_feature_repository.py
+@@ -596,25 +596,27 @@ def _install_metric_projection():
+                 raise ValueError("metric receipt changed during selected proof construction")
+             capture["token"] = ("present", expected.input_hash, stored.bundle_hash(),
+                                 expected_bytes, first_receipt[0], result.canonical_bytes())
+         return result
+ 
+     def select(self, *args, **kwargs):
+         result = select_state(self, *args, **kwargs)
+         return None if type(result) is VerifiedMetricFeatureAbsence else result
+ 
+     def select_metric_ticket(self, journal, security_id, as_of_utc, *, template_id,
+-                             registry_manifest_hash, required_feature_keys):
++                             registry_manifest_hash, required_feature_keys, metric_id=None):
+         from .formal_batch_read_journal import _issue_current_ticket, _require_current_scope
+ 
+         _require_current_scope(journal, self, root=registry_manifest_hash,
+                                as_of_utc=as_of_utc, population=(security_id,))
++        if metric_id is not None and (type(metric_id) is not str or not metric_id.startswith("V.")):
++            raise ValueError("metric ticket label requires an exact V metric ID")
+         selected_receipt = {}
+         capture_reset = ticket_capture.set(selected_receipt)
+         try:
+             result = select_state(self, security_id, as_of_utc, template_id=template_id,
+                 registry_manifest_hash=registry_manifest_hash,
+                 required_feature_keys=required_feature_keys)
+         finally:
+             ticket_capture.reset(capture_reset)
+         selection_token = selected_receipt.get("token")
+         if type(selection_token) is not tuple or len(selection_token) != 6:
+@@ -663,23 +665,27 @@ def _install_metric_projection():
+         baseline = _canonical_json_bytes(dict(request=request, identity=list(identity),
+             facts=[item.decode() for item in facts], issues=[item.decode() for item in issues],
+             input_hash=result.input_hash, bundle=None if bundle_bytes is None else bundle_bytes.decode(),
+             metadata=None if metadata_bytes is None else metadata_bytes.decode(),
+             registry_hash=registry.registry_hash,
+             feature_registry=graph.blob("feature").canonical_json.decode(),
+             selected=result.canonical_bytes().decode(), selection_status=selection_status,
+             selected_input=selected_input_bytes.decode(),
+             selected_bundle_hash=selected_bundle_hash,
+             selected_receipt=None if selected_metadata_bytes is None else selected_metadata_bytes.decode()))
++        ticket_key = (security_id, as_of_utc, template_id, registry_manifest_hash,
++                      required_feature_keys) + (() if metric_id is None else (metric_id,))
++        if metric_id is not None:
++            baseline = _canonical_json_bytes({"metric_id": metric_id,
++                "selected_evidence": json.loads(baseline)})
+         return _issue_current_ticket(journal, self, "feature",
+-            (security_id, as_of_utc, template_id, registry_manifest_hash, required_feature_keys),
+-            baseline, evidence,
++            ticket_key, baseline, evidence,
+             tuple((security_id, template_id, key) for key in required_feature_keys), result)
+ 
+     def recheck_metric_ticket(self, evidence):
+         dependencies(self)
+         (request, identity, facts, issues, input_hash, bundle_bytes, metadata_bytes,
+          registry_hash, registry_bytes, selected, selected_bytes, selection_token) = evidence
+         (selection_status, selected_input_hash, selected_bundle_hash, selected_input_bytes,
+          selected_metadata_bytes, selected_proof_bytes) = selection_token
+         if (input_hash != selected_input_hash or selected.bundle_hash != selected_bundle_hash
+                 or selected.canonical_bytes() != selected_proof_bytes
+diff --git a/ashare_pipeline/formal_financial_features.py b/ashare_pipeline/formal_financial_features.py
+index 1430ec7..2037c90 100644
+--- a/ashare_pipeline/formal_financial_features.py
++++ b/ashare_pipeline/formal_financial_features.py
+@@ -549,21 +549,23 @@ def build_formal_feature_bundle(*, security_id: str, as_of_utc: str, template_id
+         raise ValueError("invalid formal template")
+     raw = _snapshot_facts(facts)
+     if any(wire["security_id"] != security_id for _, wire in raw):
+         raise ValueError("bundle facts must match security")
+     if type(registry) is not SignedFormalFeatureRegistry:
+         raise ValueError("bundle requires exact signed registry")
+     slots = registry.slots_for_template(template_id)
+     if type(registry_manifest) is not FormalRegistryManifest:
+         raise ValueError("bundle requires exact sealed root")
+     try:
+-        hashes = {key: getattr(registry_manifest, key) for key in _ROOT_HASHES}
++        active = _ROOT_HASHES + (("valuation_adapter_registry_hash",)
++            if registry_manifest.schema_version == "formal-registry-manifest-v2" else ())
++        hashes = {key: getattr(registry_manifest, key) for key in active}
+         registry_manifest.assert_member_hashes(**hashes)
+     except (AttributeError, TypeError) as error:
+         raise ValueError("invalid root manifest") from error
+     for root_key, child_key in (("source_registry_hash", "source_registry_hash"), ("mapping_registry_hash", "mapping_registry_hash"), ("feature_registry_hash", "registry_hash")):
+         if hashes[root_key] != getattr(registry, child_key):
+             raise ValueError("root-child registry hash mismatch")
+     official = True
+     try:
+         registry_manifest.require_official()
+     except ValueError:
+diff --git a/ashare_pipeline/formal_metric_engine.py b/ashare_pipeline/formal_metric_engine.py
+index a652846..152fe4e 100644
+--- a/ashare_pipeline/formal_metric_engine.py
++++ b/ashare_pipeline/formal_metric_engine.py
+@@ -7,20 +7,21 @@ import json
+ from types import MappingProxyType
+ import weakref
+ 
+ from .formal_context_repository import FormalContextRepository
+ from .formal_feature_repository import FormalFeatureRepository, VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence
+ from .formal_feature_repository import _require_authentic_metric_feature_repository
+ from .formal_metric_context import FormalMetricContextRepository
+ from .formal_metric_batch_guard import _metric_batch_guard
+ from .formal_registry_manifest import FormalRegistryBundleLoader
+ from .formal_scoring_registry import FormalScoringRegistry
++from .formal_batch_read_journal import FormalBatchReadJournal, _issue_current_ticket, _require_current_scope
+ 
+ 
+ def _arithmetic_context():
+     # Explicit every context option: neither getcontext nor DefaultContext is
+     # authoritative. Recurring division retains 50 deterministic significant
+     # digits, without display quantization; it is not claimed to be exact.
+     return Context(prec=50, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999,
+         capitals=1, clamp=0, flags=[], traps=[InvalidOperation, DivisionByZero, Overflow])
+ 
+ 
+@@ -133,20 +134,21 @@ def _install_metric_definition_producer():
+ 
+ (_plain, _canonical, _digest, _scoring_metric_definitions,
+  _metric_definition_dependency_changes) = _install_metric_definition_producer()
+ del _install_metric_definition_producer
+ 
+ 
+ def _install_engine():
+     repositories, proofs = {}, {}
+     context_type = FormalMetricContextRepository
+     feature_read = FormalFeatureRepository.select_current_verified_metric_feature_state
++    feature_ticket = FormalFeatureRepository.select_current_metric_batch_ticket
+     require_feature = _require_authentic_metric_feature_repository
+     batch_guard = _metric_batch_guard
+     load_root = FormalRegistryBundleLoader.load
+     decimal_context = _arithmetic_context
+     encode, digest, freeze = _canonical, _digest, _freeze
+     definitions = _scoring_metric_definitions
+     checked = tuple((cls, name, method) for cls in (context_type, FormalFeatureRepository,
+         FormalContextRepository, FormalRegistryBundleLoader, FormalScoringRegistry)
+         for name, method in vars(cls).items() if callable(method) or isinstance(method, (staticmethod, classmethod)))
+ 
+@@ -229,57 +231,74 @@ def _install_engine():
+ 
+     def mint(cls, payload, *, attributes=None, private=None, publication=None):
+         proof = object.__new__(cls)
+         identity = id(proof)
+         data = dict(payload)
+         data.update(attributes or {})
+         proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)), freeze(data), encode(payload),
+             private, [True] if publication is None else publication)
+         return proof
+ 
+-    def build(repo, frozen_input_hash, scoring, metric_ids, guard):
++    def build(repo, frozen_input_hash, scoring, metric_ids, guard, owner_scope=None):
+         feature, _, verifier, context = dependencies(repo)
+         universe = context.load_universe(frozen_input_hash, scoring_registry=scoring)
+         if universe is None:
+             return None
+         universe.require_verified()
+         root = load_root(FormalRegistryBundleLoader(feature._store, verifier), universe.registry_manifest_hash)
+         scoring.require_official(root)
+         defs = definitions(scoring)
+         known = set().union(*(set(items) for items in defs.values()))
+         selected = tuple(sorted(known)) if metric_ids is None else metric_ids
+         if (type(selected) is not tuple or not selected or any(type(mid) is not str for mid in selected)
+                 or selected != tuple(sorted(set(selected))) or any(mid not in known for mid in selected)):
+             raise ValueError("metric IDs must be nonempty sorted unique registered dimension.metric_id strings")
+         industry = context.resolve_industries(universe)
+         industry.require_verified()
++        if owner_scope is not None:
++            _require_current_scope(owner_scope, repo, root=universe.registry_manifest_hash,
++                as_of_utc=universe.as_of_utc, population=tuple(universe.security_ids))
+         common = dict(registry_manifest_hash=universe.registry_manifest_hash,
+             frozen_input_hash=universe.frozen_input_hash, universe_hash=universe.universe_hash,
+             population_hash=universe.population_hash, as_of_utc=universe.as_of_utc,
+             industry_batch_hash=industry.batch_hash, registry_hashes=dict(scoring.role_hashes),
+             universe_proof_hash=hashlib.sha256(universe.canonical_bytes()).hexdigest())
+         rows, markers, requests = [], {}, {}
+         for sid in universe.security_ids:
+             assignment = industry.entries[sid]
+             signed_member = next((m for m in universe.industry["memberships"] if m["security_id"] == sid), None)
+             tid = None if signed_member is None else signed_member["template_id"]
+             marker = None
+             if tid is not None:
+                 keys = tuple(sorted({key for mid in selected for key in defs[tid][mid]["definition"]["required_feature_keys"]}))
+                 request = dict(security_id=sid, as_of_utc=universe.as_of_utc, template_id=tid,
+                     registry_manifest_hash=universe.registry_manifest_hash, required_feature_keys=keys)
+-                marker = feature_read(feature, **request)
+-                if type(marker) not in (VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence):
+-                    raise ValueError("metric feature current state requires a genuine present or absence proof")
+-                marker.require_verified()
+-                requests[sid] = request
+-                markers[sid] = marker.canonical_bytes()
++                if owner_scope is None:
++                    marker = feature_read(feature, **request)
++                    if type(marker) not in (VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence):
++                        raise ValueError("metric feature current state requires a genuine present or absence proof")
++                    marker.require_verified()
++                    requests[sid] = request
++                    markers[sid] = marker.canonical_bytes()
++                else:
++                    for mid in selected:
++                        ticket = feature_ticket(feature, owner_scope, sid, universe.as_of_utc,
++                            template_id=tid, registry_manifest_hash=universe.registry_manifest_hash,
++                            required_feature_keys=keys, metric_id=mid)
++                        chosen = ticket.selected()
++                        if type(chosen) not in (VerifiedMetricFeatureProjection, VerifiedMetricFeatureAbsence):
++                            raise ValueError("metric feature ticket requires a genuine present or absence proof")
++                        chosen.require_verified()
++                        if marker is not None and marker.canonical_bytes() != chosen.canonical_bytes():
++                            raise ValueError("metric feature changed between V selections")
++                        marker = chosen
++                    markers[sid] = marker.canonical_bytes()
+             for mid in selected:
+                 binding = None if tid is None else defs[tid][mid]
+                 reason = "invalid_template" if tid is None else assignment["pending_reason"]
+                 value, refs, projection_hash = None, (), None
+                 if reason is None:
+                     if type(marker) is VerifiedMetricFeatureAbsence:
+                         reason = "current_receipt_absent"
+                     else:
+                         projection_hash = marker.projection_hash
+                         definition = binding["definition"]
+@@ -304,25 +323,26 @@ def _install_engine():
+                     definition_hash=None if binding is None else binding["definition_hash"],
+                     direction=None if binding is None else binding["definition"]["direction"],
+                     unit=None if binding is None else binding["definition"]["unit_rule"],
+                     raw_value=value, verified_feature_refs=refs, invalid_reason=reason,
+                     status="eligible" if reason is None else "pending_evidence", projection_hash=projection_hash,
+                     feature_state_hash=None if marker is None else hashlib.sha256(markers[sid]).hexdigest())
+                 payload["input_hash"] = digest(payload)
+                 rows.append(payload)
+         # Cross-member closure: every current state is re-read after the first
+         # pass; both absence transitions and numeric corrections invalidate all.
+-        for sid, request in requests.items():
+-            current = feature_read(feature, **request)
+-            current.require_verified()
+-            if current.canonical_bytes() != markers[sid]:
+-                raise ValueError("metric feature correction or absence changed during complete batch")
++        if owner_scope is None:
++            for sid, request in requests.items():
++                current = feature_read(feature, **request)
++                current.require_verified()
++                if current.canonical_bytes() != markers[sid]:
++                    raise ValueError("metric feature correction or absence changed during complete batch")
+         context.recheck_batch(universe, industry)
+         scoring.require_official(root)
+         dependencies(repo)
+         payload = dict(common, schema_version="formal-metric-input-batch-v1", metric_ids=selected,
+             security_ids=tuple(universe.security_ids), definitions=defs, inputs=rows,
+             feature_states={sid: json.loads(wire) for sid, wire in markers.items()})
+         payload["batch_hash"] = digest(payload)
+         # Expensive immutable preparation holds no writer reservation. Every
+         # prepared proof shares this closure-private, unpublished capability.
+         publication = [False]
+@@ -362,20 +382,55 @@ def _install_engine():
+                 with batch_guard(feature._current_input_provider, feature._store) as guard:
+                     result = build(self, frozen_input_hash, scoring_registry, metric_ids, guard)
+             except BaseException:
+                 # Also revoke if context-manager rollback/close fails after the
+                 # inner finalizer returned its prepared capability.
+                 if result is not None:
+                     proofs[id(result)][4][0] = False
+                 raise
+             return result
+ 
++        def _batch_journal_identity(self):
++            feature, context, _, _ = dependencies(self)
++            return feature._store, (feature, context)
++
++        def _batch_recheck_ticket(self, evidence):
++            batch, original = evidence
++            dependencies(self)
++            if record(batch, MetricInputBatch)[2] != original:
++                raise ValueError("metric batch ticket publication changed")
++
++        def _build_batch_in_owner_scope(self, frozen_input_hash, *, scoring_registry,
++                                        metric_ids, owner_scope):
++            feature, _, _, _ = dependencies(self)
++            if type(owner_scope) is not FormalBatchReadJournal:
++                raise ValueError("metric batch requires an authentic owner scope")
++            result = None
++            try:
++                with batch_guard(feature._current_input_provider, feature._store) as guard:
++                    result = build(self, frozen_input_hash, scoring_registry, metric_ids,
++                        guard, owner_scope=owner_scope)
++                if result is None:
++                    raise ValueError("metric frozen universe is absent")
++                original = record(result, MetricInputBatch)[2]
++                ticket = _issue_current_ticket(owner_scope, self, "metric",
++                    (frozen_input_hash, result.batch_hash), original, (result, original),
++                    tuple((sid, mid) for sid in result.security_ids for mid in result.metric_ids), result)
++                def revoke(batch):
++                    if batch is result:
++                        proofs[id(result)][4][0] = False
++                return result, ticket, revoke
++            except BaseException:
++                if result is not None:
++                    proofs[id(result)][4][0] = False
++                raise
++
+         def __copy__(self):
+             raise TypeError("metric input repository cannot be copied")
+ 
+         def __deepcopy__(self, memo):
+             raise TypeError("metric input repository cannot be copied")
+ 
+     def eligible(item):
+         return record(item, MetricInput)[1]["invalid_reason"] is None
+ 
+     def peer_context(batch, *, metric_id, security_id):
+diff --git a/ashare_pipeline/formal_valuation_adapter_contract.py b/ashare_pipeline/formal_valuation_adapter_contract.py
+index 1576474..03a5050 100644
+--- a/ashare_pipeline/formal_valuation_adapter_contract.py
++++ b/ashare_pipeline/formal_valuation_adapter_contract.py
+@@ -68,21 +68,21 @@ def _entries(value, keys, path):
+ 
+ 
+ def _install_registry():
+     records = {}
+     bundle_type, scoring_type, policy_type = VerifiedRegistryBundle, FormalScoringRegistry, FormalPolicyRegistry
+     require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
+     require_scoring, read_policy = scoring_type.require_official, _read_authenticated_policy_registry
+     definitions = _scoring_metric_definitions
+     metric_owner = metric_module
+     definition_guard = metric_owner._metric_definition_dependency_changes
+-    definition_type, serialize_definition = ValuationAdapterDefinition, asdict
++    definition_type, serialize_definition, serialize_envelope = ValuationAdapterDefinition, asdict, asdict
+     dumps, loads, sha256 = json.dumps, json.loads, hashlib.sha256
+     parse = _load_canonical_object
+ 
+     def canonical(value):
+         return dumps(value, sort_keys=True, ensure_ascii=False,
+             separators=(",", ":"), allow_nan=False).encode("utf-8")
+ 
+     def sources(bundle, scoring, policy):
+         if type(bundle) is not bundle_type or type(scoring) is not scoring_type or type(policy) is not policy_type:
+             _fail("graph", "requires exact verified source types")
+@@ -241,20 +241,41 @@ def _install_registry():
+         def __init__(self, *args, **kwargs):
+             raise TypeError("valuation adapter registries require the signed loader")
+ 
+         def __getattribute__(self, name):
+             class_intact()
+             return object.__getattribute__(self, name)
+ 
+         def require_official(self, bundle):
+             record(self, bundle)
+ 
++        def require_current_bundle(self, bundle):
++            """Authenticate a fresh store load against the registry's original root.
++
++            This does not relax ``require_official``'s object-identity contract.
++            Both bundles must independently retain their loader seals, and the
++            currently loaded ten signed envelopes must match the original.
++            """
++            original = record(self)[1]
++            if type(bundle) is not bundle_type:
++                _fail("proof", "requires a loader-verified current bundle")
++            require_bundle(bundle)
++            if (bundle.manifest.schema_version != "formal-registry-manifest-v2"
++                    or serialize_envelope(bundle.manifest) != serialize_envelope(original.manifest)
++                    or tuple(bundle.roles) != tuple(original.roles)
++                    or len(bundle.roles) != 10):
++                _fail("proof", "current signed root or roles differ from original")
++            for role in original.roles:
++                left, right = blob_for(original, role), blob_for(bundle, role)
++                if serialize_envelope(left) != serialize_envelope(right):
++                    _fail("proof", "current signed child differs from original")
++
+         def dependency_for(self, template_id, metric_id):
+             found = record(self)
+             if type(template_id) is not str or type(metric_id) is not str:
+                 _fail("selector", "requires exact strings")
+             entry = found[6].get((template_id, metric_id))
+             return None if entry is None else loads(canonical(entry))
+ 
+         def adapter_for(self, template_id, metric_id):
+             found = record(self)
+             if type(template_id) is not str or type(metric_id) is not str:
+diff --git a/ashare_pipeline/formal_valuation_engine.py b/ashare_pipeline/formal_valuation_engine.py
+new file mode 100644
+index 0000000..4cded24
+--- /dev/null
++++ b/ashare_pipeline/formal_valuation_engine.py
+@@ -0,0 +1,367 @@
++"""Complete, atomically published policy-adjusted valuation inputs."""
++
++import hashlib
++import json
++import weakref
++from decimal import Decimal
++from types import MappingProxyType
++
++from .formal_context_repository import FormalContextRepository
++from .formal_feature_repository import FormalFeatureRepository
++from .formal_metric_batch_guard import _metric_batch_guard
++from .formal_metric_engine import FormalMetricInputRepository, MetricInputBatch
++from .formal_policy_repository import FormalPolicyRepository, VerifiedPolicyResultBatch
++from .formal_policy_values import digest
++from .formal_range_store import FormalRangeStore
++from .formal_registry_manifest import FormalRegistryBundleLoader
++from .formal_scoring_registry import FormalScoringRegistry
++from .formal_policy_registry import FormalPolicyRegistry
++from .formal_valuation_adapter_contract import FormalValuationAdapterRegistry
++from .formal_valuation_adapter import evaluate_valuation_adjustment
++from .formal_batch_read_journal import FormalBatchReadJournal, _issue_current_ticket
++
++
++_V_METRICS = ("V.enterprise_value_or_sustainable_roe", "V.normalized_earnings_yield",
++              "V.normalized_free_cash_flow_yield")
++_FREEZE = "2026-08-31T07:00:00+00:00"
++
++
++def _install_valuation_engine():
++    repositories, proofs = {}, {}
++    own_members = ()
++    json_module, hashlib_module = json, hashlib
++    encode, decode, sha256 = json.dumps, json.loads, hashlib.sha256
++    guard_factory = _metric_batch_guard
++    load_root = FormalRegistryBundleLoader.load
++    evaluate = evaluate_valuation_adjustment
++    metric_build = FormalMetricInputRepository._build_batch_in_owner_scope
++    policy_build = FormalPolicyRepository._build_batch_in_owner_scope
++    metric_verify = MetricInputBatch.require_verified
++    policy_verify = VerifiedPolicyResultBatch.require_verified
++    adapter_verify = FormalValuationAdapterRegistry.require_current_bundle
++    scoring_verify = FormalScoringRegistry.require_official
++    checked = tuple((cls, name, value) for cls in
++        (FormalFeatureRepository, FormalContextRepository, FormalRangeStore,
++         FormalMetricInputRepository, FormalPolicyRepository, MetricInputBatch,
++         VerifiedPolicyResultBatch, FormalValuationAdapterRegistry,
++         FormalScoringRegistry, FormalPolicyRegistry, FormalRegistryBundleLoader,
++         FormalBatchReadJournal)
++        for name, value in vars(cls).items() if callable(value))
++
++    def freeze(value):
++        if type(value) is dict:
++            return MappingProxyType({key: freeze(item) for key, item in value.items()})
++        if type(value) in (list, tuple):
++            return tuple(freeze(item) for item in value)
++        return value
++
++    def interfaces():
++        if any(vars(cls).get(name) is not value for cls, name, value in checked):
++            raise ValueError("valuation publication dependency changed")
++        if any(set(vars(cls)) != {name for name, _ in members} or any(
++                vars(cls)[name] is not value for name, value in members)
++                for cls, members in own_members):
++            raise ValueError("valuation authority interface changed")
++        if (globals().get("_metric_batch_guard") is not guard_factory
++                or globals().get("evaluate_valuation_adjustment") is not evaluate
++                or globals().get("digest") is not digest
++                or globals().get("json") is not json_module or json_module.dumps is not encode
++                or json_module.loads is not decode or globals().get("hashlib") is not hashlib_module
++                or hashlib_module.sha256 is not sha256):
++            raise ValueError("valuation publication dependency changed")
++
++    def dependencies(repository):
++        interfaces()
++        saved = repositories.get(id(repository))
++        if (type(repository) is not FormalValuationRepository or saved is None
++                or saved[0]() is not repository):
++            raise ValueError("valuation repository is forged or copied")
++        feature, context, ranges, verifier, metric_repo, policy_repo, original = saved[1:]
++        current = (id(feature), id(context), id(ranges), id(verifier), id(feature._store),
++            id(feature._bundle_store), id(feature._current_input_provider), id(context._snapshots))
++        if current != original or feature._store is not context._state_store:
++            raise ValueError("valuation repository graph changed")
++        # Both authenticated repositories recheck their own provider, context,
++        # range and verifier dependencies when called below.
++        return feature, context, ranges, verifier, metric_repo, policy_repo
++
++    def record(proof, cls):
++        interfaces()
++        saved = proofs.get(id(proof))
++        if (type(proof) is not cls or saved is None or saved[0]() is not proof
++                or not saved[4][0]):
++            raise ValueError("adjusted valuation proof is forged, copied, unpublished or revoked")
++        return saved
++
++    class SealedMeta(type):
++        def __setattr__(cls, name, value):
++            raise TypeError("valuation authority types are immutable")
++
++        def __delattr__(cls, name):
++            raise TypeError("valuation authority types are immutable")
++
++    class Proof(metaclass=SealedMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("adjusted valuation proofs require a complete publication")
++
++        def __getattribute__(self, name):
++            record(self, type(self))
++            return object.__getattribute__(self, name)
++
++        def __getattr__(self, name):
++            data = record(self, type(self))[1]
++            if name not in data:
++                raise AttributeError(name)
++            return data[name]
++
++        def require_verified(self):
++            record(self, type(self))
++
++        def canonical_bytes(self):
++            return record(self, type(self))[2]
++
++        def to_dict(self):
++            return json.loads(record(self, type(self))[2])
++
++        def __copy__(self):
++            raise TypeError("adjusted valuation proofs cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("adjusted valuation proofs cannot be copied")
++
++    class PolicyAdjustedValuationInput(Proof):
++        __slots__ = ()
++
++    class PolicyAdjustedValuationBatch(Proof):
++        __slots__ = ()
++
++        def input_for(self, security_id, metric_id):
++            if type(security_id) is not str or type(metric_id) is not str:
++                raise ValueError("valuation selectors require exact strings")
++            result = record(self, PolicyAdjustedValuationBatch)[3]["index"].get((security_id, metric_id))
++            if result is None:
++                raise ValueError("security or V metric is outside complete adjusted batch")
++            return result
++
++    def mint(cls, payload, publication, *, attributes=None, private=None):
++        proof = object.__new__(cls)
++        data = dict(payload)
++        data.update(attributes or {})
++        wire = json.dumps(payload, sort_keys=True, ensure_ascii=False,
++            separators=(",", ":"), allow_nan=False).encode()
++        identity = id(proof)
++        proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)),
++            freeze(data), wire, private, publication)
++        return proof
++
++    def prepare_adjusted_rows(base_batch, policy_batch, adapter_registry):
++        """Prepare canonical rows from authenticated batch wires; mint no authority."""
++        base, policy, adapter = base_batch.to_dict(), policy_batch.to_dict(), adapter_registry.to_dict()
++        security_ids = base["security_ids"]
++        if (security_ids != sorted(set(security_ids))
++                or tuple(base["metric_ids"]) != _V_METRICS
++                or policy["security_ids"] != security_ids
++                or base["as_of_utc"] != _FREEZE
++                or any(base[key] != policy[key] for key in
++                    ("registry_manifest_hash", "frozen_input_hash", "universe_hash", "as_of_utc"))
++                or base["registry_manifest_hash"] != adapter["registry_manifest_hash"]
++                or base["registry_hashes"] != policy["role_hashes"]
++                or any(adapter["role_hashes"].get(role) != value for role, value in base["registry_hashes"].items())
++                or policy["evidence_batch"]["universe"]["population_hash"] != base["population_hash"]
++                or policy["evidence_batch"]["industry"]["batch_hash"] != base["industry_batch_hash"]):
++            raise ValueError("valuation input batches have incompatible frozen or registry identities")
++        if (len(base["inputs"]) != len(security_ids) * 3
++                or [(row["security_id"], row["metric_id"]) for row in base["inputs"]]
++                    != [(sid, mid) for sid in security_ids for mid in _V_METRICS]
++                or [result["security_id"] for result in policy["results"]] != security_ids):
++            raise ValueError("valuation input batches are incomplete or unordered")
++        coverage = {(row["template_id"], row["metric_id"]): row for row in adapter["coverage"]}
++        adapters = {(row["template_id"], row["metric_id"]): row for row in adapter["adapters"]}
++        policy_by_sid = {row["security_id"]: row for row in policy["results"]}
++        rows = []
++        for metric in base["inputs"]:
++            sid, mid, tid = metric["security_id"], metric["metric_id"], metric["template_id"]
++            result = policy_by_sid[sid]
++            if tid is None or not result["decisions"]:
++                if (result["decisions"] or not result["pending_requirements"]
++                        or (tid is None and metric["invalid_reason"] != "invalid_template")):
++                    raise ValueError("unassigned valuation member has inconsistent policy evidence")
++                adjustment = dict(status="pending_policy_evidence",
++                    reason="invalid_template" if tid is None else "applicability_unresolved",
++                    adjusted_value=None, metric_input_hash=metric["input_hash"],
++                    policy_result_hash=result["result_hash"], decision_hash=None,
++                    adapter_definition_hash=None, policy_dependency=None, operation=None,
++                    original_metric_value=None, original_current_profit=None,
++                    normalized_profit=None)
++            else:
++                decisions = [item for item in result["decisions"] if item["role"] == "cyclic"]
++                if len(decisions) != 1 or result["security_id"] != sid:
++                    raise ValueError("valuation member lacks a unique genuine cyclic decision")
++                decision = decisions[0]
++                dependencies = decision["parameters"].get("valuation_dependencies", [])
++                selected = [item for item in dependencies if item["metric_id"] == mid]
++                if len(selected) != 1 or coverage.get((tid, mid), {}).get("policy_dependency") != selected[0]["policy_dependency"]:
++                    raise ValueError("signed adapter coverage differs from policy decision")
++                adjustment = evaluate(metric=metric, policy_result=result,
++                    cyclic_decision=decision, dependency=selected[0], adapter=adapters.get((tid, mid)))
++            row = dict(registry_manifest_hash=base["registry_manifest_hash"],
++                frozen_input_hash=base["frozen_input_hash"], universe_hash=base["universe_hash"],
++                population_hash=base["population_hash"], as_of_utc=base["as_of_utc"],
++                industry_batch_hash=base["industry_batch_hash"], security_id=sid,
++                metric_id=mid, template_id=tid, primary_industry=metric["primary_industry"],
++                secondary_industry=metric["secondary_industry"],
++                original_metric=metric, policy_result=result, adjustment=adjustment,
++                status=adjustment["status"], reason=adjustment["reason"],
++                adjusted_value=adjustment["adjusted_value"])
++            row["input_hash"] = digest(row)
++            rows.append(row)
++        return tuple(rows)
++
++    class FormalValuationRepository(metaclass=SealedMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, feature_repository, context_repository, range_store, *, registry_signature_verifier):
++            if type(self) is not FormalValuationRepository or id(self) in repositories:
++                raise ValueError("valuation repository initialization must be exact and single-use")
++            interfaces()
++            metric_repo = FormalMetricInputRepository(feature_repository, context_repository,
++                registry_signature_verifier=registry_signature_verifier)
++            policy_repo = FormalPolicyRepository(feature_repository, context_repository, range_store,
++                registry_signature_verifier=registry_signature_verifier)
++            original = (id(feature_repository), id(context_repository), id(range_store),
++                id(registry_signature_verifier), id(feature_repository._store),
++                id(feature_repository._bundle_store), id(feature_repository._current_input_provider),
++                id(context_repository._snapshots))
++            identity = id(self)
++            repositories[identity] = (weakref.ref(self, lambda _: repositories.pop(identity, None)),
++                feature_repository, context_repository, range_store, registry_signature_verifier,
++                metric_repo, policy_repo, original)
++
++        def build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry,
++                        valuation_adapter_registry):
++            feature, _, _, verifier, metric_repo, policy_repo = dependencies(self)
++            if (type(frozen_input_hash) is not str or type(scoring_registry) is not FormalScoringRegistry
++                    or type(policy_registry) is not FormalPolicyRegistry
++                    or type(valuation_adapter_registry) is not FormalValuationAdapterRegistry):
++                raise ValueError("valuation publication requires exact authenticated inputs")
++            publication = [False]
++            prepared = None
++            scope = None
++            try:
++                with guard_factory(feature._current_input_provider, feature._store) as guard:
++                    frozen = feature._store.get_verified_formal_frozen_universe(frozen_input_hash)
++                    if frozen is None:
++                        raise ValueError("valuation frozen input is absent")
++                    population = tuple(sorted(member.security_id for member in frozen.members))
++                    required = tuple((sid, mid) for sid in population for mid in _V_METRICS) + tuple(
++                        (sid,) for sid in population)
++                    scope = FormalBatchReadJournal.open(self,
++                        registry_manifest_hash=frozen.registry_manifest_hash,
++                        as_of_utc=_FREEZE, population=population, required_keys=required,
++                        frozen_input_hash=frozen_input_hash)
++                    policy, policy_ticket, policy_revoke = policy_build(policy_repo, frozen_input_hash,
++                        scoring_registry=scoring_registry, policy_registry=policy_registry,
++                        owner_scope=scope)
++                    base, metric_ticket, metric_revoke = metric_build(metric_repo, frozen_input_hash,
++                        scoring_registry=scoring_registry, metric_ids=_V_METRICS,
++                        owner_scope=scope)
++                    metric_verify(base)
++                    policy_verify(policy)
++                    if policy_ticket.selected() is not policy or metric_ticket.selected() is not base:
++                        raise ValueError("valuation component tickets changed")
++                    root_hash = base.registry_manifest_hash
++                    bundle = load_root(FormalRegistryBundleLoader(feature._store, verifier), root_hash)
++                    scoring_verify(scoring_registry, bundle)
++                    adapter_verify(valuation_adapter_registry, bundle)
++                    base_bytes, policy_bytes = base.canonical_bytes(), policy.canonical_bytes()
++                    rows = prepare_adjusted_rows(base, policy, valuation_adapter_registry)
++                    adapter_wire = valuation_adapter_registry.to_dict()
++                    common = dict(schema_version="policy-adjusted-valuation-batch-v1",
++                        registry_manifest_hash=root_hash,
++                        frozen_input_hash=frozen_input_hash, universe_hash=base.universe_hash,
++                        population_hash=base.population_hash, as_of_utc=base.as_of_utc,
++                        industry_batch_hash=base.industry_batch_hash,
++                        scoring_registry_hash=bundle.manifest.scoring_registry_hash,
++                        policy_contract_hash=policy.policy_contract_hash,
++                        valuation_adapter_registry_hash=bundle.manifest.valuation_adapter_registry_hash,
++                        base_batch_hash=base.batch_hash,
++                        base_batch_canonical_sha256=hashlib.sha256(base_bytes).hexdigest(),
++                        policy_batch_hash=policy.batch_hash,
++                        policy_batch_canonical_sha256=hashlib.sha256(policy_bytes).hexdigest(),
++                        adapter_definition_sha256=digest(adapter_wire),
++                        security_ids=list(base.security_ids), metric_ids=list(_V_METRICS),
++                        inputs=list(rows))
++                    common["batch_hash"] = digest(common)
++                    children = tuple(mint(PolicyAdjustedValuationInput,
++                        dict(row, batch_hash=common["batch_hash"]), publication,
++                        attributes={"adjusted_value": None if row["adjusted_value"] is None
++                                    else Decimal(row["adjusted_value"])}) for row in rows)
++                    index = {(row["security_id"], row["metric_id"]): item
++                             for row, item in zip(rows, children, strict=True)}
++                    prepared = mint(PolicyAdjustedValuationBatch, common, publication,
++                        attributes={"inputs": children}, private={"index": index})
++
++                    root_wire = tuple((role, bundle.blob(role).canonical_json) for role in bundle.roles)
++                    root_ticket = _issue_current_ticket(scope, self, "valuation",
++                        (frozen_input_hash, root_hash), bundle.manifest.canonical_json,
++                        (root_hash, root_wire, scoring_registry, valuation_adapter_registry,
++                         adapter_wire, verifier), (), bundle)
++                    if root_ticket.selected() is not bundle:
++                        raise ValueError("valuation root ticket changed")
++
++                    def publish():
++                        dependencies(self)
++                        metric_verify(base)
++                        policy_verify(policy)
++                        if base.canonical_bytes() != base_bytes or policy.canonical_bytes() != policy_bytes:
++                            raise ValueError("valuation source batches changed before publication")
++                        scope.finalize()
++                        publication[0] = True
++                        return prepared
++
++                    result = guard.finalize(publish)
++                return result
++            except BaseException:
++                publication[0] = False
++                if scope is not None:
++                    try:
++                        scope.close()
++                    except ValueError:
++                        pass
++                raise
++
++        def _batch_journal_identity(self):
++            feature, _, _, _, metric_repo, policy_repo = dependencies(self)
++            return feature._store, (metric_repo, policy_repo)
++
++        def _batch_recheck_ticket(self, evidence):
++            root_hash, root_wire, scoring_registry, adapter_registry, adapter_wire, verifier = evidence
++            feature, _, _, original_verifier, _, _ = dependencies(self)
++            if verifier is not original_verifier:
++                raise ValueError("valuation verifier changed")
++            current = load_root(FormalRegistryBundleLoader(feature._store, verifier), root_hash)
++            scoring_verify(scoring_registry, current)
++            adapter_verify(adapter_registry, current)
++            if (tuple((role, current.blob(role).canonical_json) for role in current.roles) != root_wire
++                    or adapter_registry.to_dict() != adapter_wire):
++                raise ValueError("valuation signed root or adapter changed")
++
++        def __copy__(self):
++            raise TypeError("valuation repositories cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("valuation repositories cannot be copied")
++
++    own_members = tuple((cls, tuple(vars(cls).items())) for cls in
++        (Proof, PolicyAdjustedValuationInput, PolicyAdjustedValuationBatch,
++         FormalValuationRepository))
++    return FormalValuationRepository, PolicyAdjustedValuationInput, PolicyAdjustedValuationBatch
++
++
++(FormalValuationRepository, PolicyAdjustedValuationInput,
++ PolicyAdjustedValuationBatch) = _install_valuation_engine()
++del _install_valuation_engine
++
++__all__ = ["FormalValuationRepository", "PolicyAdjustedValuationInput", "PolicyAdjustedValuationBatch"]
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index 61ebf29..71543e7 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -559,24 +559,25 @@ _V5_INDEX_DDL = {
+         )""",
+     "formal_source_snapshot_exact_request_idx": """CREATE INDEX IF NOT EXISTS
+         formal_source_snapshot_exact_request_idx ON formal_source_snapshot(
+             source,dataset,request_fingerprint,refresh_generation,created_at DESC
+         )""",
+ }
+ 
+ 
+ _FORMAL_REGISTRY_ROLES = (
+     "source", "mapping", "feature", "scoring", "industry", "cyclic", "redline", "status", "event",
++    "valuation_adapter",
+ )
+ _FORMAL_ROOT_FIELDS = (
+     "manifest_hash", "purpose", "approval_id", "canonical_json", "signature", "key_id",
+-    *(f"{role}_registry_hash" for role in _FORMAL_REGISTRY_ROLES),
++    *(f"{role}_registry_hash" for role in _FORMAL_REGISTRY_ROLES if role != "valuation_adapter"),
+ )
+ _FORMAL_BLOB_FIELDS = (
+     "registry_hash", "registry_role", "canonical_json", "signature", "key_id", "approval_id",
+     "declared_registry_manifest_hash", "binding_signature", "binding_key_id",
+ )
+ _V6_TABLE_DDL = {
+     "formal_financial_fact": """CREATE TABLE formal_financial_fact (
+         id TEXT PRIMARY KEY, security_id TEXT NOT NULL, statement TEXT NOT NULL,
+         metric_key TEXT NOT NULL, period_start TEXT, period_end TEXT NOT NULL,
+         period_kind TEXT NOT NULL, value REAL NOT NULL, unit TEXT NOT NULL,
+@@ -2069,21 +2070,22 @@ class StateStore:
+     def get_formal_registry_blob(self, registry_hash: str) -> VerifiedRegistryBlob | None:
+         registry_hash = _require_formal_sha256(registry_hash, "registry hash")
+         with self._transaction() as connection:
+             return self._formal_blob_from_connection(connection, registry_hash)
+ 
+     def _formal_root_snapshot(self, manifest: FormalRegistryManifest) -> dict:
+         verifier = self._require_registry_verifier()
+         if type(manifest) is not FormalRegistryManifest:
+             raise ValueError("formal registry manifest must have exact type")
+         try:
+-            hashes = {f"{role}_registry_hash": getattr(manifest, f"{role}_registry_hash") for role in _FORMAL_REGISTRY_ROLES}
++            active_roles = _FORMAL_REGISTRY_ROLES if manifest.schema_version == "formal-registry-manifest-v2" else _FORMAL_REGISTRY_ROLES[:-1]
++            hashes = {f"{role}_registry_hash": getattr(manifest, f"{role}_registry_hash") for role in active_roles}
+             manifest.assert_member_hashes(**hashes)
+             wire = {key: getattr(manifest, key) for key in _FORMAL_ROOT_FIELDS}
+         except AttributeError as error:
+             raise ValueError("formal registry manifest is incomplete") from error
+         fresh = FormalRegistryManifest.from_signed_bytes(wire["canonical_json"], wire["signature"], wire["key_id"], verifier)
+         expected = {key: getattr(fresh, key) for key in _FORMAL_ROOT_FIELDS}
+         if any(type(wire[k]) is not type(v) or wire[k] != v for k, v in expected.items()):
+             raise ValueError("formal registry manifest public fields mismatch")
+         return expected
+ 
+diff --git a/tests/formal_metric_feature_fixtures.py b/tests/formal_metric_feature_fixtures.py
+index 2a6c64c..944dca9 100644
+--- a/tests/formal_metric_feature_fixtures.py
++++ b/tests/formal_metric_feature_fixtures.py
+@@ -24,42 +24,44 @@ def configuration(docs):
+                 metric.update(period_rule=["FY2025"], unit_rule="CNY")
+                 if metric["metric_id"] == "operating_revenue_yoy":
+                     metric["direction"] = "lower"
+     for slot in docs["feature"]["slots"]:
+         leaf = ".".join(slot["slot_id"].split(".")[1:])
+         slot.update(unit="CNY", formula=dict(op="fact", fact_key=leaf, period_key="FY2025"))
+ 
+ 
+ class FinancialFixture(MetricFixture):
+     def __init__(self, *, population=False, missing_memberships=False, mutate=None,
+-                 calendar_binding_resolver=None, exchange_rows=None):
++                 calendar_binding_resolver=None, exchange_rows=None,
++                 manifest_version="formal-registry-manifest-v1"):
+         rows = exchange_rows
+         def configure(docs):
+             configuration(docs)
+             if missing_memberships:
+                 docs["industry"]["memberships"] = [dict(security_id="SH600099", template_id="bank",
+                     primary_industry="banks", secondary_industry="banks")]
+                 update_mapping_digest(docs["industry"])
+             if mutate:
+                 mutate(docs)
+             if population:
+                 ids = ["BJ430001"] + [f"SH{600000 + i}" for i in range(20)] + ["SZ000001"]
+                 docs["industry"]["memberships"] = [dict(security_id=sid,
+                     template_id="bank" if sid == "SZ000001" else "general_nonfinancial",
+                     primary_industry="manufacturing", secondary_industry="other" if sid == "SH600019" else "machinery")
+                     for sid in sorted(ids)]
+                 update_mapping_digest(docs["industry"])
+         if population:
+             rows = {exchange: [dict(security_id=sid, listing_status="listed", security_type="ordinary_a") for sid in ids]
+                 for exchange, ids in {"BJ": ["BJ430001"], "SH": [f"SH{600000+i}" for i in range(20)], "SZ": ["SZ000001"]}.items()}
+         super().__init__(mutate=configure, exchange_rows=rows, tempdir=project_temporary_directory(),
+-            calendar_binding_resolver=calendar_binding_resolver)
++            calendar_binding_resolver=calendar_binding_resolver,
++            manifest_version=manifest_version)
+         self.files = FormalFeatureBundleStore(self.root / "features")
+         self.store._formal_feature_bundle_store = self.files
+         self.issues = {}
+         self.generations = {}
+         child = self.bundle.blob("feature")
+         self.vocabulary = load_signed_feature_registry(child.canonical_json, child.signature, child.key_id,
+             self.verifier, registry_manifest=self.bundle.manifest)
+         self.provider = FormalMetricCurrentInputProvider(self.store)
+         for member in self.industry["memberships"]:
+             self.publish_current(member["security_id"])
+diff --git a/tests/formal_metric_fixtures.py b/tests/formal_metric_fixtures.py
+index c4a8ad5..28b2999 100644
+--- a/tests/formal_metric_fixtures.py
++++ b/tests/formal_metric_fixtures.py
+@@ -32,35 +32,37 @@ def industry_document():
+ 
+ 
+ def update_mapping_digest(doc):
+     doc["mapping_sha256"] = hashlib.sha256(canonical({k: doc[k] for k in
+         ("classification_system", "source_version", "effective_date", "memberships")})).hexdigest()
+ 
+ 
+ class MetricFixture:
+     """A plain helper; no imported/inherited TestCase can duplicate suite discovery."""
+ 
+-    def __init__(self, *, mutate=None, exchange_rows=None, tempdir=None, calendar_binding_resolver=None):
++    def __init__(self, *, mutate=None, exchange_rows=None, tempdir=None, calendar_binding_resolver=None,
++                 manifest_version="formal-registry-manifest-v1"):
+         self.tempdir = tempdir or tempfile.TemporaryDirectory()
+         self.root = Path(self.tempdir.name)
+         self.db_path = self.root / "metric.sqlite"
+         StateStore(self.db_path).initialize()
+         self.raw = FormalSnapshotStore(self.root / "raw", calendar_binding_resolver=calendar_binding_resolver)
+         def configure(docs):
+             docs["industry"] = industry_document()
+             docs["scoring"]["descriptors"] = [descriptor("industry_snapshot", scope_key="fixture-industry",
+                 dataset="fixture-industry", referenced_roles=["industry", "scoring", "source"])]
+             docs["source"]["configs"] = [config(dataset="fixture-industry", exchange_scope=e) for e in ("BJ", "SH", "SZ")]
+             docs["feature"]["source_registry_hash"] = hashlib.sha256(canonical(docs["source"])).hexdigest()
+             if mutate:
+                 mutate(docs)
+-        self.bundle, vocabulary, graph, self.verifier = signed_graph(mutate=configure)
++        self.bundle, vocabulary, graph, self.verifier = signed_graph(
++            mutate=configure, manifest_version=manifest_version)
+         self.industry = __import__("json").loads(self.bundle.blob("industry").canonical_json)
+         self.store, self.frozen, self.task_ids = test_state_store.StateStoreTestCase.task_backed_frozen_universe(
+             self, registry_manifest_hash=self.bundle.manifest.manifest_hash,
+             source_registry_hash=self.bundle.manifest.source_registry_hash,
+             registry_signature_verifier=self.verifier, formal_snapshot_store=self.raw, exchange_rows=exchange_rows)
+         for blob in graph.blobs.values():
+             self.store.put_formal_registry_blob(blob)
+         self.store.put_formal_registry_manifest(graph.manifest)
+         self.snapshot_id = self.store.put_formal_universe_snapshot(self.frozen)
+         self.scoring = load_formal_registry(self.bundle, RegistryApproval("official",
+diff --git a/tests/formal_policy_runtime_fixtures.py b/tests/formal_policy_runtime_fixtures.py
+index e5fa05f..cb575f1 100644
+--- a/tests/formal_policy_runtime_fixtures.py
++++ b/tests/formal_policy_runtime_fixtures.py
+@@ -11,21 +11,21 @@ from ashare_pipeline.formal_evidence import (
+     OfficialRequest,
+     SourcePolicy,
+     verify_official_fetch,
+ )
+ from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
+ from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
+ from ashare_pipeline.formal_metric_context import FormalMetricContextRepository
+ from ashare_pipeline.formal_universe import canonical_security_id
+ from tests.formal_metric_feature_fixtures import FinancialFixture
+ from tests.formal_metric_fixtures import FREEZE, update_mapping_digest
+-from tests.formal_policy_fixtures import add_policy_documents, rehash_documents
++from tests.formal_policy_fixtures import add_policy_documents, add_valuation_adapter_document, rehash_documents
+ from tests.test_formal_context_repository import descriptor, FixtureNormalizer
+ from ashare_pipeline.formal_context_schema import FormalContextRegistry
+ from tests.test_formal_feature_contract import formal_fact
+ from tests.test_formal_scoring_registry import TEMPLATES, canonical
+ from tests.test_formal_sources import config
+ 
+ 
+ _DEFAULT_TEMPLATES = {
+     "BJ430001": "general_nonfinancial",
+     "SH600000": "bank",
+@@ -119,58 +119,62 @@ def _patch_current_policy_periods(documents):
+             if rule_id == "execution_contract" or "inputs" not in rule:
+                 continue
+             for selector in rule["inputs"].values():
+                 patch_selector(selector)
+ 
+ 
+ class PolicyRuntimeFixture(FinancialFixture):
+     """Small producer-backed graph; it does not confer production meaning."""
+ 
+     def __init__(self, *, range_enabled=False, templates=None, cyclic=True, mutate=None,
+-                 extra_members=(), noncyclic_ids=()):
++                 extra_members=(), noncyclic_ids=(), valuation_adapter=False):
+         if type(range_enabled) is not bool or type(cyclic) is not bool:
+             raise ValueError("range_enabled and cyclic must be exact bool")
+         selected_templates = _templates(templates)
+         extra_members = tuple(extra_members)
+         noncyclic_ids = tuple(noncyclic_ids)
+         if (any(type(sid) is not str or canonical_security_id(sid) != sid
+                 or sid in selected_templates for sid in extra_members)
+                 or len(set(extra_members)) != len(extra_members)
+                 or any(sid not in selected_templates for sid in noncyclic_ids)):
+             raise ValueError("fixture membership inputs must be distinct canonical securities")
+ 
+         def configure(documents):
+             documents["industry"]["memberships"] = _policy_memberships(selected_templates, cyclic, noncyclic_ids)
+             update_mapping_digest(documents["industry"])
+             documents["scoring"]["descriptors"].append(descriptor("security_state"))
+             documents["source"]["configs"].extend(
+                 config(dataset="fixture-state", exchange_scope=exchange)
+                 for exchange in ("BJ", "SH", "SZ")
+             )
+             add_policy_documents(documents)
++            if valuation_adapter:
++                add_valuation_adapter_document(documents)
+             _patch_current_policy_periods(documents)
+             policy_financial_mapping_documents(documents)
+             if range_enabled:
+                 from tests.formal_range_fixtures import add_range_documents
+                 add_range_documents(documents)
+                 # W3 needs a genuine recent window, not a 400-day fixture.
+                 # Tests needing larger ranges may explicitly override this cap.
+                 for entry in documents["source"]["range_configs"]:
+                     entry["max_calendar_days_per_request"] = 20
+             if mutate is not None:
+                 mutate(documents)
+             rehash_documents(documents)
+ 
+         try:
+             super().__init__(
+                 mutate=configure,
+                 exchange_rows=_exchange_rows(selected_templates, extra_members),
++                manifest_version=("formal-registry-manifest-v2" if valuation_adapter
++                                  else "formal-registry-manifest-v1"),
+             )
+             self.policy_registry = load_formal_policy_registry(
+                 self.bundle,
+                 scoring_registry=self.scoring,
+                 feature_registry=self.vocabulary,
+             )
+             if range_enabled:
+                 from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+                 from ashare_pipeline.formal_range_source import FormalRangeSource
+                 from ashare_pipeline.formal_range_store import FormalRangeStore
+@@ -194,87 +198,98 @@ class PolicyRuntimeFixture(FinancialFixture):
+                 self.range_store = FormalRangeStore(self.store, root=self.root / "range_raw",
+                     signature_verifier=self.verifier, source_factory=self.source_factory)
+         except Exception:
+             if hasattr(self, "tempdir"):
+                 self.tempdir.cleanup()
+             raise
+         self.policy_context_repository = FormalMetricContextRepository(self.store, self.context,
+             registry_signature_verifier=self.verifier)
+         self.policy_financial_repository = FormalPolicyFinancialRepository(self.feature_repository,
+             current_input_provider=self.provider)
++        self._valuation_adapter_runtime = valuation_adapter
+         self._policy_industry_ids = set()
+         self._policy_context_generations = {}
+         if range_enabled:
+             from ashare_pipeline.formal_policy_repository import FormalPolicyRepository
+             self.policy_repository = FormalPolicyRepository(self.feature_repository, self.context,
+                 self.range_store, registry_signature_verifier=self.verifier)
+ 
+     def build_policy_batch(self):
+         return self.policy_repository.build_batch(self.frozen.frozen_input_hash,
+             scoring_registry=self.scoring, policy_registry=self.policy_registry)
+ 
+-    def populate_policy_evidence(self, *, skip_financial=(), security_state_overrides=None):
++    def populate_policy_evidence(self, *, skip_financial=(), security_state_overrides=None,
++                                 financial_overrides=None):
+         """Populate every frozen security through the genuine temporary producers."""
+         from tests.formal_policy_fixtures import REGULATORY_SEMANTICS
+         from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+         from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
+         from tests.test_formal_range_source import document_wire
+         bindings = load_policy_range_bindings(self.bundle, scoring_registry=self.scoring,
+                                               policy_registry=self.policy_registry)
+         rules = self.policy_registry.to_dict()["rules"]
+         templates = {member["security_id"]: member["template_id"] for member in self.industry["memberships"]}
++        shared_calendars = {}
+         skip_financial = set(skip_financial)
+         security_state_overrides = dict(security_state_overrides or {})
++        financial_overrides = dict(financial_overrides or {})
+         if not skip_financial <= set(templates) or not set(security_state_overrides) <= set(templates):
+             raise ValueError("fixture evidence overrides require known members")
+         for member in self.frozen.members:
+             sid = member.security_id
+             if sid not in templates:
+                 continue
+             self.put_industry(sid)
+             self._policy_industry_ids.add(sid)
+             state = dict(is_st=False, is_star_st=False, listing_status="listed",
+                          forced_delist_risk=False, suspended=False)
+             state.update(security_state_overrides.get(sid, {}))
+             self.put_policy_context(sid, "security_state", state)
+             self.put_policy_context(sid, "regulatory_state", dict(flags=[
+                 dict(flag_id=flag, active=False) for flag in REGULATORY_SEMANTICS]))
+             if sid not in skip_financial:
+-                self.policy_financial_values(sid)
++                self.policy_financial_values(sid, **financial_overrides.get(sid, {}))
+             rule = next(rule for rule in rules if rule["template_id"] == templates[sid]
+                         and rule["kind"] == "market_liquidity")
+-            self.binding = bindings.for_rule(rule["rule_id"], sid[:2])
+-            self.source = self.source_factory(self.binding)
+-            first = self.source.first_calendar_request(FREEZE)
+-            cursor, end = date.fromisoformat(first.start_date), date.fromisoformat(first.end_date)
+-            days = {}
+-            while cursor <= end:
+-                days[cursor.isoformat()] = cursor >= end - timedelta(days=19)
+-                cursor += timedelta(days=1)
+-            existing = self.range_store.select_current(first.request_fingerprint)
+-            if existing is None:
+-                self.produce_calendar(days=days)
++            calendar_key = (rule["rule_id"], sid[:2])
++            if self._valuation_adapter_runtime and calendar_key in shared_calendars:
++                self.binding, calendar = shared_calendars[calendar_key]
++                self.source = self.source_factory(self.binding)
+             else:
+-                existing.require_current()
+-                wire = existing.to_dict()
+-                document = wire["document"]
+-                if (wire["request"] != first.to_dict()
+-                        or wire["generation"]["refresh_generation"] != "g1"
+-                        or document["coverage"] != dict(start_date=first.start_date,
+-                                                         end_date=first.end_date, complete=True)
+-                        or {row["date"]: row["is_open"] for row in document["rows"]} != days
+-                        or len(document["rows"]) != len(days)):
+-                    raise ValueError("fixture calendar request or current receipt differs")
+-            calendar = FormalPolicyMarketRepository(self.range_store).select_calendar(self.binding, FREEZE)
+-            if calendar.coverage is None:
+-                raise ValueError("fixture calendar must have genuine current coverage")
+-            calendar.coverage.require_current()
++                self.binding = bindings.for_rule(rule["rule_id"], sid[:2])
++                self.source = self.source_factory(self.binding)
++                first = self.source.first_calendar_request(FREEZE)
++                cursor, end = date.fromisoformat(first.start_date), date.fromisoformat(first.end_date)
++                days = {}
++                while cursor <= end:
++                    days[cursor.isoformat()] = cursor >= end - timedelta(days=19)
++                    cursor += timedelta(days=1)
++                existing = self.range_store.select_current(first.request_fingerprint)
++                if existing is None:
++                    self.produce_calendar(days=days)
++                else:
++                    existing.require_current()
++                    wire = existing.to_dict()
++                    document = wire["document"]
++                    if (wire["request"] != first.to_dict()
++                            or wire["generation"]["refresh_generation"] != "g1"
++                            or document["coverage"] != dict(start_date=first.start_date,
++                                                             end_date=first.end_date, complete=True)
++                            or {row["date"]: row["is_open"] for row in document["rows"]} != days
++                            or len(document["rows"]) != len(days)):
++                        raise ValueError("fixture calendar request or current receipt differs")
++                calendar = FormalPolicyMarketRepository(self.range_store).select_calendar(self.binding, FREEZE)
++                if calendar.coverage is None:
++                    raise ValueError("fixture calendar must have genuine current coverage")
++                calendar.coverage.require_current()
++                if self._valuation_adapter_runtime:
++                    shared_calendars[calendar_key] = (self.binding, calendar)
+             _, source = self.range_store.resolve_planning_binding(self.binding)
+             for request in source.market_requests(sid, calendar_coverage=calendar.coverage):
+                 rows = []
+                 sample = document_wire(request)["rows"][0]
+                 base = {key: sample[key] for key in ("published_at_utc", "published_precision",
+                     "effective_at_utc", "effective_time_evidence_hash", "captured_at_utc")}
+                 for day in calendar.coverage.trading_days:
+                     if request.start_date <= day <= request.end_date:
+                         rows.append(dict(base, date=day, exchange_allows_trading=True,
+                             volume="1", volume_unit="shares", turnover="2", turnover_unit="CNY",
+@@ -284,20 +299,22 @@ class PolicyRuntimeFixture(FinancialFixture):
+                     coverage=dict(start_date=request.start_date, end_date=request.end_date, complete=True),
+                     parser_id=config.parser_id, parser_version=config.parser_version,
+                     mapping_version=config.mapping_version, normalizer_version=config.normalizer_version,
+                     request_version=config.request_version)
+                 task = self.range_store.enqueue(request, refresh_generation="g1")
+                 self.reply(wire, original_url="https://www.cninfo.com.cn/fixture/range-market.json")
+                 lease = self.range_store.lease_next("policy-market-fixture", lease_seconds=3600)
+                 self.assertEqual(lease["id"], task["id"])
+                 self.range_store.persist(task["id"], "policy-market-fixture", lease["attempt_id"],
+                                          fetch=source.fetch_verified(request))
++            if self._valuation_adapter_runtime and callable(getattr(self, "_valuation_progress", None)):
++                self._valuation_progress("policy", sid)
+ 
+     def source_factory(self, binding):
+         from ashare_pipeline.formal_range_source import FormalRangeSource
+         return FormalRangeSource(binding, transport=self.transport,
+                                  implementations=self.implementations)
+ 
+     def reply(self, *args, **kwargs):
+         from tests.formal_range_fixtures import RangeSourceFixture
+         return RangeSourceFixture.reply(self, *args, **kwargs)
+ 
+diff --git a/tests/formal_valuation_fixtures.py b/tests/formal_valuation_fixtures.py
+new file mode 100644
+index 0000000..5ad86fe
+--- /dev/null
++++ b/tests/formal_valuation_fixtures.py
+@@ -0,0 +1,65 @@
++"""Genuine signed ten-role, producer-backed valuation test universe."""
++
++from ashare_pipeline.formal_valuation_adapter_contract import load_formal_valuation_adapter_registry
++from ashare_pipeline.formal_valuation_engine import FormalValuationRepository
++from tests.formal_policy_fixtures import add_valuation_adapter_document
++from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++
++
++class ValuationRuntimeFixture(PolicyRuntimeFixture):
++    def __init__(self, *, peer_count=20):
++        if type(peer_count) is not int or peer_count < 3:
++            raise ValueError("valuation fixture requires all three exchanges")
++        securities = {"BJ430001": "general_nonfinancial"}
++        securities.update({f"SH{600000 + index}": "general_nonfinancial"
++                           for index in range(peer_count - 2)})
++        securities["SZ000001"] = "general_nonfinancial"
++
++        def choose_earnings_adapter(documents):
++            rule = documents["cyclic"]["rules"]["general_nonfinancial_cyclic_top"]
++            for dependency in rule["parameters"]["valuation_dependencies"]:
++                if dependency["metric_id"] == "V.normalized_earnings_yield":
++                    dependency.update(policy_dependency="affected", profit_semantic_id="cyclic_top",
++                        adapter_id="fixture_profit_adapter", adapter_version="fixture-v1")
++                else:
++                    dependency.update(policy_dependency="unaffected", profit_semantic_id=None,
++                        adapter_id=None, adapter_version=None)
++            add_valuation_adapter_document(documents)
++            # Keep market requests small while the genuine range producer
++            # materializes every requested slice. The resulting full window
++            # clears the independent no-effective-trade rule.
++            for config in documents["source"]["range_configs"]:
++                config["max_calendar_days_per_request"] = 1
++
++        super().__init__(range_enabled=True, templates=securities, cyclic=True,
++            noncyclic_ids=tuple(sorted(set(securities) - {"BJ430001"})),
++            valuation_adapter=True, mutate=choose_earnings_adapter)
++        self.templates = securities
++        self.valuation_registry = load_formal_valuation_adapter_registry(self.bundle,
++            scoring_registry=self.scoring, policy_registry=self.policy_registry)
++        self.repository = FormalValuationRepository(self.feature_repository, self.context,
++            self.range_store, registry_signature_verifier=self.verifier)
++        self.valuation_feature_bundles = {}
++
++    def populate_valuation_inputs(self):
++        self.populate_policy_evidence(skip_financial=tuple(sorted(set(self.templates) - {"BJ430001"})),
++            financial_overrides={"BJ430001": dict(current_profit=10.0,
++                annual_profit=(4.0, 5.0, 6.0, 7.0, 8.0))})
++        if callable(getattr(self, "_valuation_progress", None)):
++            self._valuation_progress("policy_done", None)
++        for index, sid in enumerate(sorted(self.templates)):
++            self.put_financial(sid, {
++                "V.enterprise_value_or_sustainable_roe": 0.1 + index / 1000,
++                "V.normalized_earnings_yield": 0.20 if sid == "BJ430001" else 0.1 + index / 1000,
++                "V.normalized_free_cash_flow_yield": 0.08 + index / 1000,
++            })
++            self.valuation_feature_bundles[sid] = self.persist_features(sid)
++            if callable(getattr(self, "_valuation_progress", None)):
++                self._valuation_progress("metric", sid)
++        if callable(getattr(self, "_valuation_progress", None)):
++            self._valuation_progress("metric_done", None)
++
++    def build_adjusted_batch(self):
++        return self.repository.build_batch(self.frozen.frozen_input_hash,
++            scoring_registry=self.scoring, policy_registry=self.policy_registry,
++            valuation_adapter_registry=self.valuation_registry)
+diff --git a/tests/test_formal_valuation_adapter_contract.py b/tests/test_formal_valuation_adapter_contract.py
+index 25286fb..7e5c63b 100644
+--- a/tests/test_formal_valuation_adapter_contract.py
++++ b/tests/test_formal_valuation_adapter_contract.py
+@@ -375,20 +375,42 @@ class ValuationAdapterContractTests(unittest.TestCase):
+ 
+     def test_v1_graph_cannot_load_a_formal_valuation_adapter(self):
+         bundle, vocabulary, scoring, _, _ = policy_graph(
+             manifest_version="formal-registry-manifest-v1")
+         policy = load_formal_policy_registry(bundle, scoring_registry=scoring,
+             feature_registry=vocabulary)
+         with self.assertRaisesRegex(ValueError, "valuation_adapter role is unavailable"):
+             load_formal_valuation_adapter_registry(bundle, scoring_registry=scoring,
+                 policy_registry=policy)
+ 
++    def test_current_store_bundle_requires_a_fresh_loader_seal_and_all_ten_original_roles(self):
++        from ashare_pipeline.formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
++        from tests.formal_valuation_fixtures import ValuationRuntimeFixture
++
++        fixture = ValuationRuntimeFixture(peer_count=3)
++        self.addCleanup(fixture.close)
++        current = FormalRegistryBundleLoader(fixture.store, fixture.verifier).load(
++            fixture.bundle.manifest.manifest_hash)
++        fixture.valuation_registry.require_current_bundle(current)
++        with self.assertRaises(ValueError):
++            fixture.valuation_registry.require_official(current)
++        with self.assertRaises(ValueError):
++            fixture.valuation_registry.require_current_bundle(object.__new__(VerifiedRegistryBundle))
++        child = current.blob("valuation_adapter")
++        original = child.canonical_json
++        try:
++            object.__setattr__(child, "canonical_json", b"{}")
++            with self.assertRaises(ValueError):
++                fixture.valuation_registry.require_current_bundle(current)
++        finally:
++            object.__setattr__(child, "canonical_json", original)
++
+     def test_fixture_requires_a_stage_c_root_for_adapter_document(self):
+         with self.assertRaises(ValueError):
+             policy_graph(with_valuation_adapter=True)
+         with self.assertRaises(ValueError):
+             policy_graph(version="v2", manifest_version="formal-registry-manifest-v2",
+                 with_valuation_adapter=True)
+ 
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_formal_valuation_batch.py b/tests/test_formal_valuation_batch.py
+new file mode 100644
+index 0000000..90a2500
+--- /dev/null
++++ b/tests/test_formal_valuation_batch.py
+@@ -0,0 +1,65 @@
++"""Complete policy-adjusted V batches from genuine signed evidence."""
++
++import unittest
++from decimal import Decimal
++
++from tests.formal_valuation_fixtures import ValuationRuntimeFixture
++
++
++class ValuationBatchTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture = ValuationRuntimeFixture()
++        print("C4 20-member universe ready", flush=True)
++        def progress(phase, security_id):
++            if phase in ("policy", "metric"):
++                print(f"C4 {phase} {security_id}", flush=True)
++            else:
++                print(f"C4 {phase}", flush=True)
++        cls.fixture._valuation_progress = progress
++        cls.fixture.populate_valuation_inputs()
++        cls.batch = cls.fixture.build_adjusted_batch()
++        print("C4 adjusted batch finalized", flush=True)
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.fixture.close()
++
++    def test_complete_batch_contains_every_security_and_three_v_metrics(self):
++        batch = self.batch
++        batch.require_verified()
++        self.assertEqual(batch.security_ids, tuple(sorted(self.fixture.templates)))
++        self.assertEqual(len(batch.inputs), 3 * len(batch.security_ids))
++        focal = batch.input_for("BJ430001", "V.normalized_earnings_yield")
++        self.assertEqual(focal.status, "adjusted")
++        self.assertEqual(focal.adjusted_value, Decimal("0.12"))
++        focal_market = [item for item in focal.policy_result["decisions"]
++                        if item["semantic_id"] == "no_effective_trade_20d"]
++        self.assertEqual(len(focal_market), 1)
++        self.assertEqual(focal_market[0]["evaluation_state"], "clear")
++        peer = batch.input_for("SH600000", "V.normalized_earnings_yield")
++        decisions = [item for item in peer.policy_result["decisions"] if item["role"] == "cyclic"]
++        self.assertEqual(len(decisions), 1)
++        self.assertEqual(decisions[0]["evaluation_state"], "not_applicable")
++        self.assertEqual(peer.status, "passthrough_not_applicable")
++        peer_market = [item for item in peer.policy_result["decisions"]
++                       if item["semantic_id"] == "no_effective_trade_20d"]
++        self.assertEqual(len(peer_market), 1)
++        self.assertEqual(peer_market[0]["evaluation_state"], "clear")
++
++    def test_batch_rows_are_canonical_and_bind_three_source_authorities(self):
++        batch = self.batch
++        wire = batch.to_dict()
++        expected = [(sid, mid) for sid in sorted(self.fixture.templates)
++                    for mid in ("V.enterprise_value_or_sustainable_roe",
++                                "V.normalized_earnings_yield",
++                                "V.normalized_free_cash_flow_yield")]
++        self.assertEqual([(row["security_id"], row["metric_id"])
++                          for row in wire["inputs"]], expected)
++        self.assertEqual(wire["registry_manifest_hash"], self.fixture.bundle.manifest.manifest_hash)
++        self.assertEqual(wire["valuation_adapter_registry_hash"],
++                         self.fixture.bundle.manifest.valuation_adapter_registry_hash)
++        self.assertEqual(wire["scoring_registry_hash"], self.fixture.bundle.manifest.scoring_registry_hash)
++        self.assertEqual(wire["policy_contract_hash"], self.fixture.policy_registry.contract_hash)
++        self.assertEqual(len(wire["base_batch_canonical_sha256"]), 64)
++        self.assertEqual(len(wire["policy_batch_canonical_sha256"]), 64)
+diff --git a/tests/test_formal_valuation_batch_guards.py b/tests/test_formal_valuation_batch_guards.py
+new file mode 100644
+index 0000000..56b24f1
+--- /dev/null
++++ b/tests/test_formal_valuation_batch_guards.py
+@@ -0,0 +1,473 @@
++"""Atomic publication and forgery rejection for adjusted V batches."""
++
++import copy
++import hashlib
++import sqlite3
++import sys
++import threading
++import unittest
++from pathlib import Path
++
++from ashare_pipeline.formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
++from ashare_pipeline.formal_metric_engine import FormalMetricInputRepository
++from ashare_pipeline.formal_policy_repository import VerifiedPolicyResultBatch
++from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal, _require_current_scope
++from tests.formal_policy_fixtures import REGULATORY_SEMANTICS
++
++from ashare_pipeline.formal_valuation_engine import (
++    FormalValuationRepository, PolicyAdjustedValuationBatch,
++    PolicyAdjustedValuationInput,
++)
++from tests.formal_valuation_fixtures import ValuationRuntimeFixture
++
++
++class ValuationBatchGuardTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture = ValuationRuntimeFixture(peer_count=3)
++        for security_id in cls.fixture.templates:
++            cls.fixture.put_industry(security_id)
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.fixture.close()
++
++    def build(self):
++        return self.fixture.build_adjusted_batch()
++
++    def test_store_reload_requires_original_adapter_and_exact_signed_ten_role_closure(self):
++        fixture = self.fixture
++        original = fixture.bundle
++        reloaded = FormalRegistryBundleLoader(fixture.store, fixture.verifier).load(
++            original.manifest.manifest_hash)
++        self.assertIsNot(reloaded, original)
++        self.assertEqual(len(reloaded.roles), 10)
++        fixture.valuation_registry.require_current_bundle(reloaded)
++        with self.assertRaises(ValueError):
++            fixture.valuation_registry.require_official(reloaded)
++        with self.assertRaises(ValueError):
++            fixture.valuation_registry.require_current_bundle(object.__new__(VerifiedRegistryBundle))
++        blob = reloaded.blob("valuation_adapter")
++        raw = blob.canonical_json
++        try:
++            object.__setattr__(blob, "canonical_json", b"{}")
++            with self.assertRaises(ValueError):
++                fixture.valuation_registry.require_current_bundle(reloaded)
++        finally:
++            object.__setattr__(blob, "canonical_json", raw)
++
++    def test_cross_root_store_reload_is_rejected(self):
++        foreign = ValuationRuntimeFixture(peer_count=4)
++        self.addCleanup(foreign.close)
++        foreign_bundle = FormalRegistryBundleLoader(foreign.store, foreign.verifier).load(
++            foreign.bundle.manifest.manifest_hash)
++        # A separately signed root cannot inherit this adapter's authority.
++        with self.assertRaises(ValueError):
++            self.fixture.valuation_registry.require_current_bundle(foreign_bundle)
++
++    def test_signed_membership_without_context_still_publishes_three_pending_v_rows(self):
++        fixture = ValuationRuntimeFixture(peer_count=3)
++        self.addCleanup(fixture.close)
++        original_metric = FormalMetricInputRepository(fixture.feature_repository, fixture.context,
++            registry_signature_verifier=fixture.verifier).build_batch(
++                fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring,
++                metric_ids=("V.enterprise_value_or_sustainable_roe",
++                            "V.normalized_earnings_yield", "V.normalized_free_cash_flow_yield"))
++        original_policy = fixture.build_policy_batch()
++        metric_wire, policy_wire = original_metric.canonical_bytes(), original_policy.canonical_bytes()
++        batch = fixture.build_adjusted_batch()
++        batch.require_verified()
++        self.assertEqual(len(batch.inputs), 9)
++        self.assertTrue(all(row.status == "pending_policy_evidence" for row in batch.inputs))
++        self.assertTrue(all(row.adjusted_value is None for row in batch.inputs))
++        self.assertEqual(original_metric.canonical_bytes(), metric_wire)
++        self.assertEqual(original_policy.canonical_bytes(), policy_wire)
++        self.assertEqual(batch.base_batch_canonical_sha256, hashlib.sha256(metric_wire).hexdigest())
++        self.assertEqual(batch.policy_batch_canonical_sha256, hashlib.sha256(policy_wire).hexdigest())
++
++    def test_pending_affected_unaffected_and_invalid_original_keep_their_rows(self):
++        fixture = ValuationRuntimeFixture(peer_count=3)
++        self.addCleanup(fixture.close)
++        fixture.put_industry("BJ430001")
++        fixture.put_policy_context("BJ430001", "security_state", dict(is_st=False,
++            is_star_st=False, listing_status="listed", forced_delist_risk=False,
++            suspended=False))
++        fixture.put_policy_context("BJ430001", "regulatory_state", dict(flags=[
++            dict(flag_id=flag, active=False) for flag in REGULATORY_SEMANTICS]))
++        fixture.put_financial("BJ430001", {"V.normalized_earnings_yield": 0.2,
++            "V.normalized_free_cash_flow_yield": 0.08})
++        fixture.persist_features("BJ430001")
++        batch = fixture.build_adjusted_batch()
++        self.assertEqual(len(batch.inputs), 9)
++        self.assertEqual(batch.input_for("BJ430001", "V.normalized_earnings_yield").status,
++                         "pending_policy_evidence")
++        self.assertEqual(batch.input_for("BJ430001", "V.normalized_free_cash_flow_yield").status,
++                         "passthrough_unaffected")
++        self.assertEqual(batch.input_for("BJ430001", "V.enterprise_value_or_sustainable_roe").status,
++                         "invalid_adapter_operand")
++
++    def test_genuine_three_member_market_slices_clear_independent_trade_rule(self):
++        fixture = ValuationRuntimeFixture(peer_count=3)
++        self.addCleanup(fixture.close)
++        fixture.populate_valuation_inputs()
++        policy = fixture.build_policy_batch()
++        policy.require_verified()
++        rows = {row["security_id"]: row for row in policy.to_dict()["results"]}
++        self.assertEqual(set(rows), set(fixture.templates))
++        for sid in rows:
++            decisions = [item for item in rows[sid]["decisions"]
++                         if item["semantic_id"] == "no_effective_trade_20d"]
++            self.assertEqual(len(decisions), 1)
++            self.assertEqual(decisions[0]["evaluation_state"], "clear")
++
++    def test_policy_source_disappears_after_preparation_revokes_entire_adjusted_batch(self):
++        fixture = ValuationRuntimeFixture(peer_count=3)
++        self.addCleanup(fixture.close)
++        _, ref = fixture.put_industry("BJ430001")
++        source = Path(ref.content_path)
++        original = source.read_bytes()
++        captured = []
++        observer = sqlite3.connect(fixture.store.db_path)
++        self.addCleanup(observer.close)
++        before = observer.execute("PRAGMA data_version").fetchone()[0]
++
++        def hook(frame, event, result):
++            if (event == "return" and frame.f_code.co_name == "mint"
++                    and frame.f_code.co_filename.endswith("formal_valuation_engine.py")
++                    and type(result) is PolicyAdjustedValuationBatch and not captured):
++                captured.append(result)
++                source.write_bytes(b"source-invalidated-after-policy")
++
++        try:
++            with self.assertRaises(ValueError):
++                self.run_with_trace(hook, fixture.build_adjusted_batch)
++            self.assertEqual(observer.execute("PRAGMA data_version").fetchone()[0], before)
++            self.assertEqual(len(captured), 1)
++            with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
++                captured[0].require_verified()
++        finally:
++            source.write_bytes(original)
++
++    def run_with_trace(self, hook, build=None):
++        previous_profile, previous_trace = sys.getprofile(), sys.gettrace()
++        try:
++            sys.setprofile(hook)
++            return (build or self.build)()
++        finally:
++            sys.setprofile(previous_profile)
++            sys.settrace(previous_trace)
++
++    def test_outer_finalization_failure_revokes_only_adjusted_children(self):
++        captured = {"adjusted": [], "base": [], "policy": []}
++        closed = []
++
++        def hook(frame, event, result):
++            if event == "return" and frame.f_code.co_name == "mint":
++                filename = frame.f_code.co_filename
++                if filename.endswith("formal_valuation_engine.py"):
++                    captured["adjusted"].append(result)
++                elif filename.endswith("formal_metric_engine.py"):
++                    captured["base"].append(result)
++                elif filename.endswith("formal_policy_repository.py"):
++                    captured["policy"].append(result)
++            if (not closed and captured["adjusted"] and event == "return"
++                    and frame.f_code.co_name == "finalize"
++                    and frame.f_code.co_filename.endswith("formal_metric_batch_guard.py")
++                    and "observer" in frame.f_locals):
++                closed.append(True)
++                frame.f_locals["observer"].close()
++
++        with self.assertRaises((sqlite3.Error, ValueError)):
++            self.run_with_trace(hook)
++        self.assertEqual(closed, [True])
++        self.assertTrue(captured["adjusted"])
++        with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
++            captured["adjusted"][-1].require_verified()
++        captured["base"][-1].require_verified()
++        captured["policy"][-1].require_verified()
++        self.build().require_verified()
++
++    def test_proofs_and_repository_reject_direct_construction_and_copy(self):
++        for cls in (PolicyAdjustedValuationBatch, PolicyAdjustedValuationInput):
++            with self.assertRaises(TypeError):
++                cls()
++            with self.assertRaises(ValueError):
++                cls.require_verified(object.__new__(cls))
++            subclass = type("UntrustedAdjustedProof", (cls,), {})
++            with self.assertRaises(ValueError):
++                cls.require_verified(object.__new__(subclass))
++        with self.assertRaises(ValueError):
++            FormalValuationRepository(object(), object(), object(), registry_signature_verifier=object())
++        with self.assertRaises(ValueError):
++            FormalValuationRepository.build_batch(object.__new__(FormalValuationRepository),
++                self.fixture.frozen.frozen_input_hash, scoring_registry=self.fixture.scoring,
++                policy_registry=self.fixture.policy_registry,
++                valuation_adapter_registry=self.fixture.valuation_registry)
++        batch = self.build()
++        with self.assertRaises(TypeError):
++            copy.copy(batch)
++        with self.assertRaises(TypeError):
++            copy.copy(batch.inputs[0])
++        with self.assertRaises(AttributeError):
++            batch.inputs[0].status = "adjusted"
++        try:
++            type.__setattr__(PolicyAdjustedValuationInput, "require_verified", lambda _self: None)
++            with self.assertRaisesRegex(ValueError, "authority interface changed"):
++                batch.inputs[0].require_verified()
++        finally:
++            type.__delattr__(PolicyAdjustedValuationInput, "require_verified")
++        batch.inputs[0].require_verified()
++
++    def test_replaced_adapter_entry_point_fails_before_any_publication(self):
++        from ashare_pipeline.formal_valuation_adapter_contract import FormalValuationAdapterRegistry
++        original = FormalValuationAdapterRegistry.require_current_bundle
++        try:
++            type.__setattr__(FormalValuationAdapterRegistry, "require_current_bundle",
++                lambda _self, _bundle: None)
++            with self.assertRaisesRegex(ValueError, "dependency changed"):
++                self.build()
++        finally:
++            type.__setattr__(FormalValuationAdapterRegistry, "require_current_bundle", original)
++
++
++class ValuationSourceClosureTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture = ValuationRuntimeFixture(peer_count=3)
++        cls.fixture.populate_valuation_inputs()
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.fixture.close()
++
++    def test_outer_scope_rejects_public_open_foreign_owner_thread_copy_and_replay(self):
++        fixture = self.fixture
++        population = tuple(sorted(fixture.templates))
++        required = tuple((sid, "V.normalized_earnings_yield") for sid in population)
++        with self.assertRaisesRegex(ValueError, "authentic owner build"):
++            FormalBatchReadJournal.open(fixture.repository,
++                registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
++                as_of_utc="2026-08-31T07:00:00+00:00", population=population,
++                required_keys=required, frozen_input_hash=fixture.frozen.frozen_input_hash)
++        captured = []
++        foreign = ValuationRuntimeFixture(peer_count=3)
++        self.addCleanup(foreign.close)
++
++        def hook(frame, event, result):
++            if (event == "return" and frame.f_code.co_name == "open"
++                    and frame.f_code.co_filename.endswith("formal_batch_read_journal.py")
++                    and type(result) is FormalBatchReadJournal and not captured):
++                captured.append(result)
++                with self.assertRaises(ValueError):
++                    _require_current_scope(result, foreign.repository,
++                        root=fixture.bundle.manifest.manifest_hash,
++                        as_of_utc="2026-08-31T07:00:00+00:00", population=population)
++                failures = []
++                worker = threading.Thread(target=lambda: _cross_thread_probe(result, failures))
++                worker.start()
++                worker.join()
++                self.assertEqual(failures, [ValueError])
++
++        def _cross_thread_probe(scope, failures):
++            try:
++                scope.checkpoint()
++            except Exception as error:
++                failures.append(type(error))
++
++        batch = ValuationBatchGuardTests.run_with_trace(self, hook, fixture.build_adjusted_batch)
++        batch.require_verified()
++        self.assertEqual(len(captured), 1)
++        with self.assertRaises(TypeError):
++            copy.copy(captured[0])
++        with self.assertRaisesRegex(ValueError, "closed"):
++            captured[0].checkpoint()
++
++    def test_provider_epoch_change_after_adjusted_mint_revokes_adjusted_batch(self):
++        fixture = self.fixture
++        member = "BJ430001"
++        snapshot = fixture.provider.resolve_current_inputs(security_id=member,
++            as_of_utc="2026-08-31T07:00:00+00:00", template_id=fixture.templates[member],
++            registry_manifest_hash=fixture.bundle.manifest.manifest_hash)
++        adjusted, changed = [], []
++
++        def hook(frame, event, result):
++            if (event == "return" and frame.f_code.co_name == "mint"
++                    and frame.f_code.co_filename.endswith("formal_valuation_engine.py")
++                    and type(result) is PolicyAdjustedValuationBatch and not changed):
++                adjusted.append(result)
++                changed.append(True)
++                fixture.provider.publish(snapshot)
++
++        with self.assertRaises(ValueError):
++            ValuationBatchGuardTests.run_with_trace(self, hook, fixture.build_adjusted_batch)
++        self.assertEqual(changed, [True])
++        with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
++            adjusted[0].require_verified()
++        fixture.build_adjusted_batch().require_verified()
++
++    def test_three_member_owner_selects_once_and_all_checkpoint_phases_cover_every_member(self):
++        from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
++        from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
++        from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
++        from ashare_pipeline.formal_policy_market import FormalPolicyMarketRepository
++        from ashare_pipeline.formal_financial_features import build_formal_feature_bundle
++        from ashare_pipeline.formal_metric_features import evaluate_selected_features
++        from ashare_pipeline.formal_range_source import FormalRangeSource
++
++        fixture = ValuationRuntimeFixture(peer_count=3)
++        self.addCleanup(fixture.close)
++        members = set(fixture.templates)
++        for index, sid in enumerate(sorted(members)):
++            fixture.put_industry(sid)
++            fixture.put_financial(sid, {
++                "V.enterprise_value_or_sustainable_roe": 0.1 + index / 1000,
++                "V.normalized_earnings_yield": 0.2 + index / 1000,
++                "V.normalized_free_cash_flow_yield": 0.08 + index / 1000})
++            fixture.persist_features(sid)
++        first_v = []
++        selected = {kind: [] for kind in ("financial", "state", "market")}
++        checkpoints = []
++        checked = {}
++        forbidden = []
++        checkpoint_code = FormalBatchReadJournal.checkpoint.__code__
++        feature_select_code = FormalFeatureRepository.select_current_verified_metric_feature_state.__code__
++        feature_ticket_code = FormalFeatureRepository.select_current_metric_batch_ticket.__code__
++        selectors = {
++            FormalPolicyFinancialRepository.select_current_batch_ticket.__code__: "financial",
++            FormalPolicyStateRepository.select_current_batch_ticket.__code__: "state",
++            FormalPolicyMarketRepository.select_current_batch_ticket.__code__: "market",
++        }
++        checkers = {
++            FormalPolicyFinancialRepository._batch_recheck_ticket.__code__: "financial",
++            FormalPolicyStateRepository._batch_recheck_ticket.__code__: "state",
++            FormalPolicyMarketRepository._batch_recheck_ticket.__code__: "market",
++            FormalFeatureRepository._batch_recheck_ticket.__code__: "feature",
++        }
++        banned_codes = {build_formal_feature_bundle.__code__, evaluate_selected_features.__code__,
++            FormalRangeSource.parse_verified_snapshot.__code__, feature_select_code,
++            FormalPolicyFinancialRepository.select.__code__,
++            FormalPolicyStateRepository.select.__code__,
++            FormalPolicyMarketRepository.select.__code__,
++            FormalPolicyMarketRepository.select_calendar.__code__}
++
++        def hook(frame, event, result):
++            if event != "call":
++                return
++            code = frame.f_code
++            if code is checkpoint_code:
++                checkpoints.append(frame.f_locals["self"])
++                print(f"C4 journal checkpoint {len(checkpoints)}", flush=True)
++            elif code is feature_select_code and frame.f_back.f_code is feature_ticket_code:
++                first_v.append((frame.f_locals["security_id"], frame.f_back.f_locals["metric_id"]))
++            elif code in selectors:
++                selected[selectors[code]].append(frame.f_locals["security_id"])
++            elif code in checkers and frame.f_back.f_code is checkpoint_code:
++                kind = checkers[code]
++                evidence = frame.f_locals["evidence"]
++                if kind != "market" or evidence[0] == "market":
++                    sid = evidence[0]["security_id"] if kind == "feature" else evidence[-1][0]
++                    checked.setdefault((len(checkpoints) - 1, kind), []).append(sid)
++            if code in banned_codes:
++                cursor = frame.f_back
++                while cursor is not None:
++                    if cursor.f_code is checkpoint_code:
++                        forbidden.append(code.co_name)
++                        break
++                    cursor = cursor.f_back
++
++        batch = ValuationBatchGuardTests.run_with_trace(self, hook, fixture.build_adjusted_batch)
++        batch.require_verified()
++        self.assertEqual(sorted(first_v), sorted((sid, mid) for sid in members for mid in batch.metric_ids))
++        for kind, calls in selected.items():
++            self.assertEqual(sorted(calls), sorted(members), kind)
++        self.assertEqual(len(checkpoints), 3)
++        self.assertIs(checkpoints[0], checkpoints[1])
++        self.assertIs(checkpoints[1], checkpoints[2])
++        for phase in (0, 1, 2):
++            for kind in selected:
++                self.assertEqual(sorted(checked[(phase, kind)]), sorted(members), (phase, kind))
++        self.assertEqual(sorted(checked[(2, "feature")]),
++                         sorted(sid for sid in members for _ in batch.metric_ids))
++        self.assertEqual(forbidden, [])
++        rereads = []
++        previous = sys.getprofile()
++        try:
++            sys.setprofile(lambda frame, event, _result: rereads.append(frame.f_code.co_name)
++                if event == "call" and frame.f_code.co_name in {
++                    "_batch_recheck_ticket", "select_state", "build_formal_feature_bundle"} else None)
++            for item in batch.inputs:
++                self.assertIsInstance(item.status, str)
++                self.assertIsInstance(item.security_id, str)
++        finally:
++            sys.setprofile(previous)
++        self.assertEqual(rereads, [])
++        public_metric = FormalMetricInputRepository(fixture.feature_repository,
++            fixture.context, registry_signature_verifier=fixture.verifier).build_batch(
++                fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring,
++                metric_ids=tuple(batch.metric_ids))
++        public_policy = fixture.build_policy_batch()
++        self.assertEqual(batch.base_batch_canonical_sha256,
++                         hashlib.sha256(public_metric.canonical_bytes()).hexdigest())
++        self.assertEqual(batch.policy_batch_canonical_sha256,
++                         hashlib.sha256(public_policy.canonical_bytes()).hexdigest())
++
++    def test_v_only_file_changes_revoke_outer_publication_without_database_version_change(self):
++        fixture = ValuationRuntimeFixture(peer_count=3)
++        self.addCleanup(fixture.close)
++        fixture.put_industry("BJ430001")
++        fixture.put_policy_context("BJ430001", "security_state", dict(is_st=False,
++            is_star_st=False, listing_status="listed", forced_delist_risk=False,
++            suspended=False))
++        fixture.put_policy_context("BJ430001", "regulatory_state", dict(flags=[
++            dict(flag_id=flag, active=False) for flag in REGULATORY_SEMANTICS]))
++        fixture.policy_financial_values("BJ430001")
++        fixture.put_financial("SH600000", {
++            "V.enterprise_value_or_sustainable_roe": 0.1,
++            "V.normalized_earnings_yield": 0.2,
++            "V.normalized_free_cash_flow_yield": 0.08})
++        bundle = fixture.persist_features("SH600000")
++        facts = fixture.store.list_formal_financial_facts(security_id="SH600000")
++        raw_fact = next(item for item in facts if item.metric_key == "V.normalized_earnings_yield")
++        source = fixture.store.get_formal_snapshot(raw_fact.source_snapshot_id)
++        receipt = fixture.store.get_formal_feature_bundle_row(bundle.input_hash)
++        targets = ((Path(source.content_path), "modify"),
++                   (Path(source.manifest_path), "delete"),
++                   (Path(receipt["bundle_path"]), "modify"),
++                   (Path(receipt["manifest_path"]), "delete"))
++        observer = sqlite3.connect(fixture.store.db_path)
++        self.addCleanup(observer.close)
++        for target, mode in targets:
++            with self.subTest(target=target.name, mode=mode):
++                print(f"C4 V-only closure {mode} {target.name}", flush=True)
++                original = target.read_bytes()
++                before = observer.execute("PRAGMA data_version").fetchone()[0]
++                adjusted, policies, changed = [], [], []
++
++                def hook(frame, event, result):
++                    if event != "return" or frame.f_code.co_name != "mint":
++                        return
++                    if type(result) is VerifiedPolicyResultBatch:
++                        policies.append(result)
++                    if (type(result) is PolicyAdjustedValuationBatch and not changed
++                            and frame.f_code.co_filename.endswith("formal_valuation_engine.py")):
++                        adjusted.append(result)
++                        changed.append(True)
++                        if mode == "delete":
++                            target.unlink()
++                        else:
++                            target.write_bytes(original + b"\nchanged-after-adjusted-mint")
++
++                try:
++                    with self.assertRaises(ValueError):
++                        ValuationBatchGuardTests.run_with_trace(self, hook, fixture.build_adjusted_batch)
++                    self.assertEqual(changed, [True])
++                    self.assertEqual(observer.execute("PRAGMA data_version").fetchone()[0], before)
++                    with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
++                        adjusted[0].require_verified()
++                    self.assertTrue(policies)
++                    policies[-1].require_verified()
++                    self.assertEqual(policies[-1].to_dict()["evidence_batch"]["selections"]["SH600000"], {})
++                finally:
++                    target.write_bytes(original)
++
++        fixture.build_adjusted_batch().require_verified()

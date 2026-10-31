@@ -1,0 +1,1505 @@
+# Review package: 56b0343ce1781e5138fb5de66cb1db8e1e6c5596..3ce5a903d9eafb2573c493960c0d8e180f33834e
+
+## Commits
+3ce5a90 fix final minor trust boundaries
+
+## Files changed
+ ashare_pipeline/deep_worker.py                     | 236 +++++++++++++++------
+ ashare_pipeline/financial_features.py              |   5 +-
+ ashare_pipeline/snapshot_repository.py             |   9 +-
+ ...026-08-29-seven-dimension-feature-foundation.md |   2 +-
+ progress.md                                        |   8 +
+ tests/test_deep_worker.py                          | 215 ++++++++++++++++++-
+ tests/test_orchestrator.py                         | 140 +++++++++++-
+ tests/test_snapshot_repository.py                  |  22 +-
+ 8 files changed, 561 insertions(+), 76 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/deep_worker.py b/ashare_pipeline/deep_worker.py
+index 0b4067d..576b6d2 100644
+--- a/ashare_pipeline/deep_worker.py
++++ b/ashare_pipeline/deep_worker.py
+@@ -6,21 +6,21 @@ from dataclasses import dataclass
+ from datetime import date, datetime, timedelta, timezone
+ import hashlib
+ import json
+ import math
+ import os
+ from pathlib import Path
+ import re
+ import tempfile
+ import threading
+ from types import MappingProxyType
+-from typing import Mapping, Sequence
++from typing import Callable, Mapping, Sequence
+ 
+ from ashare_pipeline.feature_contract import (
+     FeatureBundle,
+     canonical_json_bytes,
+     canonical_sha256,
+     require_aware_utc,
+ )
+ from ashare_pipeline.financial_features import (
+     SHANGHAI,
+     build_feature_bundle,
+@@ -853,76 +853,108 @@ class DeepRunSummary:
+             "snapshots_reused": self.snapshots_reused,
+             "statements_succeeded": self.statements_succeeded,
+             "retryable_failed": self.retryable_failed,
+             "terminal_failed": self.terminal_failed,
+             "feature_sets_written": self.feature_sets_written,
+             "circuit_breakers": list(self.circuit_breakers),
+             "items": [dict(item) for item in self.items],
+         }
+ 
+ 
++class _LeaseLostError(RuntimeError):
++    """Signal that an owned job lease can no longer authorize side effects."""
++
++
+ class _LeaseHeartbeat:
+     def __init__(
+         self,
+         store: StateStore,
+         job_id: str,
+         worker_id: str,
+         lease_seconds: int,
+         heartbeat_seconds: float,
+     ) -> None:
+         self.store = store
+         self.job_id = job_id
+         self.worker_id = worker_id
+         self.lease_seconds = lease_seconds
+         self.heartbeat_seconds = heartbeat_seconds
+         self._stop = threading.Event()
++        self._renew_lock = threading.Lock()
+         self.lost = threading.Event()
+         self.error: BaseException | None = None
+         self.thread = threading.Thread(
+             target=self._run,
+             name=f"deep-heartbeat-{job_id}",
+             daemon=True,
+         )
+         self.started = False
++        self.closed = False
+ 
+     def _run(self) -> None:
+         while not self._stop.wait(self.heartbeat_seconds):
+             try:
+-                self.store.renew_job_lease(
+-                    self.job_id, self.worker_id, self.lease_seconds
+-                )
++                with self._renew_lock:
++                    if self._stop.is_set():
++                        return
++                    self.store.renew_job_lease(
++                        self.job_id, self.worker_id, self.lease_seconds
++                    )
+             except BaseException as error:
+                 self.error = error
+                 self.lost.set()
+                 return
+ 
+     def __enter__(self) -> "_LeaseHeartbeat":
+         try:
+-            self.store.renew_job_lease(
+-                self.job_id, self.worker_id, self.lease_seconds
+-            )
++            with self._renew_lock:
++                self.store.renew_job_lease(
++                    self.job_id, self.worker_id, self.lease_seconds
++                )
+         except BaseException as error:
+             self.error = error
+             self.lost.set()
+             return self
+         self.thread.start()
+         self.started = True
+         return self
+ 
+     def __exit__(self, *_exc: object) -> None:
++        self.close()
++
++    def close(self) -> None:
++        if self.closed:
++            return
++        self.closed = True
+         self._stop.set()
+         if not self.started:
+             return
+         self.thread.join(timeout=max(1.0, self.heartbeat_seconds * 2.0))
+         if self.thread.is_alive():
+             raise RuntimeError("lease heartbeat thread did not stop")
+ 
++    def ensure_owned(self) -> None:
++        if self.lost.is_set():
++            raise _LeaseLostError("job lease heartbeat was lost") from self.error
++
++    def final_transition(
++        self,
++        transition: Callable[..., None],
++        *args: object,
++        **kwargs: object,
++    ) -> None:
++        """Serialize the final owned transition against periodic renewal."""
++        with self._renew_lock:
++            self.ensure_owned()
++            transition(*args, **kwargs)
++            self._stop.set()
++
+ 
+ def _thaw(value: object) -> object:
+     if isinstance(value, Mapping):
+         return {str(key): _thaw(item) for key, item in value.items()}
+     if isinstance(value, tuple):
+         return [_thaw(item) for item in value]
+     return value
+ 
+ 
+ def _validate_feature_payload(payload: object) -> dict[str, object]:
+@@ -1079,22 +1111,25 @@ def _current_statement_refs(
+         dataset: snapshots.find_exact("akshare", dataset, request)
+         for dataset in STATEMENT_DATASETS
+     }
+ 
+ 
+ def _record_fact_issues(
+     store: StateStore,
+     security_id: str,
+     dataset: str,
+     issues: Sequence[object],
++    ensure_owned: Callable[[], None] | None = None,
+ ) -> None:
+     for issue in issues:
++        if ensure_owned is not None:
++            ensure_owned()
+         store.record_quality_issue(
+             run_id=None,
+             score_run_id=None,
+             severity=issue.severity,
+             code=issue.code,
+             details={
+                 "security_id": security_id,
+                 "dataset": dataset,
+                 "details": _thaw(issue.details),
+             },
+@@ -1123,35 +1158,42 @@ def _verified_calendar_days(
+ 
+ 
+ def _normalize_statement_snapshot(
+     *,
+     store: StateStore,
+     snapshots: SnapshotRepository,
+     snapshot: SnapshotRef,
+     security_id: str,
+     trading_days: Sequence[date] | None,
+     record_issues: bool,
++    ensure_owned: Callable[[], None] | None = None,
+ ) -> tuple[tuple[object, ...], tuple[object, ...]]:
+     if trading_days is None:
+         return (), ()
+     verified = snapshots.read_verified(snapshot)
+     result = build_financial_facts(
+         verified.batch,
+         source_snapshot_id=snapshot.id,
+         expected_security_id=security_id,
+         trading_days=trading_days,
+         created_at_utc=snapshot.fetched_at,
+     )
++    if ensure_owned is not None:
++        ensure_owned()
+     store.insert_financial_facts(result.facts)
+     if record_issues:
+         _record_fact_issues(
+-            store, security_id, snapshot.dataset, result.issues
++            store,
++            security_id,
++            snapshot.dataset,
++            result.issues,
++            ensure_owned,
+         )
+     return result.facts, result.issues
+ 
+ 
+ def _target_period_present(snapshot_batch: object, report_period: str) -> bool:
+     return any(
+         isinstance(row, Mapping)
+         and isinstance(row.get("REPORT_DATE"), str)
+         and row["REPORT_DATE"][:10] == report_period
+         for row in snapshot_batch.records
+@@ -1160,25 +1202,28 @@ def _target_period_present(snapshot_batch: object, report_period: str) -> bool:
+ 
+ def _feature_file_target(project_root: Path, relative_path: str) -> Path:
+     return project_root.joinpath(*relative_path.split("/"))
+ 
+ 
+ def _write_and_store_feature_bundle(
+     *,
+     project_root: Path,
+     store: StateStore,
+     bundle: FeatureBundle,
++    ensure_owned: Callable[[], None],
+ ) -> tuple[str, str, bool]:
++    ensure_owned()
+     relative_path, bundle_hash, file_created = write_feature_bundle(
+         project_root, bundle
+     )
+     try:
++        ensure_owned()
+         _feature_set_id, database_created = store.put_feature_bundle(
+             bundle,
+             bundle_path=relative_path,
+             bundle_hash=bundle_hash,
+         )
+     except BaseException:
+         if file_created:
+             committed = store.get_feature_bundle_row(
+                 bundle.security_id, bundle.report_period, bundle.input_hash
+             )
+@@ -1199,20 +1244,21 @@ def _write_and_store_feature_bundle(
+ 
+ 
+ def _execute_feature_job(
+     *,
+     root: Path,
+     store: StateStore,
+     snapshots: SnapshotRepository,
+     context: CandidateContext,
+     job: Mapping[str, object],
+     worker_id: str,
++    heartbeat: _LeaseHeartbeat,
+ ) -> tuple[bool, Mapping[str, object]]:
+     payload = _validate_feature_payload(job["payload"])
+     security_id = payload["security_id"]
+     report_period = payload["report_period"]
+     if not isinstance(security_id, str) or not isinstance(report_period, str):
+         raise ValueError("feature identity must contain string values")
+     if security_id not in context.members:
+         raise ValueError("feature security is not in the candidate context")
+     if (
+         payload["candidate_set_hash"] != context.candidate_set_hash
+@@ -1275,20 +1321,21 @@ def _execute_feature_job(
+         snapshot = statement_refs[dataset]
+         if snapshot is None:
+             continue
+         facts, issues = _normalize_statement_snapshot(
+             store=store,
+             snapshots=snapshots,
+             snapshot=snapshot,
+             security_id=security_id,
+             trading_days=trading_days,
+             record_issues=False,
++            ensure_owned=heartbeat.ensure_owned,
+         )
+         normalized_facts.extend(facts)
+         issue_codes.update(issue.code for issue in issues)
+ 
+     selection = select_visible_facts(
+         normalized_facts,
+         as_of_utc=payload["as_of_utc"],
+         snapshot_fetched_at={
+             snapshot.id: snapshot.fetched_at
+             for snapshot in statement_refs.values()
+@@ -1304,108 +1351,152 @@ def _execute_feature_job(
+         facts=selection.facts,
+         fact_blockers=tuple(sorted(set(selection.blockers) | issue_codes)),
+         statement_snapshot_hashes=statement_hashes,
+         trade_calendar_snapshot_hash=(
+             calendar_ref.payload_hash if calendar_ref is not None else None
+         ),
+         reported_target_period=payload["reported_target_period"],
+     )
+     if bundle.input_hash != expected_input_hash:
+         raise ValueError("feature bundle input hash does not match frozen payload")
++    heartbeat.ensure_owned()
+     relative_path, bundle_hash, created = _write_and_store_feature_bundle(
+         project_root=root.parent,
+         store=store,
+         bundle=bundle,
++        ensure_owned=heartbeat.ensure_owned,
+     )
+     verified = read_verified_feature_bundle(root.parent, relative_path, bundle_hash)
+     if verified != bundle:
+         raise OSError("stored feature bundle does not match built bundle")
+-    store.complete_job_with_followups(
+-        job["id"],
+-        worker_id,
+-        {"outcome": "feature_built", "bundle_hash": bundle_hash},
+-        (),
++    heartbeat.final_transition(
++        lambda: store.complete_job_with_followups(
++            job["id"],
++            worker_id,
++            {"outcome": "feature_built", "bundle_hash": bundle_hash},
++            (),
++        )
+     )
+     return created, MappingProxyType(
+         {
+             "security_id": security_id,
+             "bundle_hash": bundle_hash,
+             "outcome": "feature_built" if created else "feature_reused",
+         }
+     )
+ 
+ 
+ def _process_feature_jobs(
+     *,
+     root: Path,
+     store: StateStore,
+     snapshots: SnapshotRepository,
+     context: CandidateContext,
+     logical_now_utc: str,
+     worker_id: str,
+     lease_seconds: int,
++    heartbeat_seconds: float,
+     items: list[Mapping[str, object]],
+ ) -> int:
+     created_count = 0
+     while True:
+         job = _lease_next_at_logical_time(
+             store,
+             ["feature_build"],
+             worker_id,
+             lease_seconds,
+             logical_now_utc,
+         )
+         if job is None:
+             return created_count
++        heartbeat = _LeaseHeartbeat(
++            store,
++            job["id"],
++            worker_id,
++            lease_seconds,
++            heartbeat_seconds,
++        )
++        heartbeat.__enter__()
+         try:
++            heartbeat.ensure_owned()
+             created, item = _execute_feature_job(
+                 root=root,
+                 store=store,
+                 snapshots=snapshots,
+                 context=context,
+                 job=job,
+                 worker_id=worker_id,
++                heartbeat=heartbeat,
+             )
+-        except BaseException as error:
++        except _LeaseLostError:
++            payload = job.get("payload")
++            item_data: dict[str, object] = {
++                "outcome": "lease_lost",
++                "error_classification": "lease_lost",
++            }
++            if isinstance(payload, Mapping) and isinstance(
++                payload.get("security_id"), str
++            ):
++                item_data["security_id"] = payload["security_id"]
++            items.append(MappingProxyType(item_data))
++            break
++        except Exception as error:
+             retryable = not isinstance(error, ValueError)
+             try:
+-                store.fail_job_with_followups(
+-                    job["id"],
+-                    worker_id,
+-                    {"error_classification": "feature_build_error"},
+-                    retryable,
+-                    (
+-                        datetime.fromisoformat(logical_now_utc)
+-                        + timedelta(hours=6)
+-                    ).isoformat()
+-                    if retryable
+-                    else None,
+-                    (),
++                heartbeat.final_transition(
++                    lambda: store.fail_job_with_followups(
++                        job["id"],
++                        worker_id,
++                        {"error_classification": "feature_build_error"},
++                        retryable,
++                        (
++                            datetime.fromisoformat(logical_now_utc)
++                            + timedelta(hours=6)
++                        ).isoformat()
++                        if retryable
++                        else None,
++                        (),
++                    )
+                 )
++            except _LeaseLostError:
++                payload = job.get("payload")
++                item_data = {
++                    "outcome": "lease_lost",
++                    "error_classification": "lease_lost",
++                }
++                if isinstance(payload, Mapping) and isinstance(
++                    payload.get("security_id"), str
++                ):
++                    item_data["security_id"] = payload["security_id"]
++                items.append(MappingProxyType(item_data))
++                break
+             except ValueError:
+                 raise error
+             payload = job.get("payload")
+             security_id = (
+                 payload.get("security_id")
+                 if isinstance(payload, Mapping)
+                 else None
+             )
+             item_data: dict[str, object] = {
+                 "outcome": "feature_failed",
+                 "error_classification": "feature_build_error",
+             }
+             if isinstance(security_id, str):
+                 item_data["security_id"] = security_id
+             items.append(MappingProxyType(item_data))
+             continue
++        finally:
++            heartbeat.close()
+         created_count += int(created)
+         items.append(item)
++    return created_count
+ 
+ 
+ def _statement_followup(
+     *,
+     context: CandidateContext,
+     snapshots: SnapshotRepository,
+     security_id: str,
+     report_period: str,
+     as_of_utc: str,
+     trade_calendar_snapshot: SnapshotRef | None,
+@@ -1489,20 +1580,21 @@ def execute_queued_deep_work(
+     logical_now_utc = normalized_now.astimezone(timezone.utc).isoformat()
+     items: list[Mapping[str, object]] = []
+     feature_sets_written = _process_feature_jobs(
+         root=data_root,
+         store=store,
+         snapshots=snapshots,
+         context=context,
+         logical_now_utc=logical_now_utc,
+         worker_id=worker,
+         lease_seconds=lease_seconds,
++        heartbeat_seconds=heartbeat_seconds,
+         items=items,
+     )
+     counters = {
+         "remote_attempts": 0,
+         "snapshots_reused": 0,
+         "statements_succeeded": 0,
+         "retryable_failed": 0,
+         "terminal_failed": 0,
+     }
+     circuits: list[str] = []
+@@ -1525,21 +1617,32 @@ def execute_queued_deep_work(
+     while counters["remote_attempts"] < limit:
+         job = _lease_next_at_logical_time(
+             store,
+             ["deep_statement"],
+             worker,
+             lease_seconds,
+             logical_now_utc,
+         )
+         if job is None:
+             break
++        heartbeat = _LeaseHeartbeat(
++            store,
++            job["id"],
++            worker,
++            lease_seconds,
++            heartbeat_seconds,
++        )
++        heartbeat.__enter__()
++        security_id: str | None = None
++        dataset: str | None = None
+         try:
++            heartbeat.ensure_owned()
+             _validate_statement_payload(job["payload"])
+             payload = job["payload"]
+             if not isinstance(payload, Mapping):
+                 raise ValueError("deep statement payload must be a mapping")
+             security_id = payload["security_id"]
+             dataset = payload["dataset"]
+             report_period = payload["report_period"]
+             refresh_date = payload["refresh_date"]
+             if not all(
+                 isinstance(value, str)
+@@ -1564,78 +1667,63 @@ def execute_queued_deep_work(
+                 verified = snapshots.read_verified(snapshot)
+                 facts, issues = _normalize_statement_snapshot(
+                     store=store,
+                     snapshots=snapshots,
+                     snapshot=snapshot,
+                     security_id=security_id,
+                     trading_days=_verified_calendar_days(
+                         snapshots, trade_calendar_snapshot
+                     ),
+                     record_issues=True,
++                    ensure_owned=heartbeat.ensure_owned,
+                 )
+                 counters["snapshots_reused"] += 1
+             else:
+-                heartbeat = _LeaseHeartbeat(
+-                    store,
+-                    job["id"],
+-                    worker,
+-                    lease_seconds,
+-                    heartbeat_seconds,
+-                )
+                 batch = None
+                 source_error: (
+                     SourceBlocked | RetryableSourceError | TerminalSourceError | None
+                 ) = None
+-                with heartbeat:
+-                    if not heartbeat.lost.is_set():
+-                        counters["remote_attempts"] += 1
+-                        try:
+-                            batch = source.fetch_financial_statement(
+-                                security_id, dataset, report_period
+-                            )
+-                        except (
+-                            SourceBlocked,
+-                            RetryableSourceError,
+-                            TerminalSourceError,
+-                        ) as error:
+-                            source_error = error
+-                if heartbeat.lost.is_set():
+-                    items.append(
+-                        _statement_item(
+-                            security_id=security_id,
+-                            dataset=dataset,
+-                            outcome="lease_lost",
+-                            error_classification="lease_lost",
+-                        )
++                heartbeat.ensure_owned()
++                counters["remote_attempts"] += 1
++                try:
++                    batch = source.fetch_financial_statement(
++                        security_id, dataset, report_period
+                     )
+-                    break
++                except (
++                    SourceBlocked,
++                    RetryableSourceError,
++                    TerminalSourceError,
++                ) as error:
++                    source_error = error
++                heartbeat.ensure_owned()
+                 if source_error is not None:
+                     blocked = isinstance(source_error, SourceBlocked)
+                     retryable = blocked or isinstance(
+                         source_error, RetryableSourceError
+                     )
+                     classification = (
+                         "source_blocked"
+                         if blocked
+                         else "retryable_source"
+                         if retryable
+                         else "terminal_source"
+                     )
+                     followup = _statement_followup(
+                         context=context,
+                         snapshots=snapshots,
+                         security_id=security_id,
+                         report_period=report_period,
+                         as_of_utc=logical_now_utc,
+                         trade_calendar_snapshot=trade_calendar_snapshot,
+                     )
+-                    store.fail_job_with_followups(
++                    heartbeat.final_transition(
++                        store.fail_job_with_followups,
+                         job["id"],
+                         worker,
+                         {"error_classification": classification},
+                         retryable,
+                         (
+                             normalized_now.astimezone(timezone.utc)
+                             + timedelta(hours=6)
+                         ).isoformat()
+                         if retryable
+                         else None,
+@@ -1646,126 +1734,135 @@ def execute_queued_deep_work(
+                     items.append(
+                         _statement_item(
+                             security_id=security_id,
+                             dataset=dataset,
+                             outcome=counter,
+                             error_classification=classification,
+                         )
+                     )
+                     if blocked:
+                         circuits.append("akshare")
++                    heartbeat.close()
+                     feature_sets_written += _process_feature_jobs(
+                         root=data_root,
+                         store=store,
+                         snapshots=snapshots,
+                         context=context,
+                         logical_now_utc=logical_now_utc,
+                         worker_id=worker,
+                         lease_seconds=lease_seconds,
++                        heartbeat_seconds=heartbeat_seconds,
+                         items=items,
+                     )
+                     if blocked:
+                         break
+                     continue
+                 if batch is None:
+                     raise RuntimeError("remote statement request produced no batch")
+                 if (
+                     batch.source != "akshare"
+                     or batch.dataset != dataset
+                     or batch.request != request
+                 ):
+                     followup = _statement_followup(
+                         context=context,
+                         snapshots=snapshots,
+                         security_id=security_id,
+                         report_period=report_period,
+                         as_of_utc=logical_now_utc,
+                         trade_calendar_snapshot=trade_calendar_snapshot,
+                     )
+-                    store.fail_job_with_followups(
++                    heartbeat.final_transition(
++                        store.fail_job_with_followups,
+                         job["id"],
+                         worker,
+                         {"error_classification": "mismatched_source_batch"},
+                         False,
+                         None,
+                         (followup,),
+                     )
+                     counters["terminal_failed"] += 1
+                     items.append(
+                         _statement_item(
+                             security_id=security_id,
+                             dataset=dataset,
+                             outcome="terminal_failed",
+                             error_classification="mismatched_source_batch",
+                         )
+                     )
++                    heartbeat.close()
+                     feature_sets_written += _process_feature_jobs(
+                         root=data_root,
+                         store=store,
+                         snapshots=snapshots,
+                         context=context,
+                         logical_now_utc=logical_now_utc,
+                         worker_id=worker,
+                         lease_seconds=lease_seconds,
++                        heartbeat_seconds=heartbeat_seconds,
+                         items=items,
+                     )
+                     continue
++                heartbeat.ensure_owned()
+                 snapshot, _created = snapshots.persist(batch)
+                 verified = snapshots.read_verified(snapshot)
+                 facts, issues = _normalize_statement_snapshot(
+                     store=store,
+                     snapshots=snapshots,
+                     snapshot=snapshot,
+                     security_id=security_id,
+                     trading_days=_verified_calendar_days(
+                         snapshots, trade_calendar_snapshot
+                     ),
+                     record_issues=True,
++                    ensure_owned=heartbeat.ensure_owned,
+                 )
+ 
+             del facts
+             followup = _statement_followup(
+                 context=context,
+                 snapshots=snapshots,
+                 security_id=security_id,
+                 report_period=report_period,
+                 as_of_utc=logical_now_utc,
+                 trade_calendar_snapshot=trade_calendar_snapshot,
+             )
+             terminal_issue = next(
+                 (issue for issue in issues if issue.severity == "error"), None
+             )
+             target_present = _target_period_present(
+                 verified.batch, report_period
+             )
+             if terminal_issue is not None:
+-                store.fail_job_with_followups(
++                heartbeat.final_transition(
++                    store.fail_job_with_followups,
+                     job["id"],
+                     worker,
+                     {"error_classification": "malformed_statement"},
+                     False,
+                     None,
+                     (followup,),
+                 )
+                 counters["terminal_failed"] += 1
+                 items.append(
+                     _statement_item(
+                         security_id=security_id,
+                         dataset=dataset,
+                         snapshot_hash=snapshot.payload_hash,
+                         outcome="terminal_failed",
+                         error_classification="malformed_statement",
+                     )
+                 )
+             elif context.reported_target_period[security_id] and not target_present:
+                 after_cutoff = normalized_now > _TARGET_PERIOD_CUTOFF_CN
+-                store.fail_job_with_followups(
++                heartbeat.final_transition(
++                    store.fail_job_with_followups,
+                     job["id"],
+                     worker,
+                     {"error_classification": "target_period_missing"},
+                     not after_cutoff,
+                     (
+                         normalized_now.astimezone(timezone.utc)
+                         + timedelta(hours=6)
+                     ).isoformat()
+                     if not after_cutoff
+                     else None,
+@@ -1776,65 +1873,82 @@ def execute_queued_deep_work(
+                 items.append(
+                     _statement_item(
+                         security_id=security_id,
+                         dataset=dataset,
+                         snapshot_hash=snapshot.payload_hash,
+                         outcome=counter,
+                         error_classification="target_period_missing",
+                     )
+                 )
+             else:
+-                store.complete_job_with_followups(
++                heartbeat.final_transition(
++                    store.complete_job_with_followups,
+                     job["id"],
+                     worker,
+                     {
+                         "outcome": "snapshot_reused" if same_refresh else "statement_persisted",
+                         "snapshot_hash": snapshot.payload_hash,
+                     },
+                     (followup,),
+                 )
+                 counters["statements_succeeded"] += 1
+                 items.append(
+                     _statement_item(
+                         security_id=security_id,
+                         dataset=dataset,
+                         snapshot_hash=snapshot.payload_hash,
+                         outcome="snapshot_reused" if same_refresh else "statement_succeeded",
+                     )
+                 )
++            heartbeat.close()
+             feature_sets_written += _process_feature_jobs(
+                 root=data_root,
+                 store=store,
+                 snapshots=snapshots,
+                 context=context,
+                 logical_now_utc=logical_now_utc,
+                 worker_id=worker,
+                 lease_seconds=lease_seconds,
++                heartbeat_seconds=heartbeat_seconds,
+                 items=items,
+             )
++        except _LeaseLostError:
++            item_data: dict[str, object] = {
++                "outcome": "lease_lost",
++                "error_classification": "lease_lost",
++            }
++            if security_id is not None:
++                item_data["security_id"] = security_id
++            if dataset is not None:
++                item_data["dataset"] = dataset
++            items.append(MappingProxyType(item_data))
++            break
+         except (SourceBlocked, RetryableSourceError, TerminalSourceError):
+             raise
+         except BaseException:
+             # Unexpected local errors are allowed to surface only after the owned
+             # job is safely transitioned when its lease is still valid.
+             try:
+-                store.fail_job_with_followups(
++                heartbeat.final_transition(
++                    store.fail_job_with_followups,
+                     job["id"],
+                     worker,
+                     {"error_classification": "worker_error"},
+                     False,
+                     None,
+                     (),
+                 )
+             except ValueError:
+                 pass
+             raise
++        finally:
++            heartbeat.close()
+ 
+     return DeepRunSummary(
+         expanded,
+         superseded,
+         counters["remote_attempts"],
+         counters["snapshots_reused"],
+         counters["statements_succeeded"],
+         counters["retryable_failed"],
+         counters["terminal_failed"],
+         feature_sets_written,
+diff --git a/ashare_pipeline/financial_features.py b/ashare_pipeline/financial_features.py
+index 511a2aa..8be6e78 100644
+--- a/ashare_pipeline/financial_features.py
++++ b/ashare_pipeline/financial_features.py
+@@ -777,21 +777,24 @@ def build_feature_bundle(
+         financial_blockers.add("financial_fact_security_mismatch")
+     if any(fact.mapping_version != MAPPING_VERSION for fact in supplied_facts):
+         financial_blockers.add("financial_fact_mapping_version_mismatch")
+     selected = tuple(sorted(
+         (
+             fact for fact in supplied_facts
+             if fact.security_id == security_id and fact.mapping_version == MAPPING_VERSION
+         ),
+         key=lambda item: (item.metric_key, item.period_end, item.effective_at_utc, item.id),
+     ))
+-    financial_blockers.update(balance_equation_blockers(selected))
++    if template.financial_slots:
++        financial_blockers.update(balance_equation_blockers(selected))
++    else:
++        financial_blockers.discard("balance_equation_mismatch")
+     if template.template_id == "unclassified":
+         financial_blockers.add("industry_template_unclassified")
+     if (
+         template.specialized_inputs_required
+         and template.template_id != "unclassified"
+     ):
+         financial_blockers.add("specialized_financial_inputs_missing")
+     if trade_calendar_snapshot_hash is None:
+         financial_blockers.add("trade_calendar_missing")
+     missing_statement = any(
+diff --git a/ashare_pipeline/snapshot_repository.py b/ashare_pipeline/snapshot_repository.py
+index 5d9642f..ed9fa16 100644
+--- a/ashare_pipeline/snapshot_repository.py
++++ b/ashare_pipeline/snapshot_repository.py
+@@ -137,21 +137,28 @@ class SnapshotRepository:
+             raise ValueError("snapshot path must stay inside the project data directory") from error
+         if not relative_path.startswith("data/"):
+             raise ValueError("snapshot path must stay inside the project data directory")
+         return relative_path
+ 
+     def _resolve_payload_path(self, payload_path: str) -> Path:
+         if not isinstance(payload_path, str) or not payload_path:
+             raise ValueError("snapshot payload path is required")
+         posix_path = PurePosixPath(payload_path)
+         if Path(payload_path).is_absolute() or PureWindowsPath(payload_path).is_absolute() or posix_path.is_absolute():
+-            return Path(payload_path).resolve()
++            resolved = Path(payload_path).resolve()
++            try:
++                resolved.relative_to(self.data_root.resolve())
++            except (OSError, ValueError) as error:
++                raise ValueError(
++                    "absolute legacy snapshot path must stay inside repository data root"
++                ) from error
++            return resolved
+         if "\\" in payload_path:
+             raise ValueError("relative snapshot path must not contain a backslash")
+         posix_parts = posix_path.parts
+         if ".." in posix_parts:
+             raise ValueError("relative snapshot paths cannot include parent traversal")
+         if not posix_parts or posix_parts[0] != "data":
+             raise ValueError("relative snapshot path must stay inside the project data directory")
+         resolved = self.project_root.joinpath(*posix_parts).resolve()
+         try:
+             resolved.relative_to(self.data_root)
+diff --git a/docs/superpowers/plans/2026-08-29-seven-dimension-feature-foundation.md b/docs/superpowers/plans/2026-08-29-seven-dimension-feature-foundation.md
+index aff9382..ce31060 100644
+--- a/docs/superpowers/plans/2026-08-29-seven-dimension-feature-foundation.md
++++ b/docs/superpowers/plans/2026-08-29-seven-dimension-feature-foundation.md
+@@ -466,21 +466,21 @@ def test_initialize_migrates_literal_v2_database_to_v3_without_changing_existing
+             [(2,), (3,)],
+         )
+         tables = {row[0] for row in connection.execute(
+             "SELECT name FROM sqlite_master WHERE type='table'"
+         )}
+     self.assertTrue({"financial_fact", "feature_set", "feature_value"} <= tables)
+ ```
+ 
+ Add tests for two consecutive initializations, foreign-key rejection, invalid feature status/dimension, coverage -0.01 and 1.01, and preservation of final score-run immutability.
+ 
+-The literal-v2 migration regression must not preserve only `run`. Seed representative, foreign-key-consistent rows in every existing v2 table (`run`, `snapshot`, `job`, `score_run`, `score_item`, `quality_issue`, and `export_artifact`), capture each table with a deterministic `SELECT * ... ORDER BY` before initialization, and compare every table row-for-row after migration. The v3 table/version assertions come only after those preservation assertions.
++The literal-v2 migration regression must not preserve only `run`. Seed representative, foreign-key-consistent rows in every existing v2 table (`run`, `source_snapshot`, `job`, `score_run`, `score_item`, `quality_issue`, and `artifact`), capture each table with a deterministic `SELECT * ... ORDER BY` before initialization, and compare every table row-for-row after migration. The v3 table/version assertions come only after those preservation assertions.
+ 
+ - [ ] **Step 2: Run the migration test to verify RED**
+ 
+ Run:
+ 
+ ```powershell
+ .\.venv\Scripts\python.exe -m unittest tests.test_state_store.StateStoreTestCase.test_initialize_migrates_literal_v2_database_to_v3_without_changing_existing_rows -v
+ ```
+ 
+ Expected: FAIL because schema version is still 2 and v3 tables do not exist.
+diff --git a/progress.md b/progress.md
+index fae0509..e76b4f5 100644
+--- a/progress.md
++++ b/progress.md
+@@ -80,10 +80,18 @@
+ - 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
+ - `formal_score_ready=false`，未发布 formal scores；正式等待价格池与正式强烈关注池继续关闭且为空。
+ 
+ ## 七维最终信任边界收口（2026-09-01）
+ 
+ - verified progress 现将 bundle 的精确行业来源名称与注册模板绑定到当前冻结的 `CandidateContext`；不匹配记录 fail closed，且保持 visible newest-only、no-fallback。
+ - 资产负债恒等式及容差/适用性由单一生产 authority 定义；builder 与 StateStore 首写、幂等复用、verified progress 路径均从已认证 canonical raw facts 重算，拒绝 blocker 或财务状态的语义伪造。
+ - progress 在按证券选择最新记录之前强制 `feature_set.as_of_utc <= now_utc`；未来 bundle 不计数、不制造 unknown，也不能压制当前时点可见的较旧记录，等于截止时刻仍可见。
+ - 本轮 focused 9/9、受影响模块 294/294、fresh full `unittest` 399/399 通过；尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
+ - `formal_score_ready=false`、`seven_dimension_ready=false`；未发布 formal scores，正式等待价格池与正式强烈关注池继续关闭且为空。
++
++## 七维最终六项 Minor 收口（2026-09-01）
++
++- deep statement 与 feature job 现由同一个 owned heartbeat 覆盖完整租约生命周期；本地持久化、标准化、feature 构造及最终 owned transition 前均 fail closed，最终 transition 与周期续租串行化，`KeyboardInterrupt`/`SystemExit` 清理 heartbeat 后继续向外传播。
++- legacy absolute snapshot 仅在 resolved target 保持于配置 `data_root` 内时兼容；零财务槽位的 bank/insurance/broker bundle 不再宣告不适用的资产负债恒等式 marker，但 canonical raw facts 继续保留且 bundle 仍由 specialized blocker 保持 blocked。
++- migration 计划表名与 forged-unclassified 回归的阶段边界已校正；本轮 focused 9/9、受影响模块 329/329、fresh full offline `unittest` 407/407 通过。后续 scoped re-review 与 controller verification 仍是独立门闸，本记录不预判其结论。
++- 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收；未迁移或改写 runtime/tracked data。
++- `formal_score_ready=false`、`seven_dimension_ready=false`；未发布 formal scores，正式等待价格池与正式强烈关注池继续关闭且为空。
+diff --git a/tests/test_deep_worker.py b/tests/test_deep_worker.py
+index 8d86fc0..fc58a99 100644
+--- a/tests/test_deep_worker.py
++++ b/tests/test_deep_worker.py
+@@ -342,21 +342,21 @@ class DeepWorkerTestCase(unittest.TestCase):
+             failures={"balance_sheet": error},
+             entered=entered,
+             release=release,
+         )
+         real_renew = self.store.renew_job_lease
+         renewal_count = 0
+ 
+         def renew(*args, **kwargs):
+             nonlocal renewal_count
+             renewal_count += 1
+-            if renewal_count == 1:
++            if renewal_count == 1 or not entered.is_set():
+                 return real_renew(*args, **kwargs)
+             if transfer_owner:
+                 with closing(sqlite3.connect(self.store.db_path)) as connection:
+                     connection.execute(
+                         """UPDATE job SET lease_worker = ?, lease_expires_at = ?
+                            WHERE id = ?""",
+                         ("worker-b", "2099-01-01T00:00:00+00:00", job_id),
+                     )
+                     connection.commit()
+             release.set()
+@@ -953,20 +953,231 @@ class DeepWorkerTestCase(unittest.TestCase):
+                 trade_calendar_snapshot=calendar,
+                 limit=1,
+                 lease_seconds=2,
+                 heartbeat_seconds=0.02,
+             )
+ 
+         self.assertTrue(entered.is_set())
+         self.assertGreaterEqual(len(renewals), 2)
+         self.assertEqual(summary.statements_succeeded, 1)
+ 
++    def test_statement_job_renews_lease_during_local_normalization(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        self._enqueue_statement()
++        calendar = self._calendar_ref()
++        renewals: list[str] = []
++        released = threading.Event()
++        entered = threading.Event()
++        real_renew = self.store.renew_job_lease
++        real_normalize = deep_worker_module._normalize_statement_snapshot
++        released_during_normalize = False
++
++        def renew(*args, **kwargs):
++            expiry = real_renew(*args, **kwargs)
++            renewals.append(expiry)
++            if len(renewals) >= 2:
++                released.set()
++            return expiry
++
++        def blocking_normalize(**kwargs):
++            nonlocal released_during_normalize
++            entered.set()
++            released_during_normalize = released.wait(timeout=0.5)
++            return real_normalize(**kwargs)
++
++        with (
++            patch.object(self.store, "renew_job_lease", side_effect=renew),
++            patch.object(
++                deep_worker_module,
++                "_normalize_statement_snapshot",
++                side_effect=blocking_normalize,
++            ),
++        ):
++            summary = self._run(
++                source=FakeStatementSource(),
++                trade_calendar_snapshot=calendar,
++                limit=1,
++                heartbeat_seconds=0.01,
++            )
++
++        self.assertTrue(entered.is_set())
++        self.assertTrue(released_during_normalize)
++        self.assertGreaterEqual(len(renewals), 2)
++        self.assertEqual(summary.statements_succeeded, 1)
++
++    def test_feature_job_renews_lease_during_feature_construction(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        context = load_candidate_context(self.data_root)
++        job_id = deep_worker_module.enqueue_feature_build(
++            self.store,
++            security_id="SH600001",
++            report_period=REPORT_PERIOD,
++            as_of_utc="2026-08-29T12:00:00+00:00",
++            candidate_context=context,
++            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
++            trade_calendar_snapshot=None,
++        )
++        renewals: list[str] = []
++        released = threading.Event()
++        entered = threading.Event()
++        real_renew = self.store.renew_job_lease
++        real_build = deep_worker_module.build_feature_bundle
++        released_during_build = False
++
++        def renew(*args, **kwargs):
++            expiry = real_renew(*args, **kwargs)
++            renewals.append(expiry)
++            if len(renewals) >= 2:
++                released.set()
++            return expiry
++
++        def blocking_build(**kwargs):
++            nonlocal released_during_build
++            entered.set()
++            released_during_build = released.wait(timeout=0.5)
++            return real_build(**kwargs)
++
++        with (
++            patch.object(self.store, "renew_job_lease", side_effect=renew),
++            patch.object(
++                deep_worker_module,
++                "build_feature_bundle",
++                side_effect=blocking_build,
++            ),
++        ):
++            summary = self._run(
++                source=None,
++                online=False,
++                heartbeat_seconds=0.01,
++            )
++
++        self.assertTrue(entered.is_set())
++        self.assertTrue(released_during_build)
++        self.assertGreaterEqual(len(renewals), 2)
++        self.assertEqual(self.store.get_job(job_id)["status"], "succeeded")
++        self.assertEqual(summary.feature_sets_written, 1)
++
++    def test_feature_heartbeat_loss_before_publish_prevents_later_side_effects(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        context = load_candidate_context(self.data_root)
++        job_id = deep_worker_module.enqueue_feature_build(
++            self.store,
++            security_id="SH600001",
++            report_period=REPORT_PERIOD,
++            as_of_utc="2026-08-29T12:00:00+00:00",
++            candidate_context=context,
++            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
++            trade_calendar_snapshot=None,
++        )
++        release = threading.Event()
++        real_renew = self.store.renew_job_lease
++        real_build = deep_worker_module.build_feature_bundle
++        renewal_count = 0
++
++        def renew(*args, **kwargs):
++            nonlocal renewal_count
++            renewal_count += 1
++            if renewal_count == 1:
++                return real_renew(*args, **kwargs)
++            release.set()
++            raise ValueError("lease owner changed")
++
++        def blocking_build(**kwargs):
++            release.wait(timeout=0.5)
++            return real_build(**kwargs)
++
++        with (
++            patch.object(self.store, "renew_job_lease", side_effect=renew),
++            patch.object(
++                deep_worker_module,
++                "build_feature_bundle",
++                side_effect=blocking_build,
++            ),
++        ):
++            summary = self._run(
++                source=None,
++                online=False,
++                heartbeat_seconds=0.01,
++            )
++
++        self.assertGreaterEqual(renewal_count, 2)
++        self.assertEqual(self.store.get_job(job_id)["status"], "running")
++        self.assertEqual([item["outcome"] for item in summary.items], ["lease_lost"])
++        self._assert_no_feature_artifacts()
++
++    def _assert_feature_process_control_propagates(
++        self, error_type: type[BaseException]
++    ) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        context = load_candidate_context(self.data_root)
++        job_id = deep_worker_module.enqueue_feature_build(
++            self.store,
++            security_id="SH600001",
++            report_period=REPORT_PERIOD,
++            as_of_utc="2026-08-29T12:00:00+00:00",
++            candidate_context=context,
++            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
++            trade_calendar_snapshot=None,
++        )
++
++        with (
++            patch.object(
++                deep_worker_module,
++                "build_feature_bundle",
++                side_effect=error_type("stop"),
++            ),
++            self.assertRaises(error_type),
++        ):
++            self._run(source=None, online=False, heartbeat_seconds=0.01)
++
++        self.assertEqual(self.store.get_job(job_id)["status"], "running")
++        self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
++
++    def test_feature_keyboard_interrupt_propagates_without_retry_transition(self) -> None:
++        self._assert_feature_process_control_propagates(KeyboardInterrupt)
++
++    def test_feature_system_exit_propagates_without_retry_transition(self) -> None:
++        self._assert_feature_process_control_propagates(SystemExit)
++
++    def test_feature_ordinary_exception_remains_a_retryable_failure(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        context = load_candidate_context(self.data_root)
++        job_id = deep_worker_module.enqueue_feature_build(
++            self.store,
++            security_id="SH600001",
++            report_period=REPORT_PERIOD,
++            as_of_utc="2026-08-29T12:00:00+00:00",
++            candidate_context=context,
++            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
++            trade_calendar_snapshot=None,
++        )
++
++        with patch.object(
++            deep_worker_module,
++            "build_feature_bundle",
++            side_effect=RuntimeError("ordinary failure"),
++        ):
++            summary = self._run(source=None, online=False, heartbeat_seconds=0.01)
++
++        self.assertEqual(self.store.get_job(job_id)["status"], "retryable_failed")
++        self.assertEqual(
++            [dict(item) for item in summary.items],
++            [
++                {
++                    "security_id": "SH600001",
++                    "outcome": "feature_failed",
++                    "error_classification": "feature_build_error",
++                }
++            ],
++        )
++        self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
++
+     def test_heartbeat_failure_prevents_stale_worker_completion(self) -> None:
+         self._write_candidates({"SH600001": "包装印刷"})
+         job_id = self._enqueue_statement()
+         calendar = self._calendar_ref()
+         source = FakeStatementSource()
+ 
+         with patch.object(
+             self.store,
+             "renew_job_lease",
+             side_effect=ValueError("lease owner changed"),
+@@ -1493,32 +1704,34 @@ class DeepWorkerTestCase(unittest.TestCase):
+         target = self.project_root / (
+             f"data/curated/formal_features/{REPORT_PERIOD}/SH600001/"
+             f"{bundle.input_hash}.json"
+         )
+ 
+         with self.assertRaisesRegex(ValueError, "evidence"):
+             deep_worker_module._write_and_store_feature_bundle(
+                 project_root=self.project_root,
+                 store=self.store,
+                 bundle=bundle,
++                ensure_owned=lambda: None,
+             )
+         self.assertFalse(target.exists())
+ 
+         relative_path, digest, created = deep_worker_module.write_feature_bundle(
+             self.project_root, bundle
+         )
+         original = target.read_bytes()
+         with self.assertRaisesRegex(ValueError, "evidence"):
+             deep_worker_module._write_and_store_feature_bundle(
+                 project_root=self.project_root,
+                 store=self.store,
+                 bundle=bundle,
++                ensure_owned=lambda: None,
+             )
+ 
+         self.assertTrue(created)
+         self.assertEqual(relative_path, target.relative_to(self.project_root).as_posix())
+         self.assertEqual(digest, bundle.bundle_hash())
+         self.assertEqual(target.read_bytes(), original)
+         with closing(sqlite3.connect(self.store.db_path)) as connection:
+             self.assertEqual(
+                 connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                 0,
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+index 302a0b0..244ebac 100644
+--- a/tests/test_orchestrator.py
++++ b/tests/test_orchestrator.py
+@@ -1759,52 +1759,172 @@ class OrchestratorTestCase(unittest.TestCase):
+         object.__setattr__(forged, "financial_status", "partial")
+         object.__setattr__(
+             forged,
+             "blockers",
+             tuple(
+                 blocker
+                 for blocker in forged.blockers
+                 if blocker != "industry_template_unclassified"
+             ),
+         )
+-        crossed = False
+-        try:
+-            relative_path, bundle_hash, _created = write_feature_bundle(
+-                self.base, forged
++        expected_contract_error = "unclassified template requires blocked status"
++        relative_path = (
++            "data/curated/formal_features/2026-06-30/SH600001/"
++            f"{forged.input_hash}.json"
++        )
++        feature_root = self.base / "data" / "curated" / "formal_features"
++        with self.assertRaisesRegex(OSError, "feature part is malformed"):
++            write_feature_bundle(self.base, forged)
++        self.assertEqual(list(feature_root.rglob("*.json")), [])
++        with closing(sqlite3.connect(store.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
++                0,
+             )
++
++        with self.assertRaisesRegex(ValueError, expected_contract_error):
+             store.put_feature_bundle(
+-                forged, bundle_path=relative_path, bundle_hash=bundle_hash
++                forged,
++                bundle_path=relative_path,
++                bundle_hash=forged.bundle_hash(),
++            )
++        with closing(sqlite3.connect(store.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
++                0,
++            )
++
++        forged_bytes = canonical_json_bytes(forged.to_dict())
++        forged_hash = hashlib.sha256(forged_bytes).hexdigest()
++        target = self.base.joinpath(*relative_path.split("/"))
++        target.parent.mkdir(parents=True, exist_ok=True)
++        target.write_bytes(forged_bytes)
++        self.assertEqual(len(list(feature_root.rglob("*.json"))), 1)
++        with self.assertRaisesRegex(OSError, "feature bundle is malformed"):
++            read_verified_feature_bundle(self.base, relative_path, forged_hash)
++        with closing(sqlite3.connect(store.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
++                0,
+             )
+-            read_verified_feature_bundle(self.base, relative_path, bundle_hash)
+-            crossed = True
+-        except (OSError, ValueError):
+-            pass
+ 
+         status, exit_code = orchestrator.run_command(
+             self.root,
+             store.db_path,
+             "status",
+             now_cn="2026-08-29T20:00:00+08:00",
+         )
+-        self.assertFalse(crossed)
+         self.assertEqual(exit_code, 0)
+         self.assertEqual(
+             status["deep"]["feature_set_counts"],
+             {"partial": 0, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertFalse(status["formal_score_ready"])
+         self.assertFalse(status["seven_dimension_ready"])
+         self.assertEqual(
+             status["official_pool_counts"],
+             {"waiting_price": 0, "strong_attention": 0},
+         )
+ 
++    def test_zero_slot_specialized_templates_keep_imbalanced_facts_auditable_without_balance_marker(self):
++        cases = (
++            ("银行", "bank"),
++            ("保险", "insurance"),
++            ("证券", "broker"),
++        )
++        for industry_name, template_id in cases:
++            with self.subTest(template=template_id):
++                case_base = self.base / template_id
++                case_root = case_base / "data"
++                write_candidate_documents(
++                    case_root, {"SH600001": industry_name}
++                )
++                store = StateStore(case_root / "state.sqlite3")
++                store.initialize()
++                context = orchestrator.load_candidate_context(case_root)
++                bundle, facts, _snapshot_ids = installed_ready_bundle(
++                    store,
++                    candidate_set_hash=context.candidate_set_hash,
++                    snapshot_tag=f"zero-slot-{template_id}",
++                    source_industry_name=industry_name,
++                    fact_values={("total_assets", "2021-12-31"): 10_000.0},
++                )
++
++                self.assertEqual(bundle.industry.template_id, template_id)
++                self.assertEqual(bundle.financial_status, "blocked")
++                self.assertEqual(bundle.financial_coverage, 0.0)
++                self.assertIn(
++                    "specialized_financial_inputs_missing", bundle.blockers
++                )
++                self.assertNotIn("balance_equation_mismatch", bundle.blockers)
++                relative_path, bundle_hash, file_created = write_feature_bundle(
++                    case_base, bundle
++                )
++                feature_id, database_created = store.put_feature_bundle(
++                    bundle,
++                    bundle_path=relative_path,
++                    bundle_hash=bundle_hash,
++                )
++                reused_id, reused_created = store.put_feature_bundle(
++                    bundle,
++                    bundle_path=relative_path,
++                    bundle_hash=bundle_hash,
++                )
++                verified = read_verified_feature_bundle(
++                    case_base, relative_path, bundle_hash
++                )
++                with closing(sqlite3.connect(store.db_path)) as connection:
++                    self.assertEqual(
++                        connection.execute(
++                            "SELECT COUNT(*) FROM financial_fact"
++                        ).fetchone()[0],
++                        len(facts),
++                    )
++                    self.assertEqual(
++                        connection.execute(
++                            """SELECT value FROM financial_fact
++                            WHERE metric_key='total_assets' AND period_end='2021-12-31'"""
++                        ).fetchone()[0],
++                        10_000.0,
++                    )
++                status, exit_code = orchestrator.run_command(
++                    case_root,
++                    store.db_path,
++                    "status",
++                    now_cn="2026-08-30T00:00:00+08:00",
++                )
++
++                self.assertTrue(file_created)
++                self.assertTrue(database_created)
++                self.assertEqual(feature_id, bundle_hash)
++                self.assertEqual(reused_id, feature_id)
++                self.assertFalse(reused_created)
++                self.assertEqual(verified.canonical_bytes(), bundle.canonical_bytes())
++                self.assertNotIn(
++                    "balance_equation_mismatch", verified.blockers
++                )
++                self.assertEqual(exit_code, 0)
++                self.assertEqual(
++                    status["deep"]["feature_set_counts"],
++                    {"partial": 0, "financial_ready": 0, "blocked": 1},
++                )
++                self.assertEqual(
++                    status["deep"]["template_counts"], {template_id: 1}
++                )
++                self.assertEqual(status["deep"]["unknown_failure_count"], 0)
++                self.assertFalse(status["formal_score_ready"])
++                self.assertFalse(status["seven_dimension_ready"])
++                self.assertEqual(
++                    status["official_pool_counts"],
++                    {"waiting_price": 0, "strong_attention": 0},
++                )
++
+     def test_builder_unclassified_persists_reads_and_counts_blocked(self):
+         write_candidate_documents(self.root, {"SH600001": "不存在行业"})
+         store = StateStore(self.root / "state.sqlite3")
+         store.initialize()
+         context = orchestrator.load_candidate_context(self.root)
+         built = build_bundle_with_overrides(
+             candidate_set_hash=context.candidate_set_hash,
+             source_industry_name="不存在行业",
+         )
+         relative_path, bundle_hash, _created = write_feature_bundle(self.base, built)
+diff --git a/tests/test_snapshot_repository.py b/tests/test_snapshot_repository.py
+index b2d26ee..7bcd4cd 100644
+--- a/tests/test_snapshot_repository.py
++++ b/tests/test_snapshot_repository.py
+@@ -243,38 +243,58 @@ class SnapshotRepositoryTestCase(unittest.TestCase):
+ 
+     def test_persist_records_a_project_relative_data_path(self):
+         snapshot, _ = self.repository.persist(
+             statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+         )
+ 
+         self.assertFalse(Path(snapshot.payload_path).is_absolute())
+         self.assertTrue(snapshot.payload_path.startswith("data/raw/"))
+         self.assertTrue((self.project_root / snapshot.payload_path).is_file())
+ 
+-    def test_read_verified_accepts_an_existing_absolute_legacy_path(self):
++    def test_read_verified_accepts_a_contained_absolute_legacy_path(self):
+         batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+         path, digest, _ = self.snapshot_store.write(batch)
+         snapshot_id, _ = self.state_store.record_snapshot(
+             batch.source,
+             batch.dataset,
+             canonical_sha256(batch.request),
+             digest,
+             str(path.resolve()),
+             len(batch.records),
+             batch.fetched_at_utc,
+         )
+ 
+         verified = self.repository.read_verified(self.repository.get(snapshot_id))
+ 
+         self.assertEqual(verified.ref.id, snapshot_id)
+         self.assertEqual(verified.batch.records, batch.records)
+ 
++    def test_read_verified_rejects_an_absolute_legacy_path_outside_data_root(self):
++        batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
++        contained, digest, _ = self.snapshot_store.write(batch)
++        outside = self.project_root / "outside-legacy.json"
++        outside.write_bytes(contained.read_bytes())
++        snapshot_id, _ = self.state_store.record_snapshot(
++            batch.source,
++            batch.dataset,
++            canonical_sha256(batch.request),
++            digest,
++            str(outside.resolve()),
++            len(batch.records),
++            batch.fetched_at_utc,
++        )
++
++        with self.assertRaisesRegex(
++            ValueError, "absolute legacy snapshot path must stay inside"
++        ):
++            self.repository.read_verified(self.repository.get(snapshot_id))
++
+     def test_read_verified_rejects_relative_parent_traversal(self):
+         batch = statement_batch("SH600001", 100.0, "2026-08-29T00:00:00+00:00")
+         _, digest, _ = self.snapshot_store.write(batch)
+         snapshot_id, _ = self.state_store.record_snapshot(
+             batch.source, batch.dataset, canonical_sha256(batch.request), digest,
+             "data/../outside.json", len(batch.records), batch.fetched_at_utc,
+         )
+ 
+         with self.assertRaisesRegex(ValueError, "relative"):
+             self.repository.read_verified(self.repository.get(snapshot_id))

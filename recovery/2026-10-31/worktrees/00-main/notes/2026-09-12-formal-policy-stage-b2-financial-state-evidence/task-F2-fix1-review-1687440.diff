@@ -1,0 +1,599 @@
+# F2 fix round 1 review
+Fix base: fb4f9a681303dbe5ce53ef2007e69e0cb42ab0fe
+Head: 16874408e9f68886d5a5cf223dd703aa4c1b2915
+Scope: ashare_pipeline/formal_feature_repository.py ashare_pipeline/formal_policy_financial.py tests/formal_policy_runtime_fixtures.py tests/test_formal_policy_financial.py
+
+1687440 fix: bind policy quarter evidence and scope signed issues
+ ashare_pipeline/formal_feature_repository.py |  61 ++++++++++-
+ ashare_pipeline/formal_policy_financial.py   |  43 ++++++--
+ tests/formal_policy_runtime_fixtures.py      |  17 +++
+ tests/test_formal_policy_financial.py        | 148 +++++++++++++++++++++++++--
+ 4 files changed, 249 insertions(+), 20 deletions(-)
+diff --git a/ashare_pipeline/formal_feature_repository.py b/ashare_pipeline/formal_feature_repository.py
+index 55efde5..8db92c8 100644
+--- a/ashare_pipeline/formal_feature_repository.py
++++ b/ashare_pipeline/formal_feature_repository.py
+@@ -588,54 +588,100 @@ def _install_metric_projection():
+ del _install_metric_projection
+ 
+ 
+ def _install_policy_projection(provider_module):
+     """Install only after the owned provider module has completed initialization.
+ 
+     Kept independent from the required-only metric entry point. Existing metric
+     registration authenticates repositories created before this installation.
+     """
+     from types import MappingProxyType
++    from . import formal_financial_schema as mapping_module
++    from . import formal_metric_features as metric_module
+     from .formal_policy_registry import FormalPolicyRegistry
+     from .formal_policy_values import PolicyIntegrityError, PolicyPreconditionError
+ 
+     repository_type = FormalFeatureRepository
+     provider_type = provider_module.FormalMetricCurrentInputProvider
+     resolve = provider_type.resolve_current_inputs
+     guard = provider_module._metric_batch_guard
+     authentic = _require_authentic_metric_feature_repository
+     read_registry = repository_type._registry
+     persisted = repository_type._persisted_facts
+     read_bundle = repository_type._read_authenticated_bundle
+     identity_of = repository_type._snapshot_identity
+     evaluator, builder = evaluate_selected_features, build_formal_feature_bundle
+     require_policy, policy_wire = FormalPolicyRegistry.require_verified, FormalPolicyRegistry.to_dict
++    mapping_type = mapping_module.SignedFinancialMappingRegistry
++    load_mapping, select_mapping = mapping_type.from_signed_bytes, mapping_type.select
++    mapping_functions = tuple((name, value) for name, value in vars(mapping_module).items() if callable(value))
++    mapping_methods = tuple((cls, dict(vars(cls))) for cls in
++        (mapping_type, mapping_module.FormalFactMapping, mapping_module._FormalFactBinding))
++    metric_leaves = metric_module._leaves
+     records = {}
+ 
+     def freeze(value):
+         if type(value) is dict:
+             return MappingProxyType({k: freeze(v) for k, v in value.items()})
+         return tuple(map(freeze, value)) if type(value) is list else value
+ 
+     def dependencies(repository, provider=None):
+         authentic(repository)
++        if (any(vars(mapping_module).get(name) is not value for name, value in mapping_functions)
++                or any(set(vars(cls)) != set(methods)
++                    or any(vars(cls)[name] is not value for name, value in methods.items())
++                    for cls, methods in mapping_methods)):
++            raise PolicyIntegrityError("policy financial mapping validation dependency changed")
+         actual = repository._current_input_provider
+         if (type(actual) is not provider_type or (provider is not None and actual is not provider)
+                 or provider_module.FormalMetricCurrentInputProvider is not provider_type
+                 or provider_type.resolve_current_inputs is not resolve
+                 or provider_module._metric_batch_guard is not guard):
+             raise PolicyIntegrityError("policy provider dependency changed or is not owned")
+         if (repository_type.select_current_verified_policy_feature_state is not select
+                 or "select_current_verified_policy_feature_state" in vars(repository)):
+             raise PolicyIntegrityError("policy repository selector was replaced")
+         return actual
+ 
++    def scoped_issues(graph, verifier, security_id, slots, issues):
++        """Prove only metric exclusion; issues contain no trusted year identity."""
++        blob = graph.blob("mapping")
++        mapping_index = {}
++        # Only the real supported financial contract is accepted. Unknown
++        # versions, placeholder graphs and invalid signatures fail the read.
++        mapping = load_mapping(blob.canonical_json, signature=blob.signature,
++            key_id=blob.key_id, verifier=verifier)
++        if type(mapping) is not mapping_type or mapping.registry_hash != graph.manifest.mapping_registry_hash:
++            raise PolicyIntegrityError("policy issue mapping differs from the authenticated root")
++        for binding in mapping.bindings:
++            if binding.exchange_scope != security_id[:2]:
++                continue
++            selected = select_mapping(mapping, source=binding.source, dataset=binding.dataset,
++                parser_id=binding.parser_id, parser_version=binding.parser_version,
++                mapping_version=binding.mapping_version, exchange=binding.exchange_scope)
++            mapping_index.update((entry.mapping_id, entry) for entry in selected)
++        # Free details/source-field text cannot add exclusion authority.
++        scopes = []
++        for issue in issues:
++            mapped = mapping_index.get(issue.mapping_id)
++            metric = None
++            if (issue.code in {"required_source_field_missing", "duplicate_source_field", "nonnumeric_value"}
++                    and mapped is not None and issue.source_field == mapped.source_field):
++                metric = mapped.metric_key
++            scopes.append((issue, metric))
++        result = {}
++        for slot in slots:
++            dependencies = {metric for metric, _ in metric_leaves(slot.formula)}
++            result[slot.slot_id] = tuple(issue for issue, metric in scopes
++                if metric is None or metric in dependencies)
++        return result
++
+     def record(item):
+         saved = records.get(id(item))
+         if type(item) is not PolicyFeatureState or saved is None or saved[0]() is not item:
+             raise PolicyIntegrityError("policy feature state is forged or copied")
+         if (set(vars(PolicyFeatureState)) != {k for k, _ in methods}
+                 or any(vars(PolicyFeatureState).get(k) is not v for k, v in methods)):
+             raise PolicyIntegrityError("policy feature state interface changed")
+         return saved
+ 
+     class StateMeta(type):
+@@ -729,34 +775,43 @@ def _install_policy_projection(provider_module):
+                         or persisted(self, security_id) != fact_bytes):
+                     raise PolicyIntegrityError("policy provider facts/issues or persisted sources changed")
+ 
+             current()
+             expected = builder(security_id=security_id, as_of_utc=as_of_utc,
+                 template_id=template_id, facts=facts, issues=issues,
+                 registry=registry, registry_manifest=graph.manifest)
+             stored = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+             if stored is not None and stored.canonical_bytes() != expected.canonical_bytes():
+                 raise PolicyIntegrityError("policy receipt differs from complete rebuilt inputs")
+-            values, blockers = ((), ("current_receipt_absent",)) if stored is None else evaluator(
+-                slots=slots, facts=facts, issues=issues, as_of_utc=as_of_utc)
++            local_issues = scoped_issues(graph, self._verifier, security_id, slots, issues)
++            values, blockers = [], set()
++            if stored is None:
++                blockers.add("current_receipt_absent")
++            else:
++                for slot in slots:
++                    local_values, local_blockers = evaluator(slots=(slot,), facts=facts,
++                        issues=local_issues[slot.slot_id], as_of_utc=as_of_utc)
++                    values.extend(local_values)
++                    blockers.update(local_blockers)
+             current()
+             reread = read_bundle(self, input_hash=expected.input_hash, require_complete=False)
+             if ((reread is None) != (stored is None)
+                     or (reread is not None and reread.canonical_bytes() != expected.canonical_bytes())):
+                 raise PolicyIntegrityError("policy receipt changed during projection")
+             require_policy(policy_registry)
+             current()
+             payload = dict(request, rule_ids=list(rule_ids), selectors=selectors,
+                 policy_contract_hash=policy["contract_hash"],
+                 slots=[s.to_dict() for s in slots], values=[v.to_dict() for v in values],
+-                blockers=list(blockers), facts=[f.to_dict() for f in facts],
++                blockers=sorted(blockers), facts=[f.to_dict() for f in facts],
+                 issues=[i.to_dict() for i in issues],
++                slot_issues={key: [i.to_dict() for i in selected] for key, selected in local_issues.items()},
+                 source_refs=[FormalEvidenceRef.from_formal_fact(f).to_dict() for f in facts],
+                 input_hash=expected.input_hash, bundle_hash=expected.bundle_hash(),
+                 batch_id=identity[-1], current_receipt_absent=stored is None,
+                 algorithm_version="formal-policy-feature-projection-v1")
+             payload["projection_hash"] = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+             encoded = _canonical_json_bytes(payload)
+ 
+             def mint():
+                 result = object.__new__(PolicyFeatureState)
+                 key = id(result)
+diff --git a/ashare_pipeline/formal_policy_financial.py b/ashare_pipeline/formal_policy_financial.py
+index 3e7d75e..a23faf4 100644
+--- a/ashare_pipeline/formal_policy_financial.py
++++ b/ashare_pipeline/formal_policy_financial.py
+@@ -3,21 +3,21 @@
+ from __future__ import annotations
+ 
+ import json
+ import weakref
+ from datetime import datetime
+ from types import MappingProxyType
+ 
+ from . import formal_feature_repository as feature_module
+ from . import formal_metric_batch_guard as provider_module
+ from .formal_feature_contract import FormalEvidenceRef
+-from .formal_financial_features import select_visible_formal_facts
++from .formal_financial_features import derive_comparable_quarters, select_visible_formal_facts
+ from .formal_financial_schema import FormalFinancialFact
+ from .formal_metric_context import VerifiedMetricIndustryBatch
+ from .formal_policy_registry import FormalPolicyRegistry
+ from .formal_policy_values import (
+     PolicyIntegrityError, PolicyPreconditionError, PolicyValue, _decimal_text,
+     bridge_v6, canonical_bytes, digest,
+ )
+ from .state_store import StateStore
+ 
+ 
+@@ -70,29 +70,48 @@ def _observation(selector, slot, projected, state, fy_end=None):
+             end = period[2:] + "-12-31"
+             selected = select_visible_formal_facts(
+                 (f for f in candidates if f.period_kind == "FY" and f.period_end == end), _FREEZE)
+             if "fact_selection_tie_conflict" in selected.blockers:
+                 raise PolicyIntegrityError("policy fact selection has ambiguous leading versions")
+             diagnostics.extend(selected.blockers)
+             if len(selected.facts) != 1:
+                 diagnostics.append("financial_domain_conflict" if len(selected.facts) > 1 else "financial_input_missing")
+                 continue
+             actual = selected.facts
+-        elif fy_end is None:
+-            # Scalar quarter leaves retain the exact V6 component evidence; the
+-            # evaluator already authenticated quarter arithmetic and its periods.
+-            evidence_ids = {ref["formal_fact_id"] for ref in (projected or {}).get("evidence", [])}
+-            actual = tuple(f for f in candidates if f.id in evidence_ids)
+-            if not actual:
+-                diagnostics.append("financial_input_missing")
++        elif (fy_end is None and len(period) == 6 and period[:4].isdigit()
++                and period[4] == "Q" and period[5] in "1234"):
++            # Use the original V6 endpoint/predecessor semantics for this exact
++            # AST occurrence, then retain only its derived quarter components.
++            year, quarter = period[:4], int(period[5])
++            ends = ("03-31", "06-30", "09-30", "12-31")
++            end = year + "-" + ends[quarter - 1]
++            predecessor = year + "-" + ends[quarter - 2] if quarter > 1 else None
++            selected = select_visible_formal_facts((f for f in candidates if f.period_end == end
++                or (f.nature == "duration" and f.period_end == predecessor)), _FREEZE)
++            if "fact_selection_tie_conflict" in selected.blockers:
++                raise PolicyIntegrityError("policy quarter selection has ambiguous leading versions")
++            diagnostics.extend(selected.blockers)
++            quarters = derive_comparable_quarters(selected.facts)
++            derived = tuple(q for q in quarters.facts if q.quarter_key == period)
++            quarter_blockers = set(quarters.blockers)
++            requested_ids = {f.id for f in selected.facts if f.period_end == end}
++            covered_ids = {identity for q in derived for identity in q.component_fact_ids}
++            if requested_ids and requested_ids <= covered_ids:
++                quarter_blockers.discard("quarter_missing_prerequisite")
++            diagnostics.extend(quarter_blockers)
++            if len(derived) != 1:
++                diagnostics.append("financial_domain_conflict" if len(derived) > 1 else "financial_input_missing")
++                continue
++            by_id = {f.id: f for f in selected.facts}
++            actual = tuple(by_id[identity] for identity in derived[0].component_fact_ids)
+         else:
+-            diagnostics.append("financial_domain_conflict")
++            diagnostics.append("financial_domain_conflict" if fy_end else "financial_input_missing")
+             continue
+         for fact in actual:
+             wire = fact.to_dict()
+             bases.add(wire["accounting_basis"])
+             if fy_end is not None:
+                 annual_ends.add(wire["period_end"])
+                 previous = str(int(fy_end[:4]) - 1) + "-12-31"
+                 if (wire["period_end"] != fy_end and not
+                         (wire["nature"] == "instant" and wire["period_end"] == previous)):
+                     diagnostics.append("financial_domain_conflict")
+@@ -101,43 +120,44 @@ def _observation(selector, slot, projected, state, fy_end=None):
+                 diagnostics.append("financial_domain_conflict")
+             leaves.append(dict(ast_path=path, formal_fact_id=wire["id"],
+                 fact_key=leaf["fact_key"], period_key=period, **{key: wire[key] for key in
+                 ("security_id", "period_start", "period_end", "period_kind", "nature", "statement",
+                  "accounting_basis", "unit", "mapping_version")}))
+             ref = FormalEvidenceRef.from_formal_fact(fact).to_dict()
+             source_refs[canonical_bytes(ref)] = ref
+     if len(bases) > 1 or (fy_end is not None and annual_ends and fy_end not in annual_ends):
+         diagnostics.append("financial_domain_conflict")
+     raw = projected["value"] if projected else None
++    slot_issues = state["slot_issues"][slot["slot_id"]]
+     if state["current_receipt_absent"]:
+         reason = "current_receipt_absent"
+-    elif state["issues"] or "financial_domain_conflict" in diagnostics:
++    elif slot_issues or "financial_domain_conflict" in diagnostics:
+         reason = "financial_domain_conflict"
+     elif projected is None or projected["status"] != "derived":
+         missing = (projected or {}).get("missing_reason")
+         reason = {"formula_unit_mismatch": "unsupported_unit",
+             "formula_zero_denominator": "invalid_denominator",
+             "formula_fact_ambiguous": "financial_domain_conflict"}.get(missing, "financial_input_missing")
+     else:
+         reason = "financial_input_missing" if diagnostics else None
+     if projected is not None and (projected["unit"] != selector["expected_unit"]
+             or projected["formula_version"] != selector["formula_version"]):
+         raise PolicyIntegrityError("policy value differs from its signed selector")
+     refs = [source_refs[key] for key in sorted(source_refs)]
+     visibility = dict(as_of_utc=_FREEZE,
+         minimum_published_precision="date" if any(r["published_precision"] != "timestamp" for r in refs) else
+             "timestamp" if refs else None,
+         published_at_utc=sorted({r["published_at_utc"] for r in refs}),
+         effective_at_utc=sorted({r["effective_at_utc"] for r in refs}))
+     record = dict(selector_hash=digest(selector), slot_hash=digest(slot), formula_hash=digest(slot["formula"]),
+         formula_version=slot["formula_version"], value=_policy_value(raw, slot["unit"], state["projection_hash"], reason),
+-        unit=slot["unit"], facts=leaves, issues=[*state["issues"], *sorted(set(diagnostics))],
++        unit=slot["unit"], facts=leaves, issues=[*slot_issues, *sorted(set(diagnostics))],
+         source_refs=refs, visibility=visibility, bridge_version=_BRIDGE, projection_hash=state["projection_hash"])
+     if fy_end is not None:
+         record = dict(fy_end=fy_end, **record)
+     return record, dict(original_value=raw, original_value_repr=repr(raw),
+         original_projection_hash=state["projection_hash"], bridge_version=_BRIDGE,
+         converted_value=record["value"]["value"])
+ 
+ 
+ def _install_financial():
+     repositories, selections = {}, {}
+@@ -269,20 +289,21 @@ def _install_financial():
+         state.recheck()
+         dependencies(self)
+         require_policy(policy_registry)
+         require_industry(industry_batch)
+         payload = dict(values=values, annual=annual, lineage=dict(security_id=security_id, template_id=template_id,
+             algorithm_version="formal-policy-financial-selection-v1", contract_version=policy["contract_version"],
+             registry_manifest_hash=policy["registry_manifest_hash"], role_hashes=policy["role_hashes"],
+             policy_contract_hash=policy["contract_hash"], frozen_input_hash=industry["frozen_input_hash"],
+             universe_hash=industry["universe_hash"], industry_batch_hash=industry["batch_hash"], as_of_utc=as_of_utc,
+             applicability=applicability, rule_ids=list(rule_ids), scalar=scalar, bridges=bridges,
++            all_issues=wire["issues"], slot_issues=wire["slot_issues"],
+             projection_hash=wire["projection_hash"], input_hash=wire["input_hash"], bundle_hash=wire["bundle_hash"],
+             batch_id=wire["batch_id"], current_receipt_absent=wire["current_receipt_absent"]))
+         payload["selection_hash"] = digest(payload)
+         result = object.__new__(PolicyFinancialSelection)
+         key = id(result)
+         selections[key] = (weakref.ref(result, lambda _: selections.pop(key, None)), canonical_bytes(payload), self,
+             dict(security_id=security_id, as_of_utc=as_of_utc, template_id=template_id,
+                  policy_registry=policy_registry, industry_batch=industry_batch))
+         return result
+ 
+diff --git a/tests/formal_policy_runtime_fixtures.py b/tests/formal_policy_runtime_fixtures.py
+index bd3505b..47ad549 100644
+--- a/tests/formal_policy_runtime_fixtures.py
++++ b/tests/formal_policy_runtime_fixtures.py
+@@ -34,20 +34,36 @@ _POLICY_UNITS = {
+     "fixture.policy.current.equity": "CNY",
+     "fixture.policy.current.roe": "ratio",
+     "fixture.policy.current.margin": "ratio",
+     "fixture.policy.current.profit": "CNY",
+     "fixture.policy.roe": "ratio",
+     "fixture.policy.margin": "ratio",
+     "fixture.policy.profit": "CNY",
+ }
+ 
+ 
++def policy_financial_mapping_documents(documents):
++    """Add actual signed mapping capability before the graph is signed."""
++    mappings = []
++    for key, unit in sorted(_POLICY_UNITS.items()):
++        instant = key == "fixture.policy.current.equity"
++        mappings.append(dict(mapping_id="map." + key, statement="balance" if instant else "income",
++            metric_key=key, source_field=key, unit=unit, nature="instant" if instant else "duration",
++            period_kind="FY", accounting_basis="consolidated"))
++    documents["mapping"] = dict(schema_version="formal-financial-mapping-registry-v1",
++        registry_role="mapping", row_format="item_value_v1", mappings=mappings,
++        bindings=[dict(source="cninfo", dataset="annual_report", parser_id="fixture-annual",
++            parser_version="fixture-annual-v1", mapping_version="fixture-annual-map-v1",
++            exchange_scope=exchange, mapping_ids=sorted(m["mapping_id"] for m in mappings))
++            for exchange in ("BJ", "SH", "SZ")])
++
++
+ def _templates(value):
+     if value is None:
+         return dict(_DEFAULT_TEMPLATES)
+     if type(value) is not dict or not value:
+         raise ValueError("templates must be a nonempty security-to-template object")
+     result = {}
+     for security_id, template_id in value.items():
+         if (type(security_id) is not str or canonical_security_id(security_id) != security_id
+                 or type(template_id) is not str or template_id not in TEMPLATES):
+             raise ValueError("templates contains an invalid security or template")
+@@ -116,20 +132,21 @@ class PolicyRuntimeFixture(FinancialFixture):
+         def configure(documents):
+             documents["industry"]["memberships"] = _policy_memberships(selected_templates, cyclic)
+             update_mapping_digest(documents["industry"])
+             documents["scoring"]["descriptors"].append(descriptor("security_state"))
+             documents["source"]["configs"].extend(
+                 config(dataset="fixture-state", exchange_scope=exchange)
+                 for exchange in ("BJ", "SH", "SZ")
+             )
+             add_policy_documents(documents)
+             _patch_current_policy_periods(documents)
++            policy_financial_mapping_documents(documents)
+             if range_enabled:
+                 from tests.formal_range_fixtures import add_range_documents
+                 add_range_documents(documents)
+             if mutate is not None:
+                 mutate(documents)
+             rehash_documents(documents)
+ 
+         try:
+             super().__init__(
+                 mutate=configure,
+diff --git a/tests/test_formal_policy_financial.py b/tests/test_formal_policy_financial.py
+index a163fbc..695f071 100644
+--- a/tests/test_formal_policy_financial.py
++++ b/tests/test_formal_policy_financial.py
+@@ -1,18 +1,18 @@
+ """Authenticate real policy projections without granting metric eligibility."""
+ 
+ import copy
+ from decimal import Decimal
+ import unittest
+ from unittest.mock import patch
+ 
+-from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture, policy_financial_mapping_documents
+ from tests.formal_metric_fixtures import FREEZE
+ from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
+ from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
+ from ashare_pipeline.formal_metric_batch_guard import FormalMetricCurrentInputProvider
+ from ashare_pipeline.formal_financial_schema import FormalFactIssue, FormalFinancialFact
+ 
+ 
+ def change_roe_formula(documents, *, wrong_year=False, repeated_leaf=False):
+     slot = next(s for s in documents["feature"]["slots"] if s["slot_id"] == "bank.policy.roe_2021")
+     current = documents["cyclic"]["rules"]["bank_cyclic_top"]["inputs"]["annual_roe"]["observations"][0]["selector"]
+@@ -22,20 +22,29 @@ def change_roe_formula(documents, *, wrong_year=False, repeated_leaf=False):
+     else:
+         numerator = dict(op="fact", fact_key="fixture.policy.profit", period_key="FY2021")
+         slot["formula"] = dict(op="divide", left=numerator,
+             right=dict(op="fact", fact_key="fixture.policy.current.equity", period_key="FY2020"))
+         if repeated_leaf:
+             slot["formula"]["right"] = dict(op="add", left=slot["formula"]["right"],
+                 right=dict(op="fact", fact_key="fixture.policy.current.equity", period_key="FY2020"))
+         current["period_keys"] = ["FY2020", "FY2021"]
+ 
+ 
++def quarter_equity_formula(documents, quarter="Q1"):
++    slot = next(s for s in documents["feature"]["slots"] if s["slot_id"] == "bank.policy.equity")
++    slot["formula"] = dict(op="add",
++        left=dict(op="fact", fact_key="fixture.quarter.cash", period_key="2024" + quarter),
++        right=dict(op="fact", fact_key="fixture.quarter.cash", period_key="2025" + quarter))
++    documents["redline"]["rules"]["bank_nonpositive_equity"]["inputs"]["value"]["period_keys"] = [
++        "2024" + quarter, "2025" + quarter]
++
++
+ class PolicyFinancialTests(unittest.TestCase):
+     def fixture(self, **kwargs):
+         fixture = PolicyRuntimeFixture(**kwargs)
+         self.addCleanup(fixture.close)
+         return fixture
+ 
+     def select(self, fixture):
+         self.assertTrue(callable(getattr(fixture, "financial_selection", None)),
+                         "independent authenticated financial selection is missing")
+         return fixture.financial_selection("SH600000")
+@@ -202,32 +211,159 @@ class PolicyFinancialTests(unittest.TestCase):
+ 
+     def test_zero_denominator_is_typed_pending(self):
+         fixture = self.fixture(mutate=change_roe_formula)
+         fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": 0},
+             fy_end="2020-12-31", units={"fixture.policy.current.equity": "CNY"}, persist=False)
+         fixture.policy_financial_values("SH600000")
+         selected = self.select(fixture)
+         pending = [r[0]["value"].to_dict()["pending"] for r in selected.annual.values()]
+         self.assertTrue(any(p and p[0]["code"] == "invalid_denominator" for p in pending))
+ 
+-    def test_full_issue_snapshot_blocks_values_and_recheck(self):
+-        fixture = self.fixture()
++    def test_signed_local_issue_preserves_independent_equity_and_rechecks_full_snapshot(self):
++        fixture = self.fixture(mutate=policy_financial_mapping_documents)
+         fixture.policy_financial_values("SH600000")
+         selected = self.select(fixture)
+-        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", None,
+-            "fixture.policy.roe", {"period": "FY2021"}),)
++        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
++            "fixture.policy.roe", {"period": "FY2021", "metric_key": "fixture.policy.current.equity"}),)
+         fixture.publish_current("SH600000")
+         fixture.persist_features("SH600000")
+         with self.assertRaises(ValueError):
+             selected.recheck()
+         current = fixture.financial_selection("SH600000")
+-        self.assertTrue(all(v.state == "domain_conflict" for v in current.values.values()))
++        self.assertTrue(all(v.state == "value" for v in current.values.values()))
++        self.assertEqual(len(current.lineage["all_issues"]), 1)
++        self.assertEqual(current.lineage["all_issues"][0]["details"]["metric_key"], "fixture.policy.current.equity")
++        self.assertEqual(sorted(v.value for v in current.values.values()),
++            [Decimal("1"), Decimal("5"), Decimal("5"), Decimal("5")])
++        roe = next(records for records in current.annual.values()
++            if records[0]["facts"][0]["fact_key"] == "fixture.policy.roe")
++        self.assertTrue(all(r["value"].state == "domain_conflict" for r in roe))
++        self.assertEqual(sum(records[0]["value"].state == "value" for records in current.annual.values()), 2)
++        # Period detail is audited but cannot narrow an issue to one FY.
++        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
++            "fixture.policy.roe", {"period": "FY2022"}),)
++        fixture.publish_current("SH600000")
++        fixture.persist_features("SH600000")
++        with self.assertRaises(ValueError):
++            current.recheck()
++
++    def test_unscoped_issue_remains_global_despite_free_scope_details(self):
++        fixture = self.fixture(mutate=policy_financial_mapping_documents)
++        fixture.policy_financial_values("SH600000")
++        for mapping_id, source_field in ((None, "fixture.policy.roe"),
++                ("undeclared", "fixture.policy.roe"), ("map.fixture.policy.roe", "wrong_field")):
++            with self.subTest(mapping_id=mapping_id, source_field=source_field):
++                fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", mapping_id,
++                    source_field, {"metric_key": "fixture.policy.roe", "period": "FY2021"}),)
++                fixture.publish_current("SH600000")
++                fixture.persist_features("SH600000")
++                selected = self.select(fixture)
++                self.assertTrue(all(v.state == "domain_conflict" for v in selected.values.values()))
++
++    def test_unsupported_mapping_schema_is_a_contract_failure(self):
++        def unsupported(documents):
++            documents["mapping"] = dict(registry_role="mapping", schema_version="fixture-v1")
++        fixture = self.fixture(cyclic=False, mutate=unsupported)
++        fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": 1},
++            fy_end="2025-12-31", units={"fixture.policy.current.equity": "CNY"})
++        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
++            "fixture.policy.roe", {"period": "FY2021"}),)
++        fixture.publish_current("SH600000")
++        fixture.persist_features("SH600000")
++        with self.assertRaises(ValueError):
++            self.select(fixture)
++
++    def test_declared_financial_mapping_corruption_is_not_global_pending(self):
++        def malformed(documents):
++            policy_financial_mapping_documents(documents)
++            documents["mapping"]["bindings"][0]["mapping_ids"].append("unknown_mapping")
++        fixture = self.fixture(cyclic=False, mutate=malformed)
++        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
++            "fixture.policy.roe", {}),)
++        fixture.publish_current("SH600000")
++        fixture.persist_features("SH600000")
++        with self.assertRaises(ValueError):
++            self.select(fixture)
++
++    def test_unknown_mapping_version_cannot_downgrade_to_global_pending(self):
++        def unsupported(documents):
++            policy_financial_mapping_documents(documents)
++            documents["mapping"]["schema_version"] = "formal-financial-mapping-registry-v2"
++        fixture = self.fixture(cyclic=False, mutate=unsupported)
++        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
++            "fixture.policy.roe", {}),)
++        fixture.publish_current("SH600000")
++        fixture.persist_features("SH600000")
++        with self.assertRaises(ValueError):
++            self.select(fixture)
++
++    def test_missing_exchange_mapping_binding_cannot_scope_an_issue(self):
++        def other_exchanges(documents):
++            policy_financial_mapping_documents(documents)
++            documents["mapping"]["bindings"] = [b for b in documents["mapping"]["bindings"] if b["exchange_scope"] != "SH"]
++        fixture = self.fixture(cyclic=False, mutate=other_exchanges)
++        fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": 1},
++            fy_end="2025-12-31", units={"fixture.policy.current.equity": "CNY"})
++        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
++            "fixture.policy.roe", {}),)
++        fixture.publish_current("SH600000")
++        fixture.persist_features("SH600000")
++        self.assertTrue(all(v.state == "domain_conflict" for v in self.select(fixture).values.values()))
++
++    def test_mapping_type_and_parser_substitution_before_first_selection_fail(self):
++        from ashare_pipeline import formal_financial_schema as mapping_module
++        fixture = self.fixture(cyclic=False, mutate=policy_financial_mapping_documents)
++        fixture.issues["SH600000"] = (FormalFactIssue("required_source_field_missing", "map.fixture.policy.roe",
++            "fixture.policy.roe", {}),)
++        fixture.publish_current("SH600000")
++        fixture.persist_features("SH600000")
++        for owner, name, replacement in ((mapping_module, "SignedFinancialMappingRegistry", object),
++                (mapping_module.SignedFinancialMappingRegistry, "from_signed_bytes", lambda *_a, **_k: None)):
++            with self.subTest(name=name), patch.object(owner, name, replacement), self.assertRaises(ValueError):
++                self.select(fixture)
++
++    def quarter_fixture(self, quarter="Q1"):
++        fixture = self.fixture(cyclic=False, mutate=lambda docs: quarter_equity_formula(docs, quarter))
++        for year, first, half in ((2024, 10, 30), (2025, 20, 50)):
++            fixture.put_financial("SH600000", {"fixture.quarter.cash": first},
++                generation=f"q1-{year}", period_end=f"{year}-03-31", period_kind="Q1")
++            if quarter == "Q2":
++                fixture.put_financial("SH600000", {"fixture.quarter.cash": half},
++                    generation=f"h1-{year}", period_end=f"{year}-06-30", period_kind="H1")
++        fixture.persist_features("SH600000")
++        return fixture
++
++    def test_quarter_scalar_leaves_bind_their_own_years_and_components(self):
++        for quarter, expected_value, expected_count in (("Q1", "30", 1), ("Q2", "50", 2)):
++            with self.subTest(quarter=quarter):
++                fixture = self.quarter_fixture(quarter)
++                selected = self.select(fixture)
++                scalar = next(iter(selected.lineage["scalar"].values()))
++                self.assertEqual(scalar["value"].value, Decimal(expected_value))
++                for path, year in (("formula.left", "2024"), ("formula.right", "2025")):
++                    leaves = [f for f in scalar["facts"] if f["ast_path"] == path]
++                    self.assertEqual(len(leaves), expected_count)
++                    self.assertEqual({f["period_end"][:4] for f in leaves}, {year})
++                    self.assertEqual({f["period_key"] for f in leaves}, {year + quarter})
++
++    def test_quarter_leading_version_conflict_is_integrity_failure(self):
++        fixture = self.quarter_fixture()
++        fact = next(f for f in fixture.store.list_formal_financial_facts(security_id="SH600000")
++            if f.period_end == "2024-03-31")
++        wire = fact.to_dict()
++        wire.pop("id")
++        wire["value"] = 99.0
++        fixture.store.insert_formal_financial_facts((FormalFinancialFact.create(**wire),))
++        fixture.publish_current("SH600000")
++        fixture.persist_features("SH600000")
++        with self.assertRaises(ValueError):
++            self.select(fixture)
+ 
+     def test_mixed_accounting_basis_cannot_form_roe(self):
+         fixture = self.fixture(mutate=change_roe_formula)
+         fixture.put_policy_financial("SH600000", {"fixture.policy.current.equity": 2},
+             fy_end="2020-12-31", units={"fixture.policy.current.equity": "CNY"}, persist=False)
+         facts = fixture.store.list_formal_financial_facts(security_id="SH600000")
+         fixture.sql("DELETE FROM formal_financial_fact WHERE security_id=?", ("SH600000",))
+         changed = []
+         for fact in facts:
+             wire = fact.to_dict()
+

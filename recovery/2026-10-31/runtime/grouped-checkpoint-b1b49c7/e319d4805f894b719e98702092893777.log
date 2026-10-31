@@ -1,0 +1,14 @@
+TEST_STARTED test_financial_formulas.FinancialFormulaAuthorityTests.test_accrual_and_roic_use_the_exact_hand_checked_raw_operand_sets
+test_accrual_and_roic_use_the_exact_hand_checked_raw_operand_sets (test_financial_formulas.FinancialFormulaAuthorityTests.test_accrual_and_roic_use_the_exact_hand_checked_raw_operand_sets) ... ok
+TEST_STARTED test_financial_formulas.FinancialFormulaAuthorityTests.test_catalog_is_the_literal_closed_ninety_slot_projection
+test_catalog_is_the_literal_closed_ninety_slot_projection (test_financial_formulas.FinancialFormulaAuthorityTests.test_catalog_is_the_literal_closed_ninety_slot_projection) ... ok
+TEST_STARTED test_financial_formulas.FinancialFormulaAuthorityTests.test_evaluator_preserves_growth_cagr_and_frozen_window_boundaries
+test_evaluator_preserves_growth_cagr_and_frozen_window_boundaries (test_financial_formulas.FinancialFormulaAuthorityTests.test_evaluator_preserves_growth_cagr_and_frozen_window_boundaries) ... ok
+TEST_STARTED test_financial_formulas.FinancialFormulaAuthorityTests.test_evaluator_returns_hand_checked_results_and_exact_operand_ids
+test_evaluator_returns_hand_checked_results_and_exact_operand_ids (test_financial_formulas.FinancialFormulaAuthorityTests.test_evaluator_returns_hand_checked_results_and_exact_operand_ids) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.002s
+
+OK
+GROUP_SUMMARY {"ids": ["test_financial_formulas.FinancialFormulaAuthorityTests.test_accrual_and_roic_use_the_exact_hand_checked_raw_operand_sets", "test_financial_formulas.FinancialFormulaAuthorityTests.test_catalog_is_the_literal_closed_ninety_slot_projection", "test_financial_formulas.FinancialFormulaAuthorityTests.test_evaluator_preserves_growth_cagr_and_frozen_window_boundaries", "test_financial_formulas.FinancialFormulaAuthorityTests.test_evaluator_returns_hand_checked_results_and_exact_operand_ids"], "passed": ["test_financial_formulas.FinancialFormulaAuthorityTests.test_accrual_and_roic_use_the_exact_hand_checked_raw_operand_sets", "test_financial_formulas.FinancialFormulaAuthorityTests.test_catalog_is_the_literal_closed_ninety_slot_projection", "test_financial_formulas.FinancialFormulaAuthorityTests.test_evaluator_preserves_growth_cagr_and_frozen_window_boundaries", "test_financial_formulas.FinancialFormulaAuthorityTests.test_evaluator_returns_hand_checked_results_and_exact_operand_ids"], "tests_run": 4, "failures": 0, "errors": 0, "skipped": 0}

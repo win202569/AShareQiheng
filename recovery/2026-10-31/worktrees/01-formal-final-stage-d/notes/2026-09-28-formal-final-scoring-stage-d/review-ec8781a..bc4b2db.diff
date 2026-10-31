@@ -1,0 +1,1763 @@
+# Review package: ec8781a..bc4b2db
+
+## Commits
+bc4b2db feat: persist atomic formal final runs
+
+## Files changed
+ ashare_pipeline/formal_final_eligibility.py  |  40 ++-
+ ashare_pipeline/formal_final_publication.py  | 143 +++++++++
+ ashare_pipeline/formal_final_repository.py   | 449 +++++++++++++++++++++++++++
+ ashare_pipeline/formal_final_score_inputs.py |  53 +++-
+ ashare_pipeline/formal_final_scoring.py      |  37 ++-
+ ashare_pipeline/formal_pool.py               |  57 +++-
+ tests/test_formal_final_atomicity.py         | 290 +++++++++++++++++
+ tests/test_formal_final_repository.py        | 165 ++++++++++
+ 8 files changed, 1206 insertions(+), 28 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_final_eligibility.py b/ashare_pipeline/formal_final_eligibility.py
+index 3e3f28a..11f916a 100644
+--- a/ashare_pipeline/formal_final_eligibility.py
++++ b/ashare_pipeline/formal_final_eligibility.py
+@@ -1,20 +1,23 @@
+ """Authenticated final states and two-pool eligibility from matching D1/D2 proofs."""
+ 
+ from __future__ import annotations
+ 
+ import hashlib
+ import inspect
+ import json
+ import weakref
+ from decimal import Decimal
+ from types import MappingProxyType
++from weakref import ref as _reference
++
++from .formal_final_publication import _claim_preparation
+ 
+ from .formal_final_score_inputs import PolicyAdjustedScoreInputBatch
+ from .formal_final_scoring import FinalScoreCardBatch
+ from .formal_scoring import _canonical, _digest, _freeze
+ 
+ 
+ _HARD_VETO_SEMANTICS = frozenset({
+     "st", "star_st", "delisting_arrangement", "forced_delist_risk",
+     "governance_red", "nonpositive_equity", "audit_adverse",
+     "audit_disclaimer", "audit_qualified", "no_effective_trade_20d",
+@@ -63,32 +66,39 @@ def _validate_ready_card_provenance(card_wire, row_wire, security_id, input_batc
+     # D2 batch cards are raw rows. Their proof-only score_batch_hash is
+     # authenticated separately by the selector canonical-byte check.
+     if (card_wire["security_id"] != security_id
+             or card_wire["source_entry_hash"] != row_wire["entry_hash"]
+             or card_wire["source_batch_hash"] != input_batch_hash
+             or card_wire["secondary_industry"] != row_wire["secondary_industry"]):
+         raise ValueError("eligibility card and input provenance mismatch")
+ 
+ 
+ def _install_eligibility():
+-    proofs = {}
++    proofs, prepared_gates = {}, {}
++    claim, reference = _claim_preparation, _reference
+     d2_record = inspect.getclosurevars(FinalScoreCardBatch.require_verified).nonlocals["record"]
+ 
+     def d2_source(scores):
+         # D2 seals its genuine D1 source in a private proof record. Capture that
+         # authority rather than resolving a replaceable module global at use time.
+         return d2_record(scores, FinalScoreCardBatch)[3]
+ 
+     def record(item, cls):
++        if (globals().get("_prepare_final_eligibility") is not prepare
++                or any(tuple(vars(kind).items()) != members for kind, members in own_members)):
++            raise ValueError("formal eligibility authority methods changed")
+         saved = proofs.get(id(item))
+         if type(item) is not cls or saved is None or saved[0]() is not item or saved[4] is not cls:
+             raise ValueError("formal eligibility proof is forged or revoked")
++        gate = prepared_gates.get(id(item))
++        if gate is not None and not gate():
++            raise ValueError("formal eligibility proof is unpublished or revoked")
+         inputs, scores, input_bytes, score_bytes = saved[2]
+         inputs.require_verified()
+         scores.require_verified()
+         if (inputs.canonical_bytes() != input_bytes or scores.canonical_bytes() != score_bytes
+                 or d2_source(scores) is not inputs):
+             raise ValueError("formal eligibility source publication changed")
+         return saved
+ 
+     class SealedMeta(type):
+         def __setattr__(cls, name, value):
+@@ -140,21 +150,21 @@ def _install_eligibility():
+                 raise ValueError("eligibility selector is outside the frozen universe")
+             result = saved[5][security_id]
+             result.require_verified()
+             return result
+ 
+     def mint(cls, payload, sources, *, index=None, attributes=None):
+         result = object.__new__(cls)
+         key = id(result)
+         data = dict(payload)
+         data.update(attributes or {})
+-        proofs[key] = (weakref.ref(result, lambda _: proofs.pop(key, None)),
++        proofs[key] = (reference(result, lambda _: (proofs.pop(key, None), prepared_gates.pop(key, None))),
+             _freeze(data), sources, _canonical(payload), cls, MappingProxyType(index or {}))
+         return result
+ 
+     def build(inputs, scores):
+         if type(inputs) is not PolicyAdjustedScoreInputBatch or type(scores) is not FinalScoreCardBatch:
+             raise ValueError("eligibility requires genuine D1 and D2 batches")
+         inputs.require_verified()
+         scores.require_verified()
+         if d2_source(scores) is not inputs:
+             raise ValueError("eligibility D1/D2 publications do not match")
+@@ -259,17 +269,35 @@ def _install_eligibility():
+             index[sid] = mint(FormalEligibility, payload, sources)
+         batch_payload = dict(schema_version="formal-eligibility-batch-v1",
+             security_ids=ids, source_batch_hash=input_batch_hash,
+             score_batch_hash=score_batch_hash, eligibilities=rows)
+         batch_payload["batch_hash"] = _digest(batch_payload)
+         result = mint(FormalEligibilityBatch, batch_payload, sources, index=index,
+             attributes={"eligibilities": tuple(index[sid] for sid in ids)})
+         result.require_verified()
+         return result
+ 
+-    return FormalEligibility, FormalEligibilityBatch, build, d2_source
+-
+-
+-FormalEligibility, FormalEligibilityBatch, build_formal_eligibility_batch, _d2_source = _install_eligibility()
++    def prepare(source, inputs, scores, capability, *, source_inputs, source_scores):
++        gate = claim(capability, source, "eligibility")
++        saved = record(source, FormalEligibilityBatch)
++        if saved[2][0] is not source_inputs or saved[2][1] is not source_scores:
++            raise ValueError("prepared eligibility sources differ from D1/D2")
++        sources = (inputs, scores, saved[2][2], saved[2][3])
++        index = {}
++        for sid, original in saved[5].items():
++            child = mint(FormalEligibility, dict(record(original, FormalEligibility)[1]), sources)
++            prepared_gates[id(child)] = gate
++            index[sid] = child
++        result = mint(FormalEligibilityBatch, json.loads(saved[3]), sources, index=index,
++            attributes={"eligibilities": tuple(index.values())})
++        prepared_gates[id(result)] = gate
++        return result, MappingProxyType(index)
++
++    own_members = tuple((kind, tuple(vars(kind).items())) for kind in
++        (Proof, FormalEligibility, FormalEligibilityBatch))
++    return FormalEligibility, FormalEligibilityBatch, build, d2_source, prepare
++
++
++FormalEligibility, FormalEligibilityBatch, build_formal_eligibility_batch, _d2_source, _prepare_final_eligibility = _install_eligibility()
+ del _install_eligibility
+ 
+ __all__ = ["FormalEligibility", "FormalEligibilityBatch", "build_formal_eligibility_batch"]
+diff --git a/ashare_pipeline/formal_final_publication.py b/ashare_pipeline/formal_final_publication.py
+new file mode 100644
+index 0000000..bdd84e1
+--- /dev/null
++++ b/ashare_pipeline/formal_final_publication.py
+@@ -0,0 +1,143 @@
++"""Private preparation authority for one all-or-nothing Stage D publication.
++
++Adapters can only consume a capability while this coordinator is preparing its
++exact source batch. No capability, proof constructor or mint operation escapes.
++The post-commit method contains only the prevalidated shared-state assignment.
++"""
++
++from weakref import ref as _reference
++
++
++def _install_authority():
++    preparing = {}
++
++    def claim(capability, source, stage):
++        saved = preparing.get(id(capability))
++        if (saved is None or saved[0] is not capability
++                or saved[1].get(stage) is not source or stage in saved[3]):
++            raise ValueError("prepared adapter requires the active coordinator capability")
++        saved[3].add(stage)
++        return saved[2]
++
++    class SealedMeta(type):
++        def __setattr__(cls, name, value):
++            raise TypeError("publication authority methods are immutable")
++
++        def __delattr__(cls, name):
++            raise TypeError("publication authority methods are immutable")
++
++    class FormalFinalPublicationCoordinator(metaclass=SealedMeta):
++        def __init__(self, *args, **kwargs):
++            raise TypeError("publication coordinator is created only by prepare")
++
++        @staticmethod
++        def prepare(*, input_batch, score_batch, eligibility_batch, pool_batch):
++            # Imports are intentionally deferred: each producer captures claim
++            # at installation without importing the other Stage D producers.
++            from .formal_final_score_inputs import _prepare_final_inputs
++            from .formal_final_scoring import _prepare_final_scores
++            from .formal_final_eligibility import _prepare_final_eligibility
++            from .formal_pool import _prepare_final_pools
++
++            sources = (input_batch, score_batch, eligibility_batch, pool_batch)
++            for source in sources:
++                source.require_verified()
++            source_bytes = tuple(source.canonical_bytes() for source in sources)
++            state = bytearray(1)  # 0 prepared, 1 armed, 2 committed, 3 revoked
++            prevalidated = [False]
++            armed, revoked = [False], [False]
++            capability = object()
++            gate = lambda: state[0] == 2 and armed[0] and not revoked[0]
++            preparing[id(capability)] = (capability, dict(zip(
++                ("inputs", "scores", "eligibility", "pools"), sources)), gate, set())
++            try:
++                inputs, input_rows, source_recheck = _prepare_final_inputs(input_batch, capability)
++                scores, cards = _prepare_final_scores(score_batch, inputs, input_rows, capability,
++                    source_input=input_batch)
++                eligibility, eligibility_rows = _prepare_final_eligibility(eligibility_batch,
++                    inputs, scores, capability, source_inputs=input_batch, source_scores=score_batch)
++                pools, decisions = _prepare_final_pools(pool_batch, eligibility, capability,
++                    source_eligibility=eligibility_batch)
++            except BaseException:
++                state[0] = 3
++                raise
++            finally:
++                preparing.pop(id(capability), None)
++            batches = (inputs, scores, eligibility, pools)
++            children = tuple(input_rows.values()) + tuple(c for c in cards.values() if c is not None)
++            children += tuple(eligibility_rows.values()) + decisions
++            owner = [None]
++
++            def authentic(item):
++                if owner[0]() is not item or type(item) is not PreparedPublication:
++                    raise ValueError("publication is forged or copied")
++                if any(tuple(vars(cls).items()) != members for cls, members in interfaces):
++                    raise ValueError("publication methods changed")
++
++            class PreparedPublication(metaclass=SealedMeta):
++                __slots__ = ("__weakref__",)
++
++                def __init__(self, *args, **kwargs):
++                    raise TypeError("publication cannot be constructed")
++
++                def __getattribute__(self, name):
++                    authentic(self)
++                    return object.__getattribute__(self, name)
++
++                @property
++                def batches(self):
++                    return batches
++
++                @property
++                def children(self):
++                    return children
++
++                def recheck(self):
++                    if state[0] == 3:
++                        raise ValueError("publication was revoked")
++                    source_recheck()
++                    for source, raw in zip(sources, source_bytes, strict=True):
++                        source.require_verified()
++                        if source.canonical_bytes() != raw:
++                            raise ValueError("publication source changed")
++
++                def prevalidate_commit(self):
++                    if state[0] != 0:
++                        raise ValueError("publication commit is not preparable")
++                    self.recheck()
++                    prevalidated[0] = True
++
++                def arm(self):
++                    if state[0] != 0 or not prevalidated[0]:
++                        raise ValueError("publication cannot be armed")
++                    state[0] = 1
++                    armed[0] = True
++
++                def mark_committed(self):
++                    state[0] = 2
++
++                def revoke(self):
++                    revoked[0] = True
++                    state[0] = 3
++
++                def __copy__(self):
++                    raise TypeError("publication cannot be copied")
++
++                def __deepcopy__(self, memo):
++                    raise TypeError("publication cannot be copied")
++
++                def __reduce_ex__(self, protocol):
++                    raise TypeError("publication cannot be reconstructed")
++
++            interfaces = ((PreparedPublication, tuple(vars(PreparedPublication).items())),)
++            result = object.__new__(PreparedPublication)
++            owner[0] = _reference(result)
++            return result
++
++    return claim, FormalFinalPublicationCoordinator
++
++
++_claim_preparation, FormalFinalPublicationCoordinator = _install_authority()
++del _install_authority
++
++__all__ = ["FormalFinalPublicationCoordinator"]
+diff --git a/ashare_pipeline/formal_final_repository.py b/ashare_pipeline/formal_final_repository.py
+new file mode 100644
+index 0000000..63b6a09
+--- /dev/null
++++ b/ashare_pipeline/formal_final_repository.py
+@@ -0,0 +1,449 @@
++"""Append-only, atomic V8 Stage D runs and non-authoritative recovery DTOs."""
++
++from contextlib import closing
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from decimal import Decimal
++import hashlib
++import json
++from pathlib import Path
++from types import MappingProxyType
++from uuid import uuid4
++
++from .formal_coverage_manifest import VerifiedCoverageManifest
++from .formal_final_publication import FormalFinalPublicationCoordinator
++from .formal_final_score_inputs import PolicyAdjustedScoreInputBatch
++from .formal_final_scoring import FinalScoreCardBatch
++from .formal_final_eligibility import FormalEligibilityBatch, _validate_scorecard_coverage
++from .formal_pool import PoolSelectionBatch
++from .formal_registry_manifest import FormalRegistryBundleLoader
++from .formal_repository_identity import _require_repository_initialization
++from .state_store import StateStore
++
++
++ARTIFACT_KINDS = ("coverage_manifest", "score_input_batch", "scorecard_batch",
++    "eligibility_batch", "pool_selection_batch")
++_TABLES = ("formal_final_run", "formal_final_artifact", "formal_final_input",
++    "formal_final_scorecard", "formal_final_status", "formal_final_eligibility",
++    "formal_final_pool_decision", "formal_final_dependency")
++_BATCH_TYPES = (PolicyAdjustedScoreInputBatch, FinalScoreCardBatch,
++    FormalEligibilityBatch, PoolSelectionBatch)
++_prepare_publication = FormalFinalPublicationCoordinator.prepare
++
++
++def _json_value(value):
++    if type(value) is Decimal:
++        if not value.is_finite():
++            raise ValueError("Stage D decimal must be finite")
++        return str(value)
++    if type(value) is float:
++        raise ValueError("Stage D payload cannot contain float")
++    if type(value) in (dict, MappingProxyType):
++        if any(type(key) is not str for key in value):
++            raise ValueError("Stage D object keys must be strings")
++        return {key: _json_value(item) for key, item in value.items()}
++    if type(value) in (tuple, list):
++        return [_json_value(item) for item in value]
++    if value is None or type(value) in (str, bool, int):
++        return value
++    raise ValueError("Stage D payload has an unsupported value")
++
++
++def _serialize_payload(value):
++    raw = json.dumps(_json_value(value), ensure_ascii=False, sort_keys=True,
++        separators=(",", ":"), allow_nan=False)
++    return raw, hashlib.sha256(raw.encode()).hexdigest()
++
++
++def _immutable(value):
++    if type(value) is dict:
++        return MappingProxyType({key: _immutable(item) for key, item in value.items()})
++    if type(value) in (list, tuple):
++        return tuple(_immutable(item) for item in value)
++    return value
++
++
++def _new_run_id():
++    return uuid4().hex
++
++
++@dataclass(frozen=True)
++class FormalFinalRunSnapshot:
++    """Detached immutable history. It is intentionally not a live proof."""
++    header: MappingProxyType
++    artifacts: MappingProxyType
++    artifact_hashes: MappingProxyType
++    inputs: tuple
++    scorecards: tuple
++    statuses: tuple
++    eligibilities: tuple
++    pool_decisions: tuple
++    dependencies: tuple
++
++    def __getattr__(self, name):
++        try:
++            return self.header[name]
++        except KeyError as exc:
++            raise AttributeError(name) from exc
++
++    @property
++    def security_ids(self):
++        return tuple(row["security_id"] for row in self.inputs)
++
++    def to_dict(self):
++        return _json_value(dict(header=self.header,
++            artifacts={key: json.loads(raw) for key, raw in self.artifacts.items()},
++            artifact_hashes=self.artifact_hashes, inputs=self.inputs,
++            scorecards=self.scorecards, statuses=self.statuses, eligibilities=self.eligibilities,
++            pool_decisions=self.pool_decisions, dependencies=self.dependencies))
++
++
++@dataclass(frozen=True)
++class FormalFinalRunReceipt:
++    run_id: str
++    status: str
++    input_manifest_hash: str
++    result_hash: str
++    input_batch: PolicyAdjustedScoreInputBatch
++    score_batch: FinalScoreCardBatch
++    eligibility_batch: FormalEligibilityBatch
++    pool_batch: PoolSelectionBatch
++
++    @property
++    def batches(self):
++        return self.input_batch, self.score_batch, self.eligibility_batch, self.pool_batch
++
++
++def _coverage_identity(coverage, wire, ids, mode):
++    if type(coverage) is not VerifiedCoverageManifest:
++        raise ValueError("run requires a genuine coverage manifest")
++    coverage.require_verified()
++    data = coverage.to_dict()
++    rows = data["rows"]
++    if ({row["security_id"] for row in rows} != set(ids)
++            or any(row["frozen_input_hash"] != wire["frozen_input_hash"]
++                   or row["exchange"] != row["security_id"][:2] for row in rows)
++            or data["freeze_at_utc"] != wire["as_of_utc"]):
++        raise ValueError("coverage does not cover the exact frozen universe")
++    if data.get("authenticated_context"):
++        if (data["registry_manifest_hash"] != wire["registry_manifest_hash"]
++                or data["frozen_input_hash"] != wire["frozen_input_hash"]
++                or data["universe_records_hash"] != wire["universe_hash"]
++                or data["member_count"] != len(ids)):
++            raise ValueError("coverage root or universe identity mismatch")
++    if mode == "official_candidate":
++        coverage.require_official_ready()
++    elif not data["blockers"]:
++        coverage.require_preview_ready()
++
++
++def _recheck_sources(store, coverage, batches, mode, publication, connection):
++    publication.recheck()
++    inputs = batches[0].to_dict()
++    ids = tuple(inputs["security_ids"])
++    _coverage_identity(coverage, inputs, ids, mode)
++    row = connection.execute("SELECT * FROM formal_universe_snapshot WHERE frozen_input_hash = ?",
++        (inputs["frozen_input_hash"],)).fetchone()
++    if row is None:
++        raise ValueError("run frozen universe is no longer present")
++    frozen, _ = store._formal_universe_from_connection(connection, row)
++    if (tuple(member.security_id for member in frozen.members) != ids
++            or frozen.universe_hash != inputs["universe_hash"]
++            or frozen.registry_manifest_hash != inputs["registry_manifest_hash"]):
++        raise ValueError("run root or frozen membership changed")
++    bundle = FormalRegistryBundleLoader(store, store._require_registry_verifier()).load(
++        inputs["registry_manifest_hash"])
++    if bundle.manifest.schema_version != "formal-registry-manifest-v2":
++        raise ValueError("Stage D run requires a v2 registry root")
++    if mode == "official_candidate":
++        bundle.require_official()
++
++
++def _arm_publication(publication):
++    publication.arm()
++
++
++def _payload_columns(payload):
++    raw, digest = _serialize_payload(payload)
++    return dict(payload_json=raw, payload_hash=digest)
++
++
++def _decimal_text(value):
++    if type(value) is not str:
++        raise ValueError("score projection requires decimal text")
++    number = Decimal(value)
++    if not number.is_finite() or str(number) != value:
++        raise ValueError("score projection is not a canonical finite decimal")
++    return value
++
++
++def _project_rows(run_id, wires):
++    inputs, scores, eligibility, pools = wires
++    ids = tuple(inputs["security_ids"])
++    _validate_scorecard_coverage(ids, scores)
++    if (tuple(row["security_id"] for row in inputs["inputs"]) != ids
++            or tuple(eligibility["security_ids"]) != ids
++            or tuple(row["security_id"] for row in eligibility["eligibilities"]) != ids
++            or tuple(pools["security_ids"]) != ids
++            or len(set(ids)) != len(ids) or ids != tuple(sorted(ids))):
++        raise ValueError("Stage D member coverage is incomplete or duplicated")
++    if (scores["source_batch_hash"] != inputs["batch_hash"]
++            or eligibility["source_batch_hash"] != inputs["batch_hash"]
++            or eligibility["score_batch_hash"] != scores["batch_hash"]
++            or pools["source_batch_hash"] != eligibility["batch_hash"]):
++        raise ValueError("Stage D batch dependency closure differs")
++    for key in ("registry_manifest_hash", "frozen_input_hash", "universe_hash"):
++        if scores[key] != inputs[key]:
++            raise ValueError("Stage D roots differ")
++    rows = {name: [] for name in _TABLES[2:]}
++    for item in inputs["inputs"]:
++        rows["formal_final_input"].append(dict(run_id=run_id, security_id=item["security_id"],
++            entry_hash=item["entry_hash"], **_payload_columns(item)))
++    for item in scores["cards"]:
++        projection = {key: _decimal_text(item[key]) for key in ("S0", "Sc", "Sbase", "B", "R_safety")}
++        rows["formal_final_scorecard"].append(dict(run_id=run_id, security_id=item["security_id"],
++            card_hash=item["card_hash"], C=_decimal_text(item["confidence"]["C"]),
++            grade=item["Sc_grade"], **projection, **_payload_columns(item)))
++    for item in eligibility["eligibilities"]:
++        status = {key: item[key] for key in ("security_id", "state", "reason_codes")}
++        rows["formal_final_status"].append(dict(run_id=run_id, security_id=item["security_id"],
++            state=item["state"], reason_codes_json=_serialize_payload(item["reason_codes"])[0],
++            **_payload_columns(status)))
++        flags = {key: int(item[key]) for key in ("strong_qualified", "wait_qualified", "hard_veto",
++            "strong_prohibited", "wait_prohibited")}
++        rows["formal_final_eligibility"].append(dict(run_id=run_id, security_id=item["security_id"],
++            eligibility_hash=item["eligibility_hash"], **flags, **_payload_columns(item)))
++    expected_pairs = {(sid, pool) for sid in ids for pool in ("strong", "wait")}
++    actual_pairs = [(item["security_id"], item["pool"]) for item in pools["decisions"]]
++    if len(actual_pairs) != len(expected_pairs) or set(actual_pairs) != expected_pairs:
++        raise ValueError("pool decisions must cover both pools and every frozen member")
++    ordinals = {}
++    for pool in ("strong", "wait"):
++        selected = pools[pool + "_security_ids"]
++        if len(selected) != len(set(selected)) or pools["counts"][pool] != len(selected):
++            raise ValueError("pool selected membership or count is invalid")
++        ordinals.update({(sid, pool): index for index, sid in enumerate(selected, 1)})
++    for item in pools["decisions"]:
++        ordinal = ordinals.get((item["security_id"], item["pool"]))
++        if (item["decision"] == "selected") != (ordinal is not None):
++            raise ValueError("pool selected membership differs from its decisions")
++        rows["formal_final_pool_decision"].append(dict(run_id=run_id, security_id=item["security_id"],
++            pool_name=item["pool"], decision=item["decision"], selected_ordinal=ordinal,
++            decision_hash=item["decision_hash"], **_payload_columns(item)))
++    # Preserve root-wide and per-member dependencies. Fine-grained upstream
++    # hashes are retained with their field paths for the later rebuild planner.
++    dependencies = {}
++    def add_dependencies(value, *, sid, path):
++        if type(value) is dict:
++            for key, child in value.items():
++                child_path = path + "." + key
++                if ((key.endswith("_hash") or key.endswith("_sha256"))
++                        and type(child) is str and child):
++                    dependency = dict(security_id=sid, source_kind=key,
++                        source_id=child_path, source_hash=child,
++                        effect_scope="global" if sid is None else "security",
++                        dependent_key="run" if sid is None else sid)
++                    dependencies[(key, child_path, dependency["dependent_key"])] = dependency
++                elif type(child) in (dict, list):
++                    add_dependencies(child, sid=sid, path=child_path)
++        elif type(value) is list:
++            for index, child in enumerate(value):
++                add_dependencies(child, sid=sid, path=path + "." + str(index))
++    add_dependencies({key: value for key, value in inputs.items() if key != "inputs"},
++        sid=None, path="batch")
++    for item in inputs["inputs"]:
++        add_dependencies(item, sid=item["security_id"], path="input." + item["security_id"])
++    for _, dependency in sorted(dependencies.items()):
++        rows["formal_final_dependency"].append(dict(run_id=run_id, **dependency,
++            **_payload_columns(dependency)))
++    return rows
++
++
++def _insert_rows(connection, table, rows, columns):
++    sql = "INSERT INTO " + table + " (" + ",".join(columns) + ") VALUES ("
++    sql += ",".join("?" for _ in columns) + ")"
++    connection.executemany(sql, [tuple(row[key] for key in columns) for row in rows])
++
++
++def _verify_persisted(connection, run_id, expected):
++    # Full value comparison checks exact member/key sets, every hash and every
++    # Decimal projection. Counts alone cannot prove an untorn result.
++    for table, rows in expected.items():
++        actual = [dict(row) for row in connection.execute(
++            "SELECT * FROM " + table + " WHERE run_id = ?", (run_id,))]
++        canonical = lambda entries: sorted(_serialize_payload(row)[0] for row in entries)
++        if canonical(actual) != canonical(rows):
++            raise ValueError("persisted Stage D table differs: " + table)
++    artifacts = {row["artifact_kind"]: row for row in expected["formal_final_artifact"]}
++    if set(artifacts) != set(ARTIFACT_KINDS):
++        raise ValueError("Stage D requires exactly the five owned artifact kinds")
++    for row in artifacts.values():
++        if hashlib.sha256(row["payload_json"].encode()).hexdigest() != row["artifact_hash"]:
++            raise ValueError("Stage D artifact canonical hash differs")
++    header = expected["formal_final_run"][0]
++    inputs = json.loads(artifacts["score_input_batch"]["payload_json"])
++    if (any(header[key] != inputs[key] for key in
++            ("registry_manifest_hash", "frozen_input_hash", "universe_hash", "as_of_utc"))
++            or header["coverage_manifest_hash"] != artifacts["coverage_manifest"]["artifact_hash"]):
++        raise ValueError("run header differs from its canonical artifacts")
++    identity = _input_identity(header, artifacts)
++    if header["input_manifest_hash"] != _serialize_payload(identity)[1]:
++        raise ValueError("run input manifest differs from its canonical artifacts")
++    if header["result_hash"] != _result_hash(header, artifacts):
++        raise ValueError("run result identity differs from canonical artifacts")
++
++
++def _input_identity(header, artifacts):
++    return {**{key: header[key] for key in ("mode", "registry_manifest_hash",
++        "frozen_input_hash", "universe_hash", "as_of_utc", "code_version", "contract_version")},
++        "coverage_manifest_hash": artifacts["coverage_manifest"]["artifact_hash"],
++        "score_input_batch_hash": artifacts["score_input_batch"]["artifact_hash"]}
++
++
++def _result_hash(header, artifacts):
++    return _serialize_payload(dict(input_manifest_hash=header["input_manifest_hash"],
++        status=header["status"], artifacts={name: row["artifact_hash"]
++            for name, row in artifacts.items()}))[1]
++
++
++class FormalFinalRunRepository:
++    """The sole Stage D mutation is commit_complete_run; history has no writer."""
++
++    def __init__(self, state_store, *, code_version, contract_version="formal-final-v1"):
++        if type(state_store) is not StateStore:
++            raise ValueError("Stage D repository requires the owning StateStore")
++        _require_repository_initialization(state_store)
++        if any(type(value) is not str or not value.strip() for value in (code_version, contract_version)):
++            raise ValueError("Stage D requires code and contract identities")
++        self._store = state_store
++        self._path = Path(state_store.db_path).resolve()
++        self._code_version, self._contract_version = code_version, contract_version
++
++    def commit_complete_run(self, *, mode, coverage_manifest, input_batch,
++                            score_batch, eligibility_batch, pool_batch):
++        if mode not in ("test_preview", "official_candidate"):
++            raise ValueError("Stage D run mode is invalid")
++        if Path(self._store.db_path).resolve() != self._path:
++            raise ValueError("Stage D repository database changed")
++        batches = (input_batch, score_batch, eligibility_batch, pool_batch)
++        if any(type(batch) is not cls for batch, cls in zip(batches, _BATCH_TYPES, strict=True)):
++            raise ValueError("Stage D requires genuine exact batch types")
++        for batch in batches:
++            batch.require_verified()
++        wires = tuple(batch.to_dict() for batch in batches)
++        _coverage_identity(coverage_manifest, wires[0], tuple(wires[0]["security_ids"]), mode)
++        publication = _prepare_publication(input_batch=input_batch, score_batch=score_batch,
++            eligibility_batch=eligibility_batch, pool_batch=pool_batch)
++        try:
++            run_id = _new_run_id()
++            rows = _project_rows(run_id, wires)
++            raw_artifacts = (coverage_manifest.canonical_bytes(),) + tuple(
++                batch.canonical_bytes() for batch in batches)
++            artifacts = {}
++            for kind, raw in zip(ARTIFACT_KINDS, raw_artifacts, strict=True):
++                canonical, digest = _serialize_payload(json.loads(raw))
++                if canonical.encode() != raw:
++                    raise ValueError("Stage D artifact is not canonical")
++                artifacts[kind] = dict(run_id=run_id, artifact_kind=kind,
++                    payload_json=canonical, artifact_hash=digest)
++            if len(artifacts) != 5 or set(artifacts) != {
++                    "coverage_manifest", "score_input_batch", "scorecard_batch",
++                    "eligibility_batch", "pool_selection_batch"}:
++                raise ValueError("Stage D requires exactly its five canonical artifacts")
++            blocked = bool(coverage_manifest.blockers) or any(
++                row["state"] == "pending_evidence" for row in wires[2]["eligibilities"])
++            header = dict(run_id=run_id, mode=mode, status="blocked" if blocked else "preview_ready",
++                **{key: wires[0][key] for key in ("registry_manifest_hash", "frozen_input_hash",
++                    "universe_hash", "as_of_utc")},
++                coverage_manifest_hash=coverage_manifest.manifest_hash,
++                code_version=self._code_version, contract_version=self._contract_version,
++                created_at=datetime.now(timezone.utc).isoformat())
++            header["input_manifest_hash"] = _serialize_payload(_input_identity(header, artifacts))[1]
++            header["result_hash"] = _result_hash(header, artifacts)
++            expected = {"formal_final_run": [header], "formal_final_artifact": list(artifacts.values()), **rows}
++            publication.prevalidate_commit()
++            # Resolve and validate everything which can fail before entering the
++            # commit boundary. The captured flip itself performs only STORE_SUBSCR.
++            mark_committed = publication.mark_committed
++            receipt = FormalFinalRunReceipt(run_id, header["status"], header["input_manifest_hash"],
++                header["result_hash"], *publication.batches)
++            empty_columns = {
++                "formal_final_scorecard": ("run_id", "security_id", "card_hash", "S0", "Sc", "Sbase",
++                    "B", "R_safety", "C", "grade", "payload_json", "payload_hash"),
++            }
++            connection = self._store._connect()
++            committed = False
++            try:
++                connection.execute("BEGIN IMMEDIATE")
++                _recheck_sources(self._store, coverage_manifest, batches, mode, publication, connection)
++                for table in _TABLES:
++                    items = expected[table]
++                    columns = tuple(items[0]) if items else empty_columns.get(table)
++                    if columns is None:
++                        raise ValueError("Stage D required table has no complete records: " + table)
++                    _insert_rows(connection, table, items, columns)
++                _verify_persisted(connection, run_id, expected)
++                _recheck_sources(self._store, coverage_manifest, batches, mode, publication, connection)
++                _arm_publication(publication)
++                connection.commit()
++                mark_committed()
++                committed = True
++            except BaseException:
++                publication.revoke()
++                connection.rollback()
++                raise
++            finally:
++                # Closing is cleanup after publication. It cannot turn a
++                # successful durable commit into a reported failed run.
++                try:
++                    connection.close()
++                except Exception:
++                    if not committed:
++                        raise
++            return receipt
++        except BaseException:
++            publication.revoke()
++            raise
++
++    def get_run(self, run_id):
++        with self._store._transaction() as connection:
++            return self._read_run(connection, run_id)
++
++    def _read_run(self, connection, run_id):
++        row = connection.execute("SELECT * FROM formal_final_run WHERE run_id = ?", (run_id,)).fetchone()
++        if row is None:
++            return None
++        artifacts = list(connection.execute(
++            "SELECT * FROM formal_final_artifact WHERE run_id = ? ORDER BY artifact_kind", (run_id,)))
++        if {item["artifact_kind"] for item in artifacts} != set(ARTIFACT_KINDS):
++            raise ValueError("historical run artifact set is incomplete")
++        payloads, hashes = {}, {}
++        for item in artifacts:
++            raw = item["payload_json"].encode()
++            if hashlib.sha256(raw).hexdigest() != item["artifact_hash"]:
++                raise ValueError("historical run artifact hash mismatch")
++            payloads[item["artifact_kind"]], hashes[item["artifact_kind"]] = raw, item["artifact_hash"]
++        groups = []
++        for table in _TABLES[2:]:
++            order = "source_kind,source_id,effect_scope,dependent_key" if table == "formal_final_dependency" else "security_id"
++            if table == "formal_final_pool_decision":
++                order += ",pool_name"
++            group = []
++            for item in connection.execute("SELECT * FROM " + table + " WHERE run_id = ? ORDER BY " + order, (run_id,)):
++                raw = item["payload_json"]
++                if hashlib.sha256(raw.encode()).hexdigest() != item["payload_hash"]:
++                    raise ValueError("historical run payload hash mismatch")
++                group.append(_immutable(json.loads(raw)))
++            groups.append(tuple(group))
++        return FormalFinalRunSnapshot(_immutable(dict(row)), MappingProxyType(payloads),
++            MappingProxyType(hashes), *groups)
++
++    def list_runs_by_input_manifest(self, input_manifest_hash):
++        with self._store._transaction() as connection:
++            ids = tuple(row[0] for row in connection.execute(
++                "SELECT run_id FROM formal_final_run WHERE input_manifest_hash = ? ORDER BY created_at,run_id",
++                (input_manifest_hash,)))
++            return tuple(self._read_run(connection, run_id) for run_id in ids)
++
++
++__all__ = ["FormalFinalRunRepository", "FormalFinalRunReceipt", "FormalFinalRunSnapshot"]
+diff --git a/ashare_pipeline/formal_final_score_inputs.py b/ashare_pipeline/formal_final_score_inputs.py
+index f0bd77d..7d47add 100644
+--- a/ashare_pipeline/formal_final_score_inputs.py
++++ b/ashare_pipeline/formal_final_score_inputs.py
+@@ -2,38 +2,41 @@
+ 
+ Only this repository can publish D1 proofs. Business gaps remain authenticated
+ entries; identity mismatches abort the whole publication.
+ """
+ 
+ import hashlib
+ import json
+ import weakref
+ from types import MappingProxyType
+ 
++from .formal_final_publication import _claim_preparation
++
+ from . import formal_metric_engine as metric_engine
+ from .formal_metric_batch_guard import _metric_batch_guard
+ from .formal_metric_engine import _canonical, _digest, _freeze
+ from .formal_policy_registry import FormalPolicyRegistry
+ from .formal_policy_repository import FormalPolicyRepository, VerifiedPolicyResultBatch, PolicyResult
+ from .formal_registry_manifest import FormalRegistryBundleLoader
+ from .formal_score_inputs import FormalScoreInputRepository, FormalScoreInputBatch, FormalScoreInput
+ from .formal_scoring_registry import FormalScoringRegistry
+ from .formal_valuation_adapter_contract import FormalValuationAdapterRegistry
+ from .formal_valuation_engine import (
+     FormalValuationRepository, PolicyAdjustedValuationBatch,
+     PolicyAdjustedValuationScore, PolicyAdjustedValuationPeerContext,
+     build_valuation_peer_context, score_valuation_percentile,
+ )
+ 
+ 
+ def _install_final_inputs():
+-    repositories, proofs = {}, {}
++    repositories, proofs, prepared_gates, prepared_origins = {}, {}, {}, {}
++    claim = _claim_preparation
+     encode, digest, freeze = _canonical, _digest, _freeze
+     decode, sha256, reference = json.loads, hashlib.sha256, weakref.ref
+     guard_factory, load_root = _metric_batch_guard, FormalRegistryBundleLoader.load
+     base_build = FormalScoreInputRepository.build_batch
+     policy_build = FormalPolicyRepository.build_batch
+     valuation_build = FormalValuationRepository.build_batch
+     peer_context, percentile = build_valuation_peer_context, score_valuation_percentile
+     metric_owner = vars(metric_engine)
+     metric_dependencies = metric_engine._metric_definition_dependency_changes
+     v_metrics = ("V.enterprise_value_or_sustainable_roe", "V.normalized_earnings_yield",
+@@ -44,21 +47,22 @@ def _install_final_inputs():
+         if callable(value) and name != "_install_final_inputs")
+     classes = {base for cls in (*source_types, FormalScoreInput, PolicyResult,
+         PolicyAdjustedValuationScore, PolicyAdjustedValuationPeerContext,
+         FormalScoreInputRepository, FormalPolicyRepository, FormalValuationRepository,
+         FormalScoringRegistry, FormalPolicyRegistry, FormalValuationAdapterRegistry,
+         FormalRegistryBundleLoader) for base in cls.__mro__ if base is not object}
+     checked = tuple((cls, name, value) for cls in classes for name, value in vars(cls).items()
+         if callable(value) or isinstance(value, (staticmethod, classmethod)))
+ 
+     def interfaces():
+-        if (metric_owner.get("_freeze") is not freeze
++        if (owner.get("_prepare_final_inputs") is not prepare
++                or metric_owner.get("_freeze") is not freeze
+                 or metric_owner.get("_metric_definition_dependency_changes") is not metric_dependencies
+                 or metric_dependencies()
+                 or any(owner.get(name) is not value for name, value in captured)
+                 or any(vars(cls).get(name) is not value for cls, name, value in checked)
+                 or any(tuple(vars(cls).items()) != members for cls, members in own_members)):
+             raise ValueError("final score authority dependency changed")
+ 
+     def dependencies(repository):
+         interfaces()
+         saved = repositories.get(id(repository))
+@@ -72,20 +76,26 @@ def _install_final_inputs():
+                 or feature._verifier is not verifier or context._verifier is not verifier):
+             raise ValueError("final score repository graph changed")
+         return feature, context, ranges, verifier, base, policy, valuation
+ 
+     def record(proof, cls):
+         interfaces()
+         saved = proofs.get(id(proof))
+         if (type(proof) is not cls or saved is None or saved[0]() is not proof
+                 or not saved[4][0] or saved[6] is not cls):
+             raise ValueError("final score proof is forged, copied, unpublished or revoked")
++        gate = prepared_gates.get(id(proof))
++        if gate is not None and not gate():
++            raise ValueError("final score proof is unpublished or revoked")
++        original = prepared_origins.get(id(proof))
++        if original is not None:
++            record(original, cls)
+         if cls is PolicyAdjustedScoreInput and encode(saved[1]) != saved[2]:
+             raise ValueError("final score entry differs from its published canonical bytes")
+         return saved
+ 
+     class SealedMeta(type):
+         def __setattr__(cls, name, value):
+             raise TypeError("final score authority types are immutable")
+ 
+         def __delattr__(cls, name):
+             raise TypeError("final score authority types are immutable")
+@@ -95,20 +105,24 @@ def _install_final_inputs():
+     class Proof(metaclass=SealedMeta):
+         __slots__ = ("__weakref__",)
+ 
+         def __init_subclass__(cls, **kwargs):
+             if not subclass_open[0]:
+                 raise TypeError("final score proof types cannot be inherited")
+ 
+         def __init__(self, *args, **kwargs):
+             raise TypeError("final score proofs require an authenticated complete batch")
+ 
++        def __getattribute__(self, name):
++            record(self, type(self))
++            return object.__getattribute__(self, name)
++
+         def __getattr__(self, name):
+             data = record(self, type(self))[1]
+             if name not in data:
+                 raise AttributeError(name)
+             return data[name]
+ 
+         def require_verified(self):
+             record(self, type(self))
+ 
+         def canonical_bytes(self):
+@@ -145,21 +159,22 @@ def _install_final_inputs():
+                 raise ValueError("final score selector is not bound to this publication")
+             return child
+ 
+     subclass_open[0] = False
+ 
+     def mint(cls, payload, publication, retention, *, attributes=None, index=None):
+         result = object.__new__(cls)
+         key = id(result)
+         data = dict(payload)
+         data.update(attributes or {})
+-        proofs[key] = (reference(result, lambda _: proofs.pop(key, None)), freeze(data),
++        proofs[key] = (reference(result, lambda _: (proofs.pop(key, None), prepared_gates.pop(key, None),
++            prepared_origins.pop(key, None))), freeze(data),
+             encode(payload), index, publication, retention, cls)
+         return result
+ 
+     def verify_sources(sources):
+         for source, cls in zip(sources, source_types, strict=True):
+             if type(source) is not cls:
+                 raise ValueError("final score requires three genuine source batches")
+             source.require_verified()
+         return tuple(source.canonical_bytes() for source in sources)
+ 
+@@ -386,19 +401,47 @@ def _install_final_inputs():
+             except BaseException:
+                 publication[0] = False
+                 raise
+ 
+         def __copy__(self):
+             raise TypeError("final score repositories cannot be copied")
+ 
+         def __deepcopy__(self, memo):
+             raise TypeError("final score repositories cannot be copied")
+ 
++    def prepare(source, capability):
++        gate = claim(capability, source, "inputs")
++        saved = record(source, PolicyAdjustedScoreInputBatch)
++        original_rows = {sid: record(source.input_for(sid), PolicyAdjustedScoreInput)
++            for sid in saved[3]}
++        publication, retention = [True], saved[5]
++        index = {}
++        for sid, row in original_rows.items():
++            child = mint(PolicyAdjustedScoreInput, dict(row[1]), publication, retention)
++            prepared_gates[id(child)] = gate
++            prepared_origins[id(child)] = source.input_for(sid)
++            index[sid] = child
++        result = mint(PolicyAdjustedScoreInputBatch, decode(saved[2]), publication, retention,
++            attributes={"inputs": tuple(index.values())}, index=MappingProxyType(index))
++        prepared_gates[id(result)] = gate
++        prepared_origins[id(result)] = source
++        source_bytes = verify_sources(retention[1])
++
++        def recheck():
++            record(source, PolicyAdjustedScoreInputBatch)
++            dependencies(retention[0])
++            if verify_sources(retention[1]) != source_bytes:
++                raise ValueError("final input dependencies changed before commit")
++            for proof in retention[2]:
++                proof.require_verified()
++
++        return result, MappingProxyType(index), recheck
++
+     own_members = tuple((cls, tuple(vars(cls).items())) for cls in
+         (Proof, PolicyAdjustedScoreInput, PolicyAdjustedScoreInputBatch, FormalFinalScoreInputRepository))
+-    return FormalFinalScoreInputRepository, PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput
++    return FormalFinalScoreInputRepository, PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput, prepare
+ 
+ 
+-FormalFinalScoreInputRepository, PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput = _install_final_inputs()
++FormalFinalScoreInputRepository, PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput, _prepare_final_inputs = _install_final_inputs()
+ del _install_final_inputs
+ 
+ __all__ = ["FormalFinalScoreInputRepository", "PolicyAdjustedScoreInputBatch", "PolicyAdjustedScoreInput"]
+diff --git a/ashare_pipeline/formal_final_scoring.py b/ashare_pipeline/formal_final_scoring.py
+index 8cf4e42..a6f6f3f 100644
+--- a/ashare_pipeline/formal_final_scoring.py
++++ b/ashare_pipeline/formal_final_scoring.py
+@@ -1,20 +1,22 @@
+ """Authenticated final scorecards from complete policy-adjusted D1 inputs."""
+ 
+ from __future__ import annotations
+ 
+ import hashlib
+ import json
+ import weakref
+ from decimal import Decimal, InvalidOperation, localcontext
+ from types import MappingProxyType
+ 
++from .formal_final_publication import _claim_preparation
++
+ from . import formal_final_score_inputs as input_module
+ from . import formal_scoring as scoring_module
+ from .formal_final_score_inputs import PolicyAdjustedScoreInput, PolicyAdjustedScoreInputBatch
+ from .formal_scoring import (
+     _arithmetic_context, _calculate_untrusted_arithmetic,
+     _calculate_untrusted_confidence, _canonical, _digest, _freeze,
+     grade_for_score,
+ )
+ 
+ 
+@@ -178,21 +180,22 @@ def _calculate_untrusted_final(wire, *, _context=_arithmetic_context,
+         cap_trace=cap_trace, dimensions=dimensions,
+         dimension_grades={key: _grade(value) for key, value in dimensions.items()},
+         global_slot_weights=weights, confidence=confidence, risk_metric_values=risk_values,
+         **arithmetic)
+     for key in ("S0", "Sc", "Sbase", "B", "M_persistence", "CA_downside", "R_safety"):
+         result[key + "_grade"] = _grade(result[key])
+     return result
+ 
+ 
+ def _install_final_scoring():
+-    proofs = {}
++    proofs, prepared_gates = {}, {}
++    claim = _claim_preparation
+     source_batch_type, source_row_type = PolicyAdjustedScoreInputBatch, PolicyAdjustedScoreInput
+     source_batch_verify = source_batch_type.require_verified
+     source_batch_bytes = source_batch_type.canonical_bytes
+     source_input_for = source_batch_type.input_for
+     source_row_verify = source_row_type.require_verified
+     source_row_bytes = source_row_type.canonical_bytes
+     source_row_wire = source_row_type.to_dict
+     helpers = (_arithmetic_context, _calculate_untrusted_arithmetic,
+         _calculate_untrusted_confidence, grade_for_score, _canonical, _digest, _freeze,
+         _calculate_untrusted_final)
+@@ -200,21 +203,22 @@ def _install_final_scoring():
+     core_defaults = dict(core.__kwdefaults__)
+     cap_defaults = dict(_cap_trace.__kwdefaults__)
+     constants = (_DIMENSION_WEIGHTS, _DIMENSION_COUNTS, _RISK_IDS, _V_IDS)
+     owner = globals()
+     input_owner = vars(input_module)
+     scoring_owner = vars(scoring_module)
+     encode, digest, freeze = _canonical, _digest, _freeze
+     sha256, decode, reference = hashlib.sha256, json.loads, weakref.ref
+ 
+     def dependencies():
+-        if (owner.get("PolicyAdjustedScoreInputBatch") is not source_batch_type
++        if (owner.get("_prepare_final_scores") is not prepare
++                or owner.get("PolicyAdjustedScoreInputBatch") is not source_batch_type
+                 or owner.get("PolicyAdjustedScoreInput") is not source_row_type
+                 or input_owner.get("PolicyAdjustedScoreInputBatch") is not source_batch_type
+                 or input_owner.get("PolicyAdjustedScoreInput") is not source_row_type
+                 or any(owner.get(name) is not value for name, value in zip((
+                     "_arithmetic_context", "_calculate_untrusted_arithmetic",
+                     "_calculate_untrusted_confidence", "grade_for_score", "_canonical",
+                     "_digest", "_freeze", "_calculate_untrusted_final"), helpers, strict=True))
+                 or any(scoring_owner.get(name) is not value for name, value in zip((
+                     "_arithmetic_context", "_calculate_untrusted_arithmetic",
+                     "_calculate_untrusted_confidence", "grade_for_score", "_canonical",
+@@ -240,20 +244,23 @@ def _install_final_scoring():
+         if type(raw) is not bytes:
+             raise ValueError("final score source batch canonical bytes are invalid")
+         return raw
+ 
+     def record(proof, cls):
+         dependencies()
+         saved = proofs.get(id(proof))
+         if (type(proof) is not cls or saved is None or saved[0]() is not proof
+                 or saved[5] is not cls):
+             raise ValueError("final score proof is forged, copied or unregistered")
++        gate = prepared_gates.get(id(proof))
++        if gate is not None and not gate():
++            raise ValueError("final score proof is unpublished or revoked")
+         source_batch, source_bytes, source_row, row_bytes = saved[3], saved[4][0], saved[4][1], saved[4][2]
+         if verify_source(source_batch) != source_bytes:
+             raise ValueError("final score source batch has changed or been revoked")
+         if source_row is not None:
+             source_row_verify(source_row)
+             if source_row_bytes(source_row) != row_bytes:
+                 raise ValueError("final score source row has changed or been revoked")
+             if source_input_for(source_batch, saved[1]["security_id"]) is not source_row:
+                 raise ValueError("final score source row belongs to another batch")
+         return saved
+@@ -332,21 +339,21 @@ def _install_final_scoring():
+ 
+     open_subclass[0] = False
+ 
+     def mint(cls, payload, source_batch, source_bytes, source_row=None, row_bytes=None,
+              *, cards=None, pending=None):
+         result = object.__new__(cls)
+         key = id(result)
+         data = dict(payload)
+         if cards is not None:
+             data["cards"] = tuple(card for card in cards.values() if card is not None)
+-        proofs[key] = (reference(result, lambda _: proofs.pop(key, None)), freeze(data),
++        proofs[key] = (reference(result, lambda _: (proofs.pop(key, None), prepared_gates.pop(key, None))), freeze(data),
+             encode(payload), source_batch, (source_bytes, source_row, row_bytes), cls,
+             MappingProxyType(cards or {}), MappingProxyType(pending or {}))
+         return result
+ 
+     def build(inputs):
+         source_bytes = verify_source(inputs)
+         security_ids = tuple(inputs.security_ids)
+         if len(security_ids) != len(set(security_ids)) or security_ids != tuple(sorted(security_ids)):
+             raise ValueError("final score D1 universe is not canonical")
+         rows, row_proofs, pending = [], {}, {}
+@@ -405,19 +412,39 @@ def _install_final_scoring():
+                 cards[sid] = mint(FinalScoreCard,
+                     dict(payload, score_batch_hash=batch_payload["batch_hash"]),
+                     inputs, source_bytes, row, row_bytes)
+         result = mint(FinalScoreCardBatch, batch_payload, inputs, source_bytes,
+             cards=cards, pending=pending)
+         verify_source(inputs)
+         if source_batch_bytes(inputs) != source_bytes:
+             raise ValueError("final score D1 batch changed during calculation")
+         return result
+ 
++    def prepare(source, inputs, input_rows, capability, *, source_input):
++        gate = claim(capability, source, "scores")
++        saved = record(source, FinalScoreCardBatch)
++        if saved[3] is not source_input:
++            raise ValueError("prepared D2 source is not the supplied D1 publication")
++        cards = {}
++        for sid, card in saved[6].items():
++            if card is None:
++                cards[sid] = None
++                continue
++            row = record(card, FinalScoreCard)
++            child = mint(FinalScoreCard, dict(row[1]), inputs, saved[4][0],
++                input_rows[sid], row[4][2])
++            prepared_gates[id(child)] = gate
++            cards[sid] = child
++        result = mint(FinalScoreCardBatch, decode(saved[2]), inputs, saved[4][0],
++            cards=cards, pending=saved[7])
++        prepared_gates[id(result)] = gate
++        return result, MappingProxyType(cards)
++
+     own_members = tuple((cls, tuple(vars(cls).items())) for cls in
+         (Proof, FinalScoreCard, FinalScoreCardBatch))
+-    return FinalScoreCard, FinalScoreCardBatch, build
++    return FinalScoreCard, FinalScoreCardBatch, build, prepare
+ 
+ 
+-FinalScoreCard, FinalScoreCardBatch, build_final_score_card_batch = _install_final_scoring()
++FinalScoreCard, FinalScoreCardBatch, build_final_score_card_batch, _prepare_final_scores = _install_final_scoring()
+ del _install_final_scoring
+ 
+ __all__ = ["FinalScoreCard", "FinalScoreCardBatch", "build_final_score_card_batch"]
+diff --git a/ashare_pipeline/formal_pool.py b/ashare_pipeline/formal_pool.py
+index 67b0347..b748e75 100644
+--- a/ashare_pipeline/formal_pool.py
++++ b/ashare_pipeline/formal_pool.py
+@@ -1,19 +1,22 @@
+ """Deterministic, authenticated strong and waiting-price pool selection."""
+ 
+ from __future__ import annotations
+ 
+ import json
+ import weakref
+ from dataclasses import dataclass
+ from decimal import Decimal
+ from types import MappingProxyType
++from weakref import ref as _reference
++
++from .formal_final_publication import _claim_preparation
+ 
+ from .formal_final_eligibility import FormalEligibilityBatch
+ from .formal_scoring import _canonical, _digest, _freeze
+ from .formal_universe import canonical_security_id
+ 
+ 
+ _SORT_KEYS = {"Sc", "B", "C", "R_safety", "V"}
+ _POOL_NAMES = ("strong", "wait")
+ _DECISIONS = frozenset({"selected", "not_qualified", "industry_cap_reached", "overall_capacity_reached"})
+ 
+@@ -108,39 +111,41 @@ def _select_detached_rows(rows, *, strong_industry_cap=4, wait_industry_cap=10,
+                 counts[industry] = counts.get(industry, 0) + 1
+                 decisions[sid] = "selected"
+         return tuple(selected), MappingProxyType(decisions)
+ 
+     strong, strong_trace = scan("strong")
+     wait, wait_trace = scan("wait")
+     return _DetachedSelection(strong, wait, strong_trace, wait_trace)
+ 
+ 
+ def _install_pool_proofs():
+-    proofs = {}
++    proofs, prepared_gates = {}, {}
++    claim, reference = _claim_preparation, _reference
+     eligibility_type = FormalEligibilityBatch
+     eligibility_verify = eligibility_type.require_verified
+     eligibility_to_dict = eligibility_type.to_dict
+ 
+     def verify_source(source):
+         if type(source) is not eligibility_type:
+             raise ValueError("pool selection requires a genuine FormalEligibilityBatch")
+         eligibility_verify(source)
+         wire = eligibility_to_dict(source)
+         if _canonical(wire) != source.canonical_bytes():
+             raise ValueError("eligibility publication changed")
+         return wire
+ 
+     class ProofMeta(type):
+         def __setattr__(cls, name, value):
+-            if name in ("__getattribute__", "__bases__"):
+-                raise TypeError("pool proof guard cannot be replaced")
+-            super().__setattr__(name, value)
++            raise TypeError("pool proof methods cannot be replaced")
++
++        def __delattr__(cls, name):
++            raise TypeError("pool proof methods cannot be removed")
+ 
+     class Proof(metaclass=ProofMeta):
+         __slots__ = ("__weakref__",)
+ 
+         def __init__(self, *args, **kwargs):
+             raise TypeError("pool proofs require genuine eligibility")
+ 
+         def __getattribute__(self, name):
+             if name not in ("__class__", "__weakref__"):
+                 record(self, type(self))
+@@ -160,54 +165,64 @@ def _install_pool_proofs():
+ 
+         def to_dict(self):
+             return json.loads(record(self, type(self))[2])
+ 
+         def __copy__(self):
+             raise TypeError("pool proofs cannot be copied")
+ 
+         def __deepcopy__(self, memo):
+             raise TypeError("pool proofs cannot be copied")
+ 
++        def __reduce_ex__(self, protocol):
++            raise TypeError("pool proofs cannot be reconstructed")
++
+     class PoolSelectionDecision(Proof):
+         __slots__ = ()
+ 
+     class PoolSelectionBatch(Proof):
+         __slots__ = ()
+ 
+         def decision_for(self, security_id, pool):
+             saved = record(self, PoolSelectionBatch)
+             if type(security_id) is not str or pool not in _POOL_NAMES:
+                 raise ValueError("pool selector is malformed")
+             decision = saved[4].get((security_id, pool))
+             if decision is None:
+                 raise ValueError("pool selector is outside the frozen universe")
+             decision.require_verified()
+             return decision
+ 
+     def record(item, cls):
++        if (globals().get("_prepare_final_pools") is not prepare
++                or any(tuple(vars(kind).items()) != members for kind, members in own_members)):
++            raise ValueError("pool proof authority methods changed")
+         saved = proofs.get(id(item))
+-        if type(item) is not cls or saved is None or saved[0]() is not item:
++        if type(item) is not cls or saved is None or saved[0]() is not item or saved[6] is not cls:
+             raise ValueError("pool proof is forged or revoked")
++        gate = prepared_gates.get(id(item))
++        if gate is not None and not gate():
++            raise ValueError("pool proof is unpublished or revoked")
+         source, source_bytes = saved[3], saved[5]
+         wire = verify_source(source)
+         if source_bytes != source.canonical_bytes() or _canonical(wire) != source_bytes:
+             raise ValueError("pool source publication changed")
+         if _canonical(saved[1]) != saved[2]:
+             raise ValueError("pool proof payload was tampered")
+         return saved
+ 
+-    def mint(cls, payload, source, *, decision_map=None):
++    def mint(cls, payload, source, *, decision_map=None, source_bytes=None):
+         result = object.__new__(cls)
+         identity = id(result)
+         canonical = _canonical(payload)
+-        proofs[identity] = (weakref.ref(result, lambda _: proofs.pop(identity, None)),
+-            _freeze(payload), canonical, source, decision_map, source.canonical_bytes())
++        proofs[identity] = (reference(result, lambda _: (proofs.pop(identity, None), prepared_gates.pop(identity, None))),
++            _freeze(payload), canonical, source, decision_map,
++            source.canonical_bytes() if source_bytes is None else source_bytes, cls)
+         return result
+ 
+     def build(eligibility):
+         wire = verify_source(eligibility)
+         ids = tuple(wire.get("security_ids", ()))
+         rows = wire.get("eligibilities")
+         if type(ids) is not tuple or type(rows) is not list or tuple(r.get("security_id") for r in rows) != ids:
+             raise ValueError("eligibility universe is malformed")
+         detached = [{key: row.get(key) for key in (
+             "security_id", "secondary_industry", "state", "strong_qualified",
+@@ -232,17 +247,35 @@ def _install_pool_proofs():
+             "wait_security_ids": selected.wait_ids, "counts": {"strong": len(selected.strong_ids), "wait": len(selected.wait_ids)},
+             "decisions": tuple(decisions)}
+         payload["batch_hash"] = _digest(payload)
+         result = mint(PoolSelectionBatch, payload, eligibility, decision_map=decision_map)
+         result.require_verified()
+         return result
+ 
+     def public(eligibility):
+         return build(eligibility)
+ 
+-    return PoolSelectionDecision, PoolSelectionBatch, public
+-
+-
+-PoolSelectionDecision, PoolSelectionBatch, select_formal_pools = _install_pool_proofs()
++    def prepare(source, eligibility, capability, *, source_eligibility):
++        gate = claim(capability, source, "pools")
++        saved = record(source, PoolSelectionBatch)
++        if saved[3] is not source_eligibility:
++            raise ValueError("prepared pool source differs from eligibility")
++        index = {}
++        for key, original in saved[4].items():
++            child = mint(PoolSelectionDecision, dict(record(original, PoolSelectionDecision)[1]),
++                eligibility, source_bytes=saved[5])
++            prepared_gates[id(child)] = gate
++            index[key] = child
++        result = mint(PoolSelectionBatch, json.loads(saved[2]), eligibility,
++            decision_map=MappingProxyType(index), source_bytes=saved[5])
++        prepared_gates[id(result)] = gate
++        return result, tuple(index.values())
++
++    own_members = tuple((kind, tuple(vars(kind).items())) for kind in
++        (Proof, PoolSelectionDecision, PoolSelectionBatch))
++    return PoolSelectionDecision, PoolSelectionBatch, public, prepare
++
++
++PoolSelectionDecision, PoolSelectionBatch, select_formal_pools, _prepare_final_pools = _install_pool_proofs()
+ del _install_pool_proofs
+ 
+ __all__ = ["PoolSelectionDecision", "PoolSelectionBatch", "select_formal_pools"]
+diff --git a/tests/test_formal_final_atomicity.py b/tests/test_formal_final_atomicity.py
+new file mode 100644
+index 0000000..5c1d1fd
+--- /dev/null
++++ b/tests/test_formal_final_atomicity.py
+@@ -0,0 +1,290 @@
++"""Transaction failures must leave neither durable rows nor live child proofs."""
++
++import copy
++import inspect
++import pickle
++import sqlite3
++import unittest
++import weakref
++from contextlib import closing
++from unittest.mock import patch
++
++from tests.test_formal_final_repository import minimal_batches
++from tests.test_formal_final_migration import TABLES
++
++
++class FaultConnection:
++    def __init__(self, connection, fail_table=None, before_commit=None):
++        self.connection = connection
++        self.fail_table = fail_table
++        self.before_commit = before_commit
++        self.writing = False
++
++    def execute(self, sql, *args):
++        if sql == "BEGIN IMMEDIATE":
++            self.writing = True
++        if self.fail_table and sql.startswith("INSERT INTO " + self.fail_table + " "):
++            raise RuntimeError("injected table failure")
++        return self.connection.execute(sql, *args)
++
++    def executemany(self, sql, values):
++        if self.fail_table and sql.startswith("INSERT INTO " + self.fail_table + " "):
++            raise RuntimeError("injected table failure")
++        return self.connection.executemany(sql, values)
++
++    def commit(self):
++        if self.before_commit and self.writing:
++            self.before_commit()
++        return self.connection.commit()
++
++    def __getattr__(self, name):
++        return getattr(self.connection, name)
++
++
++class FormalFinalAtomicityContractTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture, cls.batches = minimal_batches()
++
++    def setUp(self):
++        from ashare_pipeline.formal_final_repository import FormalFinalRunRepository
++        self.repository = FormalFinalRunRepository(self.fixture.store, code_version="task9-test")
++
++    def counts(self):
++        with closing(self.fixture.store._connect()) as connection:
++            return tuple(connection.execute("SELECT COUNT(*) FROM " + name).fetchone()[0] for name in TABLES)
++
++    def test_every_commit_failure_leaves_zero_stage_d_rows_and_revokes_children(self):
++        import ashare_pipeline.formal_final_repository as module
++        from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
++        original = self.fixture.store._connect
++        for table in TABLES:
++            before = self.counts()
++            captured = []
++            prepare = FormalFinalPublicationCoordinator.prepare
++            def capture(*args, **kwargs):
++                result = prepare(*args, **kwargs)
++                captured.append(result)
++                return result
++            with self.subTest(table=table), patch.object(module, "_prepare_publication", capture), patch.object(
++                    self.fixture.store, "_connect", lambda: FaultConnection(original(), fail_table=table)):
++                with self.assertRaisesRegex(RuntimeError, "injected table failure"):
++                    self.repository.commit_complete_run(**self.batches)
++            self.assertEqual(self.counts(), before)
++            self.assertTrue(captured)
++            for proof in captured[0].batches + captured[0].children:
++                with self.assertRaises(ValueError):
++                    proof.require_verified()
++            for proof in tuple(self.batches[key] for key in (
++                    "input_batch", "score_batch", "eligibility_batch", "pool_batch")):
++                proof.require_verified()
++
++    def test_serialization_final_source_set_arm_and_commit_failures_rollback(self):
++        import ashare_pipeline.formal_final_repository as module
++        for name in ("_serialize_payload", "_recheck_sources", "_verify_persisted", "_arm_publication"):
++            before = self.counts()
++            original = getattr(module, name)
++            calls = [0]
++            def fail(*args, **kwargs):
++                calls[0] += 1
++                if name == "_recheck_sources" and calls[0] == 1:
++                    return original(*args, **kwargs)
++                raise RuntimeError("injected boundary")
++            with self.subTest(boundary=name), patch.object(module, name, side_effect=fail):
++                with self.assertRaisesRegex(RuntimeError, "injected boundary"):
++                    self.repository.commit_complete_run(**self.batches)
++            self.assertEqual(self.counts(), before)
++        before = self.counts()
++        original = self.fixture.store._connect
++        def fail():
++            raise sqlite3.OperationalError("injected commit")
++        with patch.object(self.fixture.store, "_connect", lambda: FaultConnection(original(), before_commit=fail)):
++            with self.assertRaisesRegex(sqlite3.OperationalError, "injected commit"):
++                self.repository.commit_complete_run(**self.batches)
++        self.assertEqual(self.counts(), before)
++
++    def test_armed_proofs_remain_invisible_until_commit_returns(self):
++        import ashare_pipeline.formal_final_repository as module
++        captured = []
++        prepare = module._prepare_publication
++        def capture(*args, **kwargs):
++            result = prepare(*args, **kwargs)
++            captured.append(result)
++            return result
++        def observe():
++            for proof in captured[0].batches + captured[0].children:
++                with self.assertRaises(ValueError):
++                    proof.require_verified()
++        original = self.fixture.store._connect
++        with patch.object(module, "_prepare_publication", capture), patch.object(self.fixture.store,
++                "_connect", lambda: FaultConnection(original(), before_commit=observe)):
++            receipt = self.repository.commit_complete_run(**self.batches)
++        for proof in receipt.batches:
++            proof.require_verified()
++
++    def test_post_commit_mark_committed_is_prevalidated_and_cannot_fail(self):
++        from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
++        coordinator = FormalFinalPublicationCoordinator.prepare(**{
++            key: self.batches[key] for key in ("input_batch", "score_batch", "eligibility_batch", "pool_batch")})
++        coordinator.prevalidate_commit()
++        coordinator.arm()
++        # No source recheck, JSON, hashing, SQL or minting belongs to the flip.
++        import dis
++        instructions = list(dis.get_instructions(type(coordinator).mark_committed))
++        self.assertFalse(any("CALL" in item.opname or "BUILD" in item.opname or "RAISE" in item.opname
++            for item in instructions))
++        coordinator.mark_committed()
++        for proof in coordinator.batches:
++            proof.require_verified()
++        coordinator.revoke()
++        coordinator.mark_committed()  # A retained flip cannot resurrect revoked children.
++        for proof in coordinator.batches:
++            with self.assertRaises(ValueError):
++                proof.require_verified()
++
++    def test_prepared_adapters_reject_constructor_copy_pickle_and_method_replacement(self):
++        from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
++        prepared = FormalFinalPublicationCoordinator.prepare(**{
++            key: self.batches[key] for key in ("input_batch", "score_batch", "eligibility_batch", "pool_batch")})
++        for proof in prepared.batches:
++            cls = type(proof)
++            with self.assertRaises(TypeError):
++                cls()
++            for action in (copy.copy, copy.deepcopy, pickle.dumps):
++                with self.assertRaises((TypeError, ValueError)):
++                    action(proof)
++            with self.assertRaises((TypeError, ValueError)):
++                object.__new__(cls).require_verified()
++            with self.assertRaises(TypeError):
++                setattr(cls, "require_verified", lambda self: None)
++        with self.assertRaises(TypeError):
++            FormalFinalPublicationCoordinator()
++        with self.assertRaises(TypeError):
++            setattr(type(prepared), "mark_committed", lambda self: None)
++        prepared.revoke()
++
++    def test_weak_reference_redirect_does_not_authenticate_forgery(self):
++        from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
++        source = self.batches["input_batch"]
++        with patch.object(weakref, "ref", lambda item, *args: lambda: source):
++            # Stage C captures weakref's original authority and deliberately
++            # rejects this environment change during final source revalidation.
++            with self.assertRaises(ValueError):
++                FormalFinalPublicationCoordinator.prepare(**{
++                    key: self.batches[key] for key in (
++                        "input_batch", "score_batch", "eligibility_batch", "pool_batch")})
++        for proof in tuple(self.batches[key] for key in (
++                "input_batch", "score_batch", "eligibility_batch", "pool_batch")):
++            proof.require_verified()
++            with self.assertRaises(ValueError):
++                forged = object.__new__(type(proof))
++                weakref.proxy(forged).require_verified()
++
++    def test_source_revocation_invalidates_committed_descendants(self):
++        from ashare_pipeline.formal_final_score_inputs import PolicyAdjustedScoreInputBatch
++        receipt = self.repository.commit_complete_run(**self.batches)
++        source = self.batches["input_batch"]
++        record = inspect.getclosurevars(PolicyAdjustedScoreInputBatch.input_for).nonlocals["record"]
++        proofs = inspect.getclosurevars(record).nonlocals["proofs"]
++        state = proofs[id(source)][4]
++        state[0] = False
++        try:
++            for proof in receipt.batches:
++                with self.assertRaises(ValueError):
++                    proof.require_verified()
++        finally:
++            state[0] = True
++
++    def test_adapter_never_accepts_an_external_mint_capability(self):
++        from ashare_pipeline.formal_final_score_inputs import _prepare_final_inputs
++        from ashare_pipeline.formal_final_scoring import _prepare_final_scores
++        from ashare_pipeline.formal_final_eligibility import _prepare_final_eligibility
++        from ashare_pipeline.formal_pool import _prepare_final_pools
++        inputs, scores, eligibility, pools = tuple(self.batches[key] for key in (
++            "input_batch", "score_batch", "eligibility_batch", "pool_batch"))
++        actions = (
++            lambda: _prepare_final_inputs(inputs, object()),
++            lambda: _prepare_final_scores(scores, inputs, {}, object(), source_input=inputs),
++            lambda: _prepare_final_eligibility(eligibility, inputs, scores, object(),
++                source_inputs=inputs, source_scores=scores),
++            lambda: _prepare_final_pools(pools, eligibility, object(), source_eligibility=eligibility),
++        )
++        for action in actions:
++            with self.assertRaises(ValueError):
++                action()
++
++    def test_final_set_recheck_detects_missing_member_and_changed_hash(self):
++        import ashare_pipeline.formal_final_repository as module
++        insert = module._insert_rows
++        for damage in ("DELETE FROM formal_final_status WHERE run_id=? AND security_id='SH600000'",
++                       "UPDATE formal_final_input SET payload_hash='changed' WHERE run_id=?"):
++            before = self.counts()
++            def corrupt(connection, table, rows, columns):
++                insert(connection, table, rows, columns)
++                if table == "formal_final_dependency":
++                    connection.execute(damage, (rows[0]["run_id"],))
++            with self.subTest(damage=damage), patch.object(module, "_insert_rows", corrupt):
++                with self.assertRaisesRegex(ValueError, "persisted Stage D table differs"):
++                    self.repository.commit_complete_run(**self.batches)
++            self.assertEqual(self.counts(), before)
++
++    def test_final_serialization_failure_after_inserts_rolls_back(self):
++        import ashare_pipeline.formal_final_repository as module
++        insert, serialize = module._insert_rows, module._serialize_payload
++        writing_complete = [False]
++        def insert_and_track(connection, table, rows, columns):
++            insert(connection, table, rows, columns)
++            if table == "formal_final_dependency":
++                writing_complete[0] = True
++        def fail_serialization(value):
++            if writing_complete[0]:
++                raise ValueError("injected final serialization")
++            return serialize(value)
++        before = self.counts()
++        with patch.object(module, "_insert_rows", insert_and_track), patch.object(
++                module, "_serialize_payload", fail_serialization):
++            with self.assertRaisesRegex(ValueError, "injected final serialization"):
++                self.repository.commit_complete_run(**self.batches)
++        self.assertTrue(writing_complete[0])
++        self.assertEqual(self.counts(), before)
++
++    def test_connection_cleanup_cannot_revoke_a_durable_commit(self):
++        original = self.fixture.store._connect
++        class CleanupFailure(FaultConnection):
++            def close(self):
++                self.connection.close()
++                if self.writing:
++                    raise RuntimeError("injected cleanup")
++        with patch.object(self.fixture.store, "_connect", lambda: CleanupFailure(original())):
++            receipt = self.repository.commit_complete_run(**self.batches)
++        self.assertIsNotNone(self.repository.get_run(receipt.run_id))
++        for proof in receipt.batches:
++            proof.require_verified()
++
++    def test_replaced_verification_method_cannot_open_an_unpublished_proof(self):
++        from ashare_pipeline.formal_final_publication import FormalFinalPublicationCoordinator
++        prepared = FormalFinalPublicationCoordinator.prepare(**{
++            key: self.batches[key] for key in ("input_batch", "score_batch", "eligibility_batch", "pool_batch")})
++        for proof in prepared.batches:
++            base = type(proof).__mro__[1]
++            original = vars(base)["require_verified"]
++            type.__setattr__(base, "require_verified", lambda self: None)
++            try:
++                with self.assertRaises(ValueError):
++                    proof.require_verified()
++            finally:
++                type.__setattr__(base, "require_verified", original)
++        prepared.revoke()
++
++    def test_adapter_method_replacement_fails_closed_before_write(self):
++        from ashare_pipeline import formal_final_score_inputs, formal_final_scoring
++        from ashare_pipeline import formal_final_eligibility, formal_pool
++        for module, name in ((formal_final_score_inputs, "_prepare_final_inputs"),
++                (formal_final_scoring, "_prepare_final_scores"),
++                (formal_final_eligibility, "_prepare_final_eligibility"),
++                (formal_pool, "_prepare_final_pools")):
++            before = self.counts()
++            with self.subTest(name=name), patch.object(module, name, lambda *args, **kwargs: None):
++                with self.assertRaises(ValueError):
++                    self.repository.commit_complete_run(**self.batches)
++            self.assertEqual(self.counts(), before)
+diff --git a/tests/test_formal_final_repository.py b/tests/test_formal_final_repository.py
+new file mode 100644
+index 0000000..51aa52c
+--- /dev/null
++++ b/tests/test_formal_final_repository.py
+@@ -0,0 +1,165 @@
++"""Atomic Stage D persistence contracts, using genuine producer proofs."""
++
++import atexit
++import copy
++import hashlib
++import json
++import sqlite3
++import unittest
++from contextlib import closing
++from decimal import Decimal
++from unittest.mock import patch
++
++from ashare_pipeline.formal_coverage_manifest import CoverageRequirement, FormalCoverageAuditor
++from ashare_pipeline.formal_final_eligibility import build_formal_eligibility_batch
++from ashare_pipeline.formal_final_scoring import build_final_score_card_batch
++from ashare_pipeline.formal_pool import select_formal_pools
++from tests.formal_final_scoring_fixtures import FinalScoringFixture
++from tests.test_formal_final_scoring import d1_batch
++from tests.test_formal_coverage_manifest import good
++from tests.test_formal_final_migration import TABLES
++
++
++_SHARED = None
++
++
++def minimal_batches():
++    global _SHARED
++    if _SHARED is None:
++        print("Task 9 minimal fixture: signed three-member root", flush=True)
++        fixture = FinalScoringFixture(peer_count=3)
++        atexit.register(fixture.close)
++        for sid in fixture.templates:
++            fixture.put_industry(sid)
++        print("Task 9 minimal fixture: D1", flush=True)
++        inputs = d1_batch(fixture)
++        print("Task 9 minimal fixture: D2", flush=True)
++        scores = build_final_score_card_batch(inputs)
++        print("Task 9 minimal fixture: D3 and pools", flush=True)
++        eligibility = build_formal_eligibility_batch(inputs, scores)
++        pools = select_formal_pools(eligibility)
++        requirements = [CoverageRequirement(fixture.frozen.frozen_input_hash,
++            sid, "financial", "selector", "2025", sid[:2], ("CNY",))
++            for sid in inputs.security_ids]
++        coverage = FormalCoverageAuditor(repository_validators={
++            "financial": lambda *_: True}).audit(requirements, [good(r) for r in requirements])
++        _SHARED = fixture, dict(mode="test_preview", coverage_manifest=coverage,
++            input_batch=inputs, score_batch=scores, eligibility_batch=eligibility, pool_batch=pools)
++    return _SHARED
++
++
++class FormalFinalRepositoryContractTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture, cls.batches = minimal_batches()
++
++    def setUp(self):
++        from ashare_pipeline.formal_final_repository import FormalFinalRunRepository
++        self.repository = FormalFinalRunRepository(self.fixture.store, code_version="task9-test")
++
++    def test_complete_run_persists_exact_universe_and_all_artifact_hashes(self):
++        receipt = self.repository.commit_complete_run(**self.batches)
++        snapshot = self.repository.get_run(receipt.run_id)
++        self.assertEqual(snapshot.security_ids, ("BJ430001", "SH600000", "SZ000001"))
++        expected = {"coverage_manifest", "score_input_batch", "scorecard_batch",
++            "eligibility_batch", "pool_selection_batch"}
++        self.assertEqual(set(snapshot.artifacts), expected)
++        for name, raw in snapshot.artifacts.items():
++            self.assertEqual(hashlib.sha256(raw).hexdigest(), snapshot.artifact_hashes[name])
++        self.assertEqual(snapshot.result_hash, receipt.result_hash)
++        self.assertEqual(len(snapshot.inputs), 3)
++        self.assertEqual(len(snapshot.statuses), 3)
++        self.assertEqual(len(snapshot.eligibilities), 3)
++        self.assertEqual(len(snapshot.pool_decisions), 6)
++        self.assertTrue(snapshot.dependencies)
++        for proof in receipt.batches:
++            proof.require_verified()
++        self.assertIsNot(receipt.input_batch, self.batches["input_batch"])
++
++    def test_decimals_round_trip_as_canonical_text_without_float(self):
++        from ashare_pipeline.formal_final_repository import _serialize_payload
++        exact = "0.1234567890123456789012345678901234567890123456789"
++        raw, digest = _serialize_payload({"Sc": Decimal(exact)})
++        self.assertEqual(raw, '{"Sc":"' + exact + '"}')
++        self.assertEqual(digest, hashlib.sha256(raw.encode()).hexdigest())
++        with closing(sqlite3.connect(":memory:")) as connection:
++            connection.execute("CREATE TABLE sample(payload TEXT)")
++            connection.execute("INSERT INTO sample VALUES (?)", (raw,))
++            restored = json.loads(connection.execute("SELECT payload FROM sample").fetchone()[0])
++        self.assertEqual(Decimal(restored["Sc"]), Decimal(exact))
++        for invalid in (0.1, float("nan"), Decimal("Infinity")):
++            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
++                _serialize_payload({"Sc": invalid})
++
++    def test_same_input_allows_two_append_only_replays_with_same_result_hash(self):
++        first = self.repository.commit_complete_run(**self.batches)
++        second = self.repository.commit_complete_run(**self.batches)
++        self.assertNotEqual(first.run_id, second.run_id)
++        self.assertEqual(first.input_manifest_hash, second.input_manifest_hash)
++        self.assertEqual(first.result_hash, second.result_hash)
++        runs = self.repository.list_runs_by_input_manifest(first.input_manifest_hash)
++        self.assertTrue({first.run_id, second.run_id} <= {r.run_id for r in runs})
++
++    def test_historical_run_cannot_be_updated_or_rebound(self):
++        receipt = self.repository.commit_complete_run(**self.batches)
++        before = self.repository.get_run(receipt.run_id)
++        with patch("ashare_pipeline.formal_final_repository._new_run_id", return_value=receipt.run_id):
++            with self.assertRaises(sqlite3.IntegrityError):
++                self.repository.commit_complete_run(**self.batches)
++        self.assertEqual(self.repository.get_run(receipt.run_id), before)
++        for prefix in ("put_", "replace_", "mark_ready", "update_", "delete_"):
++            self.assertFalse(any(name.startswith(prefix) for name in dir(self.repository)))
++
++    def test_cross_root_or_forged_batch_is_rejected_before_write(self):
++        before = self.counts()
++        for key in ("coverage_manifest", "input_batch", "score_batch", "eligibility_batch", "pool_batch"):
++            source = self.batches[key]
++            for fake in (source.to_dict(), object.__new__(type(source))):
++                with self.subTest(key=key), self.assertRaises((ValueError, TypeError)):
++                    self.repository.commit_complete_run(**dict(self.batches, **{key: fake}))
++        r = CoverageRequirement("different-frozen", "SH600000", "financial", "selector", "2025", "SH")
++        other = FormalCoverageAuditor().audit([r])
++        with self.assertRaises(ValueError):
++            self.repository.commit_complete_run(**dict(self.batches, coverage_manifest=other))
++        self.assertEqual(self.counts(), before)
++
++    def test_recovery_dto_never_authenticates_as_live_proof(self):
++        receipt = self.repository.commit_complete_run(**self.batches)
++        snapshot = self.repository.get_run(receipt.run_id)
++        self.assertFalse(hasattr(snapshot, "require_verified"))
++        self.assertEqual(copy.deepcopy(snapshot.to_dict()), snapshot.to_dict())
++        with self.assertRaises(TypeError):
++            snapshot.artifacts["score_input_batch"] = b"{}"
++        with self.assertRaises((TypeError, ValueError)):
++            build_final_score_card_batch(snapshot)
++        self.assertIsNone(self.repository.get_run("missing"))
++
++    def test_blocked_run_is_complete_and_has_no_fabricated_pool(self):
++        receipt = self.repository.commit_complete_run(**self.batches)
++        snapshot = self.repository.get_run(receipt.run_id)
++        self.assertEqual(snapshot.status, "blocked")
++        self.assertEqual(snapshot.scorecards, ())
++        self.assertEqual({row["state"] for row in snapshot.statuses}, {"pending_evidence"})
++        self.assertEqual({row["decision"] for row in snapshot.pool_decisions}, {"not_qualified"})
++
++    def test_official_mode_does_not_accept_preview_coverage(self):
++        before = self.counts()
++        with self.assertRaises(ValueError):
++            self.repository.commit_complete_run(**dict(self.batches, mode="official_candidate"))
++        for mode in ("preview", "validated", "published", None):
++            with self.subTest(mode=mode), self.assertRaises(ValueError):
++                self.repository.commit_complete_run(**dict(self.batches, mode=mode))
++        self.assertEqual(self.counts(), before)
++
++    def test_artifact_vocabulary_is_enforced_by_the_atomic_writer(self):
++        import ashare_pipeline.formal_final_repository as module
++        before = self.counts()
++        wrong = ("coverage_manifest", "input_manifest", "scorecard_batch",
++            "eligibility_batch", "pool_selection_batch")
++        with patch.object(module, "ARTIFACT_KINDS", wrong), self.assertRaises(ValueError):
++            self.repository.commit_complete_run(**self.batches)
++        self.assertEqual(self.counts(), before)
++
++    def counts(self):
++        with closing(self.fixture.store._connect()) as connection:
++            return tuple(connection.execute("SELECT COUNT(*) FROM " + name).fetchone()[0] for name in TABLES)

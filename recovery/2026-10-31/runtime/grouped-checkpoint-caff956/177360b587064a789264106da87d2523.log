@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_integration.GenuineFullChainTests.test_cross_frozen_security_and_registry_inputs_fail_closed
+test_cross_frozen_security_and_registry_inputs_fail_closed (test_formal_final_integration.GenuineFullChainTests.test_cross_frozen_security_and_registry_inputs_fail_closed) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 8959.262s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_integration.GenuineFullChainTests.test_cross_frozen_security_and_registry_inputs_fail_closed"], "passed": ["test_formal_final_integration.GenuineFullChainTests.test_cross_frozen_security_and_registry_inputs_fail_closed"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

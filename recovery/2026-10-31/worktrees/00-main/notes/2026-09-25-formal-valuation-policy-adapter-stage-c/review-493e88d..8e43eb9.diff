@@ -1,0 +1,689 @@
+# Review package: 493e88d..8e43eb9
+
+## Commits
+8e43eb9 Harden C4 owner closure and metric publication phase
+
+## Files changed
+ ashare_pipeline/formal_batch_read_journal.py |  20 +++
+ ashare_pipeline/formal_metric_engine.py      |  13 +-
+ ashare_pipeline/formal_valuation_adapter.py  |  37 ++++++
+ ashare_pipeline/formal_valuation_engine.py   |  34 ++---
+ tests/test_formal_valuation_batch_guards.py  | 186 ++++++++++++++++++++++++++-
+ 5 files changed, 266 insertions(+), 24 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_batch_read_journal.py b/ashare_pipeline/formal_batch_read_journal.py
+index 384f81b..c43750c 100644
+--- a/ashare_pipeline/formal_batch_read_journal.py
++++ b/ashare_pipeline/formal_batch_read_journal.py
+@@ -202,20 +202,40 @@ def _install_journal():
+                         continue
+                     owner = record[16][ticket_record[2][1]]
+                     checker = (owner._batch_recheck_policy_ticket if ticket_record[2][1] == "policy_feature"
+                                else owner._batch_recheck_ticket)
+                     checker(ticket_record[4])
+                     record[15][id(ticket)] = phase
+             except Exception:
+                 record[1] = "consumed"
+                 raise
+ 
++        def checkpoint_metric(self, owner):
++            """Close every V source ticket before its metric batch can publish."""
++            record = _scope(self)
++            if record[4] != "valuation" or record[16].get("metric") is not owner:
++                raise ValueError("metric checkpoint requires the valuation owner scope")
++            required = {key for key in record[12] if len(key) == 2}
++            feature = record[16].get("feature")
++            actual = set()
++            for ticket in record[13].values():
++                saved = _ticket(ticket, self)
++                issuer, kind, key = saved[2]
++                if (issuer == id(feature) and kind == "feature" and len(key) == 6
++                        and type(key[-1]) is str and key[-1].startswith("V.")):
++                    actual.add((key[0], key[-1]))
++            if not required or actual != required:
++                record[1] = "consumed"
++                raise ValueError("metric V source ticket coverage is incomplete")
++            self.checkpoint()
++            record[14] += 1
++
+         def next_phase(self):
+             record = _scope(self)
+             record[14] += 1
+ 
+         def close(self):
+             # Revocation must still work when the owner graph is no longer
+             # valid; ordinary scope reads intentionally reject that graph.
+             record = scopes.get(id(self))
+             if (type(self) is not FormalBatchReadJournal or record is None
+                     or record[0]() is not self or record[1] != "active"
+diff --git a/ashare_pipeline/formal_metric_engine.py b/ashare_pipeline/formal_metric_engine.py
+index 152fe4e..ccec901 100644
+--- a/ashare_pipeline/formal_metric_engine.py
++++ b/ashare_pipeline/formal_metric_engine.py
+@@ -346,20 +346,22 @@ def _install_engine():
+         # Expensive immutable preparation holds no writer reservation. Every
+         # prepared proof shares this closure-private, unpublished capability.
+         publication = [False]
+         inputs = tuple(mint(MetricInput, dict(row, batch_hash=payload["batch_hash"]),
+             publication=publication) for row in rows)
+         index = {(row["security_id"], row["metric_id"]): item for row, item in zip(rows, inputs, strict=True)}
+         prepared = mint(MetricInputBatch, payload, attributes=dict(inputs=inputs), private=dict(index=index,
+             groups=None, ranks={}, contexts={}), publication=publication)
+ 
+         def publish_complete():
++            if owner_scope is not None:
++                owner_scope.checkpoint_metric(repo)
+             publication[0] = True
+             return prepared
+ 
+         try:
+             return guard.finalize(publish_complete)
+         except BaseException:
+             publication[0] = False
+             raise
+ 
+     class FormalMetricInputRepository:
+@@ -394,41 +396,46 @@ def _install_engine():
+             return feature._store, (feature, context)
+ 
+         def _batch_recheck_ticket(self, evidence):
+             batch, original = evidence
+             dependencies(self)
+             if record(batch, MetricInputBatch)[2] != original:
+                 raise ValueError("metric batch ticket publication changed")
+ 
+         def _build_batch_in_owner_scope(self, frozen_input_hash, *, scoring_registry,
+                                         metric_ids, owner_scope):
+-            feature, _, _, _ = dependencies(self)
+-            if type(owner_scope) is not FormalBatchReadJournal:
+-                raise ValueError("metric batch requires an authentic owner scope")
+             result = None
+             try:
++                feature, _, _, _ = dependencies(self)
++                if type(owner_scope) is not FormalBatchReadJournal:
++                    raise ValueError("metric batch requires an authentic owner scope")
+                 with batch_guard(feature._current_input_provider, feature._store) as guard:
+                     result = build(self, frozen_input_hash, scoring_registry, metric_ids,
+                         guard, owner_scope=owner_scope)
+                 if result is None:
+                     raise ValueError("metric frozen universe is absent")
+                 original = record(result, MetricInputBatch)[2]
+                 ticket = _issue_current_ticket(owner_scope, self, "metric",
+                     (frozen_input_hash, result.batch_hash), original, (result, original),
+                     tuple((sid, mid) for sid in result.security_ids for mid in result.metric_ids), result)
+                 def revoke(batch):
+                     if batch is result:
+                         proofs[id(result)][4][0] = False
+                 return result, ticket, revoke
+             except BaseException:
+                 if result is not None:
+                     proofs[id(result)][4][0] = False
++                if type(owner_scope) is FormalBatchReadJournal:
++                    try:
++                        owner_scope.close()
++                    except ValueError:
++                        pass
+                 raise
+ 
+         def __copy__(self):
+             raise TypeError("metric input repository cannot be copied")
+ 
+         def __deepcopy__(self, memo):
+             raise TypeError("metric input repository cannot be copied")
+ 
+     def eligible(item):
+         return record(item, MetricInput)[1]["invalid_reason"] is None
+diff --git a/ashare_pipeline/formal_valuation_adapter.py b/ashare_pipeline/formal_valuation_adapter.py
+index c0a5f61..1bfbc5d 100644
+--- a/ashare_pipeline/formal_valuation_adapter.py
++++ b/ashare_pipeline/formal_valuation_adapter.py
+@@ -1,17 +1,18 @@
+ """Pure, detached valuation adjustment. This module does not mint formal proofs."""
+ 
+ from __future__ import annotations
+ 
+ from decimal import (Context, Decimal, DivisionByZero, InvalidOperation, Overflow,
+                      ROUND_HALF_EVEN, localcontext)
+ 
++from . import formal_policy_values as _policy_values_module
+ from .formal_policy_values import digest
+ 
+ 
+ _METRIC_KEYS = frozenset(("registry_manifest_hash", "frozen_input_hash", "universe_hash",
+     "population_hash", "as_of_utc", "industry_batch_hash", "registry_hashes",
+     "universe_proof_hash", "security_id", "metric_id", "template_id",
+     "primary_industry", "secondary_industry", "definition_hash", "direction",
+     "unit", "raw_value", "verified_feature_refs", "invalid_reason", "status",
+     "projection_hash", "feature_state_hash", "input_hash"))
+ _RESULT_KEYS = frozenset(("registry_manifest_hash", "frozen_input_hash", "universe_hash",
+@@ -267,11 +268,47 @@ def evaluate_valuation_adjustment(*, metric: dict, policy_result: dict,
+                     raise ValueError("nonfinite adjusted value")
+             except (ValueError, ArithmeticError):
+                 result.update(status="invalid_adapter_operand", reason="adjustment_arithmetic_failed")
+             else:
+                 result.update(status="adjusted_no_numeric_change" if adjusted == raw else "adjusted",
+                     reason="cyclic_policy_matched", adjusted_value=_decimal_text(adjusted))
+     result["result_hash"] = digest(result)
+     return result
+ 
+ 
++def _install_valuation_adapter_owner():
++    """Keep C3's pure evaluator private dependency graph fixed for C4 owners."""
++    names = (
++        "Context", "Decimal", "DivisionByZero", "InvalidOperation", "Overflow",
++        "ROUND_HALF_EVEN", "localcontext", "digest", "_policy_values_module",
++        "_METRIC_KEYS", "_RESULT_KEYS", "_DECISION_KEYS", "_DEPENDENCY_KEYS",
++        "_ADAPTER_KEYS", "_BASIS_KEYS", "_PRECONDITIONS", "_arithmetic_context",
++        "profit_ratio_rescale", "_exact", "_hash", "_text", "_decimal",
++        "_decimal_text", "_definition_hash", "_dependencies", "_basis",
++        "evaluate_valuation_adjustment",
++    )
++    originals = tuple((name, globals()[name]) for name in names)
++    policy_values = _policy_values_module
++    policy_dependencies = tuple((name, getattr(policy_values, name)) for name in
++        ("digest", "canonical_bytes", "json", "hashlib"))
++    json_dumps = policy_values.json.dumps
++    sha256 = policy_values.hashlib.sha256
++    evaluator = evaluate_valuation_adjustment
++
++    def require_owner():
++        if (globals().get("_require_valuation_adapter_owner") is not require_owner
++                or any(globals().get(name) is not value for name, value in originals)
++                or any(getattr(policy_values, name, None) is not value
++                       for name, value in policy_dependencies)
++                or policy_values.json.dumps is not json_dumps
++                or policy_values.hashlib.sha256 is not sha256):
++            raise ValueError("valuation adapter dependency changed")
++        return evaluator
++
++    return require_owner
++
++
++_require_valuation_adapter_owner = _install_valuation_adapter_owner()
++del _install_valuation_adapter_owner
++
++
+ __all__ = ["profit_ratio_rescale", "evaluate_valuation_adjustment"]
+diff --git a/ashare_pipeline/formal_valuation_engine.py b/ashare_pipeline/formal_valuation_engine.py
+index 4cded24..53cfca0 100644
+--- a/ashare_pipeline/formal_valuation_engine.py
++++ b/ashare_pipeline/formal_valuation_engine.py
+@@ -10,37 +10,39 @@ from .formal_context_repository import FormalContextRepository
+ from .formal_feature_repository import FormalFeatureRepository
+ from .formal_metric_batch_guard import _metric_batch_guard
+ from .formal_metric_engine import FormalMetricInputRepository, MetricInputBatch
+ from .formal_policy_repository import FormalPolicyRepository, VerifiedPolicyResultBatch
+ from .formal_policy_values import digest
+ from .formal_range_store import FormalRangeStore
+ from .formal_registry_manifest import FormalRegistryBundleLoader
+ from .formal_scoring_registry import FormalScoringRegistry
+ from .formal_policy_registry import FormalPolicyRegistry
+ from .formal_valuation_adapter_contract import FormalValuationAdapterRegistry
+-from .formal_valuation_adapter import evaluate_valuation_adjustment
++from . import formal_valuation_adapter as adapter_module
+ from .formal_batch_read_journal import FormalBatchReadJournal, _issue_current_ticket
+ 
+ 
+ _V_METRICS = ("V.enterprise_value_or_sustainable_roe", "V.normalized_earnings_yield",
+               "V.normalized_free_cash_flow_yield")
+ _FREEZE = "2026-08-31T07:00:00+00:00"
+ 
+ 
+ def _install_valuation_engine():
+     repositories, proofs = {}, {}
+     own_members = ()
+     json_module, hashlib_module = json, hashlib
+-    encode, decode, sha256 = json.dumps, json.loads, hashlib.sha256
++    encode, decode, sha256, hash_payload = json.dumps, json.loads, hashlib.sha256, digest
+     guard_factory = _metric_batch_guard
+     load_root = FormalRegistryBundleLoader.load
+-    evaluate = evaluate_valuation_adjustment
++    adapter_source = adapter_module
++    adapter_owner = adapter_source._require_valuation_adapter_owner
++    evaluate = adapter_owner()
+     metric_build = FormalMetricInputRepository._build_batch_in_owner_scope
+     policy_build = FormalPolicyRepository._build_batch_in_owner_scope
+     metric_verify = MetricInputBatch.require_verified
+     policy_verify = VerifiedPolicyResultBatch.require_verified
+     adapter_verify = FormalValuationAdapterRegistry.require_current_bundle
+     scoring_verify = FormalScoringRegistry.require_official
+     checked = tuple((cls, name, value) for cls in
+         (FormalFeatureRepository, FormalContextRepository, FormalRangeStore,
+          FormalMetricInputRepository, FormalPolicyRepository, MetricInputBatch,
+          VerifiedPolicyResultBatch, FormalValuationAdapterRegistry,
+@@ -56,22 +58,24 @@ def _install_valuation_engine():
+         return value
+ 
+     def interfaces():
+         if any(vars(cls).get(name) is not value for cls, name, value in checked):
+             raise ValueError("valuation publication dependency changed")
+         if any(set(vars(cls)) != {name for name, _ in members} or any(
+                 vars(cls)[name] is not value for name, value in members)
+                 for cls, members in own_members):
+             raise ValueError("valuation authority interface changed")
+         if (globals().get("_metric_batch_guard") is not guard_factory
+-                or globals().get("evaluate_valuation_adjustment") is not evaluate
+-                or globals().get("digest") is not digest
++                or globals().get("adapter_module") is not adapter_source
++                or adapter_source._require_valuation_adapter_owner is not adapter_owner
++                or adapter_owner() is not evaluate
++                or globals().get("digest") is not hash_payload
+                 or globals().get("json") is not json_module or json_module.dumps is not encode
+                 or json_module.loads is not decode or globals().get("hashlib") is not hashlib_module
+                 or hashlib_module.sha256 is not sha256):
+             raise ValueError("valuation publication dependency changed")
+ 
+     def dependencies(repository):
+         interfaces()
+         saved = repositories.get(id(repository))
+         if (type(repository) is not FormalValuationRepository or saved is None
+                 or saved[0]() is not repository):
+@@ -116,21 +120,21 @@ def _install_valuation_engine():
+                 raise AttributeError(name)
+             return data[name]
+ 
+         def require_verified(self):
+             record(self, type(self))
+ 
+         def canonical_bytes(self):
+             return record(self, type(self))[2]
+ 
+         def to_dict(self):
+-            return json.loads(record(self, type(self))[2])
++            return decode(record(self, type(self))[2])
+ 
+         def __copy__(self):
+             raise TypeError("adjusted valuation proofs cannot be copied")
+ 
+         def __deepcopy__(self, memo):
+             raise TypeError("adjusted valuation proofs cannot be copied")
+ 
+     class PolicyAdjustedValuationInput(Proof):
+         __slots__ = ()
+ 
+@@ -142,21 +146,21 @@ def _install_valuation_engine():
+                 raise ValueError("valuation selectors require exact strings")
+             result = record(self, PolicyAdjustedValuationBatch)[3]["index"].get((security_id, metric_id))
+             if result is None:
+                 raise ValueError("security or V metric is outside complete adjusted batch")
+             return result
+ 
+     def mint(cls, payload, publication, *, attributes=None, private=None):
+         proof = object.__new__(cls)
+         data = dict(payload)
+         data.update(attributes or {})
+-        wire = json.dumps(payload, sort_keys=True, ensure_ascii=False,
++        wire = encode(payload, sort_keys=True, ensure_ascii=False,
+             separators=(",", ":"), allow_nan=False).encode()
+         identity = id(proof)
+         proofs[identity] = (weakref.ref(proof, lambda _: proofs.pop(identity, None)),
+             freeze(data), wire, private, publication)
+         return proof
+ 
+     def prepare_adjusted_rows(base_batch, policy_batch, adapter_registry):
+         """Prepare canonical rows from authenticated batch wires; mint no authority."""
+         base, policy, adapter = base_batch.to_dict(), policy_batch.to_dict(), adapter_registry.to_dict()
+         security_ids = base["security_ids"]
+@@ -208,21 +212,21 @@ def _install_valuation_engine():
+                     cyclic_decision=decision, dependency=selected[0], adapter=adapters.get((tid, mid)))
+             row = dict(registry_manifest_hash=base["registry_manifest_hash"],
+                 frozen_input_hash=base["frozen_input_hash"], universe_hash=base["universe_hash"],
+                 population_hash=base["population_hash"], as_of_utc=base["as_of_utc"],
+                 industry_batch_hash=base["industry_batch_hash"], security_id=sid,
+                 metric_id=mid, template_id=tid, primary_industry=metric["primary_industry"],
+                 secondary_industry=metric["secondary_industry"],
+                 original_metric=metric, policy_result=result, adjustment=adjustment,
+                 status=adjustment["status"], reason=adjustment["reason"],
+                 adjusted_value=adjustment["adjusted_value"])
+-            row["input_hash"] = digest(row)
++            row["input_hash"] = hash_payload(row)
+             rows.append(row)
+         return tuple(rows)
+ 
+     class FormalValuationRepository(metaclass=SealedMeta):
+         __slots__ = ("__weakref__",)
+ 
+         def __init__(self, feature_repository, context_repository, range_store, *, registry_signature_verifier):
+             if type(self) is not FormalValuationRepository or id(self) in repositories:
+                 raise ValueError("valuation repository initialization must be exact and single-use")
+             interfaces()
+@@ -254,53 +258,53 @@ def _install_valuation_engine():
+                     frozen = feature._store.get_verified_formal_frozen_universe(frozen_input_hash)
+                     if frozen is None:
+                         raise ValueError("valuation frozen input is absent")
+                     population = tuple(sorted(member.security_id for member in frozen.members))
+                     required = tuple((sid, mid) for sid in population for mid in _V_METRICS) + tuple(
+                         (sid,) for sid in population)
+                     scope = FormalBatchReadJournal.open(self,
+                         registry_manifest_hash=frozen.registry_manifest_hash,
+                         as_of_utc=_FREEZE, population=population, required_keys=required,
+                         frozen_input_hash=frozen_input_hash)
+-                    policy, policy_ticket, policy_revoke = policy_build(policy_repo, frozen_input_hash,
+-                        scoring_registry=scoring_registry, policy_registry=policy_registry,
+-                        owner_scope=scope)
+                     base, metric_ticket, metric_revoke = metric_build(metric_repo, frozen_input_hash,
+                         scoring_registry=scoring_registry, metric_ids=_V_METRICS,
+                         owner_scope=scope)
++                    policy, policy_ticket, policy_revoke = policy_build(policy_repo, frozen_input_hash,
++                        scoring_registry=scoring_registry, policy_registry=policy_registry,
++                        owner_scope=scope)
+                     metric_verify(base)
+                     policy_verify(policy)
+                     if policy_ticket.selected() is not policy or metric_ticket.selected() is not base:
+                         raise ValueError("valuation component tickets changed")
+                     root_hash = base.registry_manifest_hash
+                     bundle = load_root(FormalRegistryBundleLoader(feature._store, verifier), root_hash)
+                     scoring_verify(scoring_registry, bundle)
+                     adapter_verify(valuation_adapter_registry, bundle)
+                     base_bytes, policy_bytes = base.canonical_bytes(), policy.canonical_bytes()
+                     rows = prepare_adjusted_rows(base, policy, valuation_adapter_registry)
+                     adapter_wire = valuation_adapter_registry.to_dict()
+                     common = dict(schema_version="policy-adjusted-valuation-batch-v1",
+                         registry_manifest_hash=root_hash,
+                         frozen_input_hash=frozen_input_hash, universe_hash=base.universe_hash,
+                         population_hash=base.population_hash, as_of_utc=base.as_of_utc,
+                         industry_batch_hash=base.industry_batch_hash,
+                         scoring_registry_hash=bundle.manifest.scoring_registry_hash,
+                         policy_contract_hash=policy.policy_contract_hash,
+                         valuation_adapter_registry_hash=bundle.manifest.valuation_adapter_registry_hash,
+                         base_batch_hash=base.batch_hash,
+-                        base_batch_canonical_sha256=hashlib.sha256(base_bytes).hexdigest(),
++                        base_batch_canonical_sha256=sha256(base_bytes).hexdigest(),
+                         policy_batch_hash=policy.batch_hash,
+-                        policy_batch_canonical_sha256=hashlib.sha256(policy_bytes).hexdigest(),
+-                        adapter_definition_sha256=digest(adapter_wire),
++                        policy_batch_canonical_sha256=sha256(policy_bytes).hexdigest(),
++                        adapter_definition_sha256=hash_payload(adapter_wire),
+                         security_ids=list(base.security_ids), metric_ids=list(_V_METRICS),
+                         inputs=list(rows))
+-                    common["batch_hash"] = digest(common)
++                    common["batch_hash"] = hash_payload(common)
+                     children = tuple(mint(PolicyAdjustedValuationInput,
+                         dict(row, batch_hash=common["batch_hash"]), publication,
+                         attributes={"adjusted_value": None if row["adjusted_value"] is None
+                                     else Decimal(row["adjusted_value"])}) for row in rows)
+                     index = {(row["security_id"], row["metric_id"]): item
+                              for row, item in zip(rows, children, strict=True)}
+                     prepared = mint(PolicyAdjustedValuationBatch, common, publication,
+                         attributes={"inputs": children}, private={"index": index})
+ 
+                     root_wire = tuple((role, bundle.blob(role).canonical_json) for role in bundle.roles)
+diff --git a/tests/test_formal_valuation_batch_guards.py b/tests/test_formal_valuation_batch_guards.py
+index 56b24f1..bbae87f 100644
+--- a/tests/test_formal_valuation_batch_guards.py
++++ b/tests/test_formal_valuation_batch_guards.py
+@@ -2,21 +2,21 @@
+ 
+ import copy
+ import hashlib
+ import sqlite3
+ import sys
+ import threading
+ import unittest
+ from pathlib import Path
+ 
+ from ashare_pipeline.formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
+-from ashare_pipeline.formal_metric_engine import FormalMetricInputRepository
++from ashare_pipeline.formal_metric_engine import FormalMetricInputRepository, MetricInputBatch
+ from ashare_pipeline.formal_policy_repository import VerifiedPolicyResultBatch
+ from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal, _require_current_scope
+ from tests.formal_policy_fixtures import REGULATORY_SEMANTICS
+ 
+ from ashare_pipeline.formal_valuation_engine import (
+     FormalValuationRepository, PolicyAdjustedValuationBatch,
+     PolicyAdjustedValuationInput,
+ )
+ from tests.formal_valuation_fixtures import ValuationRuntimeFixture
+ 
+@@ -150,20 +150,193 @@ class ValuationBatchGuardTests(unittest.TestCase):
+ 
+     def run_with_trace(self, hook, build=None):
+         previous_profile, previous_trace = sys.getprofile(), sys.gettrace()
+         try:
+             sys.setprofile(hook)
+             return (build or self.build)()
+         finally:
+             sys.setprofile(previous_profile)
+             sys.settrace(previous_trace)
+ 
++    def test_digest_rebinding_after_adjusted_mint_revokes_unpublished_batch(self):
++        import ashare_pipeline.formal_valuation_engine as engine
++
++        original = engine.digest
++        captured = []
++
++        def hook(frame, event, result):
++            if (event == "return" and frame.f_code.co_name == "mint"
++                    and frame.f_code.co_filename.endswith("formal_valuation_engine.py")
++                    and type(result) is PolicyAdjustedValuationBatch and not captured):
++                captured.append(result)
++                engine.digest = lambda _wire: "0" * 64
++
++        try:
++            with self.assertRaises(ValueError):
++                self.run_with_trace(hook)
++        finally:
++            engine.digest = original
++        self.assertEqual(len(captured), 1)
++        with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
++            captured[0].require_verified()
++
++    def test_c3_dynamic_dependency_rebinding_blocks_formal_valuation_build(self):
++        import ashare_pipeline.formal_valuation_adapter as adapter
++        import ashare_pipeline.formal_policy_values as policy_values
++
++        changes = (
++            (adapter, "_decimal_text", lambda _value: "999"),
++            (adapter, "Decimal", object()),
++            (adapter, "localcontext", object()),
++            (adapter, "Context", object()),
++            (adapter, "ROUND_HALF_EVEN", "ROUND_DOWN"),
++            (adapter, "_hash", lambda *_args: None),
++            (adapter, "digest", lambda _wire: "0" * 64),
++            (policy_values, "json", object()),
++        )
++        for module, name, replacement in changes:
++            with self.subTest(module=module.__name__, name=name):
++                original = getattr(module, name)
++                try:
++                    setattr(module, name, replacement)
++                    with self.assertRaisesRegex(ValueError, "valuation adapter dependency"):
++                        self.build()
++                finally:
++                    setattr(module, name, original)
++        self.build().require_verified()
++
++    def test_metric_own_checkpoint_revokes_base_before_publication_on_last_v_source_change(self):
++        from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
++
++        fixture = ValuationRuntimeFixture(peer_count=3)
++        self.addCleanup(fixture.close)
++        fixture.put_financial("SH600000", {
++            "V.enterprise_value_or_sustainable_roe": 0.1,
++            "V.normalized_earnings_yield": 0.2,
++            "V.normalized_free_cash_flow_yield": 0.08})
++        fixture.persist_features("SH600000")
++        fact = next(item for item in fixture.store.list_formal_financial_facts(
++            security_id="SH600000") if item.metric_key == "V.normalized_earnings_yield")
++        source = Path(fixture.store.get_formal_snapshot(fact.source_snapshot_id).content_path)
++        original = source.read_bytes()
++        selected, bases = [], []
++
++        def hook(frame, event, result):
++            if event != "return":
++                return
++            if (frame.f_code is FormalFeatureRepository.select_current_metric_batch_ticket.__code__
++                    and frame.f_locals.get("security_id") == "SH600000"):
++                selected.append(frame.f_locals["metric_id"])
++                if len(selected) == 3:
++                    source.write_bytes(original + b"\nchanged-after-third-v-ticket")
++            elif (frame.f_code.co_name == "mint"
++                    and frame.f_code.co_filename.endswith("formal_metric_engine.py")
++                    and type(result) is MetricInputBatch):
++                bases.append(result)
++
++        try:
++            with self.assertRaises(ValueError):
++                self.run_with_trace(hook, fixture.build_adjusted_batch)
++            self.assertEqual(len(selected), 3)
++            self.assertEqual(len(bases), 1)
++            with self.assertRaisesRegex(ValueError, "forged or copied"):
++                bases[0].require_verified()
++        finally:
++            source.write_bytes(original)
++        fixture.build_adjusted_batch().require_verified()
++
++    def test_metric_checkpoint_rejects_one_missing_member_metric_ticket(self):
++        from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
++
++        fixture = ValuationRuntimeFixture(peer_count=3)
++        self.addCleanup(fixture.close)
++        observed = {"selected": 0}
++
++        def hook(frame, event, result):
++            if (event == "return" and frame.f_code.co_name == "open"
++                    and frame.f_code.co_filename.endswith("formal_batch_read_journal.py")
++                    and type(result) is FormalBatchReadJournal):
++                observed["scope"] = result
++            if (event == "return" and frame.f_code is
++                    FormalFeatureRepository.select_current_metric_batch_ticket.__code__):
++                observed["selected"] += 1
++                if observed["selected"] == 8:
++                    metric = fixture.repository._batch_journal_identity()[1][0]
++                    with self.assertRaisesRegex(ValueError, "metric V source ticket coverage"):
++                        observed["scope"].checkpoint_metric(metric)
++                    observed["incomplete_rejected"] = True
++
++        with self.assertRaises(ValueError):
++            self.run_with_trace(hook, fixture.build_adjusted_batch)
++        self.assertTrue(observed.get("incomplete_rejected"))
++        self.assertEqual(observed["selected"], 8)
++        with self.assertRaisesRegex(ValueError, "closed"):
++            observed["scope"].checkpoint()
++        fixture.build_adjusted_batch().require_verified()
++
++    def test_metric_private_early_failures_consume_only_the_genuine_owner_scope(self):
++        from ashare_pipeline.formal_feature_repository import FormalFeatureRepository
++
++        metric_ids = ("V.enterprise_value_or_sustainable_roe",
++                      "V.normalized_earnings_yield", "V.normalized_free_cash_flow_yield")
++        for failure in ("invalid_frozen", "interface_changed", "invalid_metrics"):
++            with self.subTest(failure=failure):
++                fixture = ValuationRuntimeFixture(peer_count=3)
++                self.addCleanup(fixture.close)
++                observed = {}
++
++                def hook(frame, event, result):
++                    if (event != "return" or frame.f_code.co_name != "open"
++                            or not frame.f_code.co_filename.endswith("formal_batch_read_journal.py")
++                            or type(result) is not FormalBatchReadJournal or observed):
++                        return
++                    scope = result
++                    _, (metric, _) = fixture.repository._batch_journal_identity()
++                    request = dict(scoring_registry=fixture.scoring, metric_ids=metric_ids)
++                    fake = object.__new__(FormalBatchReadJournal)
++                    try:
++                        metric._build_batch_in_owner_scope(fixture.frozen.frozen_input_hash,
++                            owner_scope=fake, **request)
++                    except ValueError:
++                        observed["fake_rejected"] = True
++                    try:
++                        scope.checkpoint()
++                        observed["fake_preserved_true_scope"] = True
++                    except ValueError:
++                        observed["fake_preserved_true_scope"] = False
++                    frozen = fixture.frozen.frozen_input_hash
++                    if failure == "invalid_frozen":
++                        frozen = "0" * 64
++                    elif failure == "invalid_metrics":
++                        request["metric_ids"] = ("V.missing_metric",)
++                    original = FormalFeatureRepository.select_current_metric_batch_ticket
++                    try:
++                        if failure == "interface_changed":
++                            FormalFeatureRepository.select_current_metric_batch_ticket = lambda *_a, **_k: None
++                        try:
++                            metric._build_batch_in_owner_scope(frozen, owner_scope=scope, **request)
++                        except ValueError:
++                            observed["entry_rejected"] = True
++                    finally:
++                        FormalFeatureRepository.select_current_metric_batch_ticket = original
++                    try:
++                        scope.checkpoint()
++                        observed["true_scope_consumed"] = False
++                    except ValueError:
++                        observed["true_scope_consumed"] = True
++
++                with self.assertRaises(ValueError):
++                    self.run_with_trace(hook, fixture.build_adjusted_batch)
++                self.assertEqual(observed, dict(fake_rejected=True,
++                    fake_preserved_true_scope=True, entry_rejected=True,
++                    true_scope_consumed=True))
++
+     def test_outer_finalization_failure_revokes_only_adjusted_children(self):
+         captured = {"adjusted": [], "base": [], "policy": []}
+         closed = []
+ 
+         def hook(frame, event, result):
+             if event == "return" and frame.f_code.co_name == "mint":
+                 filename = frame.f_code.co_filename
+                 if filename.endswith("formal_valuation_engine.py"):
+                     captured["adjusted"].append(result)
+                 elif filename.endswith("formal_metric_engine.py"):
+@@ -227,21 +400,20 @@ class ValuationBatchGuardTests(unittest.TestCase):
+             with self.assertRaisesRegex(ValueError, "dependency changed"):
+                 self.build()
+         finally:
+             type.__setattr__(FormalValuationAdapterRegistry, "require_current_bundle", original)
+ 
+ 
+ class ValuationSourceClosureTests(unittest.TestCase):
+     @classmethod
+     def setUpClass(cls):
+         cls.fixture = ValuationRuntimeFixture(peer_count=3)
+-        cls.fixture.populate_valuation_inputs()
+ 
+     @classmethod
+     def tearDownClass(cls):
+         cls.fixture.close()
+ 
+     def test_outer_scope_rejects_public_open_foreign_owner_thread_copy_and_replay(self):
+         fixture = self.fixture
+         population = tuple(sorted(fixture.templates))
+         required = tuple((sid, "V.normalized_earnings_yield") for sid in population)
+         with self.assertRaisesRegex(ValueError, "authentic owner build"):
+@@ -373,28 +545,30 @@ class ValuationSourceClosureTests(unittest.TestCase):
+                     if cursor.f_code is checkpoint_code:
+                         forbidden.append(code.co_name)
+                         break
+                     cursor = cursor.f_back
+ 
+         batch = ValuationBatchGuardTests.run_with_trace(self, hook, fixture.build_adjusted_batch)
+         batch.require_verified()
+         self.assertEqual(sorted(first_v), sorted((sid, mid) for sid in members for mid in batch.metric_ids))
+         for kind, calls in selected.items():
+             self.assertEqual(sorted(calls), sorted(members), kind)
+-        self.assertEqual(len(checkpoints), 3)
++        self.assertEqual(len(checkpoints), 4)
+         self.assertIs(checkpoints[0], checkpoints[1])
+         self.assertIs(checkpoints[1], checkpoints[2])
+-        for phase in (0, 1, 2):
++        self.assertIs(checkpoints[2], checkpoints[3])
++        for phase in (1, 2, 3):
+             for kind in selected:
+                 self.assertEqual(sorted(checked[(phase, kind)]), sorted(members), (phase, kind))
+-        self.assertEqual(sorted(checked[(2, "feature")]),
+-                         sorted(sid for sid in members for _ in batch.metric_ids))
++        for phase in (0, 1, 2, 3):
++            self.assertEqual(sorted(checked[(phase, "feature")]),
++                             sorted(sid for sid in members for _ in batch.metric_ids))
+         self.assertEqual(forbidden, [])
+         rereads = []
+         previous = sys.getprofile()
+         try:
+             sys.setprofile(lambda frame, event, _result: rereads.append(frame.f_code.co_name)
+                 if event == "call" and frame.f_code.co_name in {
+                     "_batch_recheck_ticket", "select_state", "build_formal_feature_bundle"} else None)
+             for item in batch.inputs:
+                 self.assertIsInstance(item.status, str)
+                 self.assertIsInstance(item.security_id, str)

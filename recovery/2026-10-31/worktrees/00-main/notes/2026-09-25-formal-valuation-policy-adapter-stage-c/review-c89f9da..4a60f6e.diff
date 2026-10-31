@@ -1,0 +1,203 @@
+# Review package: c89f9da..4a60f6e
+
+## Commits
+4a60f6e Consume owner policy scope on early build failure
+
+## Files changed
+ ashare_pipeline/formal_policy_repository.py | 19 +++++++------
+ tests/test_formal_policy_batch_guards.py    | 21 ++++++++++----
+ tests/test_formal_policy_repository.py      | 44 +++++++++++++++++++++++++++++
+ 3 files changed, 70 insertions(+), 14 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_policy_repository.py b/ashare_pipeline/formal_policy_repository.py
+index 3763099..7a116f9 100644
+--- a/ashare_pipeline/formal_policy_repository.py
++++ b/ashare_pipeline/formal_policy_repository.py
+@@ -233,36 +233,39 @@ def _install_repository():
+                 raise ValueError("policy result batch has no original current-state recheck")
+             saved[2](batch)
+ 
+         def build_batch(self, frozen_input_hash, *, scoring_registry, policy_registry):
+             return self._build_batch(frozen_input_hash, scoring_registry=scoring_registry,
+                                      policy_registry=policy_registry, owner_scope=None)[0]
+ 
+         def _build_batch_in_owner_scope(self, frozen_input_hash, *, scoring_registry,
+                                         policy_registry, owner_scope):
+             """Return a batch, coverage ticket, and revoker to an enclosing owner."""
+-            batch, revoke, check_dependencies = self._build_batch(frozen_input_hash,
+-                scoring_registry=scoring_registry, policy_registry=policy_registry,
+-                owner_scope=owner_scope)
++            batch = revoke = None
+             try:
++                batch, revoke, check_dependencies = self._build_batch(frozen_input_hash,
++                    scoring_registry=scoring_registry, policy_registry=policy_registry,
++                    owner_scope=owner_scope)
+                 wire = record(batch)[2]
+                 ticket = _issue_current_ticket(owner_scope, self, "policy",
+                     (frozen_input_hash, batch.batch_hash), wire,
+                     (batch, wire, check_dependencies),
+                     tuple((sid,) for sid in batch.security_ids), batch)
+                 return batch, ticket, revoke
+             except BaseException:
+-                revoke(batch)
+-                try:
+-                    owner_scope.close()
+-                except ValueError:
+-                    pass
++                if revoke is not None:
++                    revoke(batch)
++                if type(owner_scope) is FormalBatchReadJournal:
++                    try:
++                        owner_scope.close()
++                    except ValueError:
++                        pass
+                 raise
+ 
+         def _batch_recheck_ticket(self, evidence):
+             batch, wire, check_dependencies = evidence
+             dependencies(self)
+             if record(batch)[2] != wire:
+                 raise ValueError("policy result ticket publication changed")
+             check_dependencies()
+ 
+         def _batch_journal_identity(self):
+diff --git a/tests/test_formal_policy_batch_guards.py b/tests/test_formal_policy_batch_guards.py
+index 80669f5..e99c5dd 100644
+--- a/tests/test_formal_policy_batch_guards.py
++++ b/tests/test_formal_policy_batch_guards.py
+@@ -37,50 +37,59 @@ class PolicyBatchGuardTests(unittest.TestCase):
+ 
+         selected = {
+             FormalPolicyFinancialRepository.select.__code__: 0,
+             FormalPolicyStateRepository.select.__code__: 0,
+             FormalPolicyMarketRepository.select.__code__: 0,
+         }
+         market_ticket_code = FormalPolicyMarketRepository.select_current_batch_ticket.__code__
+         market_tickets = []
+         market_assembled = []
+         checked = {
+-            FormalPolicyFinancialRepository._batch_recheck_ticket.__code__: 0,
+-            FormalPolicyStateRepository._batch_recheck_ticket.__code__: 0,
+-            FormalPolicyMarketRepository._batch_recheck_ticket.__code__: 0,
++            FormalPolicyFinancialRepository._batch_recheck_ticket.__code__: ("financial", 10),
++            FormalPolicyStateRepository._batch_recheck_ticket.__code__: ("state", 7),
++            FormalPolicyMarketRepository._batch_recheck_ticket.__code__: ("market", 12),
+         }
++        phase_checks = set()
+         checkpoints = []
+         checkpoint_code = FormalBatchReadJournal.checkpoint.__code__
+ 
+         def profile(frame, event, result):
+             if event != "call":
+                 return
+             if frame.f_code in selected:
+                 selected[frame.f_code] += 1
+             if frame.f_code is market_ticket_code:
+                 market_tickets.append(1)
+             if (frame.f_code.co_name == "assemble_market"
+                     and frame.f_code.co_filename.endswith("formal_policy_market.py")):
+                 market_assembled.append(1)
+-            if frame.f_code in checked:
+-                checked[frame.f_code] += 1
+             if frame.f_code is checkpoint_code:
+                 checkpoints.append(frame.f_locals["self"])
++            if frame.f_code in checked and checkpoints:
++                owner, request_index = checked[frame.f_code]
++                evidence = frame.f_locals["evidence"]
++                if owner != "market" or evidence[0] == "market":
++                    phase_checks.add((len(checkpoints), owner, evidence[request_index][0]))
+ 
+         batch = self.run_hook(profile)
+         batch.require_verified()
+         self.assertEqual(list(selected.values()), [3, 3, 0])
+         self.assertEqual(len(market_tickets), 3)
+         self.assertEqual(len(market_assembled), 3)
+         self.assertEqual(len(checkpoints), 2)
+         self.assertIs(checkpoints[0], checkpoints[1])
+-        self.assertTrue(all(count >= 6 for count in checked.values()))
++        self.assertEqual(phase_checks, {
++            (phase, owner, sid)
++            for phase in (1, 2)
++            for owner in ("financial", "state", "market")
++            for sid in ("BJ430001", "SH600000", "SZ000001")
++        })
+         with self.assertRaises(ValueError):
+             checkpoints[0].checkpoint()
+ 
+     def test_after_first_security_read_second_security_provider_changes(self):
+         self.fixture.put_industry("BJ430001")
+         self.fixture.put_industry("SH600000")
+         touched = []
+         def hook(frame, event, result):
+             if (not touched and event == "return" and frame.f_code.co_name == "select"
+                     and frame.f_code.co_filename.endswith("formal_policy_financial.py")
+diff --git a/tests/test_formal_policy_repository.py b/tests/test_formal_policy_repository.py
+index 0f4e676..2257e46 100644
+--- a/tests/test_formal_policy_repository.py
++++ b/tests/test_formal_policy_repository.py
+@@ -127,20 +127,64 @@ class PolicyRepositoryTests(unittest.TestCase):
+         batch.require_verified()
+         self.assertIs(ticket.selected(), batch)
+         scope.finalize()
+         with self.assertRaises(ValueError):
+             fixture.policy_repository._build_batch_in_owner_scope(
+                 fixture.frozen.frozen_input_hash, owner_scope=scope, **args)
+         revoke(batch)
+         with self.assertRaises(ValueError):
+             batch.require_verified()
+ 
++    def test_private_owner_scope_entry_failure_consumes_after_interface_restore(self):
++        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
++        from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
++
++        fixture = self.fixture()
++        universe = fixture.policy_context_repository.load_universe(
++            fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++        scope = FormalBatchReadJournal.open(fixture.policy_repository,
++            registry_manifest_hash=universe.registry_manifest_hash,
++            as_of_utc=universe.as_of_utc,
++            population=tuple(universe.security_ids),
++            required_keys=tuple((sid,) for sid in universe.security_ids))
++        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
++        with patch.object(FormalPolicyFinancialRepository, "_batch_recheck_ticket", lambda *_: None):
++            with self.assertRaises(ValueError):
++                fixture.policy_repository._build_batch_in_owner_scope(
++                    fixture.frozen.frozen_input_hash, owner_scope=scope, **args)
++        with self.assertRaises(ValueError):
++            fixture.policy_repository._build_batch_in_owner_scope(
++                fixture.frozen.frozen_input_hash, owner_scope=scope, **args)
++        with self.assertRaises(ValueError):
++            scope.checkpoint()
++
++    def test_private_owner_scope_missing_frozen_input_consumes_before_prepare(self):
++        from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
++
++        fixture = self.fixture()
++        universe = fixture.policy_context_repository.load_universe(
++            fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
++        scope = FormalBatchReadJournal.open(fixture.policy_repository,
++            registry_manifest_hash=universe.registry_manifest_hash,
++            as_of_utc=universe.as_of_utc,
++            population=tuple(universe.security_ids),
++            required_keys=tuple((sid,) for sid in universe.security_ids))
++        args = dict(scoring_registry=fixture.scoring, policy_registry=fixture.policy_registry)
++        with self.assertRaises(ValueError):
++            fixture.policy_repository._build_batch_in_owner_scope(
++                "0" * 64, owner_scope=scope, **args)
++        with self.assertRaises(ValueError):
++            fixture.policy_repository._build_batch_in_owner_scope(
++                fixture.frozen.frozen_input_hash, owner_scope=scope, **args)
++        with self.assertRaises(ValueError):
++            scope.checkpoint()
++
+     def test_unknown_membership_never_fabricates_five_template_decisions(self):
+         fixture = self.fixture()
+         batch = fixture.build_policy_batch()
+         for item in batch.results:
+             self.assertEqual(item.decisions, ())
+             self.assertEqual(item.evidence_state, "pending_evidence")
+             self.assertEqual(dict(item.dimension_caps), {})
+             self.assertEqual(dict(item.pool_prohibitions), {})
+ 
+     def test_missing_universe_is_failure(self):

@@ -1,0 +1,304 @@
+# Task 3B fix round 1 — scoped review package
+
+No commits; original review is the two-file frozen baseline retained in task-3b-review.diff and original source snapshots. Branch HEAD remains a2cc2ce.
+Original production 62e6eee897f18161ffda276368191a6c5715b5b4209e0a48d9b482606fe869e5; tests ec561a8eef8ce992d934d969d33a5f617701d7c5842a49d448a7d74dd1be74ca.
+Fix production b3bede39fe332ba9eb27ef8272207717705e5d2ab74b918db1a7f73d20ed6b18; tests 72469344b328b62c04d67523915b211f4d51423c94bd0ec667cf2a02da6c3392. Parent independently matched both.
+Scope: only the exact below fixes; no upstream/registry/fixture/data changes. Review original Important dispatch-bypass plus parent module-export failure, and new breakage in these hunks only.
+Parent final-hash 33-test split running session16637; worker owns final-hash linked-covered integration. Neither is yet recorded complete here.
+
+diff --git a/ashare_pipeline/formal_scoring.py b/ashare_pipeline/formal_scoring.py
+index 0ff462a..89b6708 100644
+--- a/ashare_pipeline/formal_scoring.py
++++ b/ashare_pipeline/formal_scoring.py
+@@ -122,24 +122,25 @@ def _calculate_untrusted_confidence(slot_weights, temporal_qualities, *, continu
+         h = min(Decimal(continuous_fy_count) / Decimal("5"), Decimal("1"))
+         k = Decimal("1")
+         c = Decimal("0.60") + Decimal("0.40") * (
+             Decimal("0.30") * d + Decimal("0.25") * p
+             + Decimal("0.25") * h + Decimal("0.20") * k)
+         if confidence_cap is not None:
+             c = min(c, confidence_cap)
+         return {"D": d, "P": p, "H": h, "K": k, "C": c}
+ 
+ 
+ def _install_pre_policy_scoring():
+     proofs = {}
++    module_globals = globals()
+     source_module = score_input_module
+     source_type = FormalScoreInput
+     decimal_context = _arithmetic_context
+     finite_decimal = _finite_decimal
+     arithmetic = _calculate_untrusted_arithmetic
+     confidence_arithmetic = _calculate_untrusted_confidence
+     grade = grade_for_score
+     plain, encode, digest, freeze = _plain, _canonical, _digest, _freeze
+     json_module, hashlib_module, weakref_module = json, hashlib, weakref
+     json_loads, json_dumps, sha256, weak_ref = json.loads, json.dumps, hashlib.sha256, weakref.ref
+     local_context, decimal_type = localcontext, Decimal
+     mapping_proxy_type = MappingProxyType
+@@ -157,44 +158,52 @@ def _install_pre_policy_scoring():
+                 for name, value in vars(base).items()
+                 if callable(value) or isinstance(value, (staticmethod, classmethod))}))
+ 
+     source_methods = capture_methods((source_type,))
+     source_verify = resolved_method(source_type, "require_verified")
+     source_canonical = resolved_method(source_type, "canonical_bytes")
+     source_getattr = resolved_method(source_type, "__getattr__")
+ 
+     def methods_unchanged(checks):
+         if any(resolved_method(cls, name) is not value for cls, name, value in checks):
+             raise ValueError("pre-policy score proof dependency changed")
+ 
++    def class_members_unchanged(checks):
++        for cls, expected in checks:
++            current = vars(cls)
++            if (set(current) != {name for name, _ in expected}
++                    or any(current[name] is not value for name, value in expected)):
++                raise ValueError("pre-policy score proof class member changed")
++
+     def dependencies():
+         methods_unchanged(source_methods)
+         methods_unchanged(own_methods)
++        class_members_unchanged(own_members)
+         if (score_input_module is not source_module or FormalScoreInput is not source_type
+                 or score_input_module.FormalScoreInput is not source_type
+                 or _arithmetic_context is not decimal_context or _finite_decimal is not finite_decimal
+                 or _calculate_untrusted_arithmetic is not arithmetic
+                 or _calculate_untrusted_confidence is not confidence_arithmetic
+                 or grade_for_score is not grade or _plain is not plain or _canonical is not encode
+                 or _digest is not digest or _freeze is not freeze
+                 or json is not json_module or hashlib is not hashlib_module or weakref is not weakref_module
+                 or json.loads is not json_loads or json.dumps is not json_dumps
+                 or hashlib.sha256 is not sha256 or weakref.ref is not weak_ref
+                 or localcontext is not local_context or Decimal is not decimal_type
+                 or MappingProxyType is not mapping_proxy_type
+                 or Context is not context_type or ROUND_HALF_EVEN is not rounding_mode
+                 or (InvalidOperation, DivisionByZero, Overflow) != decimal_traps
+                 or _DIMENSION_WEIGHTS is not dimension_weights or _RISK_METRIC_IDS is not risk_metric_ids
+                 or _DIMENSION_SLOT_COUNTS is not dimension_slot_counts
+-                or PrePolicyScoreCalculation is not proof_type
++                or module_globals.get("PrePolicyScoreCalculation") is not proof_type
+                 or calculate_pre_policy_score is not calculate):
+             raise ValueError("pre-policy score calculation dependency changed")
+ 
+     def verify_source(source, expected_bytes=None):
+         dependencies()
+         if type(source) is not source_type:
+             raise ValueError("pre-policy scoring requires an exact genuine FormalScoreInput")
+         source_verify(source)
+         wire = source_canonical(source)
+         if type(wire) is not bytes or (expected_bytes is not None and wire != expected_bytes):
+             raise ValueError("pre-policy score source input changed or is noncanonical")
+         return wire
+@@ -296,30 +305,45 @@ def _install_pre_policy_scoring():
+             risk_exposure=scores["risk_exposure"])
+         payload["calculation_hash"] = digest(payload)
+         return payload
+ 
+     def proof_record(proof):
+         dependencies()
+         record = proofs.get(id(proof))
+         if type(proof) is not proof_type or record is None or record[0]() is not proof:
+             raise ValueError("pre-policy score proof is forged, copied or unregistered")
+         verify_source(record[3], record[4])
+         return record
+ 
+-    class Proof:
++    class ProofMeta(type):
++        def __setattr__(cls, name, value):
++            if name == "__getattribute__":
++                raise TypeError("pre-policy proof attribute-resolution guard cannot be replaced")
++            return super().__setattr__(name, value)
++
++        def __delattr__(cls, name):
++            if name == "__getattribute__":
++                raise TypeError("pre-policy proof attribute-resolution guard cannot be removed")
++            return super().__delattr__(name)
++
++    class Proof(metaclass=ProofMeta):
+         __slots__ = ("__weakref__",)
+ 
+         def __init__(self, *args, **kwargs):
+             raise TypeError("pre-policy score proofs require a genuine complete FormalScoreInput")
+ 
++        def __getattribute__(self, name):
++            proof_record(self)
++            return object.__getattribute__(self, name)
++
+         def __getattr__(self, name):
+             data = proof_record(self)[1]
+             if name not in data:
+                 raise AttributeError(name)
+             return data[name]
+ 
+         def require_verified(self):
+             proof_record(self)
+ 
+         def canonical_bytes(self):
+             return proof_record(self)[2]
+ 
+@@ -341,20 +365,21 @@ def _install_pre_policy_scoring():
+         source_bytes = verify_source(source)
+         payload = build_payload(source, source_bytes)
+         verify_source(source, source_bytes)
+         frozen_payload, canonical_payload = freeze(payload), encode(payload)
+         result = object.__new__(proof_type)
+         identity = id(result)
+         proofs[identity] = (weak_ref(result, lambda _: proofs.pop(identity, None)),
+             frozen_payload, canonical_payload, source, source_bytes)
+         verify_source(source, source_bytes)
+         return result
+ 
+     own_methods = capture_methods((Proof, proof_type))
++    own_members = tuple((cls, tuple(vars(cls).items())) for cls in (Proof, proof_type))
+     return proof_type, calculate
+ 
+ 
+ PrePolicyScoreCalculation, calculate_pre_policy_score = _install_pre_policy_scoring()
+ del _install_pre_policy_scoring
+ 
+ 
+ __all__ = ["PrePolicyScoreCalculation", "calculate_pre_policy_score", "grade_for_score"]
+
+diff --git a/tests/test_formal_scoring.py b/tests/test_formal_scoring.py
+index a2690b7..f3a76c6 100644
+--- a/tests/test_formal_scoring.py
++++ b/tests/test_formal_scoring.py
+@@ -122,24 +122,79 @@ class PureScoringArithmeticTests(unittest.TestCase):
+                 api._calculate_untrusted_arithmetic(dimensions=candidate_dimensions,
+                     confidence=candidate_confidence, metric_values=candidate_risk)
+         for weights, qualities, years, cap in (
+                 ({"a": Decimal("0.5")}, {"a": Decimal("1")}, 4, None),
+                 ({"a": Decimal("1")}, {"b": Decimal("1")}, 4, None),
+                 ({"a": Decimal("1")}, {"a": Decimal("1")}, 3, None),
+                 ({"a": Decimal("1")}, {"a": Decimal("1")}, 4, True)):
+             with self.assertRaises(ValueError):
+                 api._calculate_untrusted_confidence(weights, qualities,
+                     continuous_fy_count=years, confidence_cap=cap)
+ 
+ 
++class ProofDispatchGuardTests(unittest.TestCase):
++    def api(self):
++        return importlib.import_module("ashare_pipeline.formal_scoring")
++
++    def test_class_descriptor_cannot_shadow_forged_field_rejection(self):
++        api = self.api()
++        forged = object.__new__(api.PrePolicyScoreCalculation)
++        with self.assertRaisesRegex(ValueError, "forged, copied or unregistered"):
++            _ = forged.S0
++        with patch.object(api.PrePolicyScoreCalculation, "S0",
++                property(lambda self: Decimal("99")), create=True):
++            with self.assertRaises(ValueError):
++                _ = forged.S0
++        with self.assertRaisesRegex(ValueError, "forged, copied or unregistered"):
++            _ = forged.S0
++
++    def test_replaced_verification_method_cannot_bypass_forged_rejection(self):
++        api = self.api()
++        forged = object.__new__(api.PrePolicyScoreCalculation)
++        with self.assertRaisesRegex(ValueError, "forged, copied or unregistered"):
++            forged.require_verified()
++        with patch.object(api.PrePolicyScoreCalculation, "require_verified",
++                lambda self: True, create=True):
++            with self.assertRaises(ValueError):
++                forged.require_verified()
++        with self.assertRaisesRegex(ValueError, "forged, copied or unregistered"):
++            forged.require_verified()
++
++    def test_module_export_class_replacement_is_detected_then_restores_normal_rejection(self):
++        api = self.api()
++        proof_type = api.PrePolicyScoreCalculation
++        forged = object.__new__(proof_type)
++        inherited_verify = proof_type.__mro__[1].require_verified
++        with patch.object(api, "PrePolicyScoreCalculation", object):
++            with self.assertRaisesRegex(ValueError, "calculation dependency changed"):
++                inherited_verify(forged)
++        with self.assertRaisesRegex(ValueError, "forged, copied or unregistered"):
++            inherited_verify(forged)
++
++    def test_attribute_resolution_guard_itself_cannot_be_replaced(self):
++        api = self.api()
++        proof_type = api.PrePolicyScoreCalculation
++        for owner in (proof_type, proof_type.__mro__[1]):
++            replacement = patch.object(owner, "__getattribute__",
++                lambda self, name: Decimal("99"), create=True)
++            try:
++                with self.subTest(owner=owner.__name__), self.assertRaises(TypeError):
++                    replacement.start()
++            finally:
++                replacement.stop()
++        forged = object.__new__(proof_type)
++        with self.assertRaisesRegex(ValueError, "forged, copied or unregistered"):
++            _ = forged.S0
++
++
+ class AuthenticatedPrePolicyScoringTests(unittest.TestCase):
+     def api(self):
+         return importlib.import_module("ashare_pipeline.formal_scoring")
+ 
+     def build_input(self, fixture):
+         from ashare_pipeline.formal_score_inputs import FormalScoreInputRepository
+         repository = FormalScoreInputRepository(fixture.feature_repository, fixture.context,
+             registry_signature_verifier=fixture.verifier)
+         batch = repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
+         return batch, batch.input_for(FOCAL)
+ 
+     def test_default_linked_covered_input_mints_distinct_immutable_pre_policy_audit(self):
+@@ -219,24 +274,33 @@ class AuthenticatedPrePolicyScoringTests(unittest.TestCase):
+                 SimpleNamespace(require_verified=lambda: None)):
+             with self.subTest(invalid=type(invalid).__name__), self.assertRaises((TypeError, ValueError)):
+                 calculate(invalid)
+         class DerivedInput(type(source)):
+             __slots__ = ()
+         with self.assertRaises(ValueError):
+             calculate(object.__new__(DerivedInput))
+         with self.assertRaises(TypeError):
+             calculate(source, confidence=Decimal("1"))
+ 
+         from ashare_pipeline import formal_score_inputs as input_api
+         source_base = type(source).__mro__[1]
++        expected_S0 = result.S0
++        with patch.object(proof_type, "S0", property(lambda self: Decimal("99")), create=True):
++            with self.assertRaises(ValueError):
++                _ = result.S0
++        self.assertEqual(result.S0, expected_S0)
++        with patch.object(proof_type, "require_verified", lambda self: True, create=True):
++            with self.assertRaises(ValueError):
++                result.require_verified()
++        result.require_verified()
+         for owner, name in ((api, "_arithmetic_context"), (api, "_finite_decimal"),
+                 (api, "_calculate_untrusted_arithmetic"), (api, "_calculate_untrusted_confidence"),
+                 (api, "_plain"), (api, "_canonical"), (api, "_digest"), (api, "_freeze"), (api, "grade_for_score"),
+                 (api, "Decimal"), (api, "localcontext"), (api, "_DIMENSION_WEIGHTS"),
+                 (api, "_RISK_METRIC_IDS"), (api, "_DIMENSION_SLOT_COUNTS"),
+                 (api, "MappingProxyType"), (api, "Context"), (api, "ROUND_HALF_EVEN"),
+                 (api, "json"), (api, "hashlib"), (api, "weakref"),
+                 (api.json, "loads"), (api.json, "dumps"), (hashlib, "sha256"),
+                 (api.weakref, "ref"), (api, "score_input_module"), (api, "FormalScoreInput"),
+                 (input_api, "FormalScoreInput"),
+                 (source_base, "require_verified"), (source_base, "canonical_bytes"),
+                 (source_base, "to_dict"), (source_base, "__getattr__"),
+@@ -281,20 +345,20 @@ class AuthenticatedPrePolicyScoringTests(unittest.TestCase):
+                 captured.append(result)
+                 with self.assertRaises(ValueError):
+                     fixture.provider.publish(replace(snapshot, batch_id="pre-policy-source-revocation"))
+ 
+         previous = sys.getprofile()
+         try:
+             sys.setprofile(profile)
+             with self.assertRaisesRegex(ValueError, "changed during complete batch finalization"):
+                 repository.build_batch(fixture.frozen.frozen_input_hash, scoring_registry=fixture.scoring)
+         finally:
+             sys.setprofile(previous)
+         self.assertEqual(len(captured), 1)
+-        for operation in (captured[0].require_verified, captured[0].canonical_bytes,
+-                captured[0].to_dict, lambda: captured[0].risk_exposure):
++        for operation in (lambda: captured[0].require_verified(), lambda: captured[0].canonical_bytes(),
++                lambda: captured[0].to_dict(), lambda: captured[0].risk_exposure):
+             with self.assertRaises(ValueError):
+                 operation()
+ 
+ 
+ if __name__ == "__main__":
+     unittest.main()
+

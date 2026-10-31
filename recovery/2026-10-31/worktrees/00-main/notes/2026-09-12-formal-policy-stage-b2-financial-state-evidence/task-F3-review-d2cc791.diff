@@ -1,0 +1,1108 @@
+# F3 task-scoped review package
+BASE c7fb672bfe47d2831bb4c1e850d6397407b9464b
+HEAD d2cc791829b76aecf0b5a6d69e3290b603e96704
+SCOPE ashare_pipeline/formal_policy_state.py, ashare_pipeline/formal_policy_values.py, tests/test_formal_policy_state.py, tests/test_formal_policy_values.py, tests/formal_policy_runtime_fixtures.py, ashare_pipeline/formal_policy_registry.py
+
+# Commits
+d2cc791 feat: preserve explicit policy state coverage and missing entries
+
+# Stat
+ ashare_pipeline/formal_policy_registry.py |  13 +-
+ ashare_pipeline/formal_policy_state.py    | 223 ++++++++++++++++
+ ashare_pipeline/formal_policy_values.py   |  64 ++++-
+ tests/formal_policy_runtime_fixtures.py   |  53 +++-
+ tests/test_formal_policy_state.py         | 415 ++++++++++++++++++++++++++++++
+ tests/test_formal_policy_values.py        |  45 +++-
+ 6 files changed, 802 insertions(+), 11 deletions(-)
+
+# Full task diff (U10)
+diff --git a/ashare_pipeline/formal_policy_registry.py b/ashare_pipeline/formal_policy_registry.py
+index f9189b4..1186880 100644
+--- a/ashare_pipeline/formal_policy_registry.py
++++ b/ashare_pipeline/formal_policy_registry.py
+@@ -364,21 +364,22 @@ def _install_policy_registry():
+             *cls.__dataclass_fields__))
+     source_bases = tuple((cls, cls.__bases__, cls.__mro__) for cls, _ in source_interfaces)
+ 
+     def class_snapshot(classes):
+         return tuple((cls, tuple(vars(cls).items()), cls.__bases__, cls.__mro__) for cls in classes)
+ 
+     def dependencies():
+         if any(owner.get(name) is not expected for owner, name, expected in bindings):
+             raise ValueError("policy proof dependency changed")
+         if (module_globals.get("FormalPolicyRegistry") is not proof_type
+-                or module_globals.get("load_formal_policy_registry") is not load):
++                or module_globals.get("load_formal_policy_registry") is not load
++                or module_globals.get("_read_authenticated_policy_registry") is not read):
+             raise ValueError("policy proof entry point changed")
+         if (any(resolved_member(cls, name) is not expected for cls, name, expected in source_members)
+                 or any(cls.__bases__ != bases or cls.__mro__ != mro for cls, bases, mro in source_bases)):
+             raise ValueError("policy proof source interface changed")
+         for cls, expected, bases, mro in own_members:
+             current = vars(cls)
+             if (cls.__bases__ != bases or cls.__mro__ != mro
+                     or set(current) != {name for name, _ in expected}
+                     or any(current[name] is not value for name, value in expected)):
+                 raise ValueError("policy proof class member or inheritance changed")
+@@ -492,19 +493,25 @@ def _install_policy_registry():
+ 
+         def forget(reference):
+             record = records.get(identity)
+             if record is not None and record[0] is reference:
+                 records.pop(identity, None)
+ 
+         records[identity] = (weak_ref(result, forget), frozen_payload, canonical,
+             bundle, scoring_registry, feature_registry, root_hash, hashes)
+         return result
+ 
++    def read(proof):
++        """Internal consumer read anchored in this owner's original proof record."""
++        record = proof_record(proof)
++        return dict(loads(record[2]), contract_hash=record[1]["contract_hash"])
++
+     own_members = class_snapshot((ProofMeta, Proof, proof_type))
+-    return proof_type, load
++    return proof_type, load, read
+ 
+ 
+-FormalPolicyRegistry, load_formal_policy_registry = _install_policy_registry()
++(FormalPolicyRegistry, load_formal_policy_registry,
++ _read_authenticated_policy_registry) = _install_policy_registry()
+ del _install_policy_registry
+ 
+ 
+ __all__ = ["FormalPolicyRegistry", "load_formal_policy_registry"]
+diff --git a/ashare_pipeline/formal_policy_state.py b/ashare_pipeline/formal_policy_state.py
+new file mode 100644
+index 0000000..9132cf5
+--- /dev/null
++++ b/ashare_pipeline/formal_policy_state.py
+@@ -0,0 +1,223 @@
++"""Internal policy state selections from current, authenticated Context reads."""
++
++from __future__ import annotations
++
++import json
++import weakref
++from types import MappingProxyType
++
++from .formal_context_repository import FormalContextRepository
++from .formal_metric_context import (
++    FormalMetricContextRepository, _require_authentic_metric_context_repository,
++)
++from .formal_policy_registry import _read_authenticated_policy_registry
++from .formal_policy_values import (
++    PolicyIntegrityError, PolicyPreconditionError, _policy_value_operations, canonical_bytes, digest,
++)
++from .formal_universe import canonical_security_id
++
++
++_FREEZE = "2026-08-31T07:00:00+00:00"
++_STATE_KINDS = frozenset(("security_state", "regulatory_state"))
++
++
++def read_flag(flags: tuple[dict, ...], flag_id: str) -> bool | None:
++    """An absent entry is not an observed false state."""
++    matches = [item for item in flags if item["flag_id"] == flag_id]
++    if not matches:
++        return None
++    if len(matches) != 1 or type(matches[0]["active"]) is not bool:
++        raise ValueError("flag must have one explicit boolean observation")
++    return matches[0]["active"]
++
++
++def _freeze(value):
++    if type(value) is dict:
++        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
++    return tuple(map(_freeze, value)) if type(value) is list else value
++
++
++def _install_state():
++    repositories, selections = {}, {}
++    context_type = FormalContextRepository
++    companion_type = FormalMetricContextRepository
++    companion_init = companion_type.__init__
++    check_context = _require_authentic_metric_context_repository
++    read_many = context_type.get_verified_many
++    read_policy = _read_authenticated_policy_registry
++    parse_value, serialize_value, check_values = _policy_value_operations()
++    captured = tuple((name, value) for name, value in globals().items()
++                     if callable(value) and name != "_install_state")
++
++    def interfaces():
++        check_values()
++        if any(globals().get(name) is not value for name, value in captured):
++            raise PolicyIntegrityError("policy state calculation dependency changed")
++        for cls, methods in own_methods:
++            if set(vars(cls)) != set(methods) or any(vars(cls)[key] is not value for key, value in methods.items()):
++                raise PolicyIntegrityError("policy state interface changed")
++        if context_type.get_verified_many is not read_many or companion_type.__init__ is not companion_init:
++            raise PolicyIntegrityError("policy state retained read dependency changed")
++
++    def dependencies(repository):
++        interfaces()
++        saved = repositories.get(id(repository))
++        if type(repository) is not FormalPolicyStateRepository or saved is None or saved[0]() is not repository:
++            raise PolicyIntegrityError("state repository is forged or copied")
++        _, context, _ = check_context(saved[1])
++        return context
++
++    def record(selection):
++        interfaces()
++        saved = selections.get(id(selection))
++        if type(selection) is not PolicyStateSelection or saved is None or saved[0]() is not selection:
++            raise PolicyIntegrityError("state selection is forged or copied")
++        return saved
++
++    class SelectionMeta(type):
++        def __setattr__(cls, name, value):
++            if name in {"__getattribute__", "__bases__"}:
++                raise TypeError("state selection lookup and inheritance are immutable")
++            return super().__setattr__(name, value)
++
++        def __delattr__(cls, name):
++            if name in {"__getattribute__", "__bases__"}:
++                raise TypeError("state selection lookup and inheritance are immutable")
++            return super().__delattr__(name)
++
++    class PolicyStateSelection(metaclass=SelectionMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("state selections require authenticated repository reads")
++
++        def __getattribute__(self, name):
++            record(self)
++            return object.__getattribute__(self, name)
++
++        def __getattr__(self, name):
++            payload = json.loads(record(self)[1])
++            if name == "values":
++                return MappingProxyType({key: parse_value(value) for key, value in payload[name].items()})
++            if name not in {"lineage", "selection_hash"}:
++                raise AttributeError(name)
++            return _freeze(payload[name])
++
++        def recheck(self):
++            saved = record(self)
++            current = select(saved[2], **saved[3])
++            if record(current)[1] != saved[1]:
++                raise PolicyIntegrityError("state selection is no longer current")
++
++        def __copy__(self):
++            raise TypeError("state selections cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("state selections cannot be copied")
++
++    def select(self, security_id, as_of_utc, *, template_id, policy_registry):
++        context = dependencies(self)
++        if (type(security_id) is not str or canonical_security_id(security_id) != security_id
++                or type(as_of_utc) is not str or as_of_utc != _FREEZE
++                or type(template_id) is not str):
++            raise PolicyPreconditionError("state selection requires canonical security, freeze and genuine registry")
++        policy = read_policy(policy_registry)
++        if template_id not in {rule["template_id"] for rule in policy["rules"]}:
++            raise PolicyPreconditionError("state template is not signed")
++        rules = [rule for rule in policy["rules"] if rule["template_id"] == template_id
++                 and any(selector.get("context_kind") in _STATE_KINDS for selector in rule["inputs"].values())]
++        selectors, bindings = {}, {}
++        manifest = {(item["role"], item["rule_id"], item["input_path"]): item
++                    for item in policy["binding_manifest"]}
++        for rule in rules:
++            for name, selector in rule["inputs"].items():
++                if selector.get("context_kind") not in _STATE_KINDS:
++                    continue
++                key = digest(selector)
++                selectors[key] = selector
++                bindings[key] = manifest[(rule["role"], rule["rule_id"], "inputs." + name)]
++        groups = sorted({(s["context_kind"], s["scope_key"]) for s in selectors.values()})
++        security_ids = tuple(sorted({security_id}))
++
++        def read():
++            result = {}
++            for kind, scope in groups:
++                selected = read_many(context, kind, scope, security_ids, as_of_utc, policy["registry_manifest_hash"])
++                fact = selected[security_id]
++                result[(kind, scope)] = None if fact is None else fact.to_dict()
++            return result
++
++        factors = read()
++        values, entries = {}, {}
++        for key, selector in sorted(selectors.items()):
++            fact = factors[(selector["context_kind"], selector["scope_key"])]
++            binding = bindings[key]
++            if fact is not None and fact["evidence"]["descriptor_id"] != selector["descriptor_id"]:
++                raise PolicyIntegrityError("selected Context descriptor differs from signed selector")
++            request = dict(security_id=security_id, security_ids=list(security_ids),
++                context_kind=selector["context_kind"], scope_key=selector["scope_key"],
++                as_of_utc=as_of_utc, registry_manifest_hash=policy["registry_manifest_hash"],
++                descriptor_id=selector["descriptor_id"], descriptor=binding["descriptor"])
++            entry = dict(selector=selector, request=request, factor=fact,
++                rule_ids=sorted(rule["rule_id"] for rule in rules
++                    if any(digest(s) == key for s in rule["inputs"].values())))
++            entry_hash = digest(entry)
++            raw = None if fact is None else (fact["value"][selector["field"]]
++                if selector["context_kind"] == "security_state"
++                else read_flag(tuple(fact["value"]["flags"]), selector["entry_id"]))
++            reason = "state_entry_missing" if raw is None else None
++            value = dict(state="missing" if reason else "value", value=raw,
++                value_type=selector["expected_type"], unit=None, evidence_hashes=[entry_hash],
++                pending=[] if reason is None else [dict(origin="runtime", code=reason,
++                    rule_id=None, evidence_hashes=[entry_hash])])
++            values[key] = serialize_value(parse_value(value))
++            entries[key] = dict(entry, entry_hash=entry_hash)
++        # Close cross-kind correction/absence races after every factor has been consumed.
++        if factors != read():
++            raise PolicyIntegrityError("Context state changed during selection")
++        dependencies(self)
++        if read_policy(policy_registry) != policy:
++            raise PolicyIntegrityError("policy registry changed during state selection")
++        payload = dict(values=values, lineage=dict(security_id=security_id, exchange=security_id[:2],
++            template_id=template_id, as_of_utc=as_of_utc,
++            algorithm_version="formal-policy-state-selection-v1", contract_version=policy["contract_version"],
++            registry_manifest_hash=policy["registry_manifest_hash"], role_hashes=policy["role_hashes"],
++            policy_contract_hash=policy["contract_hash"], rule_ids=sorted(r["rule_id"] for r in rules), entries=entries))
++        payload["selection_hash"] = digest(payload)
++        result = object.__new__(PolicyStateSelection)
++        key = id(result)
++        selections[key] = (weakref.ref(result, lambda _: selections.pop(key, None)), canonical_bytes(payload), self,
++            dict(security_id=security_id, as_of_utc=as_of_utc, template_id=template_id, policy_registry=policy_registry))
++        return result
++
++    class FormalPolicyStateRepository:
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, context_repository):
++            interfaces()
++            if type(self) is not FormalPolicyStateRepository or id(self) in repositories:
++                raise PolicyPreconditionError("state repository initialization must be exact and single-use")
++            if type(context_repository) is not context_type:
++                raise PolicyPreconditionError("genuine Context repository required")
++            companion = companion_type(context_repository._state_store, context_repository,
++                registry_signature_verifier=context_repository._verifier)
++            check_context(companion)
++            key = id(self)
++            repositories[key] = (weakref.ref(self, lambda _: repositories.pop(key, None)), companion)
++
++        def __copy__(self):
++            raise TypeError("state repositories cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("state repositories cannot be copied")
++
++    FormalPolicyStateRepository.select = select
++    own_methods = tuple((cls, dict(vars(cls))) for cls in
++                        (FormalPolicyStateRepository, PolicyStateSelection, SelectionMeta))
++    return FormalPolicyStateRepository, PolicyStateSelection
++
++
++FormalPolicyStateRepository, PolicyStateSelection = _install_state()
++del _install_state
++
++__all__ = ["FormalPolicyStateRepository", "PolicyStateSelection"]
+diff --git a/ashare_pipeline/formal_policy_values.py b/ashare_pipeline/formal_policy_values.py
+index 4b873a4..c89d2ed 100644
+--- a/ashare_pipeline/formal_policy_values.py
++++ b/ashare_pipeline/formal_policy_values.py
+@@ -1,36 +1,38 @@
+ """Non-authoritative policy values and the explicit V6 Decimal bridge."""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++from datetime import date
++from types import MappingProxyType
+ from decimal import (
+     Context,
+     Decimal,
+     DivisionByZero,
+     InvalidOperation,
+     Overflow,
+     ROUND_HALF_EVEN,
+ )
+ import hashlib
+ import json
+ import math
+ import re
+ 
+ 
+ _FIELDS = frozenset(("state", "value", "value_type", "unit", "evidence_hashes", "pending"))
+ _PENDING_FIELDS = frozenset(("origin", "code", "rule_id", "evidence_hashes"))
+ _STATES = frozenset(("value", "missing", "domain_conflict"))
+ _VALUE_TYPES = frozenset((
+     "decimal", "bool", "enum", "event_record", "calendar_record", "market_window",
+ ))
+-_COMPOUND_TYPES = frozenset(("event_record", "calendar_record", "market_window"))
++_COMPOUND_TYPES = frozenset(("calendar_record", "market_window"))
+ _RUNTIME_REASONS = frozenset((
+     "applicability_unresolved",
+     "current_receipt_absent",
+     "financial_input_missing",
+     "financial_domain_conflict",
+     "unsupported_unit",
+     "invalid_denominator",
+     "visibility_unproven",
+     "state_entry_missing",
+     "calendar_coverage_missing",
+@@ -138,20 +140,32 @@ def _decimal(value: object) -> Decimal:
+         raise ValueError("decimal wire value must be text")
+     try:
+         parsed = Decimal(value)
+     except InvalidOperation as error:
+         raise ValueError("invalid decimal wire value") from error
+     if _decimal_text(parsed) != value:
+         raise ValueError("decimal wire value is not canonical")
+     return parsed
+ 
+ 
++def _event_record(value: object):
++    """Closed Context event value shape, deliberately without proof authority."""
++    if type(value) is not dict or set(value) != {"event_id", "event_date", "quantified_value", "unit"}:
++        raise ValueError("event record requires exactly the four Context event fields")
++    event_date = value["event_date"]
++    if type(event_date) is not str or date.fromisoformat(event_date).isoformat() != event_date:
++        raise ValueError("event date must be a canonical ISO date")
++    return MappingProxyType(dict(event_id=_controlled_text(value["event_id"], "event ID"),
++        event_date=event_date, quantified_value=_decimal(value["quantified_value"]),
++        unit=_controlled_text(value["unit"], "event unit")))
++
++
+ @dataclass(frozen=True, slots=True)
+ class _Pending:
+     origin: str
+     code: str
+     rule_id: str | None
+     evidence_hashes: tuple[str, ...]
+ 
+     @classmethod
+     def from_dict(cls, wire: object) -> "_Pending":
+         if type(wire) is not dict or set(wire) != _PENDING_FIELDS:
+@@ -175,24 +189,24 @@ class _Pending:
+         return {
+             "origin": self.origin,
+             "code": self.code,
+             "rule_id": self.rule_id,
+             "evidence_hashes": list(self.evidence_hashes),
+         }
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class PolicyValue:
+-    """Detached scalar value or typed evidence-shortfall record."""
++    """Detached scalar/event value or typed evidence-shortfall record."""
+ 
+     state: str
+-    value: Decimal | bool | str | None
++    value: Decimal | bool | str | MappingProxyType | None
+     value_type: str
+     unit: str | None
+     evidence_hashes: tuple[str, ...]
+     _pending: tuple[_Pending, ...]
+ 
+     @classmethod
+     def from_dict(cls, wire: object) -> "PolicyValue":
+         if type(wire) is not dict or set(wire) != _FIELDS:
+             raise ValueError("policy value has unknown or missing fields")
+         state = wire["state"]
+@@ -204,21 +218,23 @@ class PolicyValue:
+         unit = _unit(wire["unit"], value_type)
+         if type(wire["pending"]) is not list:
+             raise ValueError("pending must be an array")
+         pending = tuple(_Pending.from_dict(item) for item in wire["pending"])
+ 
+         if state == "value":
+             if pending:
+                 raise ValueError("a present policy value cannot be pending")
+             if value_type in _COMPOUND_TYPES:
+                 raise ValueError("compound policy values require their closed producer validator")
+-            if value_type == "decimal":
++            if value_type == "event_record":
++                value = _event_record(wire["value"])
++            elif value_type == "decimal":
+                 value: Decimal | bool | str | None = _decimal(wire["value"])
+             elif value_type == "bool":
+                 if type(wire["value"]) is not bool:
+                     raise ValueError("bool policy value must be exact bool")
+                 value = wire["value"]
+             else:
+                 if type(wire["value"]) is not str:
+                     raise ValueError("enum policy value must be exact str")
+                 value = wire["value"]
+         else:
+@@ -234,29 +250,69 @@ class PolicyValue:
+             value_type=value_type,
+             unit=unit,
+             evidence_hashes=_hashes(wire["evidence_hashes"], "evidence_hashes"),
+             _pending=pending,
+         )
+ 
+     def to_dict(self) -> dict:
+         value: object = self.value
+         if self.value_type == "decimal" and value is not None:
+             value = _decimal_text(value)
++        elif self.value_type == "event_record" and value is not None:
++            value = dict(value)
++            value["quantified_value"] = _decimal_text(value["quantified_value"])
+         return {
+             "state": self.state,
+             "value": value,
+             "value_type": self.value_type,
+             "unit": self.unit,
+             "evidence_hashes": list(self.evidence_hashes),
+             "pending": [item.to_dict() for item in self._pending],
+         }
+ 
+ 
++def _install_value_operations():
++    """Retain owner-initialized DTO operations without granting evidence authority."""
++    owner = globals()
++    value_type, pending_type = PolicyValue, _Pending
++    parse, serialize = value_type.from_dict, value_type.to_dict
++    bindings = tuple((name, owner[name]) for name in (
++        "PolicyValue", "_Pending", "_unit", "_identifier", "_controlled_text", "_hashes",
++        "_decimal", "_decimal_text", "_event_record", "_FIELDS", "_PENDING_FIELDS", "_STATES",
++        "_VALUE_TYPES", "_COMPOUND_TYPES", "_RUNTIME_REASONS", "_SHA256", "_IDENTIFIER",
++        "Decimal", "date", "MappingProxyType"))
++    classes = tuple((cls, dict(vars(cls)), cls.__bases__, cls.__mro__)
++                    for cls in (value_type, pending_type))
++
++    def check():
++        if (owner.get("_policy_value_operations") is not operations
++                or any(owner.get(name) is not original for name, original in bindings)):
++            raise PolicyIntegrityError("policy value owned validation dependency changed")
++        for cls, members, bases, mro in classes:
++            # copyreg may cache slots on a detached DTO; that cache is not used
++            # by validation, serialization, attribute lookup or evidence reads.
++            current = {name: value for name, value in vars(cls).items() if name != "__slotnames__"}
++            if (cls.__bases__ != bases or cls.__mro__ != mro or set(current) != set(members)
++                    or any(current[name] is not original for name, original in members.items())):
++                raise PolicyIntegrityError("policy value owned class interface changed")
++
++    def operations():
++        # The private original authority, like other internal owner readers,
++        # is part of the trusted implementation boundary, never registration.
++        return parse, serialize, check
++
++    return operations
++
++
++_policy_value_operations = _install_value_operations()
++del _install_value_operations
++
++
+ __all__ = [
+     "PolicyIntegrityError",
+     "PolicyPreconditionError",
+     "PolicyValue",
+     "bridge_v6",
+     "canonical_bytes",
+     "decimal_context",
+     "digest",
+ ]
+diff --git a/tests/formal_policy_runtime_fixtures.py b/tests/formal_policy_runtime_fixtures.py
+index 47ad549..0542324 100644
+--- a/tests/formal_policy_runtime_fixtures.py
++++ b/tests/formal_policy_runtime_fixtures.py
+@@ -1,32 +1,33 @@
+ """Real signed runtime fixtures for synthetic policy tests only."""
+ 
+ from __future__ import annotations
+ 
+-from datetime import date
++from datetime import date, timedelta
+ import hashlib
+ import math
+ 
+ from ashare_pipeline.formal_evidence import (
+     OfficialFetch,
+     OfficialRequest,
+     SourcePolicy,
+     verify_official_fetch,
+ )
+ from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
+ from ashare_pipeline.formal_policy_financial import FormalPolicyFinancialRepository
+ from ashare_pipeline.formal_metric_context import FormalMetricContextRepository
+ from ashare_pipeline.formal_universe import canonical_security_id
+ from tests.formal_metric_feature_fixtures import FinancialFixture
+ from tests.formal_metric_fixtures import FREEZE, update_mapping_digest
+ from tests.formal_policy_fixtures import add_policy_documents, rehash_documents
+-from tests.test_formal_context_repository import descriptor
++from tests.test_formal_context_repository import descriptor, FixtureNormalizer
++from ashare_pipeline.formal_context_schema import FormalContextRegistry
+ from tests.test_formal_feature_contract import formal_fact
+ from tests.test_formal_scoring_registry import TEMPLATES, canonical
+ from tests.test_formal_sources import config
+ 
+ 
+ _DEFAULT_TEMPLATES = {
+     "BJ430001": "general_nonfinancial",
+     "SH600000": "bank",
+     "SZ000001": "bank",
+ }
+@@ -159,20 +160,68 @@ class PolicyRuntimeFixture(FinancialFixture):
+             )
+         except Exception:
+             if hasattr(self, "tempdir"):
+                 self.tempdir.cleanup()
+             raise
+         self.policy_context_repository = FormalMetricContextRepository(self.store, self.context,
+             registry_signature_verifier=self.verifier)
+         self.policy_financial_repository = FormalPolicyFinancialRepository(self.feature_repository,
+             current_input_provider=self.provider)
+         self._policy_industry_ids = set()
++        self._policy_context_generations = {}
++
++    def put_policy_context(self, security_id, kind, value, *, generation="g1"):
++        """Persist only this temporary graph's signed Context producer chain."""
++        if (type(security_id) is not str or canonical_security_id(security_id) != security_id
++                or security_id not in {member.security_id for member in self.frozen.members}):
++            raise ValueError("policy Context security must be a canonical frozen-universe member")
++        if kind not in ("security_state", "regulatory_state", "event_calendar"):
++            raise ValueError("policy Context fixture supports only state and event kinds")
++        if type(generation) is not str or not generation or generation.strip() != generation:
++            raise ValueError("generation must be canonical text")
++        scope = "fixture-state" if kind == "security_state" else "fixture-policy-" + kind
++        request = self.resolver.resolve(context_kind=kind, scope_key=scope, security_id=security_id,
++            as_of_utc=FREEZE, registry_manifest_hash=self.bundle.manifest.manifest_hash,
++            upstream_generation=generation)
++        # New generations represent later corrections, with deterministic fixture times.
++        generations = self._policy_context_generations.setdefault((security_id, kind), {})
++        if generation not in generations:
++            generations[generation] = len(generations)
++        published = (date(2026, 8, 20) + timedelta(days=generations[generation])).isoformat() + "T07:00:00+00:00"
++        raw = canonical(dict(value=value, no_coverage=False))
++        task = self.store.enqueue_formal_task("formal_context",
++            hashlib.sha256(request.canonical_bytes() + raw).hexdigest(), request.refresh_generation, {})
++        worker = "policy-context-fixture"
++        leased = self.store.lease_next_formal_task(("formal_context",), worker, 300)
++        self.assertEqual(leased["id"], task)
++        fetch = OfficialFetch(request=request.official_request, raw_bytes=raw,
++            original_url="https://www.cninfo.com.cn/fixture/context.json",
++            published_at_utc=published, published_precision="timestamp", source_updated_at_utc=None,
++            captured_at_utc="2026-09-04T07:00:00+00:00", effective_at_utc=published,
++            effective_time_evidence_hash=None, refresh_generation=request.refresh_generation,
++            parser_id=request.parser_id, parser_version=request.parser_version, mapping_version=request.mapping_version,
++            declared_security_id=security_id, declared_period=request.official_request.period_or_date)
++        verification = verify_official_fetch(fetch, SourcePolicy.cninfo())
++        self.assertEqual(verification.status, "verified")
++        ref = self.snapshots.persist_verified(fetch, verification, producing_task_id=task, worker_id=worker)
++        receipt = FormalContextRegistry.load(self.store, self.verifier,
++            self.bundle.manifest.manifest_hash).normalize_verified(request, ref, raw,
++            FixtureNormalizer(), task_id=task, worker_id=worker)
++        self.store.put_formal_context_facts(receipt)
++        self.store.complete_formal_task(task, worker, {"snapshot": ref.snapshot_id})
++        return receipt.facts[0], ref
++
++    def state_selection(self, security_id):
++        from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
++        member = next(m for m in self.industry["memberships"] if m["security_id"] == security_id)
++        return FormalPolicyStateRepository(self.context).select(security_id, FREEZE,
++            template_id=member["template_id"], policy_registry=self.policy_registry)
+ 
+     def financial_selection(self, security_id):
+         if security_id not in self._policy_industry_ids:
+             self.put_industry(security_id)
+             self._policy_industry_ids.add(security_id)
+         universe = self.policy_context_repository.load_universe(self.frozen.frozen_input_hash,
+             scoring_registry=self.scoring)
+         industry = self.policy_context_repository.resolve_industries(universe)
+         member = next(m for m in self.industry["memberships"] if m["security_id"] == security_id)
+         selected = self.policy_financial_repository.select(security_id, FREEZE,
+diff --git a/tests/test_formal_policy_state.py b/tests/test_formal_policy_state.py
+new file mode 100644
+index 0000000..94af3b0
+--- /dev/null
++++ b/tests/test_formal_policy_state.py
+@@ -0,0 +1,415 @@
++"""Real Context state evidence must preserve absence, identity and explicit false."""
++
++import copy
++import importlib.util
++import subprocess
++import sys
++import textwrap
++import unittest
++from unittest.mock import patch
++
++from ashare_pipeline.formal_policy_values import PolicyValue, digest
++from tests.formal_metric_fixtures import FREEZE
++from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++from tests.formal_policy_fixtures import context_selector
++
++
++SECURITY = dict(is_st=False, is_star_st=False, listing_status="listed",
++                forced_delist_risk=False, suspended=False)
++
++
++class PolicyStateTests(unittest.TestCase):
++    def test_value_alias_replacement_before_state_import_cannot_invent_flags(self):
++        script = textwrap.dedent('''
++            from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++            from ashare_pipeline import formal_policy_values as owner
++            fixture = PolicyRuntimeFixture()
++            try:
++                original = owner.PolicyValue
++                class ForgedValue:
++                    @classmethod
++                    def from_dict(cls, wire):
++                        wire = dict(wire)
++                        if wire["value_type"] == "bool":
++                            wire.update(state="value", value=True, pending=[])
++                        return original.from_dict(wire)
++                    def to_dict(self):
++                        return {}
++                owner.PolicyValue = ForgedValue
++                from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
++                try:
++                    selected = fixture.state_selection("SH600000")
++                    selected.recheck()
++                except ValueError:
++                    pass
++                else:
++                    raise AssertionError("public value alias invented observed flags from absence")
++            finally:
++                fixture.close()
++        ''')
++        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++    def test_value_methods_replaced_before_state_import_are_rejected(self):
++        for method in ("from_dict", "to_dict", "__getattribute__"):
++            script = textwrap.dedent('''
++                import sys
++                from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++                from ashare_pipeline import formal_policy_values as owner
++                fixture = PolicyRuntimeFixture()
++                try:
++                    parser, serializer = owner.PolicyValue.from_dict, owner.PolicyValue.to_dict
++                    if sys.argv[1] == "from_dict":
++                        def replacement(cls, wire):
++                            wire = dict(wire)
++                            if wire["value_type"] == "bool":
++                                wire.update(state="value", value=True, pending=[])
++                            return parser(wire)
++                        owner.PolicyValue.from_dict = classmethod(replacement)
++                    elif sys.argv[1] == "to_dict":
++                        def replacement(self):
++                            wire = serializer(self)
++                            if wire["value_type"] == "bool":
++                                wire.update(state="value", value=True, pending=[])
++                            return wire
++                        owner.PolicyValue.to_dict = replacement
++                    else:
++                        original_lookup = owner.PolicyValue.__getattribute__
++                        def replacement(self, name):
++                            if original_lookup(self, "value_type") == "bool":
++                                if name == "state":
++                                    return "value"
++                                if name == "value":
++                                    return True
++                                if name == "_pending":
++                                    return ()
++                            return original_lookup(self, name)
++                        owner.PolicyValue.__getattribute__ = replacement
++                    from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
++                    try:
++                        selected = fixture.state_selection("SH600000")
++                        selected.recheck()
++                    except ValueError:
++                        pass
++                    else:
++                        raise AssertionError("replaced value method manufactured current evidence")
++                finally:
++                    fixture.close()
++            ''')
++            result = subprocess.run([sys.executable, "-c", script, method], capture_output=True, text=True)
++            with self.subTest(method=method):
++                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++    def test_registry_alias_replacement_before_state_import_cannot_mint_evidence(self):
++        script = textwrap.dedent('''
++            from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++            from ashare_pipeline import formal_policy_registry as owner
++            fixture = PolicyRuntimeFixture()
++            try:
++                wire = fixture.policy_registry.to_dict()
++                class ForgedPolicy:
++                    def require_verified(self):
++                        return self
++                    def to_dict(self):
++                        return wire
++                owner.FormalPolicyRegistry = ForgedPolicy
++                from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
++                try:
++                    selected = FormalPolicyStateRepository(fixture.context).select(
++                        "SH600000", "2026-08-31T07:00:00+00:00", template_id="bank", policy_registry=ForgedPolicy())
++                    selected.recheck()
++                except ValueError:
++                    pass
++                else:
++                    raise AssertionError("public registry alias minted a state selection")
++            finally:
++                fixture.close()
++        ''')
++        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++    def test_state_first_import_preserves_genuine_registry_reads(self):
++        script = textwrap.dedent('''
++            from ashare_pipeline.formal_policy_state import FormalPolicyStateRepository
++            from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++            fixture = PolicyRuntimeFixture()
++            try:
++                selected = fixture.state_selection("SH600000")
++                assert selected.values
++                selected.recheck()
++            finally:
++                fixture.close()
++        ''')
++        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++    def api(self):
++        self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_policy_state"),
++                             "authenticated policy state selection is missing")
++        from ashare_pipeline import formal_policy_state
++        return formal_policy_state
++
++    def fixture(self, **kwargs):
++        self.api()
++        fixture = PolicyRuntimeFixture(**kwargs)
++        self.addCleanup(fixture.close)
++        return fixture
++
++    def selected_value(self, fixture, selection, semantic):
++        rule = next(r for r in fixture.policy_registry.to_dict()["rules"]
++                    if r["template_id"] == "bank" and r["semantic_id"] == semantic)
++        return selection.values[digest(rule["inputs"]["value"])], rule
++
++    def test_false_flag_is_not_missing_flag(self):
++        read_flag = self.api().read_flag
++        self.assertIs(read_flag(({"flag_id": "audit", "active": False},), "audit"), False)
++        self.assertIsNone(read_flag((), "audit"))
++        for flags in (({"flag_id": "audit", "active": 0},),
++                      ({"flag_id": "audit", "active": True},) * 2):
++            with self.assertRaises(ValueError):
++                read_flag(flags, "audit")
++
++    def test_real_false_matches_signed_expected_false(self):
++        def configure(documents):
++            descriptor = next(d for d in documents["scoring"]["descriptors"]
++                              if d["context_kind"] == "regulatory_state")
++            descriptor["allowed_regulatory_flags"] = sorted([*descriptor["allowed_regulatory_flags"], "fixture_false"])
++            for role in ("status", "event"):
++                for rule in documents[role]["rules"].values():
++                    for selector in rule.get("inputs", {}).values():
++                        if selector.get("context_kind") == "regulatory_state":
++                            selector["descriptor_id"] = digest(descriptor)
++            rule = copy.deepcopy(documents["status"]["rules"]["bank_audit_qualified"])
++            rule["semantic_id"] = "fixture_false"
++            rule["inputs"]["value"]["entry_id"] = "fixture_false"
++            rule["parameters"]["expected"] = False
++            documents["status"]["rules"]["bank_fixture_false"] = rule
++            active = documents["status"]["rules"]["execution_contract"]["rule_ids"]
++            active.append("bank_fixture_false")
++            active.sort()
++            documents["scoring"]["scoring"]["status_rules"].append(
++                dict(policy_role="status", rule_id="bank_fixture_false"))
++        fixture = self.fixture(mutate=configure)
++        fact, ref = fixture.put_policy_context("SH600000", "regulatory_state",
++            {"flags": [{"flag_id": "fixture_false", "active": False}]})
++        selected = fixture.state_selection("SH600000")
++        value, rule = self.selected_value(fixture, selected, "fixture_false")
++        self.assertEqual(value.state, "value")
++        self.assertIs(value.value, False)
++        self.assertIs(value.value, rule["parameters"]["expected"])
++        self.assertIn(fact.id, str(selected.lineage))
++        self.assertIn(ref.snapshot_id, str(selected.lineage))
++        selected.recheck()
++
++    def test_missing_flag_is_pending_and_keeps_whole_factor(self):
++        fixture = self.fixture()
++        fixture.put_policy_context("SH600000", "regulatory_state",
++            {"flags": [{"flag_id": "governance_red", "active": False}]})
++        selected = fixture.state_selection("SH600000")
++        value, _ = self.selected_value(fixture, selected, "audit_qualified")
++        self.assertIsNone(value.value)
++        self.assertEqual(value.to_dict()["pending"][0]["code"], "state_entry_missing")
++        self.assertIn("governance_red", str(selected.lineage))
++
++    def test_absent_factor_is_bound_pending_and_late_factor_invalidates(self):
++        fixture = self.fixture()
++        selected = fixture.state_selection("SH600000")
++        value, _ = self.selected_value(fixture, selected, "st")
++        self.assertEqual(value.state, "missing")
++        self.assertEqual(value.to_dict()["pending"][0]["origin"], "runtime")
++        self.assertTrue(value.evidence_hashes)
++        selected.recheck()
++        fixture.put_policy_context("SH600000", "security_state", SECURITY)
++        with self.assertRaises(ValueError):
++            selected.recheck()
++
++    def test_security_flags_and_enum_are_projected_without_suspension_veto(self):
++        fixture = self.fixture()
++        fixture.put_policy_context("SH600000", "security_state", {**SECURITY, "suspended": True})
++        selected = fixture.state_selection("SH600000")
++        for semantic in ("st", "star_st", "forced_delist_risk"):
++            value, _ = self.selected_value(fixture, selected, semantic)
++            self.assertIs(value.value, False)
++        value, _ = self.selected_value(fixture, selected, "delisting_arrangement")
++        self.assertEqual(value.value, "listed")
++        self.assertNotIn("suspended", [entry["selector"]["field"]
++            for entry in selected.lineage["entries"].values()])
++        self.assertFalse(hasattr(selected, "effects"))
++
++    def test_unapproved_flag_or_event_id_fails_producer_contract(self):
++        for kind, value in (("regulatory_state", {"flags": [{"flag_id": "invented", "active": False}]}),
++            ("event_calendar", {"events": [dict(event_id="invented", event_date="2026-08-31",
++                quantified_value="2", unit="ratio")]})):
++            fixture = self.fixture()
++            with self.subTest(kind=kind), self.assertRaises(ValueError):
++                fixture.put_policy_context("SH600000", kind, value)
++
++    def test_current_correction_invalidates_even_same_value(self):
++        fixture = self.fixture()
++        fixture.put_policy_context("SH600000", "security_state", SECURITY)
++        selected = fixture.state_selection("SH600000")
++        fixture.put_policy_context("SH600000", "security_state", SECURITY, generation="g2")
++        with self.assertRaises(ValueError):
++            selected.recheck()
++        self.assertNotEqual(selected.selection_hash, fixture.state_selection("SH600000").selection_hash)
++
++    def test_registered_raw_loss_is_failure_not_pending(self):
++        fixture = self.fixture()
++        _, ref = fixture.put_policy_context("SH600000", "security_state", SECURITY)
++        selected = fixture.state_selection("SH600000")
++        # This path is owned by this fixture's TemporaryDirectory only.
++        paths = list((fixture.root / "raw").rglob(ref.content_sha256 + ".bin"))
++        self.assertTrue(paths)
++        paths[0].unlink()
++        with self.assertRaises(ValueError):
++            selected.recheck()
++
++    def test_copied_selection_or_repository_has_no_authority(self):
++        fixture = self.fixture()
++        selected = fixture.state_selection("SH600000")
++        for clone in (copy.copy, copy.deepcopy):
++            with self.assertRaises(TypeError):
++                clone(selected)
++        fake = object.__new__(type(selected))
++        with self.assertRaises(ValueError):
++            fake.recheck()
++        context = copy.copy(fixture.context)
++        with self.assertRaises(ValueError):
++            self.api().FormalPolicyStateRepository(context)
++        repository = self.api().FormalPolicyStateRepository(fixture.context)
++        for clone in (copy.copy, copy.deepcopy):
++            with self.assertRaises(TypeError):
++                clone(repository)
++        forged = object.__new__(type(repository))
++        with self.assertRaises(ValueError):
++            forged.select("SH600000", FREEZE, template_id="bank", policy_registry=fixture.policy_registry)
++        repository.select("SH600000", FREEZE, template_id="bank", policy_registry=fixture.policy_registry).recheck()
++
++    def test_context_method_shadow_is_rejected_before_and_after_selection(self):
++        fixture = self.fixture()
++        selected = fixture.state_selection("SH600000")
++        with patch.object(fixture.context, "get_verified_many", lambda *a: {}):
++            with self.assertRaises(ValueError):
++                selected.recheck()
++            with self.assertRaises(ValueError):
++                self.api().FormalPolicyStateRepository(fixture.context)
++
++    def test_selection_method_shadow_is_rejected(self):
++        fixture = self.fixture()
++        selected = fixture.state_selection("SH600000")
++        with patch.object(type(selected), "recheck", lambda self: None):
++            with self.assertRaises(ValueError):
++                selected.recheck()
++
++    def test_value_validator_replacement_is_an_integrity_failure(self):
++        fixture = self.fixture()
++        selected = fixture.state_selection("SH600000")
++        with patch.object(PolicyValue, "from_dict", lambda wire: wire):
++            try:
++                with self.assertRaises(ValueError):
++                    selected.recheck()
++            except AttributeError as error:
++                self.fail(f"validator substitution requires an integrity error: {error}")
++
++    def test_value_serializer_replacement_cannot_forge_selected_values(self):
++        fixture = self.fixture()
++        selected = fixture.state_selection("SH600000")
++        with patch.object(PolicyValue, "to_dict", lambda self: {}):
++            with self.assertRaises(ValueError):
++                fixture.state_selection("SH600000")
++            with self.assertRaises(ValueError):
++                selected.recheck()
++
++    def test_wrong_freeze_template_and_registry_fail(self):
++        fixture = self.fixture()
++        repository = self.api().FormalPolicyStateRepository(fixture.context)
++        for security, freeze, template, registry in (("sh600000", FREEZE, "bank", fixture.policy_registry),
++            ("SH600000", "2026-08-30T07:00:00+00:00", "bank", fixture.policy_registry),
++            ("SH600000", FREEZE, "invented", fixture.policy_registry),
++            ("SH600000", FREEZE, "bank", object.__new__(type(fixture.policy_registry)))):
++            with self.subTest(security=security, freeze=freeze, template=template), self.assertRaises(ValueError):
++                repository.select(security, freeze, template_id=template, policy_registry=registry)
++
++    def test_equal_leading_versions_are_not_pending(self):
++        fixture = self.fixture()
++        fixture.put_policy_context("SH600000", "security_state", SECURITY)
++        selected = fixture.state_selection("SH600000")
++        # Test-only fixture timestamps deliberately create a genuine leading tie.
++        fixture._policy_context_generations[("SH600000", "security_state")]["tie"] = 0
++        fixture.put_policy_context("SH600000", "security_state", SECURITY, generation="tie")
++        with self.assertRaises(ValueError):
++            fixture.state_selection("SH600000")
++        with self.assertRaises(ValueError):
++            selected.recheck()
++
++    def test_receipt_loss_revokes_current_selection(self):
++        fixture = self.fixture()
++        _, ref = fixture.put_policy_context("SH600000", "regulatory_state", {"flags": []})
++        selected = fixture.state_selection("SH600000")
++        fixture.sql("DELETE FROM formal_task_snapshot_receipt WHERE task_id=?", (ref.producing_task_id,))
++        with self.assertRaises(ValueError):
++            selected.recheck()
++
++    def test_signed_major_event_flag_remains_boolean_not_quantified_zero(self):
++        fixture = self.fixture()
++        fixture.put_policy_context("SH600000", "regulatory_state",
++            {"flags": [{"flag_id": "major_event", "active": False}]})
++        selected = fixture.state_selection("SH600000")
++        value, _ = self.selected_value(fixture, selected, "major_event")
++        self.assertIs(value.value, False)
++        self.assertEqual(value.value_type, "bool")
++        self.assertIsNone(value.unit)
++
++    def test_unquantified_context_event_cannot_be_zero_filled(self):
++        fixture = self.fixture()
++        with self.assertRaises(ValueError):
++            fixture.put_policy_context("SH600000", "event_calendar", {"events": [dict(
++                event_id="fixture_quantified_event", event_date="2026-08-31", quantified_value=None, unit="ratio")]})
++
++    def test_v1_genuine_registry_rejects_quantified_event_rule_input(self):
++        def configure(documents):
++            entry = next(d for d in documents["scoring"]["descriptors"] if d["context_kind"] == "event_calendar")
++            selector = context_selector("event_calendar", "event", "event_record",
++                entry_id="fixture_quantified_event", expected_unit="ratio")
++            selector.update(descriptor_id=digest(entry), scope_key=entry["scope_key"])
++            documents["event"]["rules"]["bank_major_event"]["inputs"]["value"] = selector
++        with self.assertRaises(ValueError):
++            self.fixture(mutate=configure)
++
++    def test_unrequested_event_factor_is_not_read_or_given_policy_authority(self):
++        fixture = self.fixture()
++        selected = fixture.state_selection("SH600000")
++        fixture.put_policy_context("SH600000", "event_calendar", {"events": [dict(
++            event_id="fixture_quantified_event", event_date="2026-08-31", quantified_value="2", unit="ratio")]})
++        selected.recheck()
++        self.assertEqual(selected.selection_hash, fixture.state_selection("SH600000").selection_hash)
++        self.assertNotIn("event_calendar", [entry["selector"]["context_kind"]
++                         for entry in selected.lineage["entries"].values()])
++
++    def test_audit_views_are_detached_and_read_only(self):
++        fixture = self.fixture()
++        selected = fixture.state_selection("SH600000")
++        with self.assertRaises(TypeError):
++            selected.values["invented"] = None
++        with self.assertRaises(TypeError):
++            selected.lineage["security_id"] = "SZ000001"
++        value, _ = self.selected_value(fixture, selected, "st")
++        for clone in (copy.copy(value), copy.deepcopy(value)):
++            self.assertEqual(clone.to_dict(), value.to_dict())
++        wire = value.to_dict()
++        wire["pending"][0]["code"] = "unsupported_unit"
++        self.assertEqual(self.selected_value(fixture, selected, "st")[0].to_dict()["pending"][0]["code"],
++                         "state_entry_missing")
++        selected.recheck()
++
++    def test_replaced_raw_store_or_verifier_invalidates_retained_repository(self):
++        fixture = self.fixture()
++        selected = fixture.state_selection("SH600000")
++        for target, name, replacement in ((fixture.context, "_verifier", object()),
++                                          (fixture.snapshots, "_raw_store", copy.copy(fixture.raw))):
++            with self.subTest(name=name), patch.object(target, name, replacement), self.assertRaises(ValueError):
++                selected.recheck()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_formal_policy_values.py b/tests/test_formal_policy_values.py
+index e70bf14..ba04020 100644
+--- a/tests/test_formal_policy_values.py
++++ b/tests/test_formal_policy_values.py
+@@ -152,27 +152,68 @@ class PolicyValueTests(unittest.TestCase):
+             value_wire(state="missing", value="0", pending=[pending_wire()]),
+             value_wire(state="domain_conflict", value=False, value_type="bool", unit=None,
+                        pending=[pending_wire()]),
+             value_wire(state="missing", value=None, pending=[]),
+             value_wire(state="value", pending=[pending_wire()]),
+         )
+         for wire in invalid:
+             with self.subTest(wire=wire), self.assertRaises(ValueError):
+                 PolicyValue.from_dict(wire)
+ 
+-    def test_nonmissing_compound_records_wait_for_closed_producer_validators(self):
+-        for value_type in ("event_record", "calendar_record", "market_window"):
++    def test_nonmissing_remaining_compound_records_wait_for_closed_producer_validators(self):
++        for value_type in ("calendar_record", "market_window"):
+             with self.subTest(value_type=value_type), self.assertRaises(ValueError):
+                 PolicyValue.from_dict(value_wire(
+                     value_type=value_type, value={"apparently": "valid"}, unit=None
+                 ))
+ 
++    def test_event_record_preserves_four_fields_without_evidence_authority(self):
++        record = dict(event_id="fixture_quantified_event", event_date="2026-08-31",
++                      quantified_value="4.2", unit="ratio")
++        try:
++            value = PolicyValue.from_dict(value_wire(value_type="event_record", value=record, unit=None))
++        except ValueError as error:
++            self.fail(f"the closed event record must preserve actual Context fields: {error}")
++        self.assertEqual(value.to_dict()["value"], record)
++        self.assertEqual(value.value["quantified_value"], Decimal("4.2"))
++        record["quantified_value"] = "9"
++        self.assertEqual(value.to_dict()["value"]["quantified_value"], "4.2")
++        with self.assertRaises(TypeError):
++            value.value["event_id"] = "other"
++        self.assertFalse(hasattr(value, "require_verified"))
++
++    def test_event_record_rejects_malformed_dates_units_or_quantities(self):
++        record = dict(event_id="fixture_quantified_event", event_date="2026-08-31",
++                      quantified_value="4.2", unit="ratio")
++        invalid = ["4.2", {"apparently": "valid"}, {**record, "extra": True},
++            {key: value for key, value in record.items() if key != "event_date"}]
++        invalid.extend({**record, **change} for change in (
++            {"event_date": "2026-02-30"}, {"event_date": "20260831"},
++            {"event_date": 20260831}, {"event_id": ""}, {"unit": ""},
++            {"quantified_value": None}, {"quantified_value": False},
++            {"quantified_value": 4.2}, {"quantified_value": "NaN"},
++            {"quantified_value": "4.20"}))
++        for record in invalid:
++            with self.subTest(record=record), self.assertRaises(ValueError):
++                PolicyValue.from_dict(value_wire(value_type="event_record", value=record, unit=None))
++
++    def test_event_dto_preserves_context_unit_text_without_claiming_visibility(self):
++        for unit in ("%", "CNY/share"):
++            record = dict(event_id="fixture_quantified_event", event_date="2026-09-30",
++                          quantified_value="-2.5", unit=unit)
++            try:
++                value = PolicyValue.from_dict(value_wire(value_type="event_record", value=record, unit=None))
++            except ValueError as error:
++                self.fail(f"Context unit text and scheduled date must be retained by the DTO: {error}")
++            self.assertEqual(value.to_dict()["value"], record)
++            self.assertFalse(hasattr(value, "recheck"))
++
+     def test_runtime_and_signed_policy_pending_reasons_are_strict(self):
+         runtime_codes = (
+             "applicability_unresolved", "current_receipt_absent",
+             "financial_input_missing", "financial_domain_conflict", "unsupported_unit",
+             "invalid_denominator", "visibility_unproven", "state_entry_missing",
+             "calendar_coverage_missing", "market_coverage_missing", "market_price_missing",
+             "market_domain_conflict", "market_evidence_missing",
+         )
+         for code in runtime_codes:
+             with self.subTest(code=code):
+

@@ -1,0 +1,14 @@
+TEST_STARTED test_formal_final_eligibility.PureEligibilityRulesTests.test_each_threshold_uses_unrounded_decimal_at_both_adjacent_values
+test_each_threshold_uses_unrounded_decimal_at_both_adjacent_values (test_formal_final_eligibility.PureEligibilityRulesTests.test_each_threshold_uses_unrounded_decimal_at_both_adjacent_values) ... ok
+TEST_STARTED test_formal_final_eligibility.PureEligibilityRulesTests.test_hard_veto_or_both_prohibition_yields_pool_vetoed
+test_hard_veto_or_both_prohibition_yields_pool_vetoed (test_formal_final_eligibility.PureEligibilityRulesTests.test_hard_veto_or_both_prohibition_yields_pool_vetoed) ... ok
+TEST_STARTED test_formal_final_eligibility.PureEligibilityRulesTests.test_out_of_scope_precedes_pending_and_veto
+test_out_of_scope_precedes_pending_and_veto (test_formal_final_eligibility.PureEligibilityRulesTests.test_out_of_scope_precedes_pending_and_veto) ... ok
+TEST_STARTED test_formal_final_eligibility.PureEligibilityRulesTests.test_threshold_equalities_are_inclusive_except_wait_t_is_strictly_below_55
+test_threshold_equalities_are_inclusive_except_wait_t_is_strictly_below_55 (test_formal_final_eligibility.PureEligibilityRulesTests.test_threshold_equalities_are_inclusive_except_wait_t_is_strictly_below_55) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.002s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_eligibility.PureEligibilityRulesTests.test_each_threshold_uses_unrounded_decimal_at_both_adjacent_values", "test_formal_final_eligibility.PureEligibilityRulesTests.test_hard_veto_or_both_prohibition_yields_pool_vetoed", "test_formal_final_eligibility.PureEligibilityRulesTests.test_out_of_scope_precedes_pending_and_veto", "test_formal_final_eligibility.PureEligibilityRulesTests.test_threshold_equalities_are_inclusive_except_wait_t_is_strictly_below_55"], "passed": ["test_formal_final_eligibility.PureEligibilityRulesTests.test_each_threshold_uses_unrounded_decimal_at_both_adjacent_values", "test_formal_final_eligibility.PureEligibilityRulesTests.test_hard_veto_or_both_prohibition_yields_pool_vetoed", "test_formal_final_eligibility.PureEligibilityRulesTests.test_out_of_scope_precedes_pending_and_veto", "test_formal_final_eligibility.PureEligibilityRulesTests.test_threshold_equalities_are_inclusive_except_wait_t_is_strictly_below_55"], "tests_run": 4, "failures": 0, "errors": 0, "skipped": 0}

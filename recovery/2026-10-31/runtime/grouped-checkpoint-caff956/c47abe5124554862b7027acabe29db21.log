@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_performance.RunnerPerformanceTests.test_rebuild_appends_once_and_revalidates_even_when_no_input_changed
+test_rebuild_appends_once_and_revalidates_even_when_no_input_changed (test_formal_final_performance.RunnerPerformanceTests.test_rebuild_appends_once_and_revalidates_even_when_no_input_changed) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 10380.148s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_performance.RunnerPerformanceTests.test_rebuild_appends_once_and_revalidates_even_when_no_input_changed"], "passed": ["test_formal_final_performance.RunnerPerformanceTests.test_rebuild_appends_once_and_revalidates_even_when_no_input_changed"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

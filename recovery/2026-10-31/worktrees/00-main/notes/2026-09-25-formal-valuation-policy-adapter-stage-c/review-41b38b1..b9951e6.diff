@@ -1,0 +1,139 @@
+# Review package: 41b38b15..b9951e68
+
+## Commits
+b9951e6 Seal range format helper dependencies in binding checks
+
+## Files changed
+ ashare_pipeline/formal_range_contract.py | 12 +++++--
+ tests/test_formal_range_contract.py      | 55 ++++++++++++++++++++++++++++++++
+ 2 files changed, 65 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_range_contract.py b/ashare_pipeline/formal_range_contract.py
+index 25993a6..3ec7493 100644
+--- a/ashare_pipeline/formal_range_contract.py
++++ b/ashare_pipeline/formal_range_contract.py
+@@ -70,33 +70,41 @@ def _build_range_bindings_contract():
+     from .formal_range_format import RangeConfig, parse_range_entry, _range_config_to_dict
+     from . import formal_range_format as format_module
+     from . import formal_context_schema as context_module
+ 
+     require_bundle = bundle_type.require_official
+     blob_for = bundle_type.blob
+     require_scoring = scoring_type.require_official
+     policy_bytes_for = policy_type.canonical_bytes
+ 
+     module_globals = globals()
++    # parse_range_entry -> _bridge/_context_selector, _request_template and its
++    # text/tree helpers, numeric validators and _freeze. The serializer used by
++    # current checks -> _thaw (recursive). Inventory every non-builtin global
++    # reached by those call chains, including the module aliases they use.
+     dependencies = tuple((module_globals, name, module_globals[name]) for name in (
+         "_load_canonical_object", "_canonical", "_freeze", "_text", "_exchange",
+         "RangeConfig", "parse_range_entry", "MappingProxyType", "json", "hashlib", "weakref",
+     )) + tuple((vars(format_module), name, vars(format_module)[name]) for name in (
+         "RangeConfig", "parse_range_entry", "_range_config_to_dict", "_canonical",
+         "_text", "_hash", "_exchange", "_positive_number", "_positive_integer",
+         "_https_url", "_placeholder_text", "_template_tree", "_request_template",
+-        "_walk_strings", "_context_selector", "_freeze", "json", "hashlib", "math", "re",
++        "_walk_strings", "_context_selector", "_bridge", "_freeze", "_thaw",
++        "Mapping", "MappingProxyType", "json", "hashlib", "math", "re",
+         "_SOURCES", "_EXCHANGES", "_IDENTIFIER", "_VERSION_IDENTIFIER", "_SHA256",
+         "_PLACEHOLDER", "_PLACEHOLDERS", "_RANGE_FIELDS", "_RANGE_FIELD_SET",
+         "_CONTEXT_SELECTOR_FIELDS",
+     )) + ((vars(context_module), "_descriptor", validate_descriptor),
+-          (vars(json), "loads", json.loads), (vars(hashlib), "sha256", hashlib.sha256))
++          (vars(json), "loads", json.loads), (vars(json), "dumps", json.dumps),
++          (vars(hashlib), "sha256", hashlib.sha256),
++          (vars(format_module.math), "isfinite", format_module.math.isfinite),
++          (vars(format_module.re), "fullmatch", format_module.re.fullmatch))
+     config_members = tuple(vars(RangeConfig).items())
+     interfaces = (
+         (bundle_type, "require_official", require_bundle),
+         (bundle_type, "blob", blob_for),
+         (scoring_type, "require_official", require_scoring),
+         (policy_type, "canonical_bytes", policy_bytes_for),
+     )
+ 
+     def _check_dependencies() -> None:
+         if any(owner.get(name) is not expected for owner, name, expected in dependencies):
+diff --git a/tests/test_formal_range_contract.py b/tests/test_formal_range_contract.py
+index e83064f..7bfc378 100644
+--- a/tests/test_formal_range_contract.py
++++ b/tests/test_formal_range_contract.py
+@@ -61,20 +61,75 @@ class FormalRangeContractTests(unittest.TestCase):
+                 load_policy_range_bindings(bundle, scoring_registry=scoring, policy_registry=policy)
+ 
+         bindings = load_policy_range_bindings(
+             bundle, scoring_registry=scoring, policy_registry=policy)
+         binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+         with patch.object(range_format.RangeConfig, "to_dict", lambda self: original(self)):
+             with self.assertRaises(ValueError):
+                 binding.require_current()
+         binding.require_current()
+ 
++    def test_range_format_thaw_and_bridge_replacement_before_first_load_is_rejected(self):
++        from ashare_pipeline import formal_range_format as range_format
++        from ashare_pipeline.formal_range_contract import load_policy_range_bindings
++
++        bundle, vocabulary, scoring, *_ = range_graph()
++        policy = load_formal_policy_registry(
++            bundle, scoring_registry=scoring, feature_registry=vocabulary)
++        for name in ("_thaw", "_bridge"):
++            original = getattr(range_format, name)
++            with self.subTest(name=name), patch.object(
++                    range_format, name, lambda *args, _original=original: _original(*args)):
++                with self.assertRaises(ValueError):
++                    load_policy_range_bindings(
++                        bundle, scoring_registry=scoring, policy_registry=policy)
++
++    def test_range_format_thaw_cannot_hide_mutated_market_config(self):
++        from ashare_pipeline import formal_range_contract as contract
++        from ashare_pipeline import formal_range_format as range_format
++
++        bindings, *_ = self._load()
++        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
++        _, owner_read = contract._range_binding_planning_authority()
++        market = binding.market_config
++        original_dataset = market.dataset
++        original_thaw = range_format._thaw
++        try:
++            object.__setattr__(market, "dataset", "unsigned-dataset")
++
++            def disguised(value):
++                return original_dataset if value == "unsigned-dataset" else original_thaw(value)
++
++            with patch.object(range_format, "_thaw", disguised):
++                with self.assertRaises(ValueError):
++                    binding.require_current()
++                with self.assertRaises(ValueError):
++                    owner_read(binding)
++        finally:
++            object.__setattr__(market, "dataset", original_dataset)
++        binding.require_current()
++
++    def test_range_format_bridge_replacement_after_warmup_is_rejected(self):
++        from ashare_pipeline import formal_range_contract as contract
++        from ashare_pipeline import formal_range_format as range_format
++
++        bindings, *_ = self._load()
++        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
++        _, owner_read = contract._range_binding_planning_authority()
++        original = range_format._bridge
++        with patch.object(range_format, "_bridge", lambda *args: original(*args)):
++            with self.assertRaises(ValueError):
++                binding.require_current()
++            with self.assertRaises(ValueError):
++                owner_read(binding)
++        binding.require_current()
++
+     def test_v2_adapter_and_feature_bytes_remain_current_dependencies(self):
+         from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+         from tests.formal_policy_fixtures import policy_graph
+         from tests.formal_range_fixtures import add_range_documents
+ 
+         bundle, vocabulary, scoring, *_ = policy_graph(
+             manifest_version="formal-registry-manifest-v2",
+             with_valuation_adapter=True, mutate=add_range_documents)
+         policy = load_formal_policy_registry(
+             bundle, scoring_registry=scoring, feature_registry=vocabulary)

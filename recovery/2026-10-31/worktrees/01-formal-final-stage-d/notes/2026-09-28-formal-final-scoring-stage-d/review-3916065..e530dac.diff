@@ -1,0 +1,587 @@
+# Review package: 3916065333df1a7c2686185c5d1f0dbde7b75915..e530dac
+
+## Commits
+e530dac feat: derive formal score eligibility
+
+## Files changed
+ ashare_pipeline/formal_final_eligibility.py   | 271 ++++++++++++++++++++++++++
+ tests/test_formal_final_eligibility.py        | 204 +++++++++++++++++++
+ tests/test_formal_final_eligibility_guards.py |  82 ++++++++
+ 3 files changed, 557 insertions(+)
+
+## Diff
+diff --git a/ashare_pipeline/formal_final_eligibility.py b/ashare_pipeline/formal_final_eligibility.py
+new file mode 100644
+index 0000000..f1c5f9b
+--- /dev/null
++++ b/ashare_pipeline/formal_final_eligibility.py
+@@ -0,0 +1,271 @@
++"""Authenticated final states and two-pool eligibility from matching D1/D2 proofs."""
++
++from __future__ import annotations
++
++import hashlib
++import inspect
++import json
++import weakref
++from decimal import Decimal
++from types import MappingProxyType
++
++from .formal_final_score_inputs import PolicyAdjustedScoreInputBatch
++from .formal_final_scoring import FinalScoreCardBatch
++from .formal_scoring import _canonical, _digest, _freeze
++
++
++_D2_RECORD = inspect.getclosurevars(FinalScoreCardBatch.require_verified).nonlocals["record"]
++_HARD_VETO_SEMANTICS = frozenset({
++    "st", "star_st", "delisting_arrangement", "forced_delist_risk",
++    "governance_red", "nonpositive_equity", "audit_adverse",
++    "audit_disclaimer", "audit_qualified", "no_effective_trade_20d",
++})
++
++
++def _threshold_breakdown(*, Sc, B, C, M, EQ, FS, T):
++    values = {"Sc": Sc, "B": B, "C": C, "M": M, "EQ": EQ, "FS": FS, "T": T}
++    if any(type(value) is not Decimal or not value.is_finite()
++           for value in values.values()):
++        raise ValueError("eligibility thresholds require finite exact Decimal values")
++    common = {"C": C >= Decimal(".75"), "M": M >= Decimal("45"),
++              "EQ": EQ >= Decimal("45"), "FS": FS >= Decimal("45")}
++    return {"strong": {"Sc": Sc >= Decimal("70"), **common, "T": T >= Decimal("55")},
++            "wait": {"B": B >= Decimal("65"), **common, "T": T < Decimal("55")}}
++
++
++def _state_for(pending, hard_veto, strong_prohibited, wait_prohibited, *, out_of_scope=False):
++    if out_of_scope:
++        return "out_of_scope"
++    if pending:
++        return "pending_evidence"
++    if hard_veto or (strong_prohibited and wait_prohibited):
++        return "pool_vetoed"
++    return "formal_scored"
++
++
++def _validate_scorecard_coverage(security_ids, wire):
++    """Check the canonical D2 partition before interpreting any member."""
++    if type(wire) is not dict or type(wire.get("cards")) is not list or type(wire.get("pending")) is not dict:
++        raise ValueError("final scorecard coverage is malformed")
++    ids = tuple(security_ids)
++    if len(ids) != len(set(ids)) or ids != tuple(sorted(ids)) or tuple(wire.get("security_ids", ())) != ids:
++        raise ValueError("final scorecard universe differs from D1")
++    card_ids = [card.get("security_id") for card in wire["cards"] if type(card) is dict]
++    if len(card_ids) != len(wire["cards"]) or len(card_ids) != len(set(card_ids)):
++        raise ValueError("final scorecards contain a malformed or duplicate member")
++    pending_ids = set(wire["pending"])
++    if (set(card_ids) & pending_ids or set(card_ids) | pending_ids != set(ids)
++            or len(card_ids) + len(pending_ids) != len(ids)
++            or card_ids != sorted(card_ids)):
++        raise ValueError("final scorecards are missing, duplicated or outside the universe")
++
++
++def _d2_source(scores):
++    # D2 seals this source in its private proof record; checking identity closes
++    # an otherwise ambiguous same-hash, different-publication handoff.
++    return _D2_RECORD(scores, FinalScoreCardBatch)[3]
++
++
++def _install_eligibility():
++    proofs = {}
++
++    def record(item, cls):
++        saved = proofs.get(id(item))
++        if type(item) is not cls or saved is None or saved[0]() is not item or saved[4] is not cls:
++            raise ValueError("formal eligibility proof is forged or revoked")
++        inputs, scores, input_bytes, score_bytes = saved[2]
++        inputs.require_verified()
++        scores.require_verified()
++        if (inputs.canonical_bytes() != input_bytes or scores.canonical_bytes() != score_bytes
++                or _d2_source(scores) is not inputs):
++            raise ValueError("formal eligibility source publication changed")
++        return saved
++
++    class SealedMeta(type):
++        def __setattr__(cls, name, value):
++            raise TypeError("formal eligibility types are immutable")
++
++    class Proof(metaclass=SealedMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("formal eligibility requires matching genuine D1/D2 batches")
++
++        def __getattribute__(self, name):
++            record(self, type(self))
++            return object.__getattribute__(self, name)
++
++        def __getattr__(self, name):
++            data = record(self, type(self))[1]
++            if name not in data:
++                raise AttributeError(name)
++            return data[name]
++
++        def require_verified(self):
++            record(self, type(self))
++
++        def canonical_bytes(self):
++            return record(self, type(self))[3]
++
++        def to_dict(self):
++            return json.loads(record(self, type(self))[3])
++
++        def __copy__(self):
++            raise TypeError("formal eligibility proofs cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("formal eligibility proofs cannot be copied")
++
++        def __reduce_ex__(self, protocol):
++            raise TypeError("formal eligibility proofs cannot be reconstructed")
++
++    class FormalEligibility(Proof):
++        __slots__ = ()
++
++    class FormalEligibilityBatch(Proof):
++        __slots__ = ()
++
++        def eligibility_for(self, security_id):
++            saved = record(self, FormalEligibilityBatch)
++            if type(security_id) is not str or security_id not in saved[5]:
++                raise ValueError("eligibility selector is outside the frozen universe")
++            result = saved[5][security_id]
++            result.require_verified()
++            return result
++
++    def mint(cls, payload, sources, *, index=None, attributes=None):
++        result = object.__new__(cls)
++        key = id(result)
++        data = dict(payload)
++        data.update(attributes or {})
++        proofs[key] = (weakref.ref(result, lambda _: proofs.pop(key, None)),
++            _freeze(data), sources, _canonical(payload), cls, MappingProxyType(index or {}))
++        return result
++
++    def build(inputs, scores):
++        if type(inputs) is not PolicyAdjustedScoreInputBatch or type(scores) is not FinalScoreCardBatch:
++            raise ValueError("eligibility requires genuine D1 and D2 batches")
++        inputs.require_verified()
++        scores.require_verified()
++        if _d2_source(scores) is not inputs:
++            raise ValueError("eligibility D1/D2 publications do not match")
++        input_bytes, score_bytes = inputs.canonical_bytes(), scores.canonical_bytes()
++        input_wire = inputs.to_dict()
++        score_wire = scores.to_dict()
++        ids = tuple(inputs.security_ids)
++        if (_canonical(input_wire) != input_bytes or _canonical(score_wire) != score_bytes
++                or tuple(input_wire.get("security_ids", ())) != ids
++                or tuple(row.get("security_id") for row in input_wire.get("inputs", ())) != ids):
++            raise ValueError("eligibility D1 canonical member snapshot is incomplete")
++        _validate_scorecard_coverage(ids, score_wire)
++        input_batch_hash, score_batch_hash = inputs.batch_hash, scores.batch_hash
++        if (input_wire["batch_hash"] != input_batch_hash
++                or score_wire["batch_hash"] != score_batch_hash
++                or score_wire["source_batch_hash"] != input_batch_hash
++                or score_wire["source_canonical_sha256"] != hashlib.sha256(input_bytes).hexdigest()):
++            raise ValueError("eligibility D2 batch is not bound to D1")
++        for key in ("registry_manifest_hash", "frozen_input_hash", "universe_hash"):
++            if input_wire[key] != score_wire[key]:
++                raise ValueError("eligibility D1/D2 root or frozen universe mismatch")
++        input_rows = MappingProxyType({row["security_id"]: _freeze(row)
++            for row in input_wire["inputs"]})
++        card_rows = MappingProxyType({row["security_id"]: _freeze(row)
++            for row in score_wire["cards"]})
++        if len(input_rows) != len(ids) or len(card_rows) != len(score_wire["cards"]):
++            raise ValueError("eligibility member snapshot is duplicated")
++        # Validate every genuine selector once, then use only the immutable,
++        # canonical batch snapshot for derivation. DTOs never enter this API.
++        for sid in ids:
++            selected = inputs.input_for(sid)
++            if selected.canonical_bytes() != _canonical(dict(input_rows[sid],
++                    batch_hash=input_batch_hash)):
++                raise ValueError("eligibility D1 selector differs from canonical snapshot")
++            selected_card = scores.card_for(sid)
++            if selected_card is None:
++                if sid not in score_wire["pending"]:
++                    raise ValueError("eligibility missing D2 pending member")
++            elif (sid not in card_rows or selected_card.canonical_bytes() !=
++                    _canonical(dict(card_rows[sid], score_batch_hash=score_batch_hash))):
++                raise ValueError("eligibility D2 selector differs from canonical snapshot")
++        sources = (inputs, scores, input_bytes, score_bytes)
++        rows, index = [], {}
++        for sid in ids:
++            row_wire = input_rows[sid]
++            card_wire = card_rows.get(sid)
++            if row_wire["status"] not in ("ready", "pending_evidence"):
++                raise ValueError("D1 cannot declare out of scope or unknown states")
++            policy = row_wire["policy_result"]
++            pools = policy["pool_prohibitions"]
++            strong_prohibited = bool(pools.get("strong"))
++            wait_prohibited = bool(pools.get("wait"))
++            hard_veto = any(decision["semantic_id"] in _HARD_VETO_SEMANTICS
++                and any(effect["kind"] == "pool_prohibition" for effect in decision["proven_effects"])
++                for decision in policy["decisions"])
++            pending = row_wire["status"] == "pending_evidence"
++            if pending != (card_wire is None):
++                raise ValueError("D1 status and D2 scorecard partition disagree")
++            if card_wire is not None:
++                if (card_wire["security_id"] != sid
++                        or card_wire["source_entry_hash"] != row_wire["entry_hash"]
++                        or card_wire["source_batch_hash"] != input_batch_hash
++                        or card_wire["secondary_industry"] != row_wire["secondary_industry"]
++                        or card_wire["score_batch_hash"] != score_batch_hash):
++                    raise ValueError("eligibility card and input provenance mismatch")
++                fields = {"Sc": Decimal(card_wire["Sc"]),
++                    "C": Decimal(card_wire["confidence"]["C"]),
++                    "R_safety": Decimal(card_wire["R_safety"]),
++                    "B": Decimal(card_wire["B"]),
++                    "V": Decimal(card_wire["dimensions"]["V"])}
++                gates = _threshold_breakdown(Sc=fields["Sc"], B=fields["B"],
++                    C=fields["C"], M=Decimal(card_wire["dimensions"]["M"]),
++                    EQ=Decimal(card_wire["dimensions"]["EQ"]),
++                    FS=Decimal(card_wire["dimensions"]["FS"]),
++                    T=Decimal(card_wire["dimensions"]["T"]))
++            else:
++                fields = None
++                gates = {"strong": dict.fromkeys(("Sc", "C", "M", "EQ", "FS", "T"), False),
++                    "wait": dict.fromkeys(("B", "C", "M", "EQ", "FS", "T"), False)}
++            state = _state_for(pending, hard_veto, strong_prohibited, wait_prohibited)
++            strong = state == "formal_scored" and not strong_prohibited and all(gates["strong"].values())
++            wait = state == "formal_scored" and not wait_prohibited and all(gates["wait"].values())
++            if strong and wait:
++                raise ValueError("formal strong and wait eligibility must be mutually exclusive")
++            reasons = list(row_wire["reasons"] if pending else ())
++            if hard_veto:
++                reasons.append("hard_veto")
++            if strong_prohibited:
++                reasons.append("strong_prohibited")
++            if wait_prohibited:
++                reasons.append("wait_prohibited")
++            for pool, checks in gates.items():
++                reasons.extend(pool + ":" + key + "_below_threshold" for key, passed in checks.items()
++                    if not passed)
++            payload = dict(schema_version="formal-eligibility-v1", security_id=sid,
++                state=state, source_entry_hash=row_wire["entry_hash"], source_batch_hash=input_batch_hash,
++                score_batch_hash=score_batch_hash,
++                card_hash=None if card_wire is None else card_wire["card_hash"],
++                secondary_industry=None if card_wire is None else row_wire["secondary_industry"],
++                sort_fields=fields, pending_reasons=tuple(row_wire["reasons"] if pending else ()),
++                hard_veto=hard_veto, strong_prohibited=strong_prohibited,
++                wait_prohibited=wait_prohibited, thresholds=gates,
++                strong_qualified=strong, wait_qualified=wait,
++                reason_codes=tuple(sorted(set(reasons))))
++            payload["eligibility_hash"] = _digest(payload)
++            rows.append(payload)
++            index[sid] = mint(FormalEligibility, payload, sources)
++        batch_payload = dict(schema_version="formal-eligibility-batch-v1",
++            security_ids=ids, source_batch_hash=input_batch_hash,
++            score_batch_hash=score_batch_hash, eligibilities=rows)
++        batch_payload["batch_hash"] = _digest(batch_payload)
++        result = mint(FormalEligibilityBatch, batch_payload, sources, index=index,
++            attributes={"eligibilities": tuple(index[sid] for sid in ids)})
++        result.require_verified()
++        return result
++
++    return FormalEligibility, FormalEligibilityBatch, build
++
++
++FormalEligibility, FormalEligibilityBatch, build_formal_eligibility_batch = _install_eligibility()
++del _install_eligibility
++
++__all__ = ["FormalEligibility", "FormalEligibilityBatch", "build_formal_eligibility_batch"]
+diff --git a/tests/test_formal_final_eligibility.py b/tests/test_formal_final_eligibility.py
+new file mode 100644
+index 0000000..01c5142
+--- /dev/null
++++ b/tests/test_formal_final_eligibility.py
+@@ -0,0 +1,204 @@
++"""D3b state and threshold behavior over genuine D1 and D2 publications."""
++
++import unittest
++import inspect
++import sys
++from decimal import Decimal
++
++from ashare_pipeline.formal_final_eligibility import (
++    _state_for, _threshold_breakdown, build_formal_eligibility_batch,
++)
++from ashare_pipeline.formal_final_score_inputs import PolicyAdjustedScoreInputBatch
++from ashare_pipeline.formal_final_scoring import (
++    FinalScoreCardBatch, build_final_score_card_batch,
++)
++from tests.formal_final_scoring_fixtures import FinalScoringFixture
++from tests.test_formal_final_scoring import d1_batch
++from tests.test_formal_final_scoring import shared_ready_batch, NO_CAP_PEER
++
++
++class PureEligibilityRulesTests(unittest.TestCase):
++    def test_out_of_scope_precedes_pending_and_veto(self):
++        self.assertEqual(_state_for(True, True, True, True, out_of_scope=True),
++            "out_of_scope")
++
++    def test_hard_veto_or_both_prohibition_yields_pool_vetoed(self):
++        self.assertEqual(_state_for(False, True, False, False), "pool_vetoed")
++        self.assertEqual(_state_for(False, False, True, True), "pool_vetoed")
++        self.assertEqual(_state_for(True, True, True, True), "pending_evidence")
++        self.assertEqual(_state_for(False, False, True, False), "formal_scored")
++
++    def test_threshold_equalities_are_inclusive_except_wait_t_is_strictly_below_55(self):
++        values = dict(Sc=Decimal("70"), B=Decimal("65"), C=Decimal(".75"),
++            M=Decimal("45"), EQ=Decimal("45"), FS=Decimal("45"), T=Decimal("55"))
++        gates = _threshold_breakdown(**values)
++        self.assertTrue(all(gates["strong"].values()))
++        self.assertFalse(gates["wait"]["T"])
++        values["T"] = Decimal("55").next_minus()
++        gates = _threshold_breakdown(**values)
++        self.assertTrue(all(gates["wait"].values()))
++        self.assertFalse(gates["strong"]["T"])
++
++    def test_each_threshold_uses_unrounded_decimal_at_both_adjacent_values(self):
++        thresholds = {"Sc": Decimal("70"), "B": Decimal("65"),
++            "C": Decimal(".75"), "M": Decimal("45"),
++            "EQ": Decimal("45"), "FS": Decimal("45"), "T": Decimal("55")}
++        for name, boundary in thresholds.items():
++            for adjacent, expected in ((boundary.next_minus(), False),
++                                       (boundary, True), (boundary.next_plus(), True)):
++                with self.subTest(name=name, adjacent=adjacent):
++                    values = dict(thresholds, **{name: adjacent})
++                    gates = _threshold_breakdown(**values)
++                    pool = "wait" if name == "B" else "strong"
++                    self.assertIs(gates[pool][name], expected)
++            if name == "T":
++                for adjacent, expected in ((boundary.next_minus(), True),
++                                           (boundary, False), (boundary.next_plus(), False)):
++                    values = dict(thresholds, T=adjacent)
++                    self.assertIs(_threshold_breakdown(**values)["wait"]["T"], expected)
++
++
++class FormalEligibilityTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture, cls.inputs, cls.cards = shared_ready_batch()
++        cls.batch = build_formal_eligibility_batch(cls.inputs, cls.cards)
++
++    def test_pending_precedes_known_veto_and_emits_no_score_eligibility(self):
++        self.assertEqual(_state_for(True, True, True, True, out_of_scope=True),
++            "out_of_scope")
++        self.assertEqual(_state_for(True, True, True, True), "pending_evidence")
++        for sid in self.inputs.security_ids:
++            row = self.inputs.input_for(sid)
++            if row.status != "pending_evidence":
++                continue
++            item = self.batch.eligibility_for(sid)
++            self.assertEqual(item.state, "pending_evidence")
++            self.assertFalse(item.strong_qualified)
++            self.assertFalse(item.wait_qualified)
++            self.assertEqual(item.pending_reasons, row.reasons)
++
++    def test_pending_has_no_card_hash_or_sort_fields_but_remains_not_qualified_traceable(self):
++        sid = next(s for s in self.inputs.security_ids
++            if self.inputs.input_for(s).status == "pending_evidence")
++        item = self.batch.eligibility_for(sid)
++        self.assertIsNone(item.card_hash)
++        self.assertIsNone(item.sort_fields)
++        self.assertEqual(item.source_entry_hash, self.inputs.input_for(sid).entry_hash)
++        self.assertTrue(item.reason_codes)
++
++    def test_single_pool_prohibition_only_blocks_that_pool(self):
++        found = False
++        for sid in self.inputs.security_ids:
++            item = self.batch.eligibility_for(sid)
++            if item.state == "formal_scored" and item.strong_prohibited != item.wait_prohibited:
++                found = True
++                self.assertFalse(item.hard_veto)
++                self.assertFalse(item.strong_qualified if item.strong_prohibited
++                    else item.wait_qualified)
++        self.assertTrue(found)
++
++    def test_sort_fields_and_industry_are_bound_to_exact_d1_d2_hashes(self):
++        sid = NO_CAP_PEER
++        item = self.batch.eligibility_for(sid)
++        row, card = self.inputs.input_for(sid), self.cards.card_for(sid)
++        self.assertEqual(item.source_entry_hash, row.entry_hash)
++        self.assertEqual(item.card_hash, card.card_hash)
++        self.assertEqual(item.secondary_industry, row.secondary_industry)
++        self.assertEqual(item.sort_fields, {"Sc": card.Sc, "C": card.confidence["C"],
++            "R_safety": card.R_safety, "B": card.B, "V": card.dimensions["V"]})
++
++    def test_each_frozen_member_has_exactly_one_state_and_complete_threshold_trace(self):
++        self.assertEqual(self.batch.security_ids, self.inputs.security_ids)
++        self.assertEqual(len(self.batch.eligibilities), len(self.inputs.security_ids))
++        for sid in self.inputs.security_ids:
++            item = self.batch.eligibility_for(sid)
++            self.assertIn(item.state, {"out_of_scope", "pending_evidence",
++                "pool_vetoed", "formal_scored"})
++            self.assertEqual(set(item.thresholds), {"strong", "wait"})
++            self.assertEqual(set(item.thresholds["strong"]),
++                {"Sc", "C", "M", "EQ", "FS", "T"})
++            self.assertEqual(set(item.thresholds["wait"]),
++                {"B", "C", "M", "EQ", "FS", "T"})
++            self.assertFalse(item.strong_qualified and item.wait_qualified)
++
++    def test_genuine_ordinary_a_batch_has_zero_out_of_scope_members(self):
++        self.assertNotIn("out_of_scope", [item.state for item in self.batch.eligibilities])
++
++
++class SmallGenuineEligibilityTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture = FinalScoringFixture(peer_count=3)
++        try:
++            cls.fixture.populate_final_inputs()
++            cls.inputs = d1_batch(cls.fixture)
++            cls.cards = build_final_score_card_batch(cls.inputs)
++            cls.batch = build_formal_eligibility_batch(cls.inputs, cls.cards)
++        except BaseException:
++            cls.fixture.close()
++            raise
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.fixture.close()
++
++    def test_three_member_snapshot_preserves_pending_provenance(self):
++        self.assertEqual(len(self.batch.security_ids), 3)
++        self.assertEqual(tuple(item.security_id for item in self.batch.eligibilities),
++            self.inputs.security_ids)
++        for sid in self.inputs.security_ids:
++            item = self.batch.eligibility_for(sid)
++            self.assertEqual(item.state, "pending_evidence")
++            self.assertEqual(item.source_entry_hash, self.inputs.input_for(sid).entry_hash)
++            self.assertIsNone(item.card_hash)
++            self.assertIsNone(item.sort_fields)
++            self.assertFalse(item.strong_qualified or item.wait_qualified)
++
++    def test_repeated_access_revalidates_source_without_replaying_selectors(self):
++        item = self.batch.eligibility_for(self.inputs.security_ids[0])
++        selector_codes = {PolicyAdjustedScoreInputBatch.input_for.__code__,
++            FinalScoreCardBatch.card_for.__code__}
++        selected = []
++
++        def observe(frame, event, arg):
++            if event == "call" and frame.f_code in selector_codes:
++                selected.append(frame.f_code.co_name)
++
++        previous = sys.getprofile()
++        sys.setprofile(observe)
++        try:
++            for _ in range(3):
++                item.require_verified()
++                self.assertEqual(item.state, "pending_evidence")
++                self.assertIsNone(item.card_hash)
++        finally:
++            sys.setprofile(previous)
++        self.assertEqual(selected, [])
++
++        record = inspect.getclosurevars(
++            PolicyAdjustedScoreInputBatch.input_for).nonlocals["record"]
++        proofs = inspect.getclosurevars(record).nonlocals["proofs"]
++        publication = proofs[id(self.inputs)][4]
++        publication[0] = False
++        try:
++            with self.assertRaises(ValueError):
++                item.require_verified()
++        finally:
++            publication[0] = True
++        item.require_verified()
++
++    def test_three_member_guards_reject_mismatched_publication_and_plain_values(self):
++        replay = d1_batch(self.fixture)
++        self.assertEqual(replay.batch_hash, self.inputs.batch_hash)
++        self.assertIsNot(replay, self.inputs)
++        with self.assertRaises(ValueError):
++            build_formal_eligibility_batch(replay, self.cards)
++        with self.assertRaises(ValueError):
++            build_formal_eligibility_batch(self.inputs.to_dict(), self.cards)
++        with self.assertRaises(ValueError):
++            build_formal_eligibility_batch(self.inputs, self.cards.to_dict())
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_formal_final_eligibility_guards.py b/tests/test_formal_final_eligibility_guards.py
+new file mode 100644
+index 0000000..afb41ff
+--- /dev/null
++++ b/tests/test_formal_final_eligibility_guards.py
+@@ -0,0 +1,82 @@
++"""D3b accepts only matching, complete genuine Stage D proof chains."""
++
++import copy
++import unittest
++
++from ashare_pipeline.formal_final_eligibility import (
++    FormalEligibility, FormalEligibilityBatch, _validate_scorecard_coverage,
++    build_formal_eligibility_batch,
++)
++from ashare_pipeline.formal_scoring import calculate_pre_policy_score
++from tests.test_formal_final_scoring import d1_batch, shared_ready_batch, NO_CAP_PEER
++
++
++class PureEligibilityGuardTests(unittest.TestCase):
++    def test_plain_values_cannot_enter_public_builder(self):
++        for inputs, scores in (({}, {}), ([], []), (None, None)):
++            with self.subTest(types=(type(inputs), type(scores))):
++                with self.assertRaises(ValueError):
++                    build_formal_eligibility_batch(inputs, scores)
++
++    def test_proof_classes_cannot_be_constructed_or_forged(self):
++        with self.assertRaises(TypeError):
++            FormalEligibility(state="out_of_scope")
++        with self.assertRaises(TypeError):
++            FormalEligibilityBatch()
++        forged = object.__new__(FormalEligibility)
++        with self.assertRaises(ValueError):
++            forged.require_verified()
++
++
++class FormalEligibilityGuardTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.fixture, cls.inputs, cls.cards = shared_ready_batch()
++
++    def test_mismatched_d1_d2_batches_are_rejected(self):
++        other_inputs = d1_batch(self.fixture)
++        self.assertEqual(other_inputs.batch_hash, self.inputs.batch_hash)
++        self.assertIsNot(other_inputs, self.inputs)
++        with self.assertRaises(ValueError):
++            build_formal_eligibility_batch(other_inputs, self.cards)
++
++    def test_missing_duplicate_or_extra_scorecards_are_rejected(self):
++        genuine = self.cards.to_dict()
++        ids = self.inputs.security_ids
++        _validate_scorecard_coverage(ids, genuine)
++        for variant in ("missing", "duplicate", "extra"):
++            with self.subTest(variant=variant):
++                wire = copy.deepcopy(genuine)
++                if variant == "missing":
++                    wire["cards"] = [c for c in wire["cards"]
++                        if c["security_id"] != NO_CAP_PEER]
++                elif variant == "duplicate":
++                    wire["cards"].append(copy.deepcopy(wire["cards"][0]))
++                else:
++                    wire["cards"].append(dict(wire["cards"][0], security_id="SH999999"))
++                with self.assertRaises(ValueError):
++                    _validate_scorecard_coverage(ids, wire)
++
++    def test_caller_cannot_forge_out_of_scope_state(self):
++        with self.assertRaises(TypeError):
++            FormalEligibility(state="out_of_scope")
++        with self.assertRaises(TypeError):
++            FormalEligibilityBatch()
++        batch = build_formal_eligibility_batch(self.inputs, self.cards)
++        with self.assertRaises((AttributeError, TypeError)):
++            batch.eligibility_for(NO_CAP_PEER).state = "out_of_scope"
++
++    def test_plain_mapping_or_prepolicy_score_cannot_enter_eligibility(self):
++        base = self.fixture.base_repository.build_batch(
++            self.fixture.frozen.frozen_input_hash, scoring_registry=self.fixture.scoring)
++        pre_policy = calculate_pre_policy_score(base.input_for(NO_CAP_PEER))
++        for a, b in ((self.inputs.to_dict(), self.cards),
++                     (self.inputs, self.cards.to_dict()),
++                     (self.inputs, pre_policy)):
++            with self.subTest(types=(type(a), type(b))):
++                with self.assertRaises(ValueError):
++                    build_formal_eligibility_batch(a, b)
++
++
++if __name__ == "__main__":
++    unittest.main()

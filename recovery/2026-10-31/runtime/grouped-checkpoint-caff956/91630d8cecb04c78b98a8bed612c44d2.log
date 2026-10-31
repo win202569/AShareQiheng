@@ -1,0 +1,12 @@
+TEST_STARTED test_formal_final_eligibility.SmallGenuineEligibilityTests.test_repeated_access_revalidates_source_without_replaying_selectors
+test_repeated_access_revalidates_source_without_replaying_selectors (test_formal_final_eligibility.SmallGenuineEligibilityTests.test_repeated_access_revalidates_source_without_replaying_selectors) ... ok
+TEST_STARTED test_formal_final_eligibility.SmallGenuineEligibilityTests.test_three_member_guards_reject_mismatched_publication_and_plain_values
+test_three_member_guards_reject_mismatched_publication_and_plain_values (test_formal_final_eligibility.SmallGenuineEligibilityTests.test_three_member_guards_reject_mismatched_publication_and_plain_values) ... ok
+TEST_STARTED test_formal_final_eligibility.SmallGenuineEligibilityTests.test_three_member_snapshot_preserves_pending_provenance
+test_three_member_snapshot_preserves_pending_provenance (test_formal_final_eligibility.SmallGenuineEligibilityTests.test_three_member_snapshot_preserves_pending_provenance) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 561.687s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_eligibility.SmallGenuineEligibilityTests.test_repeated_access_revalidates_source_without_replaying_selectors", "test_formal_final_eligibility.SmallGenuineEligibilityTests.test_three_member_guards_reject_mismatched_publication_and_plain_values", "test_formal_final_eligibility.SmallGenuineEligibilityTests.test_three_member_snapshot_preserves_pending_provenance"], "passed": ["test_formal_final_eligibility.SmallGenuineEligibilityTests.test_repeated_access_revalidates_source_without_replaying_selectors", "test_formal_final_eligibility.SmallGenuineEligibilityTests.test_three_member_guards_reject_mismatched_publication_and_plain_values", "test_formal_final_eligibility.SmallGenuineEligibilityTests.test_three_member_snapshot_preserves_pending_provenance"], "tests_run": 3, "failures": 0, "errors": 0, "skipped": 0}

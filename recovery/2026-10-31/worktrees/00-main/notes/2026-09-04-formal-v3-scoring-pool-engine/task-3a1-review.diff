@@ -1,0 +1,537 @@
+# Task 3A1 review package
+Base: be01e65ef1557943b63b84a80383252963512db7
+Head: frozen working-tree diff (no task commit yet)
+Commits: none for this slice; parent commits only after review.
+Scope: exactly four code/test files (two production modifications, one existing test modification, one new test file); no data/progress/index changes.
+
+warning: in the working copy of 'ashare_pipeline/formal_context_schema.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'ashare_pipeline/formal_scoring_registry.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_formal_context_repository.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/ashare_pipeline/formal_context_schema.py b/ashare_pipeline/formal_context_schema.py
+index a671eb3..c418402 100644
+--- a/ashare_pipeline/formal_context_schema.py
++++ b/ashare_pipeline/formal_context_schema.py
+@@ -549,28 +549,34 @@ def _trusted_context_types():
+ 
+         @classmethod
+         def load(cls, state_store, registry_signature_verifier, registry_manifest_hash):
+             from .state_store import StateStore
+             if cls is not Registry or type(state_store) is not StateStore:
+                 raise ValueError("Context registry requires exact StateStore")
+             bundle = FormalRegistryBundleLoader(state_store, registry_signature_verifier).load(registry_manifest_hash)
+             bundle.require_official()
+             scoring = bundle.blob("scoring")
+             wire = _load(scoring.canonical_json)
+-            if wire.get("schema_version") == "formal-scoring-registry-v1":
+-                _keys(wire, ("registry_role", "schema_version", "descriptors", "scoring"))
++            version = wire.get("schema_version")
++            if version in ("formal-scoring-registry-v1", "formal-scoring-registry-v2"):
++                fields = ("registry_role", "schema_version", "descriptors", "scoring")
++                if version == "formal-scoring-registry-v2":
++                    fields += ("input_alternatives",)
++                _keys(wire, fields)
+                 if type(wire["scoring"]) is not dict:
+                     raise ValueError("Context scoring wrapper must contain a scoring object")
++                if version == "formal-scoring-registry-v2" and type(wire["input_alternatives"]) is not list:
++                    raise ValueError("Context scoring wrapper input alternatives must be an array")
+             else:
+                 _keys(wire, ("registry_role", "schema_version", "descriptors"))
+             if wire["registry_role"] != "scoring" or wire["schema_version"] not in (
+-                "formal-context-registry-v1", "formal-scoring-registry-v1"
++                "formal-context-registry-v1", "formal-scoring-registry-v1", "formal-scoring-registry-v2"
+             ):
+                 raise ValueError("unsupported Context registry wrapper")
+             if type(wire["descriptors"]) is not list:
+                 raise ValueError("Context descriptors must be a canonical array")
+             seen = set()
+             for descriptor in wire["descriptors"]:
+                 _descriptor(descriptor)
+                 identity = (descriptor["context_kind"], descriptor["scope_key"], descriptor["security_scope"])
+                 if identity in seen:
+                     raise ValueError("duplicate Context descriptor")
+diff --git a/ashare_pipeline/formal_scoring_registry.py b/ashare_pipeline/formal_scoring_registry.py
+index 0953920..654629a 100644
+--- a/ashare_pipeline/formal_scoring_registry.py
++++ b/ashare_pipeline/formal_scoring_registry.py
+@@ -12,20 +12,21 @@ from dataclasses import dataclass, fields
+ from decimal import Decimal, InvalidOperation
+ import hashlib
+ import json
+ from pathlib import Path
+ import re
+ from types import MappingProxyType
+ from typing import Literal
+ import weakref
+ 
+ from .formal_feature_contract import FormalFeatureSlot, SignedFormalFeatureRegistry
++from .formal_context_schema import _canonical as _context_canonical, _descriptor
+ from .formal_registry_manifest import VerifiedRegistryBundle
+ 
+ 
+ class RegistryValidationError(ValueError):
+     """A scoring contract or its signed graph proof is incomplete or invalid."""
+ 
+ 
+ _TEMPLATES = ("general_nonfinancial", "bank", "broker", "insurance", "real_estate")
+ _DIMENSIONS = ("G", "V", "M", "EQ", "FS", "CA", "T")
+ _WEIGHTS = tuple(map(Decimal, ("0.18", "0.18", "0.18", "0.12", "0.08", "0.16", "0.10")))
+@@ -301,24 +302,81 @@ def _metric(wire, template_id, dimension, metric_id, weight, slots, policies, co
+     _texts(wire["source_evidence_categories"], "source_evidence_categories")
+     if type(wire["policy_refs"]) is not list or not wire["policy_refs"]:
+         raise RegistryValidationError("metric policy_refs must be explicit")
+     for reference in wire["policy_refs"]:
+         _rule(reference, policies, contracts, _POLICY_ROLES)
+     values = {key: _freeze(value) for key, value in wire.items()}
+     values.update(internal_weight=weight, original_formula=_freeze(original))
+     return MetricDefinition(**values)
+ 
+ 
++def _consensus_links(wrapper, templates):
++    descriptors = wrapper["descriptors"]
++    seen = set()
++    by_hash = {}
++    for descriptor in descriptors:
++        _descriptor(descriptor)
++        identity = (descriptor["context_kind"], descriptor["scope_key"], descriptor["security_scope"])
++        if identity in seen:
++            raise RegistryValidationError("duplicate Context descriptor")
++        seen.add(identity)
++        digest = hashlib.sha256(_context_canonical(descriptor)).hexdigest()
++        if digest in by_hash:
++            raise RegistryValidationError("ambiguous Context descriptor hash")
++        by_hash[digest] = descriptor
++    alternatives = wrapper["input_alternatives"]
++    if type(alternatives) is not list:
++        raise RegistryValidationError("input_alternatives must be an explicit array")
++    result = {}
++    template_ids = []
++    for alternative in alternatives:
++        _keys(alternative, ("rule_id", "template_id", "metric_id", "feature_key", "descriptor_id"), "input alternative")
++        for field in ("rule_id", "template_id", "metric_id", "feature_key", "descriptor_id"):
++            _text(alternative[field], f"input alternative {field}")
++        template_id = alternative["template_id"]
++        template_ids.append(template_id)
++        if alternative["rule_id"] != "consensus-no-coverage-neutral-v1":
++            raise RegistryValidationError("unsupported input alternative rule_id")
++        if template_id not in templates:
++            raise RegistryValidationError("input alternative template_id is not a V3 template")
++        if alternative["metric_id"] != "T.expectation_change":
++            raise RegistryValidationError("input alternative metric_id must be T.expectation_change")
++        expectation = next(metric for metric in templates[template_id].metrics["T"]
++            if metric.metric_id == "expectation_change")
++        feature_key = alternative["feature_key"]
++        if expectation.required_feature_keys != (feature_key,) or expectation.formula != {
++                "op": "feature", "feature_key": feature_key} or expectation.field_map != {"value": feature_key}:
++            raise RegistryValidationError("input alternative feature_key differs from the sole expectation_change adapter")
++        if any(feature_key in metric.required_feature_keys for dimension in templates[template_id].metrics.values()
++                for metric in dimension if metric is not expectation):
++            raise RegistryValidationError("input alternative feature_key is shared by another metric")
++        descriptor_id = _hash(alternative["descriptor_id"], "input alternative descriptor_id")
++        linked = by_hash.get(descriptor_id)
++        if linked is None:
++            raise RegistryValidationError("input alternative descriptor_id is absent")
++        if (linked["context_kind"], linked["security_scope"], linked["request_security"], linked["period_rule"]) != (
++                "consensus_snapshot", "security", "input_security", "freeze_date_cn"):
++            raise RegistryValidationError("input alternative descriptor has incompatible Context semantics")
++        result[template_id] = _freeze(dict(alternative, context_kind=linked["context_kind"], scope_key=linked["scope_key"]))
++    if template_ids != sorted(template_ids) or len(set(template_ids)) != len(template_ids):
++        raise RegistryValidationError("input alternatives must be unique and sorted by template_id")
++    return MappingProxyType(result)
++
++
+ def _parse(raw, approval, bundle, feature_registry):
+     wrapper = _load(raw)
+-    _keys(wrapper, ("registry_role", "schema_version", "descriptors", "scoring"), "scoring wrapper")
+-    if wrapper["registry_role"] != "scoring" or wrapper["schema_version"] != "formal-scoring-registry-v1":
++    version = wrapper.get("schema_version")
++    expected_wrapper = ("registry_role", "schema_version", "descriptors", "scoring")
++    if version == "formal-scoring-registry-v2":
++        expected_wrapper += ("input_alternatives",)
++    _keys(wrapper, expected_wrapper, "scoring wrapper")
++    if wrapper["registry_role"] != "scoring" or version not in ("formal-scoring-registry-v1", "formal-scoring-registry-v2"):
+         raise RegistryValidationError("unsupported scoring wrapper")
+     if type(wrapper["descriptors"]) is not list:
+         raise RegistryValidationError("descriptors must be an array")
+     scoring = wrapper["scoring"]
+     if type(scoring) is not dict or scoring.get("purpose") not in ("test", "official"):
+         raise RegistryValidationError("scoring purpose must be test or official")
+     purpose = scoring["purpose"]
+     expected = {"contract_version", "purpose", "dimension_weights", "internal_weights", "templates", "policy_contracts",
+         "cyclic_rule", "redlines", "status_rules", "market_liquidity_rule"}
+     if purpose == "test":
+@@ -374,39 +432,41 @@ def _parse(raw, approval, bundle, feature_registry):
+             raise RegistryValidationError("template_id mismatch")
+         _keys(template["metrics"], _DIMENSIONS, "template metrics")
+         metrics = {}
+         for d, metric_ids in zip(_DIMENSIONS, _SLOTS):
+             values = template["metrics"][d]
+             if type(values) is not list or len(values) != len(metric_ids):
+                 raise RegistryValidationError(f"template {t}.{d} must contain every V3 slot")
+             metrics[d] = tuple(_metric(w, t, d, m, weight, slots[t], policies, contracts)
+                 for w, m, weight in zip(values, metric_ids, internal[d]))
+         templates[t] = TemplateDefinition(t, MappingProxyType(metrics))
++    consensus_links = (_consensus_links(wrapper, templates) if version == "formal-scoring-registry-v2"
++        else MappingProxyType({}))
+     cyclic = _rule(scoring["cyclic_rule"], policies, contracts, ("cyclic",))
+     cyclic_wire = policies["cyclic"]["rules"][cyclic.rule_id]
+     _keys(cyclic_wire, ("secondary_industries",), "cyclic classification")
+     industries = frozenset(_texts(cyclic_wire["secondary_industries"], "cyclic secondary_industries", allow_empty=True))
+     references = {}
+     for name, roles, cls in (("redlines", ("redline",), RedlineDefinition), ("status_rules", ("status", "event"), StatusRule)):
+         if type(scoring[name]) is not list or not scoring[name]:
+             raise RegistryValidationError(f"{name} must be explicit nonempty rules")
+         rules = tuple(_rule(ref, policies, contracts, roles, cls) for ref in scoring[name])
+         if len({(rule.policy_role, rule.rule_id) for rule in rules}) != len(rules) or {r.policy_role for r in rules} != set(roles):
+             raise RegistryValidationError(f"{name} requires unique rules for every role")
+         references[name] = rules
+     market = _rule(scoring["market_liquidity_rule"], policies, contracts, ("status",))
+     return dict(contract_version="V3", content_sha256=digest, templates=MappingProxyType(templates),
+         dimension_weights=MappingProxyType(weights), internal_weights=MappingProxyType(internal),
+         cyclic_secondary_industries=industries, cyclic_rule=cyclic, market_liquidity_rule=market,
+         policy_contracts=_freeze(contracts), approval=RegistryApproval(approval.purpose, approval.approved_content_sha256, approval.approval_id),
+         registry_manifest_hash=bundle.manifest.manifest_hash if bundle is not None else None,
+-        role_hashes=MappingProxyType(role_hashes), **references)
++        role_hashes=MappingProxyType(role_hashes), consensus_no_coverage_links=consensus_links, **references)
+ 
+ 
+ def _trusted_registry():
+     seals = {}
+ 
+     def fingerprint(value):
+         if type(value) in (str, bytes, int, bool, Decimal, type(None)):
+             return (type(value), value)
+         if type(value) in (tuple, frozenset):
+             return (type(value), tuple(fingerprint(v) for v in (sorted(value) if type(value) is frozenset else value)))
+@@ -435,20 +495,21 @@ def _trusted_registry():
+         internal_weights: Mapping[str, tuple[Decimal, ...]]
+         cyclic_secondary_industries: frozenset[str]
+         redlines: tuple[RedlineDefinition, ...]
+         status_rules: tuple[StatusRule, ...]
+         cyclic_rule: StatusRule
+         market_liquidity_rule: StatusRule
+         policy_contracts: Mapping[str, Mapping[str, object]]
+         approval: RegistryApproval
+         registry_manifest_hash: str | None
+         role_hashes: Mapping[str, str]
++        consensus_no_coverage_links: Mapping[str, Mapping[str, str]]
+ 
+         def __init__(self, *args, **kwargs):
+             raise RegistryValidationError("FormalScoringRegistry requires load_formal_registry")
+ 
+         def template_for(self, template_id):
+             sealed(self)
+             if type(template_id) is not str or template_id not in self.templates:
+                 raise RegistryValidationError("unknown template_id")
+             return self.templates[template_id]
+ 
+diff --git a/tests/test_formal_context_repository.py b/tests/test_formal_context_repository.py
+index ecc3dab..55a31e0 100644
+--- a/tests/test_formal_context_repository.py
++++ b/tests/test_formal_context_repository.py
+@@ -58,54 +58,81 @@ class FixtureNormalizer:
+         # Independent canonical fixture computation; the self-referential field is not yet present.
+         digest = hashlib.sha256(canonical(dict(schema_version="formal-context-normalization-input-v1",
+             descriptor_id=request.descriptor_id, normalizer_version=request.normalizer_version,
+             request=request.to_dict(), source_snapshot_manifest_sha256=snapshot.manifest_sha256,
+             source_content_sha256=snapshot.content_sha256, fact=wire))).hexdigest()
+         wire["evidence"]["normalization_input_hash"] = digest
+         return (FormalContextFact.create(**wire),)
+ 
+ 
+ class ScoringWrapperIntegrationTests(unittest.TestCase):
+-    def load_wrapper(self, mutate=None):
++    @staticmethod
++    def v2(documents):
++        wrapper = documents["scoring"]
++        linked = descriptor("consensus_snapshot", scope_key="fixture-consensus")
++        descriptor_id = hashlib.sha256(canonical(linked)).hexdigest()
++        metric = wrapper["scoring"]["templates"]["bank"]["metrics"]["T"][2]
++        wrapper.update(schema_version="formal-scoring-registry-v2",
++            input_alternatives=[dict(rule_id="consensus-no-coverage-neutral-v1", template_id="bank",
++                metric_id="T.expectation_change", feature_key=metric["required_feature_keys"][0],
++                descriptor_id=descriptor_id)])
++        wrapper["descriptors"].append(linked)
++
++    def load_wrapper(self, mutate=None, *, context_kind="security_state", scope_key="fixture-state"):
+         from tests.test_formal_scoring_registry import signed_graph
+         from ashare_pipeline.formal_context_schema import FormalContextRegistry, SignedContextRequestResolver
+         bundle, _, repository, verifier = signed_graph(context=True, mutate=mutate)
+         temp = tempfile.TemporaryDirectory()
+         self.addCleanup(temp.cleanup)
+         store = StateStore(Path(temp.name) / "context.sqlite", registry_signature_verifier=verifier)
+         store.initialize()
+         for blob in repository.blobs.values():
+             store.put_formal_registry_blob(blob)
+         store.put_formal_registry_manifest(repository.manifest)
+         registry = FormalContextRegistry.load(store, verifier, bundle.manifest.manifest_hash)
+         resolver = SignedContextRequestResolver(store, verifier)
+-        request = resolver.resolve(context_kind="security_state", scope_key="fixture-state", security_id="SZ000001",
++        request = resolver.resolve(context_kind=context_kind, scope_key=scope_key, security_id="SZ000001",
+             as_of_utc=FREEZE, registry_manifest_hash=bundle.manifest.manifest_hash, upstream_generation="wrapper-test")
+         return registry.descriptor_for(request), request
+ 
+     def test_combined_scoring_wrapper_preserves_legacy_descriptor_identity(self):
+         def legacy(docs):
+             docs["scoring"].pop("scoring")
+             docs["scoring"]["schema_version"] = "formal-context-registry-v1"
+         old_descriptor, old_request = self.load_wrapper(legacy)
++        v1_descriptor, v1_request = self.load_wrapper()
+         try:
+-            new_descriptor, new_request = self.load_wrapper()
++            v2_descriptor, v2_request = self.load_wrapper(self.v2)
+         except ValueError as error:
+-            self.fail(f"the explicitly versioned combined wrapper must be accepted: {error}")
+-        self.assertEqual(old_descriptor, new_descriptor)
+-        self.assertEqual(old_request.descriptor_id, new_request.descriptor_id)
+-        self.assertEqual(new_request.official_request.dataset, "fixture-state")
++            self.fail(f"the explicitly versioned combined wrappers must be accepted: {error}")
++        self.assertEqual(old_descriptor, v1_descriptor)
++        self.assertEqual(v1_descriptor, v2_descriptor)
++        self.assertEqual(old_request.descriptor_id, v1_request.descriptor_id)
++        self.assertEqual(v1_request.descriptor_id, v2_request.descriptor_id)
++        self.assertEqual(v2_request.official_request.dataset, "fixture-state")
++
++    def test_v2_linked_consensus_descriptor_resolves_with_canonical_entry_id(self):
++        linked_descriptor, request = self.load_wrapper(self.v2,
++            context_kind="consensus_snapshot", scope_key="fixture-consensus")
++        self.assertEqual(linked_descriptor, descriptor("consensus_snapshot", scope_key="fixture-consensus"))
++        self.assertEqual(request.descriptor_id, hashlib.sha256(canonical(linked_descriptor)).hexdigest())
++        self.assertEqual(request.official_request.dataset, "fixture-state")
+ 
+     def test_combined_wrapper_rejects_unknown_keys_versions_and_invalid_descriptors(self):
++        def v2_non_list(documents):
++            self.v2(documents)
++            documents["scoring"]["input_alternatives"] = {}
++
+         for mutation in (lambda d: d["scoring"].update(extra=True),
+-            lambda d: d["scoring"].update(schema_version="formal-scoring-registry-v2"),
++            lambda d: d["scoring"].update(schema_version="formal-scoring-registry-v999"),
+             lambda d: d["scoring"].update(scoring=[]),
++            v2_non_list,
+             lambda d: d["scoring"]["descriptors"][0].update(extra=True)):
+             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                 self.load_wrapper(mutation)
+ 
+ 
+ class ContextIntegrationTests(unittest.TestCase):
+     def setUp(self):
+         self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_context_repository"))
+         self.api = importlib.import_module("ashare_pipeline.formal_context_repository")
+         self.schema = importlib.import_module("ashare_pipeline.formal_context_schema")
+
+diff --git a/tests/test_formal_scoring_consensus_registry.py b/tests/test_formal_scoring_consensus_registry.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_formal_scoring_consensus_registry.py
+@@ -0,0 +1,211 @@
++"""Signed neutral-consensus linkage contract tests."""
++
++import hashlib
++import importlib
++import copy
++from types import MappingProxyType
++import unittest
++
++from tests.test_formal_context_repository import descriptor
++from tests.test_formal_context_schema import canonical
++from tests.test_formal_scoring_registry import FIXTURE, TEMPLATES, fixture_wire, signed_graph
++
++
++def consensus_descriptor(**changes):
++    return descriptor("consensus_snapshot", scope_key="fixture-consensus", **changes)
++
++
++def v2_graph(*, template_ids=("bank",), descriptor_changes=None, mutate=None):
++    linked_descriptor = consensus_descriptor(**(descriptor_changes or {}))
++    descriptor_id = hashlib.sha256(canonical(linked_descriptor)).hexdigest()
++    post_mutate = mutate
++
++    def make_v2(documents):
++        wrapper = documents["scoring"]
++        wrapper["schema_version"] = "formal-scoring-registry-v2"
++        wrapper["descriptors"].append(linked_descriptor)
++        links = []
++        for template_id in sorted(template_ids):
++            metric = wrapper["scoring"]["templates"][template_id]["metrics"]["T"][2]
++            links.append(dict(rule_id="consensus-no-coverage-neutral-v1", template_id=template_id,
++                metric_id="T.expectation_change", feature_key=metric["required_feature_keys"][0],
++                descriptor_id=descriptor_id))
++        wrapper["input_alternatives"] = links
++        if post_mutate is not None:
++            post_mutate(documents)
++
++    bundle, vocabulary, repository, verifier = signed_graph(context=True, mutate=make_v2)
++    return bundle, vocabulary, repository, verifier, linked_descriptor, descriptor_id
++
++
++class FormalScoringConsensusRegistryTests(unittest.TestCase):
++    def setUp(self):
++        self.api = importlib.import_module("ashare_pipeline.formal_scoring_registry")
++
++    def load_v2(self, **kwargs):
++        bundle, vocabulary, repository, verifier, linked_descriptor, descriptor_id = v2_graph(**kwargs)
++        approval = self.api.RegistryApproval("official", bundle.manifest.scoring_registry_hash,
++            bundle.manifest.approval_id)
++        registry = self.api.load_formal_registry(bundle, approval, feature_registry=vocabulary)
++        return registry, bundle, vocabulary, repository, verifier, linked_descriptor, descriptor_id
++
++    def load_official(self, bundle, vocabulary, approval=None):
++        approval = approval or self.api.RegistryApproval("official", bundle.manifest.scoring_registry_hash,
++            bundle.manifest.approval_id)
++        return self.api.load_formal_registry(bundle, approval, feature_registry=vocabulary)
++
++    def test_valid_v2_signed_registry_loads_canonical_descriptor_link(self):
++        registry, bundle, _, _, _, linked_descriptor, descriptor_id = self.load_v2()
++        registry.require_official(bundle)
++        self.assertEqual(tuple(registry.consensus_no_coverage_links), ("bank",))
++        self.assertEqual(registry.consensus_no_coverage_links["bank"], {
++            "rule_id": "consensus-no-coverage-neutral-v1",
++            "template_id": "bank",
++            "metric_id": "T.expectation_change",
++            "feature_key": "bank.T.expectation_change",
++            "descriptor_id": descriptor_id,
++            "context_kind": "consensus_snapshot",
++            "scope_key": "fixture-consensus",
++        })
++        self.assertEqual(descriptor_id, hashlib.sha256(canonical(linked_descriptor)).hexdigest())
++
++    def test_v1_fixture_and_signed_official_graph_keep_empty_immutable_links(self):
++        self.assertEqual(hashlib.sha256(FIXTURE.read_bytes()).hexdigest(),
++            "e61b4e20dbfd03396614d392b13b781b59c436ce52676d88308c500cc33174c4")
++        fixture_registry = self.api.load_formal_registry(FIXTURE, self.api.RegistryApproval.for_test_fixture())
++        bundle, vocabulary, _, _ = signed_graph()
++        official_registry = self.load_official(bundle, vocabulary)
++        for registry in (fixture_registry, official_registry):
++            self.assertEqual(registry.consensus_no_coverage_links, {})
++            with self.assertRaises(TypeError):
++                registry.consensus_no_coverage_links["bank"] = {}
++        official_registry.require_official(bundle)
++
++    def test_v2_allows_empty_subset_and_all_five_sorted_template_links(self):
++        for template_ids in ((), ("bank", "insurance"), TEMPLATES):
++            with self.subTest(template_ids=template_ids):
++                registry, bundle, _, _, _, _, _ = self.load_v2(template_ids=template_ids)
++                self.assertEqual(tuple(registry.consensus_no_coverage_links), tuple(sorted(template_ids)))
++                registry.require_official(bundle)
++
++    def test_v2_links_and_nested_values_are_immutable_and_seal_checked(self):
++        registry, bundle, _, _, _, _, _ = self.load_v2()
++        with self.assertRaises(TypeError):
++            registry.consensus_no_coverage_links["bank"] = {}
++        with self.assertRaises(TypeError):
++            registry.consensus_no_coverage_links["bank"]["scope_key"] = "other"
++        with self.assertRaises(self.api.RegistryValidationError):
++            copy.copy(registry).require_official(bundle)
++        object.__setattr__(registry, "consensus_no_coverage_links", MappingProxyType({}))
++        with self.assertRaises(self.api.RegistryValidationError):
++            registry.require_official(bundle)
++
++    def test_v2_rejects_wrong_rule_template_metric_key_hash_and_exact_fields(self):
++        def change_link(**changes):
++            return lambda docs: docs["scoring"]["input_alternatives"][0].update(changes)
++
++        cases = (
++            change_link(rule_id="other"),
++            change_link(template_id="unknown"),
++            change_link(metric_id="T.historical_valuation"),
++            change_link(feature_key="bank.T.historical_valuation"),
++            change_link(feature_key="unknown"),
++            change_link(feature_key="broker.T.expectation_change"),
++            change_link(descriptor_id="0" * 64),
++            change_link(descriptor_id="A" * 64),
++            change_link(extra="forbidden"),
++            change_link(rule_id=""),
++            lambda docs: docs["scoring"]["input_alternatives"][0].pop("metric_id"),
++            lambda docs: docs["scoring"].update(input_alternatives=[None]),
++            lambda docs: docs["scoring"]["descriptors"].pop(),
++        )
++        for mutation in cases:
++            with self.subTest(mutation=mutation), self.assertRaises(self.api.RegistryValidationError):
++                bundle, vocabulary, _, _, _, _ = v2_graph(mutate=mutation)
++                self.load_official(bundle, vocabulary)
++
++    def test_v2_rejects_shared_expectation_key_and_invalid_descriptor_semantics(self):
++        def share_key(documents):
++            metrics = documents["scoring"]["scoring"]["templates"]["bank"]["metrics"]["T"]
++            source, target = metrics[2], metrics[0]
++            for field in ("required_feature_keys", "formula", "field_map", "formula_version", "unit_rule",
++                    "period_rule", "denominator_rule"):
++                target[field] = copy.deepcopy(source[field])
++
++        with self.assertRaisesRegex(self.api.RegistryValidationError, "shared"):
++            bundle, vocabulary, _, _, _, _ = v2_graph(mutate=share_key)
++            self.load_official(bundle, vocabulary)
++
++        descriptor_cases = (
++            {"context_kind": "security_state"},
++            {"security_scope": "none", "request_security": "none", "exchange_rule": "none"},
++            {"period_rule": "none"},
++        )
++        for changes in descriptor_cases:
++            with self.subTest(changes=changes), self.assertRaisesRegex(self.api.RegistryValidationError, "semantics"):
++                bundle, vocabulary, _, _, _, _ = v2_graph(descriptor_changes=changes)
++                self.load_official(bundle, vocabulary)
++
++    def test_v2_rejects_duplicate_unsorted_or_ambiguous_descriptor_selections(self):
++        def duplicate_link(documents):
++            documents["scoring"]["input_alternatives"].append(
++                copy.deepcopy(documents["scoring"]["input_alternatives"][0]))
++
++        def unsorted_links(documents):
++            documents["scoring"]["input_alternatives"].reverse()
++
++        def duplicate_descriptor(documents):
++            documents["scoring"]["descriptors"].append(copy.deepcopy(documents["scoring"]["descriptors"][-1]))
++
++        for template_ids, mutation in ((("bank",), duplicate_link), (TEMPLATES, unsorted_links),
++                (("bank",), duplicate_descriptor)):
++            with self.subTest(mutation=mutation), self.assertRaises(self.api.RegistryValidationError):
++                bundle, vocabulary, _, _, _, _ = v2_graph(template_ids=template_ids, mutate=mutation)
++                self.load_official(bundle, vocabulary)
++
++    def test_v2_reuses_full_context_descriptor_validation(self):
++        for mutation in (
++                lambda docs: docs["scoring"]["descriptors"][-1].update(extra=True),
++                lambda docs: docs["scoring"]["descriptors"][-1].update(source=" "),
++                lambda docs: docs["scoring"]["descriptors"][-1].update(referenced_roles=["source"])):
++            with self.subTest(mutation=mutation), self.assertRaises(self.api.RegistryValidationError):
++                bundle, vocabulary, _, _, _, _ = v2_graph(mutate=mutation)
++                self.load_official(bundle, vocabulary)
++
++    def test_v2_rejects_unknown_missing_extra_wrapper_keys_and_non_list_alternatives(self):
++        cases = (
++            lambda docs: docs["scoring"].update(schema_version="formal-scoring-registry-v999"),
++            lambda docs: docs["scoring"].update(extra=True),
++            lambda docs: docs["scoring"].pop("input_alternatives"),
++            lambda docs: docs["scoring"].update(input_alternatives={}),
++            lambda docs: docs["scoring"].update(scoring=[]),
++        )
++        for mutation in cases:
++            with self.subTest(mutation=mutation), self.assertRaises(self.api.RegistryValidationError):
++                bundle, vocabulary, _, _, _, _ = v2_graph(mutate=mutation)
++                self.load_official(bundle, vocabulary)
++
++    def test_v2_keeps_approval_root_byte_integrity_and_test_purpose_separate(self):
++        registry, bundle, vocabulary, _, _, linked_descriptor, descriptor_id = self.load_v2()
++        wrong = self.api.RegistryApproval("official", "0" * 64, bundle.manifest.approval_id)
++        with self.assertRaises(self.api.RegistryValidationError):
++            self.load_official(bundle, vocabulary, wrong)
++        other, _, _, _, _, _ = v2_graph(template_ids=("broker",))
++        with self.assertRaises(self.api.RegistryValidationError):
++            registry.require_official(other)
++        object.__setattr__(bundle.blob("scoring"), "canonical_json", b"{}")
++        with self.assertRaises(self.api.RegistryValidationError):
++            registry.require_official(bundle)
++
++        wire = fixture_wire()
++        wire.update(schema_version="formal-scoring-registry-v2", descriptors=[linked_descriptor],
++            input_alternatives=[dict(rule_id="consensus-no-coverage-neutral-v1", template_id="bank",
++                metric_id="T.expectation_change", feature_key="bank.T.expectation_change",
++                descriptor_id=descriptor_id)])
++        test_registry = self.api.load_formal_registry(canonical(wire), self.api.RegistryApproval.for_test_fixture())
++        with self.assertRaisesRegex(self.api.RegistryValidationError, "test registry"):
++            test_registry.require_official(other)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_context_repository.ContextRepositoryApiTests.test_verified_context_repository_and_store_apis_exist
+test_verified_context_repository_and_store_apis_exist (test_formal_context_repository.ContextRepositoryApiTests.test_verified_context_repository_and_store_apis_exist) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_context_repository.ContextRepositoryApiTests.test_verified_context_repository_and_store_apis_exist"], "passed": ["test_formal_context_repository.ContextRepositoryApiTests.test_verified_context_repository_and_store_apis_exist"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

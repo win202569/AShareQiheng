@@ -1,0 +1,724 @@
+# Review package: 9999ff1..ef89225
+
+## Commits
+ef89225 fix: close calendar coverage and catalog owner scope
+
+## Files changed
+ ashare_pipeline/formal_coverage_manifest.py | 135 +++++++++--
+ tests/test_formal_coverage_guards.py        | 334 ++++++++++++++++++++++++++++
+ 2 files changed, 454 insertions(+), 15 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_coverage_manifest.py b/ashare_pipeline/formal_coverage_manifest.py
+index 1717e66..df2791e 100644
+--- a/ashare_pipeline/formal_coverage_manifest.py
++++ b/ashare_pipeline/formal_coverage_manifest.py
+@@ -1,15 +1,30 @@
+ """Fail-closed production coverage audit for the formal scoring run.
+ 
+ This module deliberately treats database row counts as observations only.  A
+ coverage row is verified only after its owner has revalidated the complete,
+ hash-bound evidence record.
++
++The signed catalog has a closed source-evidence vocabulary for design section 9:
++financial -> Snapshot/financial facts; trading_calendar -> Context's exchange
++calendar selector; the six other Context kinds (or the legacy context umbrella)
++-> Context facts; feature -> the current signed Feature slot; policy -> a Policy
++decision; market/range -> a Policy market-liquidity decision with its complete
++calendar/market range evidence. These last two domains mean the policy's signed
++trading window, not arbitrary market queries. Their owner is Policy, whose
++recheck authenticates the underlying Market and Range repositories.
++
++Metric percentiles, Stage C valuation, and D1 final-input batches are downstream
++calculation proofs, not source domains of this independent data audit (design
++sections 3-5, 7.3, 9 and 13). Their own repositories/gates remain necessary for a
++Stage D run. No catalog may relabel them as financial/features/policy coverage;
++unmapped domain/owner pairs are rejected before evidence reads.
+ """
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import asdict, dataclass
+ from datetime import datetime, timezone
+ import copy
+ import hashlib
+ import json
+ import pickle
+@@ -17,20 +32,21 @@ from pathlib import Path
+ import re
+ import sqlite3
+ import subprocess
+ import weakref
+ from types import MappingProxyType
+ from typing import Any, Callable, Mapping, Sequence
+ 
+ from .formal_registry_manifest import FormalRegistryBundleLoader, VerifiedRegistryBundle
+ from .formal_snapshot_repository import FormalSnapshotRepository
+ from .formal_context_repository import FormalContextRepository, _require_authentic_context_repository
++from .formal_sources import CalendarSelector
+ from .formal_feature_repository import FormalFeatureRepository
+ from .formal_policy_financial import _feature_dependencies
+ from .formal_metric_batch_guard import _metric_batch_guard
+ from .formal_policy_repository import FormalPolicyRepository, VerifiedPolicyResultBatch
+ from .formal_repository_identity import _require_repository_initialization
+ from .formal_universe import FormalFrozenUniverseInput, _validate_frozen_universe_input
+ from . import state_store as _state_schema
+ 
+ 
+ COVERAGE_CLASSES = (
+@@ -51,20 +67,32 @@ _AUDIT_ROW_FIELDS = (
+     "coverage_class", "reason_codes", "evidence_hashes", "rechecked_at_utc",
+ )
+ _VERIFIED_LINEAGE_FIELDS = (
+     "source", "dataset", "request_fingerprint", "selected_snapshot_id",
+     "content_sha256", "manifest_sha256", "parser_id", "parser_version",
+     "mapping_version", "published_at_utc", "effective_at_utc",
+     "refresh_generation", "task_id", "collection_state", "captured_at_utc",
+     "source_updated_at_utc",
+ )
+ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
++_CONTEXT_FACT_DOMAINS = frozenset({"market_close", "security_state", "industry_snapshot",
++    "regulatory_state", "event_calendar", "consensus_snapshot"})
++_DOMAIN_ADAPTERS = MappingProxyType({
++    "financial": ("formal_snapshot_repository", "financial"),
++    "trading_calendar": ("formal_context_repository", "calendar"),
++    "context": ("formal_context_repository", "context"),
++    **{kind: ("formal_context_repository", "context") for kind in _CONTEXT_FACT_DOMAINS},
++    "feature": ("formal_feature_repository", "feature"),
++    "policy": ("formal_policy_repository", "policy"),
++    "market": ("formal_policy_repository", "policy_market"),
++    "range": ("formal_policy_repository", "policy_market"),
++})
+ 
+ 
+ def _canonical(value: Any) -> bytes:
+     return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"), allow_nan=False).encode()
+ 
+ 
+ def _digest(value: Any) -> str:
+     return hashlib.sha256(_canonical(value)).hexdigest()
+ 
+@@ -164,47 +192,59 @@ def _official_inputs(contract: Any, verifier: Any, bundle: Any, loader: Any, fro
+                    or members.get(row["security_id"]) != row["exchange"] for row in catalog)):
+         raise ValueError("coverage contract must enumerate every frozen member")
+     if any(row.get("frozen_input_hash") != frozen.frozen_input_hash for row in reqs):
+         raise ValueError("coverage requirements do not match frozen root")
+     if sorted(catalog, key=_key) != sorted(reqs, key=_key):
+         raise ValueError("coverage requirements do not match signed catalog")
+     owners = wire["domain_owners"]
+     if (type(owners) is not dict or set(owners) != {row["domain"] for row in catalog}
+             or any(type(owner) is not str or not owner for owner in owners.values())):
+         raise ValueError("coverage contract repository owners are incomplete")
++    if any(domain not in _DOMAIN_ADAPTERS or owner != _DOMAIN_ADAPTERS[domain][0]
++           for domain, owner in owners.items()):
++        raise ValueError("coverage contract domain/owner pair has no authenticated adapter")
+     descriptors = wire["selector_descriptors"]
+-    owner_fields = {
+-        "formal_snapshot_repository": {"source", "dataset"},
+-        "formal_context_repository": {"context_kind", "scope_key", "as_of_utc"},
+-        "formal_feature_repository": {"input_hash", "slot_id"},
+-        "formal_policy_repository": {"batch_hash", "rule_id"},
++    adapter_fields = {
++        "financial": {"source", "dataset"},
++        "context": {"context_kind", "scope_key", "as_of_utc"},
++        "calendar": {"context_kind", "scope_key", "as_of_utc", "as_of_rule"},
++        "feature": {"input_hash", "slot_id"},
++        "policy": {"batch_hash", "rule_id"},
++        "policy_market": {"batch_hash", "rule_id"},
+     }
+     common_fields = {"owner", "domain", "security_id", "exchange", "period_or_window"}
+     if type(descriptors) is not dict or set(descriptors) != {row["selector_hash"] for row in catalog}:
+         raise ValueError("coverage contract selector catalog is incomplete")
+     for row in catalog:
+         selector = descriptors[row["selector_hash"]]
+         owner = owners[row["domain"]]
+-        if (owner not in owner_fields or type(selector) is not dict
+-                or set(selector) != common_fields | owner_fields[owner]
++        adapter = _DOMAIN_ADAPTERS[row["domain"]][1]
++        if (type(selector) is not dict
++                or set(selector) != common_fields | adapter_fields[adapter]
+                 or _digest(selector) != row["selector_hash"]
+                 or selector["owner"] != owner
+                 or any(selector[field] != row[field] for field in
+                        ("domain", "security_id", "exchange", "period_or_window"))
+                 or any(type(value) is not str or not value for value in selector.values())):
+             raise ValueError("coverage contract selector descriptor or owner mismatch")
+         if ((owner == "formal_context_repository" and _aware(selector["as_of_utc"]) is None)
+                 or (owner == "formal_feature_repository" and
+                     _SHA256.fullmatch(selector["input_hash"]) is None)
+                 or (owner == "formal_policy_repository" and
+                     _SHA256.fullmatch(selector["batch_hash"]) is None)):
+             raise ValueError("coverage contract selector descriptor is invalid")
++        if adapter == "context" and (selector["context_kind"] not in _CONTEXT_FACT_DOMAINS
++                or row["domain"] != "context" and selector["context_kind"] != row["domain"]):
++            raise ValueError("coverage contract Context domain and selected kind mismatch")
++        if adapter == "calendar":
++            CalendarSelector(**{field: selector[field] for field in
++                ("context_kind", "scope_key", "exchange", "as_of_rule")})
+     if (type(wire["expected_schema_version"]) is not int
+             or wire["expected_schema_version"] <= 0
+             or any(type(wire[field]) is not str or not wire[field]
+                    for field in ("report_period", "query_version"))):
+         raise ValueError("coverage contract audit identity is invalid")
+     return wire
+ 
+ 
+ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
+                       expected_schema_version: int) -> dict[str, Any]:
+@@ -371,39 +411,66 @@ def _typed_repository_provenance(req, source, owner, snapshots, selector, contex
+             "formal_context_repository", "formal_feature_repository", "formal_policy_repository"}:
+         raise ValueError("coverage repository owner has no authenticated adapter")
+     frozen, graph = context["frozen"], context["bundle"]
+     root, freeze = frozen.registry_manifest_hash, _aware(frozen.as_of_utc).isoformat()
+     store = snapshots._state_store
+     if (req["frozen_input_hash"] != frozen.frozen_input_hash
+             or _aware(req["period_or_window"]) != _aware(freeze)
+             or req["exchange"] != req["security_id"][:2]):
+         raise ValueError("coverage repository owner requirement root, window or exchange mismatch")
+     evidence, units = {}, []
++    calendar_selector = calendar_binding = None
+     coverage_class = "verified_complete"
+     if owner == "formal_context_repository":
+         repository = context["context_repository"]
+         if type(repository) is not FormalContextRepository:
+             raise ValueError("coverage repository owner requires genuine Context repository")
+         _require_authentic_context_repository(repository)
+         if (repository._state_store is not store or repository._snapshots is not snapshots
+                 or repository._verifier is not store._require_registry_verifier()
+                 or _aware(selector["as_of_utc"]) != _aware(freeze)):
+             raise ValueError("coverage Context owner or cutoff mismatch")
+-        fact = repository.get_verified(selector["context_kind"], selector["scope_key"],
+-            req["security_id"], freeze, root)
++        if _DOMAIN_ADAPTERS[req["domain"]][1] == "calendar":
++            calendar_selector = CalendarSelector(**{field: selector[field] for field in
++                ("context_kind", "scope_key", "exchange", "as_of_rule")})
++            calendar_binding = repository.resolve_verified_calendar_binding(
++                calendar_selector, req["exchange"], freeze, root)
++            binding = asdict(calendar_binding)
++            if any(binding[field] != expected for field, expected in (
++                    ("exchange", req["exchange"]), ("freeze_at_utc", freeze),
++                    ("registry_manifest_hash", root), ("selector_hash", calendar_selector.selector_hash))):
++                raise ValueError("coverage calendar selector binding mismatch")
++            candidates = store.list_formal_context_facts(registry_manifest_hash=root,
++                context_kind="trading_calendar", scope_key=selector["scope_key"], as_of_utc=freeze,
++                source_snapshot_id=binding["snapshot_id"])
++            matches = [fact for fact in candidates if fact.security_id is None
++                       and fact.value["exchange"] == req["exchange"]]
++            if len(matches) != 1:
++                raise ValueError("coverage calendar selected fact is absent or ambiguous")
++            fact = matches[0]
++            ref = snapshots.get_verified_by_manifest(binding["manifest_sha256"])
++            if (ref.snapshot_id != fact.source_snapshot_id or ref.snapshot_id != binding["snapshot_id"]
++                    or ref.security_id is not None or ref.exchange != req["exchange"]
++                    or ref.producing_task_id != binding["prerequisite_task_id"]):
++                raise ValueError("coverage calendar source identity mismatch")
++            evidence.update(calendar_selector=asdict(calendar_selector), calendar_binding=binding)
++        else:
++            fact = repository.get_verified(selector["context_kind"], selector["scope_key"],
++                req["security_id"], freeze, root)
+         selected = fact.to_dict()
+-        if (fact.security_id != req["security_id"] or fact.as_of_utc != freeze
++        if (fact.security_id != (None if calendar_selector is not None else req["security_id"])
++                or fact.as_of_utc != freeze
+                 or fact.registry_manifest_hash != root
+                 or fact.context_kind != selector["context_kind"]
+                 or fact.scope_key != selector["scope_key"]):
+             raise ValueError("coverage Context selected fact key mismatch")
+-        evidence = {"fact": selected}
++        evidence["fact"] = selected
+         if fact.no_coverage:
+             coverage_class = "verified_no_coverage"
+         _require_authentic_context_repository(repository)
+     elif owner == "formal_feature_repository":
+         repository = context["feature_repository"]
+         if type(repository) is not FormalFeatureRepository:
+             raise ValueError("coverage repository owner requires genuine Feature repository")
+         provider = _feature_dependencies(repository)
+         if (repository._store is not store
+                 or repository._verifier is not store._require_registry_verifier()):
+@@ -440,38 +507,57 @@ def _typed_repository_provenance(req, source, owner, snapshots, selector, contex
+                 "bundle_hash": historical.bundle_hash(),
+                 "facts": [fact.to_dict() for fact in store.list_formal_financial_facts(
+                     security_id=req["security_id"])]}
+             guard.finalize(lambda: _feature_dependencies(repository))
+     else:
+         repository, batch = context["policy_repository"], context["policy_batch"]
+         if type(repository) is not FormalPolicyRepository or type(batch) is not VerifiedPolicyResultBatch:
+             raise ValueError("coverage repository owner requires genuine Policy repository and batch")
+         if repository._batch_journal_identity()[0] is not store:
+             raise ValueError("coverage Policy owner store mismatch")
+-        if "policy" not in cache:
+-            repository.recheck_current(batch)
+-            cache["policy"] = batch.to_dict()
+-        wire = cache["policy"]
++        wire = cache["policy"] if "policy" in cache else batch.to_dict()
+         if (wire["batch_hash"] != selector["batch_hash"]
+                 or wire["frozen_input_hash"] != frozen.frozen_input_hash
+                 or wire["registry_manifest_hash"] != root or wire["as_of_utc"] != freeze
+                 or wire["universe_hash"] != frozen.universe_hash
+                 or wire["security_ids"] != [member.security_id for member in frozen.members]):
+             raise ValueError("coverage Policy batch key or root mismatch")
+         matches = [decision for result in wire["results"] if result["security_id"] == req["security_id"]
+                    for decision in result["decisions"] if decision["rule_id"] == selector["rule_id"]]
+         if (len(matches) != 1 or matches[0]["security_id"] != req["security_id"]
+                 or matches[0]["evaluation_state"] not in {"matched", "clear", "not_applicable"}
+                 or matches[0]["pending_requirements"]):
+             raise ValueError("coverage Policy selected security/rule is absent or incomplete")
+         selected = matches[0]
+         evidence = {"batch": wire}
++        if _DOMAIN_ADAPTERS[req["domain"]][1] == "policy_market":
++            rule_input = wire["evidence_batch"]["rule_inputs"][req["security_id"]].get(selector["rule_id"])
++            market = wire["evidence_batch"]["selections"][req["security_id"]].get(selector["rule_id"])
++            window = None if market is None else market.get("window")
++            if (rule_input is None or rule_input["rule"]["kind"] != "market_liquidity"
++                    or market is None or market["pending"] or window is None or window["pending"]
++                    or window != rule_input["market"]
++                    or any(window[field] != expected for field, expected in (
++                        ("security_id", req["security_id"]), ("exchange", req["exchange"]),
++                        ("as_of_utc", freeze), ("registry_manifest_hash", root), ("rule_id", selector["rule_id"])))
++                    or not window["observations"] or not window["lineage"]
++                    or not window["calendar_coverage_hash"] or not window["required_trading_days"]
++                    or any(day["coverage"] != "covered" for day in window["daily_records"])
++                    or [day["date"] for day in window["daily_records"]] != window["required_trading_days"]):
++                raise ValueError("coverage market/range requires the complete signed market-liquidity selection")
++            evidence.update(market_selection=market, market_rule=rule_input["rule"])
++        if "policy" not in cache:
++            # Reject a mismatched signed selection before expensive source
++            # reads; every accepted row still requires the original owner to
++            # recheck the complete published batch before evidence is returned.
++            repository.recheck_current(batch)
++            cache["policy"] = wire
+         if selected["evaluation_state"] == "not_applicable":
+             coverage_class = "not_applicable_signed"
+     if set(req.get("expected_units", ())) != set(units):
+         raise ValueError("coverage owner selected item units mismatch")
+ 
+     # Preserve every underlying source ref, including the facts used to derive
+     # an aggregate feature or policy decision. The owner validates its complete
+     # evidence graph above; these reads also bind raw source bytes to this row.
+     ids = set()
+     def collect(value):
+@@ -489,23 +575,42 @@ def _typed_repository_provenance(req, source, owner, snapshots, selector, contex
+         ref = store.get_formal_snapshot(snapshot_id)
+         if ref is None or ref.verification_status != "verified":
+             raise ValueError("coverage owner source snapshot is missing")
+         raw = snapshots.read_verified_raw(ref)
+         if hashlib.sha256(raw).hexdigest() != ref.content_sha256:
+             raise ValueError("coverage owner raw source hash mismatch")
+         task = store.get_formal_task(ref.producing_task_id)
+         if task is None or task["status"] != "verified":
+             raise ValueError("coverage owner source task is not verified")
+         lineage.append(dict(asdict(ref), collection_state=task["status"]))
++    # Policy owns the Range observations: its original current-state recheck
++    # above reauthenticates their signed parser/config, tasks, receipts and raw
++    # bytes (including the bound calendar coverage). Project those authenticated
++    # source identities too, so market/range rows retain real source lineage.
++    if "market_selection" in evidence:
++        for observation in evidence["market_selection"]["window"]["observations"]:
++            document, snapshot, task = observation["document"], observation["snapshot"], observation["task"]
++            lineage.append(dict(document, snapshot_id=snapshot["id"],
++                manifest_sha256=snapshot["manifest_sha256"], content_sha256=snapshot["content_sha256"],
++                content_path=snapshot["content_path"], manifest_path=snapshot["manifest_path"],
++                producing_task_id=task["id"], collection_state=task["status"],
++                refresh_generation=observation["generation"]["refresh_generation"],
++                observation_hash=observation["observation_hash"]))
+     evidence["source_snapshots"] = lineage
++    evidence["selector_descriptor"] = dict(selector)
+     evidence["registry_manifest_hash"] = root
+     evidence["registry_hashes"] = {role: graph.blob(role).registry_hash for role in graph.roles}
++    if calendar_selector is not None:
++        current = repository.resolve_verified_calendar_binding(calendar_selector, req["exchange"], freeze, root)
++        if asdict(current) != asdict(calendar_binding):
++            raise ValueError("coverage calendar selection changed during evidence read")
++        _require_authentic_context_repository(repository)
+     bindings = {"selected_snapshot_id": "snapshot_id", "task_id": "producing_task_id"}
+     record = dict(req)
+     for field in _VERIFIED_LINEAGE_FIELDS:
+         values = { _canonical(item.get(bindings.get(field, field))) for item in lineage }
+         detached = [json.loads(value) for value in sorted(values)]
+         record[field] = detached[0] if len(detached) == 1 else detached
+     record.update(required=True, coverage_class=coverage_class, observed_units=units,
+         verification_state="verified", temporal_state="visible", reason_codes=[],
+         evidence_hashes={"selection": _digest(selected), "evidence": _digest(evidence),
+                          "registry": root, "frozen_input": frozen.frozen_input_hash})
+diff --git a/tests/test_formal_coverage_guards.py b/tests/test_formal_coverage_guards.py
+index 1a5fd41..5373a19 100644
+--- a/tests/test_formal_coverage_guards.py
++++ b/tests/test_formal_coverage_guards.py
+@@ -406,20 +406,286 @@ class OwnerCoverageAdapterTests(unittest.TestCase):
+         f = self.fixture
+         batch, revoke, _ = f.policy_repository._build_batch(f.frozen.frozen_input_hash,
+             scoring_registry=f.scoring, policy_registry=f.policy_registry, owner_scope=None)
+         result = self.audit("policy", policy_batch=batch)
+         revoke(batch)
+         for gate in (result.require_preview_ready, result.require_official_ready):
+             with self.subTest(gate=gate.__name__), self.assertRaises(ValueError):
+                 gate()
+ 
+ 
++class MarketRangeCoverageAdapterTests(unittest.TestCase):
++    audit = OwnerCoverageAdapterTests.audit
++
++    @classmethod
++    def setUpClass(cls):
++        from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++        cls.fixture = PolicyRuntimeFixture(range_enabled=True, cyclic=False, templates={"SH600000": "bank"},
++                                          extra_members=("BJ430001", "SZ000001"))
++        cls.addClassCleanup(cls.fixture.close)
++        f = cls.fixture
++        f.populate_policy_evidence(skip_financial=["SH600000"])
++        for sid in ("BJ430001", "SZ000001"):
++            f.put_policy_context(sid, "security_state", dict(is_st=False, is_star_st=False,
++                listing_status="listed", forced_delist_risk=False, suspended=False))
++        cls.features = {}
++        cls.batch, cls.revoke_batch, _ = f.policy_repository._build_batch(
++            f.frozen.frozen_input_hash, scoring_registry=f.scoring,
++            policy_registry=f.policy_registry, owner_scope=None)
++        cls.status_path = f.root / "coverage-status.json"
++        cls.status_path.write_text(json.dumps(dict(generated_at_utc="2026-09-01T00:00:00+00:00",
++            schema_version=7, db_sha256=hashlib.sha256(f.db_path.read_bytes()).hexdigest(),
++            db_generation_hash=digest(db_generation(f.db_path)), schema_versions=[2, 3, 4, 5, 6, 7])), encoding="utf-8")
++
++    def catalog(self, domain, *, change=None):
++        f = self.fixture
++        requirements, descriptors = [], {}
++        for member in f.frozen.members:
++            market = member.security_id == "SH600000"
++            owner = "formal_policy_repository" if market else "formal_context_repository"
++            selected_domain = domain if market else "security_state"
++            selector = dict(owner=owner, domain=selected_domain, security_id=member.security_id,
++                exchange=member.exchange, period_or_window=f.frozen.as_of_utc)
++            if market:
++                result = next(item for item in self.batch.results if item.security_id == member.security_id)
++                rule = next(item for item in result.decisions if item.semantic_id == "no_effective_trade_20d")
++                selector.update(batch_hash=self.batch.batch_hash, rule_id=rule.rule_id)
++                if change:
++                    selector.update(change(selector))
++            else:
++                selector.update(context_kind="security_state", scope_key="fixture-state", as_of_utc=f.frozen.as_of_utc)
++            selector_hash = digest(selector)
++            descriptors[selector_hash] = selector
++            requirements.append(dict(frozen_input_hash=f.frozen.frozen_input_hash, security_id=member.security_id,
++                domain=selected_domain, selector_hash=selector_hash, exchange=member.exchange,
++                period_or_window=f.frozen.as_of_utc, expected_units=[]))
++        manifest = f.bundle.manifest
++        return dict(schema_version="formal-coverage-contract-v1", purpose="official",
++            approval_id=manifest.approval_id, signing_identity=manifest.key_id,
++            registry_manifest_hash=manifest.manifest_hash, frozen_input_hash=f.frozen.frozen_input_hash,
++            requirements=requirements, selector_descriptors=descriptors,
++            domain_owners={domain: "formal_policy_repository", "security_state": "formal_context_repository"},
++            expected_schema_version=7, report_period="2025", query_version="coverage-v1")
++
++    def test_genuine_market_and_range_requirements_use_policy_market_evidence(self):
++        wire, ranges = self.catalog("market"), self.catalog("range")
++        wire["requirements"].extend(req for req in ranges["requirements"] if req["domain"] == "range")
++        wire["selector_descriptors"].update(ranges["selector_descriptors"])
++        wire["domain_owners"].update(ranges["domain_owners"])
++        result = self.audit("market", wire=wire)
++        self.assertEqual(len(result.rows), 4)
++        for row in result.rows:
++            if row["domain"] == "security_state":
++                continue
++            receipt = row["repository_provenance"]
++            self.assertEqual(receipt["owner"], "formal_policy_repository")
++            self.assertEqual(receipt["selected_item"]["semantic_id"], "no_effective_trade_20d")
++            selected = receipt["evidence"]["market_selection"]
++            self.assertEqual(selected["window"]["exchange"], row["exchange"])
++            self.assertFalse(selected["pending"])
++            self.assertTrue(selected["lineage"])
++            source_hashes = {source["manifest_sha256"] for source in receipt["evidence"]["source_snapshots"]}
++            for observation in selected["window"]["observations"]:
++                self.assertIn(observation["snapshot"]["manifest_sha256"], source_hashes)
++        result.require_preview_ready()
++        result.require_official_ready()
++
++    def test_market_and_range_cannot_be_relabelled_unrelated_policy_decisions(self):
++        for domain in ("market", "range"):
++            wrong = next(decision.rule_id for result in self.batch.results if result.security_id == "SH600000"
++                         for decision in result.decisions if decision.semantic_id == "st")
++            with self.subTest(domain=domain), self.assertRaisesRegex(ValueError, "market|range"):
++                self.audit(domain, wire=self.catalog(domain, change=lambda s: dict(rule_id=wrong)))
++
++    def test_market_range_gates_recheck_calendar_and_market_raw_bytes(self):
++        result = self.audit("range")
++        receipt = next(row["repository_provenance"] for row in result.rows if row["domain"] == "range")
++        market = receipt["evidence"]["market_selection"]["window"]["observations"][0]
++        f = self.fixture
++        calendar_request = f.source.first_calendar_request("2026-08-31T07:00:00+00:00")
++        calendar = f.range_store.select_current(calendar_request.request_fingerprint).to_dict()
++        generation = db_generation(f.db_path)
++        for kind, observation in (("calendar", calendar), ("market", market)):
++            path = f.root / "range_raw" / observation["snapshot"]["content_path"]
++            original = path.read_bytes()
++            try:
++                path.write_bytes(b"tampered range source")
++                self.assertEqual(db_generation(f.db_path), generation)
++                for gate in (result.require_preview_ready, result.require_official_ready):
++                    with self.subTest(kind=kind, gate=gate.__name__), self.assertRaises(ValueError):
++                        gate()
++            finally:
++                path.write_bytes(original)
++
++
++class CalendarCoverageAdapterTests(unittest.TestCase):
++    def setUp(self):
++        from tests.formal_metric_fixtures import MetricFixture
++        from tests.test_formal_context_repository import descriptor
++        from tests.test_formal_sources import config
++
++        def calendar_documents(documents):
++            for exchange in ("BJ", "SH", "SZ"):
++                documents["scoring"]["descriptors"].append(descriptor("trading_calendar",
++                    scope_key="coverage-calendar-" + exchange, security_scope="none",
++                    request_security="none", period_rule="none", exchange_rule="fixed_exchange",
++                    fixed_exchange=exchange, dataset="trading_calendar", bootstrap_calendar=True))
++            documents["source"]["configs"].append(config(dataset="trading_calendar", bootstrap_calendar=True))
++            documents["feature"]["source_registry_hash"] = digest(documents["source"])
++
++        self.fixture = MetricFixture(mutate=calendar_documents)
++        self.addCleanup(self.fixture.close)
++        self.batch = None
++        self.status_path = self.fixture.root / "coverage-status.json"
++        self.calendars = {exchange: self.put_calendar(exchange) for exchange in ("BJ", "SH", "SZ")}
++        self.write_status()
++
++    def put_calendar(self, exchange, *, generation="calendar-v1", published="2026-08-19T07:00:00+00:00"):
++        from ashare_pipeline.formal_context_schema import FormalContextRegistry
++        from ashare_pipeline.formal_evidence import OfficialFetch, SourcePolicy, verify_official_fetch
++        from tests.test_formal_context_repository import FixtureNormalizer
++        f = self.fixture
++        request = f.resolver.resolve(context_kind="trading_calendar", scope_key="coverage-calendar-" + exchange,
++            security_id=None, as_of_utc="2026-08-31T07:00:00+00:00", registry_manifest_hash=f.bundle.manifest.manifest_hash,
++            upstream_generation=generation)
++        task = f.store.enqueue_formal_task("formal_context", exchange + generation, request.refresh_generation, {})
++        lease = f.store.lease_next_formal_task(("formal_context",), "coverage-calendar", 300)
++        self.assertEqual(lease["id"], task)
++        raw = canonical(dict(value=dict(exchange=exchange, calendar_version=generation,
++            trading_days=["2026-08-21", "2026-08-31", "2026-09-02"]), no_coverage=False))
++        fetch = OfficialFetch(request=request.official_request, raw_bytes=raw,
++            original_url="https://www.cninfo.com.cn/fixture/calendar.json", published_at_utc=published,
++            published_precision="timestamp", source_updated_at_utc=None,
++            captured_at_utc="2026-09-04T07:00:00+00:00", effective_at_utc=published,
++            effective_time_evidence_hash=None, refresh_generation=request.refresh_generation,
++            parser_id=request.parser_id, parser_version=request.parser_version, mapping_version=request.mapping_version,
++            declared_security_id=None, declared_period=None)
++        verified = verify_official_fetch(fetch, SourcePolicy.cninfo())
++        self.assertEqual(verified.status, "verified")
++        ref = f.snapshots.persist_verified(fetch, verified, producing_task_id=task, worker_id="coverage-calendar")
++        receipt = FormalContextRegistry.load(f.store, f.verifier, f.bundle.manifest.manifest_hash).normalize_verified(
++            request, ref, raw, FixtureNormalizer(), task_id=task, worker_id="coverage-calendar")
++        f.store.put_formal_context_facts(receipt)
++        f.store.complete_formal_task(task, "coverage-calendar", {"snapshot": ref.snapshot_id})
++        return receipt.facts[0], ref
++
++    def write_status(self):
++        f = self.fixture
++        self.status_path.write_text(json.dumps(dict(generated_at_utc="2026-09-01T00:00:00+00:00",
++            schema_version=7, db_sha256=hashlib.sha256(f.db_path.read_bytes()).hexdigest(),
++            db_generation_hash=digest(db_generation(f.db_path)), schema_versions=[2, 3, 4, 5, 6, 7])), encoding="utf-8")
++
++    def catalog(self, domain="trading_calendar", *, change=None):
++        f = self.fixture
++        descriptors, requirements = {}, []
++        for member in f.frozen.members:
++            selector = dict(owner="formal_context_repository", domain=domain, security_id=member.security_id,
++                exchange=member.exchange, period_or_window=f.frozen.as_of_utc, context_kind="trading_calendar",
++                scope_key="coverage-calendar-" + member.exchange, as_of_utc=f.frozen.as_of_utc,
++                as_of_rule="visible_at_freeze")
++            if change:
++                selector.update(change(selector))
++            selector_hash = digest(selector)
++            descriptors[selector_hash] = selector
++            requirements.append(dict(frozen_input_hash=f.frozen.frozen_input_hash, security_id=member.security_id,
++                domain=domain, selector_hash=selector_hash, exchange=member.exchange,
++                period_or_window=f.frozen.as_of_utc, expected_units=[]))
++        manifest = f.bundle.manifest
++        return dict(schema_version="formal-coverage-contract-v1", purpose="official",
++            approval_id=manifest.approval_id, signing_identity=manifest.key_id,
++            registry_manifest_hash=manifest.manifest_hash, frozen_input_hash=f.frozen.frozen_input_hash,
++            requirements=requirements, domain_owners={domain: "formal_context_repository"},
++            selector_descriptors=descriptors, expected_schema_version=7, report_period="2025", query_version="coverage-v1")
++
++    def audit(self, *, wire=None, **changes):
++        f = self.fixture
++        wire = self.catalog() if wire is None else wire
++        raw = canonical(wire)
++        args = dict(production_contract=dict(canonical_json=raw, signature=f.verifier.sign(raw),
++            key_id=f.bundle.manifest.key_id), contract_verifier=f.verifier, registry_bundle=f.bundle,
++            registry_loader=FormalRegistryBundleLoader(f.store, f.verifier), snapshot_repository=f.snapshots,
++            context_repository=f.context, frozen_universe=f.frozen, workspace_root=Path(__file__).resolve().parents[1],
++            db_path=f.db_path, status_path=self.status_path)
++        args.update(changes)
++        return FormalCoverageAuditor().audit(wire["requirements"], **args)
++
++    def test_genuine_sh_sz_bj_calendar_selectors_reach_both_gates(self):
++        from ashare_pipeline.formal_sources import CalendarSelector
++        result = self.audit()
++        result.require_preview_ready()
++        result.require_official_ready()
++        self.assertEqual({row["exchange"] for row in result.rows}, {"SH", "SZ", "BJ"})
++        requirements = {req["security_id"]: req for req in self.catalog()["requirements"]}
++        for row in result.rows:
++            receipt = row["repository_provenance"]
++            selected = receipt["evidence"]["calendar_binding"]
++            fact, ref = self.calendars[row["exchange"]]
++            self.assertEqual(selected["snapshot_id"], ref.snapshot_id)
++            self.assertEqual(selected["manifest_sha256"], ref.manifest_sha256)
++            self.assertEqual(selected["prerequisite_task_id"], ref.producing_task_id)
++            self.assertEqual(selected["exchange"], row["exchange"])
++            self.assertEqual(selected["selector_hash"], CalendarSelector("trading_calendar",
++                "coverage-calendar-" + row["exchange"], row["exchange"], "visible_at_freeze").selector_hash)
++            self.assertEqual(receipt["selected_item"], fact.to_dict())
++            self.assertEqual(receipt["requirement_hash"], digest(requirements[row["security_id"]]))
++            self.assertEqual(receipt["evidence"]["source_snapshots"][0]["content_sha256"], ref.content_sha256)
++
++    def test_calendar_descriptor_rejects_wrong_scope_exchange_kind_and_as_of_rule(self):
++        for change in (dict(scope_key="coverage-calendar-SH"), dict(exchange="SH"),
++                       dict(context_kind="security_state"), dict(as_of_rule="latest"),
++                       dict(as_of_utc="2026-08-30T07:00:00+00:00")):
++            with self.subTest(change=change), self.assertRaises(ValueError):
++                self.audit(wire=self.catalog(change=lambda _: change))
++        with self.assertRaises(ValueError):
++            self.audit(wire=self.catalog("context"))
++
++    def test_calendar_gates_recheck_raw_evidence_without_database_change(self):
++        result = self.audit()
++        f = self.fixture
++        generation = db_generation(f.db_path)
++        ref = self.calendars["SH"][1]
++        path, original = Path(ref.content_path), Path(ref.content_path).read_bytes()
++        try:
++            path.write_bytes(b"changed calendar bytes")
++            self.assertEqual(db_generation(f.db_path), generation)
++            for gate in (result.require_preview_ready, result.require_official_ready):
++                with self.subTest(gate=gate.__name__), self.assertRaises(ValueError):
++                    gate()
++        finally:
++            path.write_bytes(original)
++
++    def test_calendar_current_correction_invalidates_existing_coverage(self):
++        old = self.audit()
++        _, current = self.put_calendar("SH", generation="calendar-v2", published="2026-08-20T07:00:00+00:00")
++        self.write_status()
++        replacement = self.audit()
++        replacement.require_official_ready()
++        row = next(row for row in replacement.rows if row["exchange"] == "SH")
++        self.assertEqual(row["repository_provenance"]["evidence"]["calendar_binding"]["snapshot_id"], current.snapshot_id)
++        self.assertNotEqual(old.manifest_hash, replacement.manifest_hash)
++        for gate in (old.require_preview_ready, old.require_official_ready):
++            with self.subTest(gate=gate.__name__), self.assertRaises(ValueError):
++                gate()
++
++    def test_calendar_revoked_source_producer_invalidates_fresh_and_existing_coverage(self):
++        result = self.audit()
++        f = self.fixture
++        task_id = self.calendars["BJ"][1].producing_task_id
++        f.sql("UPDATE formal_collection_task SET status='terminal_failed' WHERE id=?", (task_id,))
++        self.write_status()
++        with self.assertRaises(ValueError):
++            self.audit()
++        for gate in (result.require_preview_ready, result.require_official_ready):
++            with self.subTest(gate=gate.__name__), self.assertRaises(ValueError):
++                gate()
++
++
+ class OfficialCoverageBoundaryTests(unittest.TestCase):
+     def setUp(self):
+         self.temp = tempfile.TemporaryDirectory()
+         self.addCleanup(self.temp.cleanup)
+         self.temp_path = Path(self.temp.name)
+         repository, manifest, _ = fixture_repository(purpose="official")
+         self.verifier = AcceptingVerifier()
+         self.db_path = self.temp_path / "formal.db"
+         self.raw_store = FormalSnapshotStore(self.temp_path / "raw")
+         self.registry_repository = StateStore(
+@@ -587,20 +853,88 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
+             key: dict(value, source="fabricated")
+             for key, value in self.selector_descriptors.items()})
+         with self.assertRaisesRegex(ValueError, "selector"):
+             self.audit(contract=self.signed_contract(bad))
+         wrong_owner = dict(self.contract_wire, selector_descriptors={
+             key: dict(value, owner="formal_context_repository")
+             for key, value in self.selector_descriptors.items()})
+         with self.assertRaisesRegex(ValueError, "selector"):
+             self.audit(contract=self.signed_contract(wrong_owner))
+ 
++    def test_catalog_rejects_unsupported_domain_owner_pairs_before_evidence_reads(self):
++        for domain in ("made_up", "trading_calendar", "context", "feature", "policy",
++                       "market", "range", "metric", "valuation", "score_input", "final_input"):
++            requirements, descriptors, records = [], {}, []
++            for req, record in zip(self.requirements, self.records, strict=True):
++                selector = dict(self.selector_descriptors[req.selector_hash], domain=domain)
++                selector_hash = digest(selector)
++                descriptors[selector_hash] = selector
++                requirements.append(dict(req.to_dict(), domain=domain, selector_hash=selector_hash))
++                records.append(dict(record, domain=domain, selector_hash=selector_hash))
++            wire = dict(self.contract_wire, requirements=requirements, selector_descriptors=descriptors,
++                domain_owners={domain: "formal_snapshot_repository"})
++            self.calls.clear()
++            with self.subTest(domain=domain):
++                with self.assertRaisesRegex(ValueError, "domain.*owner|owner.*domain"):
++                    self.audit(requirements=requirements, records=records, contract=self.signed_contract(wire),
++                               validators={domain: self.validate})
++                self.assertEqual(self.calls, [])
++
++    def contract_for_route(self, domain, owner, fields):
++        descriptors, requirements = {}, []
++        for member in self.frozen.members:
++            selector = dict(owner=owner, domain=domain, security_id=member.security_id,
++                exchange=member.exchange, period_or_window=self.frozen.as_of_utc, **fields)
++            selector_hash = digest(selector)
++            descriptors[selector_hash] = selector
++            requirements.append(dict(frozen_input_hash=self.frozen.frozen_input_hash,
++                security_id=member.security_id, domain=domain, selector_hash=selector_hash,
++                exchange=member.exchange, period_or_window=self.frozen.as_of_utc, expected_units=[]))
++        return dict(self.contract_wire, requirements=requirements, selector_descriptors=descriptors,
++                    domain_owners={domain: owner})
++
++    def verify_catalog(self, wire):
++        return coverage_module._official_inputs(self.signed_contract(wire), self.verifier,
++            self.bundle, self.registry_loader, self.frozen, wire["requirements"], self.db_path,
++            self.snapshot_repository)
++
++    def test_signed_catalog_routes_all_design_source_families(self):
++        routes = [
++            ("financial", "formal_snapshot_repository", dict(source="cninfo", dataset="annual_report")),
++            ("feature", "formal_feature_repository", dict(input_hash="a" * 64, slot_id="bank.G.revenue")),
++            ("policy", "formal_policy_repository", dict(batch_hash="b" * 64, rule_id="signed-rule")),
++            ("market", "formal_policy_repository", dict(batch_hash="b" * 64, rule_id="signed-market-rule")),
++            ("range", "formal_policy_repository", dict(batch_hash="b" * 64, rule_id="signed-market-rule")),
++        ]
++        for kind in ("trading_calendar", "market_close", "security_state", "industry_snapshot",
++                     "regulatory_state", "event_calendar", "consensus_snapshot"):
++            fields = dict(context_kind=kind, scope_key="signed-scope", as_of_utc=self.frozen.as_of_utc)
++            if kind == "trading_calendar":
++                fields["as_of_rule"] = "visible_at_freeze"
++            routes.append((kind, "formal_context_repository", fields))
++        for domain, owner, fields in routes:
++            with self.subTest(domain=domain):
++                wire = self.contract_for_route(domain, owner, fields)
++                self.assertEqual(self.verify_catalog(wire)["requirements"], wire["requirements"])
++
++    def test_catalog_rejects_unmapped_derived_proofs_and_mismatched_context_kind(self):
++        for domain, owner in (("metric", "formal_metric_repository"),
++                              ("valuation", "formal_valuation_repository"),
++                              ("score_input", "formal_score_input_repository"),
++                              ("final_input", "formal_final_score_input_repository")):
++            with self.subTest(domain=domain), self.assertRaisesRegex(ValueError, "domain/owner"):
++                self.verify_catalog(self.contract_for_route(domain, owner, {}))
++        for domain in ("market_close", "security_state", "regulatory_state", "event_calendar", "consensus_snapshot"):
++            with self.subTest(domain=domain), self.assertRaisesRegex(ValueError, "domain.*kind"):
++                self.verify_catalog(self.contract_for_route(domain, "formal_context_repository",
++                    dict(context_kind="industry_snapshot", scope_key="signed-scope", as_of_utc=self.frozen.as_of_utc)))
++
+     def test_plain_or_unapproved_registry_and_unsigned_contract_cannot_authorize_official(self):
+         with self.assertRaisesRegex(ValueError, "registry"):
+             self.audit(registry_bundle={"approved": True, "purpose": "official"})
+         with self.assertRaisesRegex(ValueError, "signature"):
+             self.audit(contract=self.signed_contract(self.contract_wire, signature="invalid"))
+         raw = dict(self.contract_wire, purpose="test")
+         with self.assertRaisesRegex(ValueError, "purpose"):
+             self.audit(contract=self.signed_contract(raw))
+         test_repository, test_manifest, _ = fixture_repository(purpose="test")
+         test_bundle = FormalRegistryBundleLoader(test_repository, AcceptingVerifier()).load(test_manifest.manifest_hash)

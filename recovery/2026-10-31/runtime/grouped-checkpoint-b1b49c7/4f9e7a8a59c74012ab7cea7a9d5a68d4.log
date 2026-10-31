@@ -1,0 +1,12 @@
+TEST_STARTED test_formal_final_fixture.FinalScoringFixtureTests.test_fixture_never_exposes_proof_mint_or_plain_proof_double
+test_fixture_never_exposes_proof_mint_or_plain_proof_double (test_formal_final_fixture.FinalScoringFixtureTests.test_fixture_never_exposes_proof_mint_or_plain_proof_double) ... ok
+TEST_STARTED test_formal_final_fixture.FinalScoringFixtureTests.test_focal_full_feature_bundle_has_trustworthy_required_slots
+test_focal_full_feature_bundle_has_trustworthy_required_slots (test_formal_final_fixture.FinalScoringFixtureTests.test_focal_full_feature_bundle_has_trustworthy_required_slots) ... ok
+TEST_STARTED test_formal_final_fixture.FinalScoringFixtureTests.test_one_v2_root_builds_base_policy_and_adjusted_valuation_batches
+test_one_v2_root_builds_base_policy_and_adjusted_valuation_batches (test_formal_final_fixture.FinalScoringFixtureTests.test_one_v2_root_builds_base_policy_and_adjusted_valuation_batches) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 177.148s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_fixture.FinalScoringFixtureTests.test_fixture_never_exposes_proof_mint_or_plain_proof_double", "test_formal_final_fixture.FinalScoringFixtureTests.test_focal_full_feature_bundle_has_trustworthy_required_slots", "test_formal_final_fixture.FinalScoringFixtureTests.test_one_v2_root_builds_base_policy_and_adjusted_valuation_batches"], "passed": ["test_formal_final_fixture.FinalScoringFixtureTests.test_fixture_never_exposes_proof_mint_or_plain_proof_double", "test_formal_final_fixture.FinalScoringFixtureTests.test_focal_full_feature_bundle_has_trustworthy_required_slots", "test_formal_final_fixture.FinalScoringFixtureTests.test_one_v2_root_builds_base_policy_and_adjusted_valuation_batches"], "tests_run": 3, "failures": 0, "errors": 0, "skipped": 0}

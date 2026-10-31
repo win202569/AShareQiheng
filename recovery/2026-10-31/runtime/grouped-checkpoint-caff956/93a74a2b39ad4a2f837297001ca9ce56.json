@@ -1,0 +1,1 @@
+{"identity": "744a2816c7d61281edb055e5d3ffde63d16dce1ed10d27d088f317b4a4fcba6c", "ids": ["test_formal_metric_batch_guard.DerivedProofPublicationTests.test_failed_finalization_revokes_derived_context_and_actual_score", "test_formal_metric_batch_guard.DerivedProofPublicationTests.test_successful_detached_context_score_and_cohort_cache_remain_valid"]}

@@ -1,0 +1,10 @@
+TEST_STARTED test_financial_features.FinancialFormulaTests.test_growth_edges_do_not_invent_denominators
+test_growth_edges_do_not_invent_denominators (test_financial_features.FinancialFormulaTests.test_growth_edges_do_not_invent_denominators) ... ok
+TEST_STARTED test_financial_features.FinancialFormulaTests.test_growth_helpers_fail_closed_on_nonfinite_values
+test_growth_helpers_fail_closed_on_nonfinite_values (test_financial_features.FinancialFormulaTests.test_growth_helpers_fail_closed_on_nonfinite_values) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.002s
+
+OK
+GROUP_SUMMARY {"ids": ["test_financial_features.FinancialFormulaTests.test_growth_edges_do_not_invent_denominators", "test_financial_features.FinancialFormulaTests.test_growth_helpers_fail_closed_on_nonfinite_values"], "passed": ["test_financial_features.FinancialFormulaTests.test_growth_edges_do_not_invent_denominators", "test_financial_features.FinancialFormulaTests.test_growth_helpers_fail_closed_on_nonfinite_values"], "tests_run": 2, "failures": 0, "errors": 0, "skipped": 0}

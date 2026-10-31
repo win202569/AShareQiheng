@@ -1,0 +1,1792 @@
+# Review package: 6b41ff648ab8e6753b72c821f84ee7e60c1cc596..a79e4270480c6d1cde06765c0e5ed6aac908edbb
+
+## Commits
+a79e427 feat: expose bounded deep collection and progress
+
+## Files changed
+ ashare_pipeline/orchestrator.py | 497 ++++++++++++++++++++++++++++++-
+ ashare_pipeline/reporting.py    |  57 ++++
+ tests/test_orchestrator.py      | 635 +++++++++++++++++++++++++++++++++++++++-
+ tests/test_reporting.py         |  47 +++
+ 4 files changed, 1221 insertions(+), 15 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/orchestrator.py b/ashare_pipeline/orchestrator.py
+index a4d4dc9..55e5fec 100644
+--- a/ashare_pipeline/orchestrator.py
++++ b/ashare_pipeline/orchestrator.py
+@@ -3,43 +3,77 @@
+ from __future__ import annotations
+ 
+ import argparse
+ import hashlib
+ import json
+ import os
+ import math
+ import re
+ import sqlite3
+ import tempfile
++from collections import Counter
+ from contextlib import closing
+-from datetime import datetime, time, timedelta, timezone
++from datetime import date, datetime, time, timedelta, timezone
+ from pathlib import Path
+ from typing import Any, Callable
+ from zoneinfo import ZoneInfo
+ 
+ from .curation import CORE_FIELDS, CUTOFF_CN, curate_performance, curate_universe, quality_gate
++from .deep_worker import (
++    STATEMENT_DATASETS,
++    CandidateContext,
++    build_candidate_context,
++    deep_statement_key,
++    load_candidate_context,
++    run_deep,
++)
++from .feature_contract import CONTRACT_VERSION, canonical_sha256
++from .financial_schema import FINANCIAL_REQUEST_VERSION
+ from .scoring import PREFILTER_REASON, build_prefilter
++from .snapshot_repository import SnapshotRef, SnapshotRepository
+ from .state_store import StateStore
+ 
+ 
+ SCHEMA_VERSION = 1
+ CURATED_SCHEMA_VERSION = 2
+ SHANGHAI = ZoneInfo("Asia/Shanghai")
+ RULESET_HASH = hashlib.sha256(b"a-share-scoring-v2-partial-prefilter-only").hexdigest()
+ PREFILTER_RULESET_HASH = hashlib.sha256(
+     b"prefilter-v1:industry-percentiles:growth-55:quality-45:top-120"
+ ).hexdigest()
+ CURATION_RULESET_HASH = hashlib.sha256(
+     b"curation-v2:sh-sz-a:no-689:cutoff-2026-08-31:stable-dedupe:coverage-95"
+ ).hexdigest()
+ FORMAL_FEATURES = ("G", "V", "M", "EQ", "FS", "CA", "T")
+ MARKET_PRICE_TRANSFORMATION_VERSION = "market-effective-close-v1"
++FEATURE_CALENDAR_START = date(2021, 1, 1)
++FEATURE_CALENDAR_MIN_END = date(2026, 9, 7)
++FEATURE_CALENDAR_REQUEST_VERSION = "trade-calendar-feature-v1"
++
++
++def _feature_calendar_end(now: datetime) -> str:
++    return max(now.date() + timedelta(days=10), FEATURE_CALENDAR_MIN_END).isoformat()
++
++
++def _feature_calendar_request(now: datetime) -> dict[str, str]:
++    return {
++        "start_date": FEATURE_CALENDAR_START.isoformat(),
++        "end_date": _feature_calendar_end(now),
++    }
++
++
++def _feature_calendar_job_key(now: datetime) -> str:
++    request_hash = canonical_sha256(_feature_calendar_request(now))
++    return (
++        f"collect:baostock:trade_dates:{FEATURE_CALENDAR_REQUEST_VERSION}:"
++        f"{request_hash}"
++    )
+ 
+ 
+ def _canonical_bytes(value: object) -> bytes:
+     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+ 
+ 
+ def _hash(value: object) -> str:
+     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+ 
+ 
+@@ -81,20 +115,60 @@ def _default_sources():
+ 
+     return BaoStockSource(), AKShareSource()
+ 
+ 
+ def _default_snapshot_store(root: Path):
+     from .snapshot_store import SnapshotStore
+ 
+     return SnapshotStore(root)
+ 
+ 
++def _default_calendar_source():
++    from .sources import BaoStockSource
++
++    return BaoStockSource()
++
++
++def _default_deep_source():
++    from .sources import AKShareSource
++
++    return AKShareSource()
++
++
++def _deep_dependencies(
++    root: Path,
++    store: StateStore,
++    *,
++    now: datetime,
++    online: bool,
++    sources: tuple[Any, Any] | None,
++    snapshot_store: Any | None,
++    deep_source: Any | None = None,
++) -> tuple[SnapshotRepository, Any | None, SnapshotRef | None]:
++    repository = SnapshotRepository(root, store, snapshot_store)
++    request = _feature_calendar_request(now)
++    calendar = repository.find_exact("baostock", "trade_dates", request)
++    if calendar is not None:
++        repository.read_verified(calendar)
++    source = None
++    if online:
++        source = deep_source
++        if source is None:
++            source = sources[1] if sources is not None else _default_deep_source()
++        if calendar is None:
++            bao = sources[0] if sources is not None else _default_calendar_source()
++            calendar, _ = repository.persist(
++                bao.fetch_trade_dates(request["start_date"], request["end_date"])
++            )
++    return repository, source, calendar
++
++
+ def _latest_completed_market_date(now: datetime) -> str:
+     candidate = now.date()
+     if now.timetz().replace(tzinfo=None) < time(15, 30):
+         candidate -= timedelta(days=1)
+     while candidate.weekday() >= 5:
+         candidate -= timedelta(days=1)
+     return candidate.isoformat()
+ 
+ 
+ def _snapshot_row(db: Path, source: str, dataset: str) -> dict | None:
+@@ -199,26 +273,33 @@ def _collect_online(
+     db: Path,
+     store: StateStore,
+     now: datetime,
+     sources: tuple[Any, Any] | None,
+     snapshot_store: Any | None,
+ ) -> tuple[list[dict], list[dict], list[str], int]:
+     now_utc = now.astimezone(timezone.utc).isoformat()
+     recovered_expired = store.recover_expired_leases(now_utc)
+     bao, ak = sources if sources is not None else _default_sources()
+     snapshots = snapshot_store if snapshot_store is not None else _default_snapshot_store(root)
+-    market_date = _latest_completed_market_date(now)
+-    tasks: list[tuple[str, str, Callable[[], Any]]] = [
+-        ("baostock", "security_master", bao.fetch_security_master),
+-        ("baostock", "trade_dates", lambda: bao.fetch_trade_dates("2026-08-24", market_date)),
+-        ("akshare", "disclosure_schedule", ak.fetch_disclosure_schedule),
+-        ("akshare", "performance_report", ak.fetch_performance_report),
++    calendar_request = _feature_calendar_request(now)
++    tasks: list[tuple[str, str, Callable[[], Any], str | None]] = [
++        ("baostock", "security_master", bao.fetch_security_master, None),
++        (
++            "baostock",
++            "trade_dates",
++            lambda: bao.fetch_trade_dates(
++                calendar_request["start_date"], calendar_request["end_date"]
++            ),
++            _feature_calendar_job_key(now),
++        ),
++        ("akshare", "disclosure_schedule", ak.fetch_disclosure_schedule, None),
++        ("akshare", "performance_report", ak.fetch_performance_report, None),
+     ]
+     batches: list[dict] = []
+     errors: list[dict] = []
+     circuit_breakers: set[str] = set()
+     attempt_date = now.date().isoformat()
+ 
+     def cached_job_result(source: str, dataset: str, job_id: str) -> list[dict]:
+         job = store.get_job(job_id)
+         if job is None:
+             return [{"source": source, "dataset": dataset, "status": "pending", "job_id": job_id}]
+@@ -237,25 +318,26 @@ def _collect_online(
+             "cached": False,
+         }
+         if job.get("error") is not None:
+             result["error"] = job["error"]
+         if job.get("next_retry_at") is not None:
+             result["next_retry_at"] = job["next_retry_at"]
+         if job.get("lease_expires_at") is not None:
+             result["lease_expires_at"] = job["lease_expires_at"]
+         return [result]
+ 
+-    for source, dataset, collect in tasks:
++    calendar_repository = SnapshotRepository(root, store, snapshots)
++    for source, dataset, collect, explicit_job_key in tasks:
+         if source in circuit_breakers:
+             batches.append({"source": source, "dataset": dataset, "status": "circuit_open"})
+             continue
+-        kind = f"fetch_source:{source}:{dataset}:{attempt_date}"
++        kind = explicit_job_key or f"fetch_source:{source}:{dataset}:{attempt_date}"
+         job_id = store.enqueue_job(kind, kind, {"source": source, "dataset": dataset, "attempt_date": attempt_date})
+         leased = store.lease_next_job([kind], "orchestrator", 900, now_utc)
+         if leased is None:
+             cached = cached_job_result(source, dataset, job_id)
+             batches.extend(cached)
+             for item in cached:
+                 cached_error = item.get("error")
+                 if not isinstance(cached_error, dict) or cached_error.get("classification") != "blocked":
+                     continue
+                 issue = {
+@@ -264,21 +346,41 @@ def _collect_online(
+                     "classification": "blocked",
+                     "error": str(cached_error.get("error") or "cached source block"),
+                     "cached": True,
+                 }
+                 errors.append(issue)
+                 circuit_breakers.add(source)
+             continue
+         try:
+             collected = collect()
+             items = list(collected.values()) if isinstance(collected, dict) else [collected]
+-            persisted = [_persist_batch(root, db, store, snapshots, item) for item in items]
++            if dataset == "trade_dates":
++                persisted = []
++                for item in items:
++                    ref, created = calendar_repository.persist(item)
++                    persisted.append(
++                        {
++                            "dataset": ref.dataset,
++                            "source": ref.source,
++                            "source_version": item.source_version,
++                            "request": item.request,
++                            "rows": ref.row_count,
++                            "hash": ref.payload_hash,
++                            "path": ref.payload_path,
++                            "semantic_hash": _hash(_semantic_batch_payload(item)),
++                            "created": created,
++                        }
++                    )
++            else:
++                persisted = [
++                    _persist_batch(root, db, store, snapshots, item) for item in items
++                ]
+             store.complete_job(job_id, {"batches": persisted})
+             batches.extend({"source": source, "status": "succeeded", **item} for item in persisted)
+         except Exception as error:
+             classification, retryable = _source_exception(error)
+             retry_at = (now + timedelta(hours=1)).astimezone(timezone.utc).isoformat() if retryable else None
+             store.fail_job(job_id, {"classification": classification, "error": str(error)}, retryable, retry_at)
+             issue = {
+                 "source": source,
+                 "dataset": dataset,
+                 "classification": classification,
+@@ -511,20 +613,51 @@ def _rebuild_curated(root: Path, db: Path, now: datetime) -> dict[str, dict]:
+         "performance": performance_document_out,
+         "prefilter": prefilter_document,
+         "quality": quality_document,
+     }
+ 
+ 
+ def _performance_input_hash(row: dict) -> str:
+     return _hash(row)
+ 
+ 
++def enqueue_daily_statement_jobs(
++    store: StateStore,
++    context: CandidateContext,
++    report_period: str,
++    as_of_cn_date: str,
++) -> tuple[str, ...]:
++    job_ids: list[str] = []
++    for security_id in sorted(context.members):
++        for dataset in STATEMENT_DATASETS:
++            job_ids.append(
++                store.enqueue_job(
++                    "deep_statement",
++                    deep_statement_key(
++                        security_id, dataset, report_period, as_of_cn_date
++                    ),
++                    {
++                        "security_id": security_id,
++                        "dataset": dataset,
++                        "report_period": report_period,
++                        "candidate_set_hash": context.candidate_set_hash,
++                        "performance_input_hash": context.performance_input_hashes[
++                            security_id
++                        ],
++                        "request_version": FINANCIAL_REQUEST_VERSION,
++                        "refresh_date": as_of_cn_date,
++                    },
++                )
++            )
++    return tuple(job_ids)
++
++
+ def _formal_feature_coverage(candidate: dict) -> float:
+     feature_map = candidate.get("formal_features")
+     if not isinstance(feature_map, dict):
+         return 0.0
+     available = sum(feature_map.get(feature) is not None for feature in FORMAL_FEATURES)
+     return available / len(FORMAL_FEATURES)
+ 
+ 
+ def _enqueue_deep_and_partial_scores(store: StateStore, curated: dict[str, dict], now: datetime) -> None:
+     if not curated:
+@@ -536,20 +669,28 @@ def _enqueue_deep_and_partial_scores(store: StateStore, curated: dict[str, dict]
+     for candidate in candidates:
+         security_id = str(candidate["security_id"])
+         source_row = performance_by_id[security_id]
+         input_hash = _performance_input_hash(source_row)
+         store.enqueue_job(
+             "deep_financial",
+             f"deep_financial:{security_id}:{input_hash}",
+             {"security_id": security_id, "input_hash": input_hash, "report_period": "2026-06-30"},
+         )
+ 
++    context = build_candidate_context(curated["prefilter"], curated["performance"])
++    enqueue_daily_statement_jobs(
++        store,
++        context,
++        "2026-06-30",
++        now.date().isoformat(),
++    )
++
+     scoring_input_hash = _hash(curated["performance"].get("input_hashes", {}))
+     with closing(sqlite3.connect(store.db_path)) as connection:
+         existing = connection.execute(
+             """SELECT id FROM score_run WHERE status = 'provisional' AND ruleset_hash = ?
+             AND universe_hash = ? ORDER BY created_at DESC LIMIT 1""",
+             (RULESET_HASH, scoring_input_hash),
+         ).fetchone()
+     score_run_id = existing[0] if existing else store.create_score_run(
+         "2026-06-30", now.isoformat(), RULESET_HASH, scoring_input_hash, "incremental"
+     )
+@@ -575,50 +716,326 @@ def _curated_metrics(root: Path) -> dict[str, dict]:
+         "quality": root / "status" / "quality.json",
+     }
+     result: dict[str, dict] = {}
+     for name, path in paths.items():
+         document = _read_json(path)
+         if document is not None:
+             result[name] = document.get("metrics", {})
+     return result
+ 
+ 
++_PROGRESS_CLASSIFICATIONS = frozenset(
++    {
++        "pending",
++        "retryable_network",
++        "source_blocked",
++        "terminal_source_missing",
++        "unverified_snapshot",
++        "target_period_missing",
++    }
++)
++
++
++def _counts(values: list[str]) -> dict[str, int]:
++    return dict(sorted(Counter(values).items()))
++
++
++def _progress_instant(value: str, field: str) -> datetime:
++    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
++    if parsed.tzinfo is None:
++        raise ValueError(f"{field} must include a timezone offset")
++    return parsed.astimezone(timezone.utc)
++
++
++def _job_error_value(job: dict[str, object]) -> str | None:
++    error = job.get("error")
++    if not isinstance(error, dict):
++        return None
++    value = error.get("error_classification", error.get("classification"))
++    return value if isinstance(value, str) else None
++
++
++def _progress_error_classification(job: dict[str, object] | None) -> str | None:
++    if job is None or job.get("status") in {"pending", "running"}:
++        return "pending"
++    raw = _job_error_value(job)
++    if raw in {"retryable_source", "retryable_network", "retryable"}:
++        return "retryable_network"
++    if raw in {"source_blocked", "blocked"}:
++        return "source_blocked"
++    if raw in {"terminal_source", "terminal_source_missing"}:
++        return "terminal_source_missing"
++    if raw == "target_period_missing":
++        return "target_period_missing"
++    if raw == "unverified_snapshot":
++        return "unverified_snapshot"
++    return None
++
++
++def _empty_deep_progress() -> dict[str, object]:
++    return {
++        "deep_candidate_count": 0,
++        "deep_parent_job_counts": {},
++        "deep_statement_job_counts": {dataset: {} for dataset in STATEMENT_DATASETS},
++        "statement_snapshot_counts": {},
++        "feature_set_counts": {
++            "partial": 0,
++            "financial_ready": 0,
++            "blocked": 0,
++        },
++        "candidate_financial_coverage": {
++            "numerator": 0,
++            "denominator": 0,
++            "rate": 0.0,
++        },
++        "incomplete_candidates": [],
++        "expired_current_lease_count": 0,
++        "unknown_failure_count": 0,
++        "active_circuit_breakers": [],
++        "template_counts": {},
++        "missing_reason_counts": {},
++        "latest_feature_contract_version": CONTRACT_VERSION,
++    }
++
++
++def build_deep_progress(
++    data_root: Path,
++    store: StateStore,
++    repository: SnapshotRepository,
++    context: CandidateContext,
++    now: datetime,
++) -> dict[str, object]:
++    resolved_root = Path(data_root).resolve()
++    if repository.data_root.resolve() != resolved_root:
++        raise ValueError("snapshot repository root must match deep progress root")
++    if Path(repository.state_store.db_path).resolve() != Path(store.db_path).resolve():
++        raise ValueError("snapshot repository state store must match progress state store")
++    refresh_date = now.date().isoformat()
++    report_period = "2026-06-30"
++    members = set(context.members)
++    jobs = store.list_jobs()
++    parent_jobs = [
++        job
++        for job in jobs
++        if job.get("kind") == "deep_financial"
++        and isinstance(job.get("payload"), dict)
++        and job["payload"].get("security_id") in members
++    ]
++    current_jobs = [
++        job
++        for job in jobs
++        if job.get("kind") == "deep_statement"
++        and isinstance(job.get("payload"), dict)
++        and job["payload"].get("security_id") in members
++        and job["payload"].get("dataset") in STATEMENT_DATASETS
++        and job["payload"].get("report_period") == report_period
++        and job["payload"].get("request_version") == FINANCIAL_REQUEST_VERSION
++        and job["payload"].get("refresh_date") == refresh_date
++    ]
++    jobs_by_slot = {
++        (job["payload"]["security_id"], job["payload"]["dataset"]): job
++        for job in current_jobs
++    }
++    statement_job_counts = {
++        dataset: _counts(
++            [
++                str(job["status"])
++                for job in current_jobs
++                if job["payload"]["dataset"] == dataset
++            ]
++        )
++        for dataset in STATEMENT_DATASETS
++    }
++    snapshot_counts = Counter()
++    incomplete: list[dict[str, object]] = []
++    complete_count = 0
++    for security_id in sorted(members):
++        missing: list[str] = []
++        states: list[str] = []
++        classifications: list[str] = []
++        for dataset in STATEMENT_DATASETS:
++            job = jobs_by_slot.get((security_id, dataset))
++            request = {"symbol": security_id, "report_period": report_period}
++            snapshot = repository.find_exact("akshare", dataset, request)
++            classification: str | None = None
++            if snapshot is None:
++                classification = _progress_error_classification(job)
++                missing.append(dataset)
++                states.append(str(job["status"]) if job is not None else "pending")
++            else:
++                try:
++                    verified = repository.read_verified(snapshot)
++                except (OSError, ValueError, UnicodeError):
++                    classification = "unverified_snapshot"
++                else:
++                    snapshot_counts[dataset] += 1
++                    target_present = any(
++                        str(record.get("REPORT_DATE", ""))[:10] == report_period
++                        for record in verified.batch.records
++                        if isinstance(record, dict)
++                    )
++                    if not target_present:
++                        classification = "target_period_missing"
++            if classification is not None:
++                classifications.append(classification)
++                if dataset not in missing:
++                    missing.append(dataset)
++                    states.append(
++                        str(job["status"]) if job is not None else "pending"
++                    )
++        if missing:
++            incomplete.append(
++                {
++                    "security_id": security_id,
++                    "missing_datasets": sorted(missing),
++                    "job_states": sorted(set(states)),
++                    "error_classifications": sorted(set(classifications)),
++                }
++            )
++        else:
++            complete_count += 1
++
++    now_utc = now.astimezone(timezone.utc)
++    expired_current = sum(
++        1
++        for job in current_jobs
++        if job.get("status") == "running"
++        and isinstance(job.get("lease_expires_at"), str)
++        and _progress_instant(job["lease_expires_at"], "lease_expires_at")
++        <= now_utc
++    )
++    known_raw = {
++        "retryable_source",
++        "retryable_network",
++        "retryable",
++        "source_blocked",
++        "blocked",
++        "terminal_source",
++        "terminal_source_missing",
++        "target_period_missing",
++        "unverified_snapshot",
++    }
++    unknown_failures = sum(
++        1
++        for job in current_jobs
++        if job.get("status") in {"retryable_failed", "terminal_failed"}
++        and _job_error_value(job) not in known_raw
++    )
++    active_circuits = sorted(
++        {
++            "akshare"
++            for job in current_jobs
++            if job.get("status") == "retryable_failed"
++            and _job_error_value(job) in {"source_blocked", "blocked"}
++            and isinstance(job.get("next_retry_at"), str)
++            and _progress_instant(job["next_retry_at"], "next_retry_at") > now_utc
++        }
++    )
++
++    feature_rows: dict[str, dict[str, object]] = {}
++    with closing(store._connect()) as connection:
++        rows = connection.execute(
++            """SELECT * FROM feature_set
++            WHERE candidate_set_hash=? AND contract_version=? AND report_period=?
++            ORDER BY security_id,as_of_utc DESC,created_at DESC,id DESC""",
++            (context.candidate_set_hash, CONTRACT_VERSION, report_period),
++        ).fetchall()
++    for row in rows:
++        public = store._feature_set_public(row)
++        security_id = str(public["security_id"])
++        if security_id in members and security_id not in feature_rows:
++            feature_rows[security_id] = public
++    feature_counts = {"partial": 0, "financial_ready": 0, "blocked": 0}
++    templates: list[str] = []
++    missing_reasons: list[str] = []
++    for row in feature_rows.values():
++        status = str(row["status"])
++        if status in feature_counts:
++            feature_counts[status] += 1
++        templates.append(str(row["template_id"]))
++        for item in row.get("missing", []):
++            if isinstance(item, dict) and isinstance(item.get("missing_reason"), str):
++                missing_reasons.append(item["missing_reason"])
++
++    denominator = len(members)
++    if len(incomplete) != denominator - complete_count:
++        raise AssertionError("incomplete candidate cardinality mismatch")
++    return {
++        "deep_candidate_count": denominator,
++        "deep_parent_job_counts": _counts([str(job["status"]) for job in parent_jobs]),
++        "deep_statement_job_counts": statement_job_counts,
++        "statement_snapshot_counts": dict(sorted(snapshot_counts.items())),
++        "feature_set_counts": feature_counts,
++        "candidate_financial_coverage": {
++            "numerator": complete_count,
++            "denominator": denominator,
++            "rate": complete_count / denominator if denominator else 0.0,
++        },
++        "incomplete_candidates": incomplete,
++        "expired_current_lease_count": expired_current,
++        "unknown_failure_count": unknown_failures,
++        "active_circuit_breakers": active_circuits,
++        "template_counts": _counts(templates),
++        "missing_reason_counts": _counts(missing_reasons),
++        "latest_feature_contract_version": CONTRACT_VERSION,
++    }
++
++
+ def _status_payload(
+     root: Path,
+     store: StateStore,
+     now: datetime,
+     command: str,
+     mode: str,
+     *,
+     pipeline_state: str | None = None,
+     source_batches: list[dict] | None = None,
+     source_errors: list[dict] | None = None,
+     circuit_breakers: list[str] | None = None,
+     blocked_reasons: list[str] | None = None,
+     recovered_expired_leases: int = 0,
+ ) -> dict:
+     curated = _curated_metrics(root)
+     if pipeline_state is None:
+         pipeline_state = str(curated.get("quality", {}).get("status", "pending"))
++    candidate_paths = (
++        root / "curated" / "prefilter.json",
++        root / "curated" / "performance.json",
++    )
++    if not any(path.exists() for path in candidate_paths):
++        deep_progress = _empty_deep_progress()
++    else:
++        context = load_candidate_context(root)
++        deep_progress = build_deep_progress(
++            root,
++            store,
++            SnapshotRepository(root, store),
++            context,
++            now,
++        )
+     return {
+         "schema_version": SCHEMA_VERSION,
+         "command": command,
+         "mode": mode,
+         "pipeline_state": pipeline_state,
+         "generated_at_utc": now.astimezone(timezone.utc).isoformat(),
+         "state": store.progress_snapshot(),
+         "curated": curated,
+         "source_batches": source_batches or [],
+         "source_errors": source_errors or [],
+         "circuit_breakers": circuit_breakers or [],
+         "blocked_reasons": blocked_reasons or [],
+         "recovered_expired_leases": recovered_expired_leases,
++        "formal_score_ready": False,
++        "seven_dimension_ready": False,
++        "official_pool_counts": {"waiting_price": 0, "strong_attention": 0},
++        "deep": deep_progress,
+         "next_actions": [
+             "继续增量采集披露变化和候选完整三表",
+             "2026-08-31收盘后补齐行情证据",
+             "七维正式特征和财报正文风险核验完成前不得冻结股票池",
+         ],
+     }
+ 
+ 
+ def _market_security_id(record: dict, universe_by_code: dict[str, str]) -> str | None:
+     security_id = str(record.get("security_id", "")).upper().strip()
+@@ -841,43 +1258,80 @@ def _finalize(root: Path, store: StateStore, now: datetime) -> tuple[list[str],
+ 
+ def run_command(
+     root: str | Path,
+     db: str | Path,
+     command: str,
+     *,
+     online: bool = False,
+     now_cn: str | None = None,
+     sources: tuple[Any, Any] | None = None,
+     snapshot_store: Any | None = None,
++    deep_source: Any | None = None,
++    limit: int = 10,
+ ) -> tuple[dict, int]:
+     root_path = Path(root).resolve()
+     db_path = Path(db).resolve()
+     now = _now_cn(now_cn)
+     store = StateStore(db_path)
+     store.initialize()
+ 
+     if command == "status":
+         payload = _status_payload(root_path, store, now, command, "status")
+         _atomic_write_json(root_path / "status" / "pipeline_status.json", payload)
+         return payload, 0
+ 
+-    run_id = store.start_run(command, now.isoformat(), {"online": online})
++    run_params = {"online": online}
++    if command == "deep":
++        run_params["limit"] = limit
++    run_id = store.start_run(command, now.isoformat(), run_params)
+ 
+     def write_then_finish(payload: dict, terminal_status: str, error: str | None = None) -> None:
+         recent = payload.get("state", {}).get("recent_run")
+         if isinstance(recent, dict) and recent.get("id") == run_id:
+             recent["status"] = terminal_status
+             recent["finished_at"] = now.astimezone(timezone.utc).isoformat()
+         _atomic_write_json(root_path / "status" / "pipeline_status.json", payload)
+         store.finish_run(run_id, terminal_status, error)
+ 
+     try:
++        if command == "deep":
++            repository, source, calendar = _deep_dependencies(
++                root_path,
++                store,
++                now=now,
++                online=online,
++                sources=sources,
++                snapshot_store=snapshot_store,
++                deep_source=deep_source,
++            )
++            summary = run_deep(
++                root_path,
++                store,
++                source=source,
++                snapshots=repository,
++                trade_calendar_snapshot=calendar,
++                now_cn=now,
++                online=online,
++                limit=limit,
++            )
++            payload = _status_payload(
++                root_path,
++                store,
++                now,
++                command,
++                "online" if online else "offline",
++                circuit_breakers=list(summary.circuit_breakers),
++            )
++            payload["deep_run"] = summary.to_dict()
++            write_then_finish(payload, "succeeded")
++            return payload, 0
++
+         if command == "finalize":
+             reasons, _ = _finalize(root_path, store, now)
+             payload = _status_payload(
+                 root_path,
+                 store,
+                 now,
+                 command,
+                 "offline",
+                 pipeline_state="blocked",
+                 blocked_reasons=reasons,
+@@ -927,31 +1381,52 @@ def run_command(
+ 
+ 
+ def _parser() -> argparse.ArgumentParser:
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--root", required=True)
+     parser.add_argument("--db", required=True)
+     subparsers = parser.add_subparsers(dest="command", required=True)
+     for command in ("bootstrap", "incremental"):
+         child = subparsers.add_parser(command)
+         child.add_argument("--online", action="store_true")
++    deep = subparsers.add_parser("deep")
++    deep.add_argument("--online", action="store_true")
++    deep.add_argument(
++        "--limit",
++        type=lambda value: _bounded_int(value, 1, 360),
++        default=10,
++    )
+     subparsers.add_parser("status")
+     finalize = subparsers.add_parser("finalize")
+     finalize.add_argument("--now-cn", required=True)
+     return parser
+ 
+ 
++def _bounded_int(value: str, minimum: int, maximum: int) -> int:
++    try:
++        parsed = int(value)
++    except ValueError as error:
++        raise argparse.ArgumentTypeError("value must be an integer") from error
++    if not minimum <= parsed <= maximum:
++        raise argparse.ArgumentTypeError(
++            f"value must be between {minimum} and {maximum}"
++        )
++
++    return parsed
++
++
+ def main(argv: list[str] | None = None) -> int:
+     arguments = _parser().parse_args(argv)
+     payload, exit_code = run_command(
+         arguments.root,
+         arguments.db,
+         arguments.command,
+         online=bool(getattr(arguments, "online", False)),
+         now_cn=getattr(arguments, "now_cn", None),
++        limit=getattr(arguments, "limit", 10),
+     )
+     print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+     return exit_code
+ 
+ 
+ if __name__ == "__main__":
+     raise SystemExit(main())
+diff --git a/ashare_pipeline/reporting.py b/ashare_pipeline/reporting.py
+index daa0116..62b985d 100644
+--- a/ashare_pipeline/reporting.py
++++ b/ashare_pipeline/reporting.py
+@@ -1,20 +1,21 @@
+ """Build a bounded, source-backed progress report artifact.
+ 
+ The generator deliberately reports engineering readiness rather than security
+ recommendations.  It accepts reviewed aggregate inputs and never copies raw
+ pipeline payloads into the reader-facing snapshot.
+ """
+ 
+ from __future__ import annotations
+ 
+ import copy
++import json
+ import math
+ import re
+ import sqlite3
+ from datetime import datetime
+ from pathlib import PurePosixPath, PureWindowsPath
+ from typing import Any, Mapping
+ 
+ 
+ REPORT_TITLE = "A股2026中报评估方法与增量采集进度"
+ MAX_SOURCE_ROWS = 25
+@@ -386,20 +387,76 @@ def _operational_rows(
+         rows.append(
+             {
+                 "priority": 3,
+                 "category": "预筛队列",
+                 "subject": "深抓候选",
+                 "status": "非正式评分",
+                 "detail": f"候选数={count if count is not None else '待采集'}；{reason}",
+                 "next_action": "仅用于安排完整三表和正文核验",
+             }
+         )
++    deep = _first(pipeline_status, "deep")
++    if isinstance(deep, Mapping) and deep:
++        coverage = _first(deep, "candidate_financial_coverage")
++        if isinstance(coverage, Mapping):
++            numerator = _number(_first(coverage, "numerator"))
++            denominator = _number(_first(coverage, "denominator"))
++            rate = _number(_first(coverage, "rate"))
++            rows.append(
++                {
++                    "priority": 3,
++                    "category": "深抓进度",
++                    "subject": "候选财报覆盖",
++                    "status": "financial-inputs-only",
++                    "detail": (
++                        f"{numerator if numerator is not None else '待确认'}/"
++                        f"{denominator if denominator is not None else '待确认'}；"
++                        f"rate={rate if rate is not None else '待确认'}"
++                    ),
++                    "next_action": "补齐三张验签且含目标期的财报快照",
++                }
++            )
++        statement_counts = _first(deep, "deep_statement_job_counts")
++        snapshot_counts = _first(deep, "statement_snapshot_counts")
++        feature_counts = _first(deep, "feature_set_counts")
++        incomplete = _first(deep, "incomplete_candidates")
++        rows.append(
++            {
++                "priority": 3,
++                "category": "深抓进度",
++                "subject": "报表作业与快照",
++                "status": "bounded",
++                "detail": (
++                    "jobs="
++                    + json.dumps(statement_counts or {}, ensure_ascii=False, sort_keys=True)
++                    + "；snapshots="
++                    + json.dumps(snapshot_counts or {}, ensure_ascii=False, sort_keys=True)
++                ),
++                "next_action": "按请求版本和刷新日继续有界执行",
++            }
++        )
++        rows.append(
++            {
++                "priority": 3,
++                "category": "深抓进度",
++                "subject": "特征包状态",
++                "status": "nonformal",
++                "detail": (
++                    "feature_sets="
++                    + json.dumps(feature_counts or {}, ensure_ascii=False, sort_keys=True)
++                    + f"；incomplete_count={len(incomplete) if isinstance(incomplete, list) else 0}"
++                    + f"；expired_leases={_first(deep, 'expired_current_lease_count') or 0}"
++                    + f"；unknown_failures={_first(deep, 'unknown_failure_count') or 0}"
++                ),
++                "next_action": "保持正式评分闸门关闭并解决缺失分类",
++            }
++        )
+     for fallback, item in _candidate_pairs(_first(pipeline_status, "next_actions")):
+         detail = item if not isinstance(item, Mapping) else _coalesce(_first(item, "action", "message"), fallback)
+         rows.append(
+             {
+                 "priority": 2,
+                 "category": "下一动作",
+                 "subject": "管线",
+                 "status": "planned",
+                 "detail": _clean_text(detail, "待确认"),
+                 "next_action": _clean_text(detail, "待确认"),
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+index a9b25b4..68a2cea 100644
+--- a/tests/test_orchestrator.py
++++ b/tests/test_orchestrator.py
+@@ -1,71 +1,157 @@
+ import io
+ import hashlib
+ import json
+ import os
+ import sqlite3
+ import tempfile
+ import unittest
+ from contextlib import closing, redirect_stdout
++from datetime import date, timedelta
+ from pathlib import Path
+ from unittest.mock import patch
+ 
++from ashare_pipeline.deep_worker import (
++    CandidateContext,
++    STATEMENT_DATASETS,
++)
++from ashare_pipeline.feature_contract import canonical_sha256
++from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
++from ashare_pipeline.snapshot_repository import SnapshotRepository
+ from ashare_pipeline.snapshot_store import SnapshotStore
+ from ashare_pipeline.sources import FetchBatch, SourceBlocked
+ from ashare_pipeline.state_store import StateStore
+ from ashare_pipeline import orchestrator
+ 
+ 
+ def batch(source, dataset, records, request=None, fetched_at="2026-08-29T12:00:00+00:00"):
+     return FetchBatch(source, dataset, request or {}, records, fetched_at, "test", {})
+ 
+ 
+ def records_hash(records):
+     payload = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+     return hashlib.sha256(payload).hexdigest()
+ 
+ 
++def write_candidate_documents(root, candidates):
++    performance_records = [
++        {
++            "security_id": security_id,
++            "industry": industry,
++            "report_period": "2026-06-30",
++        }
++        for security_id, industry in sorted(candidates.items())
++    ]
++    prefilter_records = [
++        {"security_id": row["security_id"], "industry": row["industry"]}
++        for row in performance_records
++    ]
++    documents = {
++        "performance": {
++            "schema_version": 2,
++            "input_hashes": {"fixture": "performance"},
++            "records_hash": canonical_sha256(performance_records),
++            "records": performance_records,
++        },
++        "prefilter": {
++            "schema_version": 2,
++            "input_hashes": {"fixture": "prefilter"},
++            "records_hash": canonical_sha256(prefilter_records),
++            "records": prefilter_records,
++        },
++    }
++    for name, document in documents.items():
++        path = root / "curated" / f"{name}.json"
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(
++            json.dumps(document, ensure_ascii=False, sort_keys=True),
++            encoding="utf-8",
++        )
++
++
++def exact_statement_batch(security_id, dataset, *, target=True):
++    return batch(
++        "akshare",
++        dataset,
++        [
++            {
++                "SECURITY_CODE": security_id[2:],
++                "REPORT_DATE": "2026-06-30" if target else "2025-12-31",
++                "NOTICE_DATE": "2026-08-20",
++            }
++        ],
++        {"symbol": security_id, "report_period": "2026-06-30"},
++    )
++
++
++def exact_calendar_batch(now="2026-08-29T12:00:00+00:00"):
++    return batch(
++        "baostock",
++        "trade_dates",
++        [
++            {"calendar_date": "2026-08-31", "is_trading_day": "1"},
++            {"calendar_date": "2026-09-07", "is_trading_day": "1"},
++        ],
++        {"start_date": "2021-01-01", "end_date": "2026-09-08"},
++        now,
++    )
++
++
+ class FakeBaoSource:
+     def __init__(self):
+         self.round = 0
+         self.calls = {"security_master": 0, "trade_dates": 0}
++        self.trade_date_requests = []
+         self.master = [
+             {"code": "sz.000001", "code_name": "平安银行", "ipoDate": "1991-04-03", "type": "1", "status": "1"},
+             {"code": "sh.600000", "code_name": "浦发银行", "ipoDate": "1999-11-10", "type": "1", "status": "1"},
+             {"code": "sh.900901", "code_name": "云赛B股", "type": "1", "status": "1"},
+             {"code": "bj.430047", "code_name": "北交样本", "type": "1", "status": "1"},
+         ]
+ 
+     def _time(self):
+         return f"2026-08-{29 + self.round:02d}T12:00:00+00:00"
+ 
+     def fetch_security_master(self):
+         self.calls["security_master"] += 1
+         return batch("baostock", "security_master", self.master, fetched_at=self._time())
+ 
+     def fetch_trade_dates(self, start_date, end_date):
+         self.calls["trade_dates"] += 1
++        self.trade_date_requests.append((start_date, end_date))
+         self.round += 1
+         return batch(
+             "baostock",
+             "trade_dates",
+-            [{"calendar_date": end_date, "is_trading_day": "1"}],
++            [
++                {
++                    "calendar_date": (
++                        date.fromisoformat(start_date) + timedelta(days=offset)
++                    ).isoformat(),
++                    "is_trading_day": "1",
++                }
++                for offset in range(
++                    (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days
++                    + 1
++                )
++            ],
+             {"start_date": start_date, "end_date": end_date},
+             self._time(),
+         )
+ 
+ 
+ class FakeAKSource:
+     def __init__(self):
+         self.round = 0
+         self.blocked = False
+         self.calls = {"disclosure_schedule": 0, "performance_report": 0}
++        self.statement_calls = []
+         self.performance = [
+             {
+                 "股票代码": "000001", "股票简称": "平安银行", "营业总收入同比增长": 5,
+                 "净利润同比增长": 6, "净资产收益率": 7, "销售毛利率": 8,
+                 "每股经营现金流量": 1, "所处行业": "银行", "最新公告日期": "2026-08-20",
+             },
+             {
+                 "股票代码": "600000", "股票简称": "浦发银行", "营业总收入同比增长": 4,
+                 "净利润同比增长": 5, "净资产收益率": 6, "销售毛利率": 7,
+                 "每股经营现金流量": 2, "所处行业": "银行", "最新公告日期": "2026-08-21",
+@@ -81,31 +167,564 @@ class FakeAKSource:
+         if self.blocked:
+             raise SourceBlocked("429 challenge")
+         return batch("akshare", "disclosure_schedule", [{"股票代码": "000001"}], fetched_at=self._time())
+ 
+     def fetch_performance_report(self):
+         self.calls["performance_report"] += 1
+         if self.blocked:
+             raise AssertionError("circuit breaker should skip later AKShare calls")
+         return batch("akshare", "performance_report", self.performance, {"date": "20260630"}, self._time())
+ 
++    def fetch_financial_statement(self, symbol, dataset, report_period="2026-06-30"):
++        self.statement_calls.append((symbol, dataset, report_period))
++        return exact_statement_batch(symbol, dataset)
++
++
++class FakeStatementSource:
++    def __init__(self):
++        self.calls = []
++
++    def fetch_financial_statement(self, symbol, dataset, report_period="2026-06-30"):
++        self.calls.append((symbol, dataset, report_period))
++        return exact_statement_batch(symbol, dataset)
++
+ 
+ class OrchestratorTestCase(unittest.TestCase):
+     def setUp(self):
+         self.tempdir = tempfile.TemporaryDirectory()
+         self.base = Path(self.tempdir.name)
+         self.root = self.base / "data"
+         self.db = self.base / "state.sqlite3"
+ 
+     def tearDown(self):
+         self.tempdir.cleanup()
+ 
++    def test_deep_parser_accepts_limit_bounds_and_rejects_outside(self):
++        self.assertEqual(
++            orchestrator._parser().parse_args(
++                ["--root", "data", "--db", "data/state.sqlite3", "deep"]
++            ).limit,
++            10,
++        )
++        for valid in (1, 360):
++            parsed = orchestrator._parser().parse_args(
++                [
++                    "--root",
++                    "data",
++                    "--db",
++                    "data/state.sqlite3",
++                    "deep",
++                    "--limit",
++                    str(valid),
++                ]
++            )
++            self.assertEqual(parsed.limit, valid)
++        for invalid in (0, 361):
++            with self.assertRaises(SystemExit):
++                orchestrator._parser().parse_args(
++                    [
++                        "--root",
++                        "data",
++                        "--db",
++                        "data/state.sqlite3",
++                        "deep",
++                        "--limit",
++                        str(invalid),
++                    ]
++                )
++
++    def test_enqueue_daily_statement_jobs_is_360_style_idempotent_without_source_calls(self):
++        members = {f"SH{index:06d}" for index in range(1, 121)}
++        context = CandidateContext(
++            candidate_set_hash="a" * 64,
++            members=frozenset(members),
++            performance_input_hashes={item: "b" * 64 for item in members},
++            industries={item: "包装印刷" for item in members},
++            reported_target_period={item: True for item in members},
++        )
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++
++        first = orchestrator.enqueue_daily_statement_jobs(
++            store, context, "2026-06-30", "2026-08-29"
++        )
++        second = orchestrator.enqueue_daily_statement_jobs(
++            store, context, "2026-06-30", "2026-08-29"
++        )
++
++        self.assertEqual(first, second)
++        self.assertEqual(len(first), 360)
++        self.assertEqual(len(store.list_jobs(["deep_statement"])), 360)
++
++    def test_incremental_enqueues_without_statement_calls(self):
++        bao, ak = FakeBaoSource(), FakeAKSource()
++        payload, code = orchestrator.run_command(
++            self.root,
++            self.root / "state.sqlite3",
++            "incremental",
++            online=True,
++            now_cn="2026-08-29T20:00:00+08:00",
++            sources=(bao, ak),
++        )
++
++        self.assertEqual(code, 0)
++        self.assertEqual(ak.statement_calls, [])
++        store = StateStore(self.root / "state.sqlite3")
++        self.assertEqual(len(store.list_jobs(["deep_statement"])), 6)
++        self.assertFalse(payload["formal_score_ready"])
++
++    def test_verified_calendar_cache_and_injected_deep_source_construct_no_defaults(self):
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        repository = SnapshotRepository(self.root, store)
++        expected, _ = repository.persist(exact_calendar_batch())
++        source = FakeStatementSource()
++
++        with patch(
++            "ashare_pipeline.orchestrator._default_calendar_source",
++            side_effect=AssertionError("calendar default constructed"),
++        ), patch(
++            "ashare_pipeline.orchestrator._default_deep_source",
++            side_effect=AssertionError("deep default constructed"),
++        ):
++            observed_repository, observed_source, calendar = orchestrator._deep_dependencies(
++                self.root,
++                store,
++                now=orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++                online=True,
++                sources=None,
++                snapshot_store=None,
++                deep_source=source,
++            )
++
++        self.assertEqual(observed_repository.data_root, self.root.resolve())
++        self.assertIs(observed_source, source)
++        self.assertEqual(calendar.id, expected.id)
++
++    def test_tampered_calendar_cache_fails_closed(self):
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        repository = SnapshotRepository(self.root, store)
++        calendar, _ = repository.persist(exact_calendar_batch())
++        (self.base / calendar.payload_path).write_text("{}", encoding="utf-8")
++        source = FakeStatementSource()
++        bao = FakeBaoSource()
++
++        with self.assertRaisesRegex(OSError, "hash|invalid snapshot payload"):
++            orchestrator._deep_dependencies(
++                self.root,
++                store,
++                now=orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++                online=True,
++                sources=(bao, source),
++                snapshot_store=None,
++                deep_source=source,
++            )
++        self.assertEqual(source.calls, [])
++        self.assertEqual(bao.trade_date_requests, [])
++
++    def test_changed_calendar_request_is_not_hidden_by_cached_short_job(self):
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        old_key = "fetch_source:baostock:trade_dates:2026-08-29"
++        old = store.enqueue_job(old_key, old_key, {"request": "short"})
++        store.lease_next_job([old_key], "seed", 3600, "2026-08-29T00:00:00+00:00")
++        store.complete_job(old, {"batches": [{"dataset": "trade_dates"}]})
++        bao, ak = FakeBaoSource(), FakeAKSource()
++
++        orchestrator.run_command(
++            self.root,
++            self.root / "state.sqlite3",
++            "bootstrap",
++            online=True,
++            now_cn="2026-08-29T20:00:00+08:00",
++            sources=(bao, ak),
++        )
++
++        self.assertEqual(bao.trade_date_requests, [("2021-01-01", "2026-09-08")])
++        current_key = orchestrator._feature_calendar_job_key(
++            orchestrator._now_cn("2026-08-29T20:00:00+08:00")
++        )
++        current = next(
++            item for item in store.list_jobs() if item["idempotency_key"] == current_key
++        )
++        self.assertEqual(current["status"], "succeeded")
++
++    def test_offline_deep_constructs_no_source(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        with patch(
++            "ashare_pipeline.orchestrator._default_calendar_source",
++            side_effect=AssertionError("calendar default constructed"),
++        ), patch(
++            "ashare_pipeline.orchestrator._default_deep_source",
++            side_effect=AssertionError("deep default constructed"),
++        ), patch(
++            "ashare_pipeline.orchestrator._default_sources",
++            side_effect=AssertionError("legacy defaults constructed"),
++        ):
++            payload, code = orchestrator.run_command(
++                self.root,
++                self.root / "state.sqlite3",
++                "deep",
++                online=False,
++                now_cn="2026-08-29T20:00:00+08:00",
++            )
++
++        self.assertEqual(code, 0)
++        self.assertEqual(payload["deep_run"]["remote_attempts"], 0)
++        with closing(sqlite3.connect(self.root / "state.sqlite3")) as connection:
++            params = json.loads(
++                connection.execute(
++                    "SELECT params_json FROM run ORDER BY started_at DESC LIMIT 1"
++                ).fetchone()[0]
++            )
++        self.assertEqual(params, {"limit": 10, "online": False})
++
++    def test_online_limit_one_calls_at_most_one_statement(self):
++        bao, ak = FakeBaoSource(), FakeAKSource()
++        orchestrator.run_command(
++            self.root,
++            self.root / "state.sqlite3",
++            "bootstrap",
++            online=True,
++            now_cn="2026-08-29T20:00:00+08:00",
++            sources=(bao, ak),
++        )
++        source = FakeStatementSource()
++
++        payload, code = orchestrator.run_command(
++            self.root,
++            self.root / "state.sqlite3",
++            "deep",
++            online=True,
++            now_cn="2026-08-29T20:01:00+08:00",
++            deep_source=source,
++            limit=1,
++        )
++
++        self.assertEqual(code, 0)
++        self.assertEqual(len(source.calls), 1)
++        self.assertEqual(payload["deep_run"]["remote_attempts"], 1)
++
++    def test_status_financial_coverage_requires_three_verified_target_snapshots(self):
++        write_candidate_documents(
++            self.root, {"SH600001": "包装印刷", "SH600002": "包装印刷"}
++        )
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        orchestrator.enqueue_daily_statement_jobs(
++            store, context, "2026-06-30", "2026-08-29"
++        )
++        repository = SnapshotRepository(self.root, store)
++        for security_id, datasets in {
++            "SH600001": STATEMENT_DATASETS,
++            "SH600002": ("balance_sheet", "profit_sheet"),
++        }.items():
++            for dataset in datasets:
++                repository.persist(exact_statement_batch(security_id, dataset))
++
++        status, code = orchestrator.run_command(
++            self.root,
++            self.root / "state.sqlite3",
++            "status",
++            now_cn="2026-08-29T20:00:00+08:00",
++        )
++
++        self.assertEqual(code, 0)
++        self.assertEqual(
++            status["deep"]["candidate_financial_coverage"],
++            {"numerator": 1, "denominator": 2, "rate": 0.5},
++        )
++        self.assertEqual(len(status["deep"]["incomplete_candidates"]), 1)
++        self.assertEqual(
++            status["deep"]["incomplete_candidates"][0]["missing_datasets"],
++            ["cash_flow_sheet"],
++        )
++        self.assertEqual(status["deep"]["expired_current_lease_count"], 0)
++        self.assertEqual(status["deep"]["unknown_failure_count"], 0)
++        self.assertFalse(status["formal_score_ready"])
++
++    def test_verified_snapshot_count_does_not_excuse_a_missing_target_period(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        orchestrator.enqueue_daily_statement_jobs(
++            store, context, "2026-06-30", "2026-08-29"
++        )
++        repository = SnapshotRepository(self.root, store)
++        for dataset in STATEMENT_DATASETS:
++            repository.persist(
++                exact_statement_batch(
++                    "SH600001", dataset, target=dataset != "cash_flow_sheet"
++                )
++            )
++
++        progress = orchestrator.build_deep_progress(
++            self.root,
++            store,
++            repository,
++            context,
++            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++        )
++
++        self.assertEqual(
++            progress["statement_snapshot_counts"],
++            {dataset: 1 for dataset in sorted(STATEMENT_DATASETS)},
++        )
++        self.assertEqual(progress["candidate_financial_coverage"]["numerator"], 0)
++        self.assertEqual(
++            progress["incomplete_candidates"][0]["error_classifications"],
++            ["target_period_missing"],
++        )
++
++    def test_progress_excludes_stale_request_versions(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        common = {
++            "security_id": "SH600001",
++            "report_period": "2026-06-30",
++            "candidate_set_hash": "f" * 64,
++            "performance_input_hash": context.performance_input_hashes["SH600001"],
++        }
++        store.enqueue_job(
++            "deep_statement",
++            "stale-version",
++            {
++                **common,
++                "dataset": "profit_sheet",
++                "request_version": "old-request-version",
++                "refresh_date": "2026-08-29",
++            },
++        )
++        store.enqueue_job(
++            "deep_statement",
++            "stale-date",
++            {
++                **common,
++                "dataset": "cash_flow_sheet",
++                "request_version": FINANCIAL_REQUEST_VERSION,
++                "refresh_date": "2026-08-28",
++            },
++        )
++        store.enqueue_job(
++            "deep_statement",
++            "current-first-enqueue-hash-is-irrelevant",
++            {
++                **common,
++                "dataset": "balance_sheet",
++                "request_version": FINANCIAL_REQUEST_VERSION,
++                "refresh_date": "2026-08-29",
++            },
++        )
++        store.enqueue_job(
++            "deep_statement",
++            "stale-report-period",
++            {
++                **common,
++                "dataset": "balance_sheet",
++                "report_period": "2025-12-31",
++                "request_version": FINANCIAL_REQUEST_VERSION,
++                "refresh_date": "2026-08-29",
++            },
++        )
++
++        progress = orchestrator.build_deep_progress(
++            self.root,
++            store,
++            SnapshotRepository(self.root, store),
++            context,
++            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++        )
++
++        self.assertEqual(progress["deep_statement_job_counts"]["balance_sheet"], {"pending": 1})
++        self.assertEqual(progress["deep_statement_job_counts"]["profit_sheet"], {})
++        self.assertEqual(progress["deep_statement_job_counts"]["cash_flow_sheet"], {})
++        self.assertEqual(len(progress["incomplete_candidates"]), 1)
++
++    def test_progress_classifies_current_circuits_expired_leases_and_unknown_failures(self):
++        write_candidate_documents(
++            self.root,
++            {
++                "SH600001": "包装印刷",
++                "SH600002": "包装印刷",
++                "SH600003": "包装印刷",
++            },
++        )
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        orchestrator.enqueue_daily_statement_jobs(
++            store, context, "2026-06-30", "2026-08-29"
++        )
++        jobs = store.list_jobs(["deep_statement"])
++        by_slot = {
++            (job["payload"]["security_id"], job["payload"]["dataset"]): job["id"]
++            for job in jobs
++        }
++        with closing(sqlite3.connect(store.db_path)) as connection:
++            connection.execute(
++                """UPDATE job SET status='retryable_failed',last_error_json=?,
++                next_retry_at=? WHERE id=?""",
++                (
++                    json.dumps({"error_classification": "source_blocked"}),
++                    "2026-08-29T21:00:00+08:00",
++                    by_slot[("SH600001", "balance_sheet")],
++                ),
++            )
++            connection.execute(
++                """UPDATE job SET status='running',lease_worker='worker',
++                lease_expires_at=? WHERE id=?""",
++                (
++                    "2026-08-29T19:00:00+08:00",
++                    by_slot[("SH600002", "balance_sheet")],
++                ),
++            )
++            connection.execute(
++                "UPDATE job SET status='terminal_failed',last_error_json=? WHERE id=?",
++                (
++                    json.dumps({"error_classification": "worker_error"}),
++                    by_slot[("SH600003", "balance_sheet")],
++                ),
++            )
++            connection.commit()
++
++        progress = orchestrator.build_deep_progress(
++            self.root,
++            store,
++            SnapshotRepository(self.root, store),
++            context,
++            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++        )
++
++        self.assertEqual(progress["active_circuit_breakers"], ["akshare"])
++        self.assertEqual(progress["expired_current_lease_count"], 1)
++        self.assertEqual(progress["unknown_failure_count"], 1)
++        self.assertEqual(
++            [item["security_id"] for item in progress["incomplete_candidates"]],
++            ["SH600001", "SH600002", "SH600003"],
++        )
++        for item in progress["incomplete_candidates"]:
++            self.assertEqual(item["missing_datasets"], sorted(item["missing_datasets"]))
++            self.assertEqual(item["job_states"], sorted(item["job_states"]))
++            self.assertEqual(
++                item["error_classifications"],
++                sorted(item["error_classifications"]),
++            )
++            self.assertTrue(
++                set(item["error_classifications"])
++                <= orchestrator._PROGRESS_CLASSIFICATIONS
++            )
++
++    def test_progress_feature_counts_require_current_candidate_hash_and_contract(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        rows = [
++            ("current", context.candidate_set_hash, "feature-contract-v1", "2026-06-30", "partial"),
++            ("stale-hash", "f" * 64, "feature-contract-v1", "2026-06-30", "blocked"),
++            ("stale-contract", context.candidate_set_hash, "feature-contract-v0", "2026-06-30", "blocked"),
++            ("stale-period", context.candidate_set_hash, "feature-contract-v1", "2025-12-31", "blocked"),
++        ]
++        with closing(sqlite3.connect(store.db_path)) as connection:
++            for index, (row_id, candidate_hash, contract, report_period, status) in enumerate(rows):
++                connection.execute(
++                    """INSERT INTO feature_set
++                    (id,security_id,report_period,as_of_utc,candidate_set_hash,
++                     template_id,template_version,contract_version,input_hash,status,
++                     financial_coverage,dimension_status_json,confidence_inputs_json,
++                     blockers_json,bundle_hash,bundle_path,missing_json,created_at)
++                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
++                    (
++                        row_id,
++                        "SH600001",
++                        report_period,
++                        f"2026-08-29T0{index}:00:00+00:00",
++                        candidate_hash,
++                        "general_nonfinancial",
++                        "template-registry-v1",
++                        contract,
++                        str(index) * 64,
++                        status,
++                        0.5,
++                        "{}",
++                        "{}",
++                        "[]",
++                        canonical_sha256(row_id),
++                        f"data/curated/formal_features/{row_id}.json",
++                        json.dumps([{"missing_reason": "fact_missing"}]),
++                        f"2026-08-29T0{index}:00:00+00:00",
++                    ),
++                )
++            connection.commit()
++
++        progress = orchestrator.build_deep_progress(
++            self.root,
++            store,
++            SnapshotRepository(self.root, store),
++            context,
++            orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++        )
++
++        self.assertEqual(
++            progress["feature_set_counts"],
++            {"partial": 1, "financial_ready": 0, "blocked": 0},
++        )
++        self.assertEqual(progress["template_counts"], {"general_nonfinancial": 1})
++        self.assertEqual(progress["missing_reason_counts"], {"fact_missing": 1})
++
++    def test_status_fails_closed_when_curated_candidate_documents_are_tampered(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        path = self.root / "curated" / "prefilter.json"
++        document = json.loads(path.read_text(encoding="utf-8"))
++        document["records"][0]["industry"] = "被篡改"
++        path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
++
++        with self.assertRaisesRegex(ValueError, "records_hash"):
++            orchestrator.run_command(
++                self.root,
++                self.root / "state.sqlite3",
++                "status",
++                now_cn="2026-08-29T20:00:00+08:00",
++            )
++
++    def test_build_deep_progress_rejects_mismatched_repository_root_or_store(self):
++        write_candidate_documents(self.root, {"SH600001": "包装印刷"})
++        store = StateStore(self.root / "state.sqlite3")
++        store.initialize()
++        context = orchestrator.load_candidate_context(self.root)
++        other_root = self.base / "other-data"
++        other_store = StateStore(other_root / "state.sqlite3")
++        other_store.initialize()
++        other_repository = SnapshotRepository(other_root, other_store)
++
++        with self.assertRaisesRegex(ValueError, "root"):
++            orchestrator.build_deep_progress(
++                self.root,
++                store,
++                other_repository,
++                context,
++                orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++            )
++        with self.assertRaisesRegex(ValueError, "state store"):
++            orchestrator.build_deep_progress(
++                self.root,
++                store,
++                SnapshotRepository(self.root, other_store),
++                context,
++                orchestrator._now_cn("2026-08-29T20:00:00+08:00"),
++            )
++
+     def install_market_evidence(self, records, *, universe_hash=None, declared_snapshot_hashes=None):
+         universe_document = json.loads(
+             (self.root / "curated" / "universe.json").read_text(encoding="utf-8")
+         )
+         batch_value = FetchBatch(
+             "baostock",
+             "daily",
+             {"date": "2026-08-31"},
+             records,
+             "2026-08-31T08:00:00+00:00",
+@@ -222,21 +841,21 @@ class OrchestratorTestCase(unittest.TestCase):
+         self.assertEqual(score_states, [("partial", None)])
+ 
+         _, second_code = orchestrator.run_command(
+             self.root, self.db, "incremental", online=True,
+             now_cn="2026-08-30T22:00:00+08:00", sources=(bao, ak),
+         )
+         with closing(sqlite3.connect(self.db)) as connection:
+             unchanged_snapshots = connection.execute("SELECT COUNT(*) FROM source_snapshot").fetchone()[0]
+             unchanged_deep_jobs = connection.execute("SELECT COUNT(*) FROM job WHERE kind = 'deep_financial'").fetchone()[0]
+         self.assertEqual(second_code, 0)
+-        self.assertEqual(unchanged_snapshots, initial_snapshots)
++        self.assertEqual(unchanged_snapshots, initial_snapshots + 1)
+         self.assertEqual(unchanged_deep_jobs, initial_deep_jobs)
+ 
+         ak.performance[0] = {**ak.performance[0], "净利润同比增长": 20, "最新公告日期": "2026-08-31"}
+         _, third_code = orchestrator.run_command(
+             self.root, self.db, "incremental", online=True,
+             now_cn="2026-08-31T22:00:00+08:00", sources=(bao, ak),
+         )
+         with closing(sqlite3.connect(self.db)) as connection:
+             changed_deep_jobs = connection.execute("SELECT COUNT(*) FROM job WHERE kind = 'deep_financial'").fetchone()[0]
+         self.assertEqual(third_code, 0)
+@@ -254,21 +873,23 @@ class OrchestratorTestCase(unittest.TestCase):
+             now_cn="2026-08-29T22:00:00+08:00",
+             sources=(FakeBaoSource(), FakeAKSource()),
+         )
+ 
+         self.assertEqual(code, 0)
+         self.assertEqual(status["curated"]["universe"]["universe_count"], 2)
+         self.assertTrue((self.root / "curated" / "performance.json").exists())
+         with closing(sqlite3.connect(self.db)) as connection:
+             paths = [row[0] for row in connection.execute("SELECT payload_path FROM source_snapshot")]
+         self.assertTrue(paths)
+-        self.assertTrue(all(Path(path).is_absolute() for path in paths))
++        self.assertTrue(
++            all(Path(path).is_absolute() or path.startswith("data/") for path in paths)
++        )
+ 
+     def test_curated_documents_embed_ruleset_fingerprint_and_stale_artifact_is_rebuilt(self):
+         bao, ak = FakeBaoSource(), FakeAKSource()
+         orchestrator.run_command(
+             self.root, self.db, "bootstrap", online=True,
+             now_cn="2026-08-29T22:00:00+08:00", sources=(bao, ak),
+         )
+         paths = [
+             self.root / "curated" / "universe.json",
+             self.root / "curated" / "performance.json",
+@@ -405,21 +1026,27 @@ class OrchestratorTestCase(unittest.TestCase):
+         self.assertEqual(status["source_errors"][0]["classification"], "blocked")
+         self.assertEqual(status["source_errors"][0]["error"], "429 cached challenge")
+         self.assertEqual(ak.calls, {"disclosure_schedule": 0, "performance_report": 0})
+ 
+     def test_lease_miss_reports_cached_running_retryable_and_terminal_states_truthfully(self):
+         store = StateStore(self.db)
+         store.initialize()
+         now_utc = "2026-08-29T14:00:00+00:00"
+ 
+         def seed(source, dataset, terminal_state):
+-            kind = f"fetch_source:{source}:{dataset}:2026-08-29"
++            kind = (
++                orchestrator._feature_calendar_job_key(
++                    orchestrator._now_cn("2026-08-29T22:00:00+08:00")
++                )
++                if dataset == "trade_dates"
++                else f"fetch_source:{source}:{dataset}:2026-08-29"
++            )
+             job_id = store.enqueue_job(kind, kind, {"source": source, "dataset": dataset})
+             store.lease_next_job([kind], "seed", 3600, now_utc)
+             if terminal_state == "succeeded":
+                 store.complete_job(job_id, {"batches": [{"dataset": dataset, "rows": 1, "hash": "cached-hash"}]})
+             elif terminal_state == "retryable_failed":
+                 store.fail_job(job_id, {"error": "later"}, True, "2026-08-29T15:00:00+00:00")
+             elif terminal_state == "terminal_failed":
+                 store.fail_job(job_id, {"error": "bad request"}, False)
+             return job_id
+ 
+diff --git a/tests/test_reporting.py b/tests/test_reporting.py
+index 4a557f8..fa9702b 100644
+--- a/tests/test_reporting.py
++++ b/tests/test_reporting.py
+@@ -488,20 +488,67 @@ class ProgressArtifactTests(unittest.TestCase):
+         self.assertEqual(meta["reviewed_row_count"], 32)
+         self.assertEqual(meta["shown_row_count"], 25)
+         self.assertTrue(meta["truncated"])
+         self.assertEqual(visible[0]["category"], "发布阻断")
+         self.assertIn("formal_v2_scores_unavailable", visible[0]["detail"])
+         self.assertIn("审阅32条", table["subtitle"])
+         self.assertIn("展示25条", table["subtitle"])
+         self.assertIn("truncated=true", source_metadata)
+         self.assertIn("发布阻断优先", meta["selection_rule"])
+ 
++    def test_deep_progress_counts_are_exposed_without_individual_financial_values(self):
++        artifact = build_fixture(
++            pipeline_status={
++                "deep": {
++                    "deep_candidate_count": 2,
++                    "candidate_financial_coverage": {
++                        "numerator": 1,
++                        "denominator": 2,
++                        "rate": 0.5,
++                    },
++                    "deep_statement_job_counts": {
++                        "balance_sheet": {"succeeded": 2},
++                        "profit_sheet": {"succeeded": 2},
++                        "cash_flow_sheet": {"pending": 1, "succeeded": 1},
++                    },
++                    "statement_snapshot_counts": {
++                        "balance_sheet": 2,
++                        "profit_sheet": 2,
++                        "cash_flow_sheet": 1,
++                    },
++                    "feature_set_counts": {
++                        "partial": 1,
++                        "financial_ready": 1,
++                        "blocked": 0,
++                    },
++                    "incomplete_candidates": [
++                        {
++                            "security_id": "SH600001",
++                            "missing_datasets": ["cash_flow_sheet"],
++                            "job_states": ["pending"],
++                            "error_classifications": ["pending"],
++                        }
++                    ],
++                    "expired_current_lease_count": 0,
++                    "unknown_failure_count": 0,
++                    "active_circuit_breakers": [],
++                    "latest_feature_contract_version": "feature-contract-v1",
++                }
++            }
++        )
++
++        operations = dataset(artifact, "operational_status")
++        deep_rows = [row for row in operations if row["category"] == "深抓进度"]
++        self.assertTrue(deep_rows)
++        self.assertIn("1/2", " ".join(row["detail"] for row in deep_rows))
++        self.assertNotIn("SH600001", json.dumps(deep_rows, ensure_ascii=False))
++
+     def test_snapshot_datasets_are_bounded_and_do_not_copy_raw_input(self):
+         many_rows = [
+             {"dataset": f"dataset-{index:03d}", "source": "test", "status": "ready", "row_count": index}
+             for index in range(100)
+         ]
+         artifact = build_fixture(pilot_status={"datasets": many_rows, "raw": "x" * 100_000})
+ 
+         self.assertLessEqual(len(dataset(artifact, "source_status")), 25)
+         self.assertTrue(all(len(rows) <= 25 for rows in artifact["snapshot"]["datasets"].values()))
+         self.assertLessEqual(sum(len(rows) for rows in artifact["snapshot"]["datasets"].values()), 75)

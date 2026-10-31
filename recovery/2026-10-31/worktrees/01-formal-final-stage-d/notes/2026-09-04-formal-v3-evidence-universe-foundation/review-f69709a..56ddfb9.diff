@@ -1,0 +1,225 @@
+# Review package: f69709a..56ddfb9
+
+## Commits
+56ddfb9 fix: harden formal snapshot integrity
+
+## Files changed
+ ashare_pipeline/formal_snapshot_store.py | 23 +++++++++-
+ tests/test_formal_snapshot_store.py      | 75 +++++++++++++++++++++++++++++++-
+ 2 files changed, 96 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_snapshot_store.py b/ashare_pipeline/formal_snapshot_store.py
+index 2ce3b3e..9f1cef8 100644
+--- a/ashare_pipeline/formal_snapshot_store.py
++++ b/ashare_pipeline/formal_snapshot_store.py
+@@ -26,20 +26,33 @@ class FormalStoredSnapshot:
+ def _canonical_json_bytes(value: object) -> bytes:
+     return json.dumps(
+         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+     ).encode("utf-8")
+ 
+ 
+ def _sha256_bytes(value: bytes) -> str:
+     return hashlib.sha256(value).hexdigest()
+ 
+ 
++class _DuplicateManifestKeyError(ValueError):
++    pass
++
++
++def _unique_manifest_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
++    result: dict[str, object] = {}
++    for key, value in pairs:
++        if key in result:
++            raise _DuplicateManifestKeyError(key)
++        result[key] = value
++    return result
++
++
+ class FormalSnapshotStore:
+     """Persist verified official fetches without decoding or re-encoding their bytes."""
+ 
+     def __init__(self, root: str | Path):
+         self.root = Path(root).resolve()
+ 
+     def write_verified(
+         self,
+         fetch: OfficialFetch,
+         verification: EvidenceVerification,
+@@ -166,35 +179,37 @@ class FormalSnapshotStore:
+             "verification": {
+                 "status": verification.status,
+                 "content_sha256": verification.content_sha256,
+                 "reasons": list(verification.reasons),
+                 "effective_at_utc": verification.effective_at_utc,
+             },
+             "producing_task_id": producing_task_id,
+         }
+ 
+     def _write_content(self, target: Path, raw_bytes: bytes, content_sha256: str) -> None:
++        self._require_target_within_root(target)
+         if target.exists():
+             try:
+                 existing = target.read_bytes()
+             except OSError as error:
+                 raise ValueError(f"unable to read stored content: {target}") from error
+             if _sha256_bytes(existing) != content_sha256 or existing != raw_bytes:
+                 raise ValueError("content hash verification failed for existing content")
+             return
+         self._atomic_write(
+             target,
+             raw_bytes,
+             lambda part: self._validate_content_file(part, content_sha256),
+         )
+ 
+     def _write_manifest(self, target: Path, envelope: dict[str, object], manifest_sha256: str) -> None:
++        self._require_target_within_root(target)
+         encoded = _canonical_json_bytes(envelope)
+         if target.exists():
+             existing = self._read_manifest(target, manifest_sha256)
+             if _canonical_json_bytes(existing) != encoded:
+                 raise ValueError("manifest hash verification failed for existing manifest")
+             return
+         self._atomic_write(
+             target,
+             encoded,
+             lambda part: self._read_manifest(part, manifest_sha256),
+@@ -225,26 +240,32 @@ class FormalSnapshotStore:
+     @staticmethod
+     def _validate_content_file(path: Path, expected_sha256: str) -> None:
+         try:
+             actual = _sha256_bytes(path.read_bytes())
+         except OSError as error:
+             raise ValueError(f"unable to validate stored content: {path}") from error
+         if actual != expected_sha256:
+             raise ValueError("content hash verification failed before replacement")
+ 
+     def _read_manifest(self, path: Path, expected_sha256: str) -> dict[str, object]:
++        self._require_target_within_root(path)
+         try:
+-            envelope = json.loads(path.read_text(encoding="utf-8"))
++            raw_bytes = path.read_bytes()
++            envelope = json.loads(raw_bytes.decode("utf-8"), object_pairs_hook=_unique_manifest_object)
++        except _DuplicateManifestKeyError as error:
++            raise ValueError("duplicate manifest key") from error
+         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+             raise ValueError(f"invalid manifest: {path}") from error
+         if not isinstance(envelope, dict):
+             raise ValueError("invalid manifest envelope")
++        if raw_bytes != _canonical_json_bytes(envelope):
++            raise ValueError("manifest envelope is not canonical")
+         manifest_sha256 = envelope.get("manifest_sha256")
+         if manifest_sha256 != expected_sha256:
+             raise ValueError("manifest hash does not match envelope")
+         payload = {key: value for key, value in envelope.items() if key != "manifest_sha256"}
+         if _sha256_bytes(_canonical_json_bytes(payload)) != expected_sha256:
+             raise ValueError("manifest hash verification failed")
+         return envelope
+ 
+     @staticmethod
+     def _require_sha256(value: object, label: str) -> None:
+diff --git a/tests/test_formal_snapshot_store.py b/tests/test_formal_snapshot_store.py
+index 7f6d791..3b5a254 100644
+--- a/tests/test_formal_snapshot_store.py
++++ b/tests/test_formal_snapshot_store.py
+@@ -70,25 +70,98 @@ class FormalSnapshotStoreTests(unittest.TestCase):
+             self.assertFalse(list(Path(root).rglob("*.part")))
+ 
+     def test_tampered_manifest_is_rejected(self):
+         """Skipping manifest lineage-hash validation would allow altered provenance through."""
+         with tempfile.TemporaryDirectory() as root:
+             store = FormalSnapshotStore(root)
+             fetch = verified_fetch()
+             stored = store.write_verified(fetch, verified(fetch), producing_task_id=None)
+             envelope = json.loads(Path(stored.manifest_path).read_text(encoding="utf-8"))
+             envelope["producing_task_id"] = "tampered-task"
+-            Path(stored.manifest_path).write_text(json.dumps(envelope), encoding="utf-8")
++            Path(stored.manifest_path).write_text(
++                json.dumps(envelope, sort_keys=True, separators=(",", ":")), encoding="utf-8"
++            )
+ 
+             with self.assertRaisesRegex(ValueError, "manifest hash"):
+                 store.read_verified_raw(stored)
+ 
++    def test_existing_content_symlink_outside_store_is_rejected(self):
++        """Following an existing hash-path symlink would accept outside-root bytes."""
++        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside_root:
++            store = FormalSnapshotStore(root)
++            fetch = verified_fetch()
++            target = (
++                Path(root)
++                / "data"
++                / "raw"
++                / "formal"
++                / "cninfo"
++                / "annual_report"
++                / f"{fetch.content_sha256}.bin"
++            )
++            target.parent.mkdir(parents=True)
++            outside_content = Path(outside_root) / "outside.bin"
++            outside_content.write_bytes(fetch.raw_bytes)
++            try:
++                target.symlink_to(outside_content)
++            except OSError as error:
++                self.skipTest(f"file symlinks unavailable in this test environment: {error}")
++
++            with self.assertRaisesRegex(ValueError, "stay inside"):
++                store.write_verified(fetch, verified(fetch), producing_task_id=None)
++
++    def test_existing_manifest_symlink_outside_store_is_rejected(self):
++        """Following an existing lineage-manifest symlink would accept outside provenance."""
++        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside_root:
++            store = FormalSnapshotStore(root)
++            fetch = verified_fetch()
++            stored = store.write_verified(fetch, verified(fetch), producing_task_id=None)
++            target = Path(stored.manifest_path)
++            outside_manifest = Path(outside_root) / target.name
++            outside_manifest.write_bytes(target.read_bytes())
++            target.unlink()
++            try:
++                target.symlink_to(outside_manifest)
++            except OSError as error:
++                self.skipTest(f"file symlinks unavailable in this test environment: {error}")
++
++            with self.assertRaisesRegex(ValueError, "stay inside"):
++                store.write_verified(fetch, verified(fetch), producing_task_id=None)
++
++    def test_pretty_printed_manifest_bytes_are_rejected(self):
++        """Re-canonicalizing instead of checking stored bytes would hide byte-level tampering."""
++        with tempfile.TemporaryDirectory() as root:
++            store = FormalSnapshotStore(root)
++            fetch = verified_fetch()
++            stored = store.write_verified(fetch, verified(fetch), producing_task_id=None)
++            manifest_path = Path(stored.manifest_path)
++            envelope = json.loads(manifest_path.read_text(encoding="utf-8"))
++            manifest_path.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
++
++            with self.assertRaisesRegex(ValueError, "canonical"):
++                store.read_verified_raw(stored)
++
++    def test_duplicate_manifest_keys_are_rejected(self):
++        """A JSON parser that silently keeps the last duplicate key would hide tampering."""
++        with tempfile.TemporaryDirectory() as root:
++            store = FormalSnapshotStore(root)
++            fetch = verified_fetch()
++            stored = store.write_verified(fetch, verified(fetch), producing_task_id=None)
++            manifest_path = Path(stored.manifest_path)
++            original = manifest_path.read_bytes()
++            marker = b'"producing_task_id":null,'
++            self.assertIn(marker, original)
++            manifest_path.write_bytes(original.replace(marker, marker + marker, 1))
++
++            with self.assertRaisesRegex(ValueError, "duplicate"):
++                store.read_verified_raw(stored)
++
+     def test_same_bytes_in_new_generation_reuses_bin_but_keeps_two_manifests(self):
+         """Leaving refresh generation out of lineage would collapse distinct collections."""
+         with tempfile.TemporaryDirectory() as root:
+             store = FormalSnapshotStore(root)
+             first_fetch = verified_fetch(refresh_generation="index-v1")
+             second_fetch = verified_fetch(refresh_generation="index-v2")
+ 
+             first = store.write_verified(first_fetch, verified(first_fetch), producing_task_id=None)
+             second = store.write_verified(second_fetch, verified(second_fetch), producing_task_id=None)
+ 

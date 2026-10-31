@@ -1,0 +1,1006 @@
+# F1 fixed review package
+
+Base: 7cf6b5996f029e95be9331010c22638c804f40a2
+Head: db093077c57a180499a96c1182a603c50ebdb00e
+Scope: F1 four-file whitelist only; R1/docs excluded.
+
+## Commits
+
+db09307 feat: define policy values and explicit V6 decimal bridge
+
+## Stat
+
+ ashare_pipeline/formal_policy_values.py | 260 ++++++++++++++++++++++
+ tests/formal_metric_feature_fixtures.py |   5 +-
+ tests/formal_policy_runtime_fixtures.py | 279 +++++++++++++++++++++++
+ tests/test_formal_policy_values.py      | 378 ++++++++++++++++++++++++++++++++
+ 4 files changed, 920 insertions(+), 2 deletions(-)
+
+## Diff
+
+diff --git a/ashare_pipeline/formal_policy_values.py b/ashare_pipeline/formal_policy_values.py
+new file mode 100644
+index 0000000..c26d4a2
+--- /dev/null
++++ b/ashare_pipeline/formal_policy_values.py
+@@ -0,0 +1,260 @@
++"""Non-authoritative policy values and the explicit V6 Decimal bridge."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from decimal import (
++    Context,
++    Decimal,
++    DivisionByZero,
++    InvalidOperation,
++    Overflow,
++    ROUND_HALF_EVEN,
++)
++import hashlib
++import json
++import math
++import re
++
++
++_FIELDS = frozenset(("state", "value", "value_type", "unit", "evidence_hashes", "pending"))
++_PENDING_FIELDS = frozenset(("origin", "code", "rule_id", "evidence_hashes"))
++_STATES = frozenset(("value", "missing", "domain_conflict"))
++_VALUE_TYPES = frozenset((
++    "decimal", "bool", "enum", "event_record", "calendar_record", "market_window",
++))
++_COMPOUND_TYPES = frozenset(("event_record", "calendar_record", "market_window"))
++_RUNTIME_REASONS = frozenset((
++    "applicability_unresolved",
++    "current_receipt_absent",
++    "financial_input_missing",
++    "financial_domain_conflict",
++    "unsupported_unit",
++    "invalid_denominator",
++    "visibility_unproven",
++    "state_entry_missing",
++    "calendar_coverage_missing",
++    "market_coverage_missing",
++    "market_price_missing",
++    "market_domain_conflict",
++    "market_evidence_missing",
++))
++_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
++_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
++
++
++class PolicyPreconditionError(ValueError):
++    """A trusted policy prerequisite was absent or invalid."""
++
++
++class PolicyIntegrityError(ValueError):
++    """Policy evidence or its verified identity changed unexpectedly."""
++
++
++def decimal_context() -> Context:
++    """Return the isolated context for new policy arithmetic."""
++    return Context(
++        prec=50,
++        rounding=ROUND_HALF_EVEN,
++        Emin=-999999,
++        Emax=999999,
++        capitals=1,
++        clamp=0,
++        flags=[],
++        traps=[InvalidOperation, DivisionByZero, Overflow],
++    )
++
++
++def bridge_v6(value: float | int) -> Decimal:
++    """Preserve a finite V6 float/int's existing string identity as Decimal."""
++    if type(value) is int:
++        return Decimal(str(value))
++    if type(value) is not float or not math.isfinite(value):
++        raise ValueError("finite V6 numeric value required")
++    return Decimal(str(value))
++
++
++def canonical_bytes(wire: dict) -> bytes:
++    if type(wire) is not dict:
++        raise ValueError("policy wire must be an exact object")
++    return json.dumps(
++        wire,
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++        allow_nan=False,
++    ).encode("utf-8")
++
++
++def digest(wire: dict) -> str:
++    return hashlib.sha256(canonical_bytes(wire)).hexdigest()
++
++
++def _identifier(value: object, label: str) -> str:
++    if type(value) is not str or _IDENTIFIER.fullmatch(value) is None:
++        raise ValueError(f"{label} must be a canonical identifier")
++    return value
++
++
++def _controlled_text(value: object, label: str) -> str:
++    if (type(value) is not str or not value or value.strip() != value
++            or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value)):
++        raise ValueError(f"{label} must be nonempty control-free text")
++    return value
++
++
++def _unit(value: object, value_type: str) -> str | None:
++    if value_type == "decimal":
++        return _identifier(value, "decimal unit")
++    if value is not None:
++        raise ValueError("only decimal values carry a unit")
++    return None
++
++
++def _hashes(value: object, label: str) -> tuple[str, ...]:
++    if type(value) is not list:
++        raise ValueError(f"{label} must be an array")
++    copied = []
++    for item in value:
++        if type(item) is not str or _SHA256.fullmatch(item) is None:
++            raise ValueError(f"{label} must contain canonical SHA-256 values")
++        copied.append(item)
++    return tuple(sorted(set(copied)))
++
++
++def _decimal_text(value: Decimal) -> str:
++    if not value.is_finite():
++        raise ValueError("finite decimal required")
++    if value.is_zero():
++        return "0"
++    fixed = format(value, "f")
++    if "." in fixed:
++        fixed = fixed.rstrip("0").rstrip(".")
++    return fixed
++
++
++def _decimal(value: object) -> Decimal:
++    if type(value) is not str:
++        raise ValueError("decimal wire value must be text")
++    try:
++        parsed = Decimal(value)
++    except InvalidOperation as error:
++        raise ValueError("invalid decimal wire value") from error
++    if _decimal_text(parsed) != value:
++        raise ValueError("decimal wire value is not canonical")
++    return parsed
++
++
++@dataclass(frozen=True, slots=True)
++class _Pending:
++    origin: str
++    code: str
++    rule_id: str | None
++    evidence_hashes: tuple[str, ...]
++
++    @classmethod
++    def from_dict(cls, wire: object) -> "_Pending":
++        if type(wire) is not dict or set(wire) != _PENDING_FIELDS:
++            raise ValueError("pending reason has unknown or missing fields")
++        origin = wire["origin"]
++        code = wire["code"]
++        rule_id = wire["rule_id"]
++        if origin == "runtime":
++            if type(code) is not str or code not in _RUNTIME_REASONS:
++                raise ValueError("unknown runtime pending reason")
++            if rule_id is not None:
++                raise ValueError("runtime pending reasons cannot claim a signed rule")
++        elif origin == "signed_policy":
++            code = _controlled_text(code, "signed policy reason")
++            rule_id = _controlled_text(rule_id, "signed policy rule")
++        else:
++            raise ValueError("unknown pending reason origin")
++        return cls(origin, code, rule_id, _hashes(wire["evidence_hashes"], "pending evidence_hashes"))
++
++    def to_dict(self) -> dict:
++        return {
++            "origin": self.origin,
++            "code": self.code,
++            "rule_id": self.rule_id,
++            "evidence_hashes": list(self.evidence_hashes),
++        }
++
++
++@dataclass(frozen=True, slots=True)
++class PolicyValue:
++    """Detached scalar value or typed evidence-shortfall record."""
++
++    state: str
++    value: Decimal | bool | str | None
++    value_type: str
++    unit: str | None
++    evidence_hashes: tuple[str, ...]
++    _pending: tuple[_Pending, ...]
++
++    @classmethod
++    def from_dict(cls, wire: object) -> "PolicyValue":
++        if type(wire) is not dict or set(wire) != _FIELDS:
++            raise ValueError("policy value has unknown or missing fields")
++        state = wire["state"]
++        value_type = wire["value_type"]
++        if type(state) is not str or state not in _STATES:
++            raise ValueError("unknown policy value state")
++        if type(value_type) is not str or value_type not in _VALUE_TYPES:
++            raise ValueError("unknown policy value type")
++        unit = _unit(wire["unit"], value_type)
++        if type(wire["pending"]) is not list:
++            raise ValueError("pending must be an array")
++        pending = tuple(_Pending.from_dict(item) for item in wire["pending"])
++
++        if state == "value":
++            if pending:
++                raise ValueError("a present policy value cannot be pending")
++            if value_type in _COMPOUND_TYPES:
++                raise ValueError("compound policy values require their closed producer validator")
++            if value_type == "decimal":
++                value: Decimal | bool | str | None = _decimal(wire["value"])
++            elif value_type == "bool":
++                if type(wire["value"]) is not bool:
++                    raise ValueError("bool policy value must be exact bool")
++                value = wire["value"]
++            else:
++                value = _identifier(wire["value"], "enum policy value")
++        else:
++            if wire["value"] is not None:
++                raise ValueError("missing or conflicting policy value must be null")
++            if not pending:
++                raise ValueError("missing or conflicting policy value requires a pending reason")
++            value = None
++
++        return cls(
++            state=state,
++            value=value,
++            value_type=value_type,
++            unit=unit,
++            evidence_hashes=_hashes(wire["evidence_hashes"], "evidence_hashes"),
++            _pending=pending,
++        )
++
++    def to_dict(self) -> dict:
++        value: object = self.value
++        if self.value_type == "decimal" and value is not None:
++            value = _decimal_text(value)
++        return {
++            "state": self.state,
++            "value": value,
++            "value_type": self.value_type,
++            "unit": self.unit,
++            "evidence_hashes": list(self.evidence_hashes),
++            "pending": [item.to_dict() for item in self._pending],
++        }
++
++
++__all__ = [
++    "PolicyIntegrityError",
++    "PolicyPreconditionError",
++    "PolicyValue",
++    "bridge_v6",
++    "canonical_bytes",
++    "decimal_context",
++    "digest",
++]
+diff --git a/tests/formal_metric_feature_fixtures.py b/tests/formal_metric_feature_fixtures.py
+index 1149537..2a6c64c 100644
+--- a/tests/formal_metric_feature_fixtures.py
++++ b/tests/formal_metric_feature_fixtures.py
+@@ -13,42 +13,43 @@ from tests.test_formal_feature_contract import formal_fact
+ from tests.test_formal_feature_store import project_temporary_directory
+ from tests.test_formal_scoring_registry import canonical
+ 
+ METRICS = ("G.operating_profit_per_share_cagr_3y", "G.operating_profit_per_share_yoy",
+     "G.operating_revenue_cagr_3y", "G.operating_revenue_yoy")
+ 
+ 
+ def configuration(docs):
+     for template in docs["scoring"]["scoring"]["templates"].values():
+         for metrics in template["metrics"].values():
+             for metric in metrics:
+                 metric.update(period_rule=["FY2025"], unit_rule="CNY")
+                 if metric["metric_id"] == "operating_revenue_yoy":
+                     metric["direction"] = "lower"
+     for slot in docs["feature"]["slots"]:
+         leaf = ".".join(slot["slot_id"].split(".")[1:])
+         slot.update(unit="CNY", formula=dict(op="fact", fact_key=leaf, period_key="FY2025"))
+ 
+ 
+ class FinancialFixture(MetricFixture):
+-    def __init__(self, *, population=False, missing_memberships=False, mutate=None, calendar_binding_resolver=None):
+-        rows = None
++    def __init__(self, *, population=False, missing_memberships=False, mutate=None,
++                 calendar_binding_resolver=None, exchange_rows=None):
++        rows = exchange_rows
+         def configure(docs):
+             configuration(docs)
+             if missing_memberships:
+                 docs["industry"]["memberships"] = [dict(security_id="SH600099", template_id="bank",
+                     primary_industry="banks", secondary_industry="banks")]
+                 update_mapping_digest(docs["industry"])
+             if mutate:
+                 mutate(docs)
+             if population:
+                 ids = ["BJ430001"] + [f"SH{600000 + i}" for i in range(20)] + ["SZ000001"]
+                 docs["industry"]["memberships"] = [dict(security_id=sid,
+                     template_id="bank" if sid == "SZ000001" else "general_nonfinancial",
+                     primary_industry="manufacturing", secondary_industry="other" if sid == "SH600019" else "machinery")
+                     for sid in sorted(ids)]
+                 update_mapping_digest(docs["industry"])
+         if population:
+             rows = {exchange: [dict(security_id=sid, listing_status="listed", security_type="ordinary_a") for sid in ids]
+                 for exchange, ids in {"BJ": ["BJ430001"], "SH": [f"SH{600000+i}" for i in range(20)], "SZ": ["SZ000001"]}.items()}
+         super().__init__(mutate=configure, exchange_rows=rows, tempdir=project_temporary_directory(),
+             calendar_binding_resolver=calendar_binding_resolver)
+diff --git a/tests/formal_policy_runtime_fixtures.py b/tests/formal_policy_runtime_fixtures.py
+new file mode 100644
+index 0000000..11ea89e
+--- /dev/null
++++ b/tests/formal_policy_runtime_fixtures.py
+@@ -0,0 +1,279 @@
++"""Real signed runtime fixtures for synthetic policy tests only."""
++
++from __future__ import annotations
++
++from datetime import date
++import hashlib
++import math
++
++from ashare_pipeline.formal_evidence import (
++    OfficialFetch,
++    OfficialRequest,
++    SourcePolicy,
++    verify_official_fetch,
++)
++from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
++from ashare_pipeline.formal_universe import canonical_security_id
++from tests.formal_metric_feature_fixtures import FinancialFixture
++from tests.formal_metric_fixtures import FREEZE, update_mapping_digest
++from tests.formal_policy_fixtures import add_policy_documents, rehash_documents
++from tests.test_formal_context_repository import descriptor
++from tests.test_formal_feature_contract import formal_fact
++from tests.test_formal_scoring_registry import TEMPLATES, canonical
++from tests.test_formal_sources import config
++
++
++_DEFAULT_TEMPLATES = {
++    "BJ430001": "general_nonfinancial",
++    "SH600000": "bank",
++    "SZ000001": "bank",
++}
++_POLICY_UNITS = {
++    "fixture.policy.current.equity": "CNY",
++    "fixture.policy.current.roe": "ratio",
++    "fixture.policy.current.margin": "ratio",
++    "fixture.policy.current.profit": "CNY",
++    "fixture.policy.roe": "ratio",
++    "fixture.policy.margin": "ratio",
++    "fixture.policy.profit": "CNY",
++}
++
++
++def _templates(value):
++    if value is None:
++        return dict(_DEFAULT_TEMPLATES)
++    if type(value) is not dict or not value:
++        raise ValueError("templates must be a nonempty security-to-template object")
++    result = {}
++    for security_id, template_id in value.items():
++        if (type(security_id) is not str or canonical_security_id(security_id) != security_id
++                or type(template_id) is not str or template_id not in TEMPLATES):
++            raise ValueError("templates contains an invalid security or template")
++        result[security_id] = template_id
++    return result
++
++
++def _exchange_rows(templates):
++    result = {exchange: [] for exchange in ("BJ", "SH", "SZ")}
++    for security_id in sorted(templates):
++        result[security_id[:2]].append({
++            "security_id": security_id,
++            "listing_status": "listed",
++            "security_type": "ordinary_a",
++        })
++    return result
++
++
++def _policy_memberships(templates):
++    return [
++        {
++            "security_id": security_id,
++            "template_id": templates[security_id],
++            "primary_industry": "fixture-policy",
++            "secondary_industry": "fixture-cyclic",
++        }
++        for security_id in sorted(templates)
++    ]
++
++
++def _patch_current_policy_periods(documents):
++    for slot in documents["feature"]["slots"]:
++        if slot["slot_id"].split(".policy.", 1)[-1] in {
++            "equity", "roe", "margin", "profit",
++        }:
++            slot["formula"]["period_key"] = "FY2025"
++            slot["formula"]["fact_key"] = (
++                "fixture.policy.current." + slot["slot_id"].rsplit(".", 1)[-1]
++            )
++
++    def patch_selector(selector):
++        if type(selector) is not dict:
++            return
++        if selector.get("kind") == "feature" and selector.get("period_keys") == ["FY0"]:
++            selector["period_keys"] = ["FY2025"]
++        if selector.get("kind") == "annual_series":
++            for observation in selector["observations"]:
++                patch_selector(observation["selector"])
++
++    for role in ("cyclic", "redline", "status", "event"):
++        for rule_id, rule in documents[role]["rules"].items():
++            if rule_id == "execution_contract" or "inputs" not in rule:
++                continue
++            for selector in rule["inputs"].values():
++                patch_selector(selector)
++
++
++class PolicyRuntimeFixture(FinancialFixture):
++    """Small producer-backed graph; it does not confer production meaning."""
++
++    def __init__(self, *, range_enabled=False, templates=None):
++        if type(range_enabled) is not bool:
++            raise ValueError("range_enabled must be exact bool")
++        selected_templates = _templates(templates)
++
++        def configure(documents):
++            documents["industry"]["memberships"] = _policy_memberships(selected_templates)
++            update_mapping_digest(documents["industry"])
++            documents["scoring"]["descriptors"].append(descriptor("security_state"))
++            documents["source"]["configs"].extend(
++                config(dataset="fixture-state", exchange_scope=exchange)
++                for exchange in ("BJ", "SH", "SZ")
++            )
++            add_policy_documents(documents)
++            _patch_current_policy_periods(documents)
++            if range_enabled:
++                from tests.formal_range_fixtures import add_range_documents
++                add_range_documents(documents)
++            rehash_documents(documents)
++
++        super().__init__(
++            mutate=configure,
++            exchange_rows=_exchange_rows(selected_templates),
++        )
++        self.policy_registry = load_formal_policy_registry(
++            self.bundle,
++            scoring_registry=self.scoring,
++            feature_registry=self.vocabulary,
++        )
++
++    def put_policy_financial(
++        self,
++        security_id,
++        values,
++        *,
++        fy_end,
++        units,
++        generation="g1",
++        persist=True,
++    ):
++        canonical_security_id(security_id)
++        if type(values) is not dict or not values or type(units) is not dict or set(units) != set(values):
++            raise ValueError("every policy fact requires one explicit unit")
++        if type(fy_end) is not str:
++            raise ValueError("fy_end must be an explicit canonical date")
++        try:
++            parsed_fy_end = date.fromisoformat(fy_end)
++        except ValueError as error:
++            raise ValueError("fy_end must be an explicit canonical date") from error
++        if parsed_fy_end.isoformat() != fy_end:
++            raise ValueError("fy_end must be an explicit canonical date")
++        if type(generation) is not str or not generation or generation.strip() != generation:
++            raise ValueError("generation must be canonical text")
++        if type(persist) is not bool:
++            raise ValueError("persist must be exact bool")
++        for fact_key, value in values.items():
++            if (type(fact_key) is not str or fact_key not in _POLICY_UNITS
++                    or type(units[fact_key]) is not str or units[fact_key] != _POLICY_UNITS[fact_key]
++                    or type(value) not in (int, float) or not math.isfinite(value)):
++                raise ValueError("policy fact value, key or unit is invalid")
++
++        raw = canonical(values)
++        task_key = f"{security_id}:{fy_end}:{generation}"
++        task = self.store.enqueue_formal_task("formal_statement", task_key, generation, {})
++        leased = self.store.lease_next_formal_task(
++            ("formal_statement",), "policy-financial-fixture", 300
++        )
++        self.assertEqual(leased["id"], task)
++        fetch = OfficialFetch(
++            request=OfficialRequest("cninfo", "annual_report", security_id, fy_end, security_id[:2]),
++            raw_bytes=raw,
++            original_url="https://www.cninfo.com.cn/fixture/annual.json",
++            published_at_utc="2026-03-20T08:00:00+00:00",
++            published_precision="timestamp",
++            source_updated_at_utc=None,
++            captured_at_utc="2026-09-04T07:00:00+00:00",
++            effective_at_utc="2026-03-20T08:00:00+00:00",
++            effective_time_evidence_hash=None,
++            refresh_generation=generation,
++            parser_id="fixture-annual",
++            parser_version="fixture-annual-v1",
++            mapping_version="fixture-annual-map-v1",
++            declared_security_id=security_id,
++            declared_period=fy_end,
++        )
++        verification = verify_official_fetch(fetch, SourcePolicy.cninfo())
++        ref = self.snapshots.persist_verified(
++            fetch,
++            verification,
++            producing_task_id=task,
++            worker_id="policy-financial-fixture",
++        )
++        facts = []
++        for fact_key, raw_value in values.items():
++            instant = fact_key == "fixture.policy.current.equity"
++            facts.append(formal_fact(
++                security_id=security_id,
++                statement="balance" if instant else "income",
++                metric_key=fact_key,
++                period_start=None if instant else fy_end[:4] + "-01-01",
++                period_end=fy_end,
++                period_kind="FY",
++                value=float(raw_value),
++                unit=units[fact_key],
++                nature="instant" if instant else "duration",
++                published_at_utc=ref.published_at_utc,
++                published_precision=ref.published_precision,
++                effective_at_utc=ref.effective_at_utc,
++                effective_time_evidence_hash=ref.effective_time_evidence_hash,
++                source_updated_at_utc=ref.source_updated_at_utc,
++                captured_at_utc=ref.captured_at_utc,
++                source_snapshot_id=ref.snapshot_id,
++                source_content_sha256=ref.content_sha256,
++                source_refresh_generation=ref.refresh_generation,
++                source_producing_task_id=ref.producing_task_id,
++                source_field=fact_key,
++                raw_value_sha256=hashlib.sha256(canonical(raw_value)).hexdigest(),
++                parser_id=ref.parser_id,
++                parser_version=ref.parser_version,
++                mapping_version=ref.mapping_version,
++            ))
++        self.store.insert_formal_financial_facts(tuple(facts))
++        self.store.complete_formal_task(
++            task, "policy-financial-fixture", {"snapshot": ref.snapshot_id}
++        )
++        self.publish_current(security_id)
++        if persist:
++            self.persist_features(security_id)
++        return ref
++
++    def policy_financial_values(
++        self,
++        security_id,
++        *,
++        current_equity=1.0,
++        current_roe=5.0,
++        current_margin=5.0,
++        current_profit=5.0,
++        annual_roe=(1.0, 2.0, 3.0, 4.0, 5.0),
++        annual_margin=(1.0, 2.0, 3.0, 4.0, 5.0),
++        annual_profit=(1.0, 2.0, 3.0, 4.0, 5.0),
++    ):
++        annual = (annual_roe, annual_margin, annual_profit)
++        if any(type(values) is not tuple or len(values) != 5 for values in annual):
++            raise ValueError("annual policy evidence requires five explicit FY values")
++        for index, year in enumerate(range(2021, 2026)):
++            values = {
++                "fixture.policy.roe": annual_roe[index],
++                "fixture.policy.margin": annual_margin[index],
++                "fixture.policy.profit": annual_profit[index],
++            }
++            if year == 2025:
++                values.update({
++                    "fixture.policy.current.equity": current_equity,
++                    "fixture.policy.current.roe": current_roe,
++                    "fixture.policy.current.margin": current_margin,
++                    "fixture.policy.current.profit": current_profit,
++                })
++            self.put_policy_financial(
++                security_id,
++                values,
++                fy_end=f"{year}-12-31",
++                units={key: _POLICY_UNITS[key] for key in values},
++                generation=f"g1-fy{year}",
++                persist=False,
++            )
++        self.publish_current(security_id)
++        return self.persist_features(security_id)
++
++
++__all__ = ["PolicyRuntimeFixture"]
+diff --git a/tests/test_formal_policy_values.py b/tests/test_formal_policy_values.py
+new file mode 100644
+index 0000000..9b6b3b0
+--- /dev/null
++++ b/tests/test_formal_policy_values.py
+@@ -0,0 +1,378 @@
++import copy
++from contextlib import closing
++import hashlib
++import json
++import sqlite3
++import unittest
++from decimal import Decimal, localcontext
++
++from ashare_pipeline.formal_policy_values import (
++    PolicyIntegrityError,
++    PolicyPreconditionError,
++    PolicyValue,
++    bridge_v6,
++    canonical_bytes,
++    decimal_context,
++    digest,
++)
++
++
++HASH_A = "a" * 64
++HASH_B = "b" * 64
++
++
++def value_wire(**changes):
++    wire = {
++        "state": "value",
++        "value": "4.2",
++        "value_type": "decimal",
++        "unit": "ratio",
++        "evidence_hashes": [HASH_B, HASH_A, HASH_B],
++        "pending": [],
++    }
++    wire.update(changes)
++    return wire
++
++
++def pending_wire(**changes):
++    wire = {
++        "origin": "runtime",
++        "code": "financial_input_missing",
++        "rule_id": None,
++        "evidence_hashes": [HASH_B, HASH_A, HASH_B],
++    }
++    wire.update(changes)
++    return wire
++
++
++class DecimalBridgeTests(unittest.TestCase):
++    def test_bridge_preserves_v6_float_not_original_decimal(self):
++        value = 0.1 + 0.2
++        self.assertEqual(bridge_v6(value), Decimal(str(value)))
++        self.assertNotEqual(bridge_v6(value), Decimal("0.3"))
++        huge_integer = 10 ** 1000
++        self.assertEqual(bridge_v6(huge_integer), Decimal(str(huge_integer)))
++        with localcontext() as ambient:
++            ambient.prec = 2
++            with localcontext(decimal_context()):
++                self.assertEqual(Decimal("4") + Decimal("0.2"), Decimal("4.2"))
++        for bad in (True, float("nan"), float("inf")):
++            with self.subTest(bad=bad), self.assertRaises(ValueError):
++                bridge_v6(bad)
++
++    def test_decimal_wire_is_fixed_minimal_and_independent_of_ambient_precision(self):
++        valid = ("0", "12", "-12", "0.00000000000000000001", "100000000000000000000")
++        with localcontext() as ambient:
++            ambient.prec = 2
++            for text in valid:
++                with self.subTest(text=text):
++                    item = PolicyValue.from_dict(value_wire(value=text))
++                    self.assertEqual(item.value, Decimal(text))
++                    self.assertEqual(item.to_dict()["value"], text)
++
++        invalid = (
++            "-0", "-0.0", "0.0", "1.0", "1.20", "01", "+1", ".1", "1.",
++            "1e2", "1E+2", "NaN", "Infinity", "-Infinity", " 1", "1 ", 1,
++        )
++        for value in invalid:
++            with self.subTest(value=value), self.assertRaises(ValueError):
++                PolicyValue.from_dict(value_wire(value=value))
++
++    def test_canonical_helpers_are_deterministic_and_reject_nonfinite_json(self):
++        wire = {"z": [2, 1], "text": "证据", "a": True}
++        expected = b'{"a":true,"text":"\xe8\xaf\x81\xe6\x8d\xae","z":[2,1]}'
++        self.assertEqual(canonical_bytes(wire), expected)
++        self.assertEqual(digest(wire), hashlib.sha256(expected).hexdigest())
++        with self.assertRaises(ValueError):
++            canonical_bytes({"value": float("nan")})
++
++
++class PolicyValueTests(unittest.TestCase):
++    def test_scalar_values_use_exact_types_and_normalize_evidence_hashes(self):
++        decimal_value = PolicyValue.from_dict(value_wire())
++        self.assertEqual(decimal_value.value, Decimal("4.2"))
++        self.assertEqual(decimal_value.to_dict()["evidence_hashes"], [HASH_A, HASH_B])
++
++        boolean_value = PolicyValue.from_dict(value_wire(
++            value=True, value_type="bool", unit=None, evidence_hashes=[]
++        ))
++        enum_value = PolicyValue.from_dict(value_wire(
++            value="listed", value_type="enum", unit=None, evidence_hashes=[]
++        ))
++        self.assertIs(boolean_value.value, True)
++        self.assertEqual(enum_value.value, "listed")
++
++        invalid = (
++            value_wire(value=1, value_type="bool", unit=None),
++            value_wire(value=True, value_type="enum", unit=None),
++            value_wire(value=" listed", value_type="enum", unit=None),
++            value_wire(value="4.2", value_type="wrong"),
++            value_wire(value="4.2", unit=None),
++            value_wire(value=True, value_type="bool", unit="ratio"),
++        )
++        for wire in invalid:
++            with self.subTest(wire=wire), self.assertRaises(ValueError):
++                PolicyValue.from_dict(wire)
++
++    def test_missing_and_domain_conflict_are_typed_records_not_values(self):
++        for state, value_type in (
++            ("missing", "decimal"),
++            ("domain_conflict", "enum"),
++            ("missing", "event_record"),
++            ("domain_conflict", "calendar_record"),
++            ("missing", "market_window"),
++        ):
++            wire = value_wire(
++                state=state,
++                value=None,
++                value_type=value_type,
++                unit="ratio" if value_type == "decimal" else None,
++                pending=[pending_wire()],
++            )
++            with self.subTest(state=state, value_type=value_type):
++                item = PolicyValue.from_dict(wire)
++                self.assertIsNone(item.value)
++                self.assertEqual(item.state, state)
++                self.assertEqual(item.to_dict()["pending"][0]["evidence_hashes"], [HASH_A, HASH_B])
++
++        invalid = (
++            value_wire(state="missing", value="0", pending=[pending_wire()]),
++            value_wire(state="domain_conflict", value=False, value_type="bool", unit=None,
++                       pending=[pending_wire()]),
++            value_wire(state="missing", value=None, pending=[]),
++            value_wire(state="value", pending=[pending_wire()]),
++        )
++        for wire in invalid:
++            with self.subTest(wire=wire), self.assertRaises(ValueError):
++                PolicyValue.from_dict(wire)
++
++    def test_nonmissing_compound_records_wait_for_closed_producer_validators(self):
++        for value_type in ("event_record", "calendar_record", "market_window"):
++            with self.subTest(value_type=value_type), self.assertRaises(ValueError):
++                PolicyValue.from_dict(value_wire(
++                    value_type=value_type, value={"apparently": "valid"}, unit=None
++                ))
++
++    def test_runtime_and_signed_policy_pending_reasons_are_strict(self):
++        runtime_codes = (
++            "applicability_unresolved", "current_receipt_absent",
++            "financial_input_missing", "financial_domain_conflict", "unsupported_unit",
++            "invalid_denominator", "visibility_unproven", "state_entry_missing",
++            "calendar_coverage_missing", "market_coverage_missing", "market_price_missing",
++            "market_domain_conflict", "market_evidence_missing",
++        )
++        for code in runtime_codes:
++            with self.subTest(code=code):
++                PolicyValue.from_dict(value_wire(
++                    state="missing", value=None, pending=[pending_wire(code=code)]
++                ))
++
++        invalid = (
++            pending_wire(code="unknown_runtime_reason"),
++            pending_wire(rule_id="bank_nonpositive_equity"),
++            pending_wire(origin="signed_policy", code="", rule_id="bank_rule"),
++            pending_wire(origin="signed_policy", code="bad\nreason", rule_id="bank_rule"),
++            pending_wire(origin="signed_policy", code="signed_reason", rule_id=None),
++            pending_wire(origin="signed_policy", code="signed_reason", rule_id="bad\nrule"),
++            pending_wire(origin="other", code="signed_reason", rule_id="bank_rule"),
++            {**pending_wire(), "extra": None},
++        )
++        for pending in invalid:
++            with self.subTest(pending=pending), self.assertRaises(ValueError):
++                PolicyValue.from_dict(value_wire(
++                    state="missing", value=None, pending=[pending]
++                ))
++
++        accepted = PolicyValue.from_dict(value_wire(
++            state="missing", value=None,
++            pending=[pending_wire(origin="signed_policy", code="signed reason",
++                                  rule_id="bank_nonpositive_equity")],
++        ))
++        self.assertEqual(accepted.to_dict()["pending"][0]["rule_id"], "bank_nonpositive_equity")
++
++    def test_exact_wire_and_hash_shapes_are_required(self):
++        invalid = (
++            {**value_wire(), "extra": None},
++            {key: value for key, value in value_wire().items() if key != "unit"},
++            value_wire(state="unknown"),
++            value_wire(evidence_hashes=["A" * 64]),
++            value_wire(evidence_hashes=["a" * 63]),
++            value_wire(evidence_hashes="a" * 64),
++            value_wire(pending={}),
++        )
++        for wire in invalid:
++            with self.subTest(wire=wire), self.assertRaises(ValueError):
++                PolicyValue.from_dict(wire)
++
++    def test_dto_detaches_input_and_output_containers(self):
++        wire = value_wire(
++            state="missing", value=None,
++            pending=[pending_wire(code="financial_input_missing")],
++        )
++        original = copy.deepcopy(wire)
++        item = PolicyValue.from_dict(wire)
++        wire["evidence_hashes"].append("c" * 64)
++        wire["pending"][0]["code"] = "market_evidence_missing"
++        self.assertEqual(item.to_dict(), PolicyValue.from_dict(original).to_dict())
++
++        exported = item.to_dict()
++        exported["evidence_hashes"].append("d" * 64)
++        exported["pending"][0]["code"] = "state_entry_missing"
++        self.assertEqual(item.to_dict(), PolicyValue.from_dict(original).to_dict())
++
++    def test_terminal_policy_errors_remain_value_errors(self):
++        self.assertTrue(issubclass(PolicyPreconditionError, ValueError))
++        self.assertTrue(issubclass(PolicyIntegrityError, ValueError))
++        self.assertIsNot(PolicyPreconditionError, PolicyIntegrityError)
++
++
++class PolicyRuntimeFixtureTests(unittest.TestCase):
++    def fixture(self, **kwargs):
++        from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
++
++        fixture = PolicyRuntimeFixture(**kwargs)
++        self.addCleanup(fixture.close)
++        return fixture
++
++    def test_fixture_builds_one_genuine_signed_policy_runtime_graph(self):
++        fixture = self.fixture()
++        self.assertNotIsInstance(fixture, unittest.TestCase)
++        fixture.policy_registry.require_verified()
++        self.assertEqual(fixture.policy_registry.registry_manifest_hash,
++                         fixture.bundle.manifest.manifest_hash)
++        self.assertEqual(
++            {member.security_id for member in fixture.frozen.members},
++            {"BJ430001", "SH600000", "SZ000001"},
++        )
++        for name in (
++            "bundle", "scoring", "vocabulary", "provider", "feature_repository",
++            "context", "store", "root", "frozen",
++        ):
++            with self.subTest(name=name):
++                self.assertTrue(hasattr(fixture, name))
++
++    def test_fixture_registry_detects_signed_child_mutation(self):
++        fixture = self.fixture()
++        object.__setattr__(fixture.bundle.blob("event"), "canonical_json", b"{}")
++        with self.assertRaises(ValueError):
++            fixture.policy_registry.require_verified()
++
++    def test_range_enabled_fixture_integrates_real_signed_range_documents(self):
++        fixture = self.fixture(range_enabled=True)
++        fixture.policy_registry.require_verified()
++        source = json.loads(fixture.bundle.blob("source").canonical_json)
++        self.assertEqual(source["schema_version"], "formal-source-registry-v2")
++        self.assertEqual(len(source["range_configs"]), 6)
++
++    def test_five_template_mapping_defines_matching_frozen_universe_and_memberships(self):
++        templates = {
++            "BJ430001": "general_nonfinancial",
++            "SH600000": "bank",
++            "SH600001": "insurance",
++            "SZ000001": "broker",
++            "SZ000002": "real_estate",
++        }
++        fixture = self.fixture(templates=templates)
++        fixture.policy_registry.require_verified()
++        self.assertEqual(
++            {member.security_id for member in fixture.frozen.members}, set(templates)
++        )
++        self.assertEqual(
++            {item["security_id"]: item["template_id"] for item in fixture.industry["memberships"]},
++            templates,
++        )
++
++    def test_put_policy_financial_requires_explicit_year_and_per_key_units(self):
++        fixture = self.fixture()
++        sid = "SH600000"
++        values = {"fixture.policy.roe": 7.5, "fixture.policy.profit": 80.0}
++        units = {"fixture.policy.roe": "ratio", "fixture.policy.profit": "CNY"}
++        fixture.put_policy_financial(
++            sid, values, fy_end="2024-12-31", units=units, generation="fy2024"
++        )
++        facts = [fact for fact in fixture.store.list_formal_financial_facts(security_id=sid)
++                 if fact.period_end == "2024-12-31"]
++        self.assertEqual(
++            {(fact.metric_key, fact.value, fact.unit) for fact in facts},
++            {("fixture.policy.roe", 7.5, "ratio"),
++             ("fixture.policy.profit", 80.0, "CNY")},
++        )
++        with closing(sqlite3.connect(fixture.db_path)) as connection:
++            saved_hashes = [row[0] for row in connection.execute(
++                "SELECT input_hash FROM formal_feature_set WHERE security_id=?", (sid,)
++            )]
++        self.assertEqual(len(saved_hashes), 1)
++        saved = fixture.feature_repository._read_authenticated_bundle(
++            input_hash=saved_hashes[0], require_complete=False
++        )
++        self.assertEqual(saved.security_id, sid)
++        self.assertTrue(saved.blockers)
++        self.assertEqual({item.status for item in saved.values}, {"blocked"})
++
++        invalid = (
++            {"fy_end": None, "units": units},
++            {"fy_end": "FY2024", "units": units},
++            {"fy_end": "2024-12-31", "units": {"fixture.policy.roe": "ratio"}},
++            {"fy_end": "2024-12-31", "units": {**units, "extra": "CNY"}},
++        )
++        for kwargs in invalid:
++            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
++                fixture.put_policy_financial(
++                    sid, values, generation="invalid-" + hashlib.sha256(repr(kwargs).encode()).hexdigest()[:8],
++                    **kwargs,
++                )
++
++    def test_policy_financial_values_writes_distinct_real_fy_evidence_and_receipt(self):
++        fixture = self.fixture()
++        sid = "SH600000"
++        bundle = fixture.policy_financial_values(
++            sid, current_roe=9.0, current_margin=8.0, current_profit=7.0
++        )
++        facts = fixture.store.list_formal_financial_facts(security_id=sid)
++        by_year = {}
++        for fact in facts:
++            by_year.setdefault(fact.period_end, []).append(fact)
++        self.assertEqual({key: len(value) for key, value in by_year.items()}, {
++            "2021-12-31": 3,
++            "2022-12-31": 3,
++            "2023-12-31": 3,
++            "2024-12-31": 3,
++            "2025-12-31": 7,
++        })
++        self.assertEqual(
++            {(fact.metric_key, fact.unit) for fact in facts},
++            {
++                ("fixture.policy.current.equity", "CNY"),
++                ("fixture.policy.current.roe", "ratio"),
++                ("fixture.policy.current.margin", "ratio"),
++                ("fixture.policy.current.profit", "CNY"),
++                ("fixture.policy.roe", "ratio"),
++                ("fixture.policy.margin", "ratio"),
++                ("fixture.policy.profit", "CNY"),
++            },
++        )
++        self.assertEqual(len({fact.source_producing_task_id for fact in facts}), 5)
++        values = {(fact.metric_key, fact.period_end): fact.value for fact in facts}
++        self.assertEqual(values[("fixture.policy.current.roe", "2025-12-31")], 9.0)
++        self.assertEqual(values[("fixture.policy.roe", "2025-12-31")], 5.0)
++        self.assertEqual(values[("fixture.policy.current.margin", "2025-12-31")], 8.0)
++        self.assertEqual(values[("fixture.policy.margin", "2025-12-31")], 5.0)
++        self.assertEqual(values[("fixture.policy.current.profit", "2025-12-31")], 7.0)
++        self.assertEqual(values[("fixture.policy.profit", "2025-12-31")], 5.0)
++        slots = {item.slot_id: item.to_dict()["formula"]
++                 for item in fixture.vocabulary.slots_for_template("bank")}
++        self.assertEqual(slots["bank.policy.roe"], {
++            "op": "fact", "fact_key": "fixture.policy.current.roe", "period_key": "FY2025"
++        })
++        self.assertEqual(slots["bank.policy.roe_2025"], {
++            "op": "fact", "fact_key": "fixture.policy.roe", "period_key": "FY2025"
++        })
++        self.assertEqual(bundle.security_id, sid)
++        authenticated = fixture.feature_repository._read_authenticated_bundle(
++            input_hash=bundle.input_hash, require_complete=False
++        )
++        self.assertEqual(authenticated.canonical_bytes(), bundle.canonical_bytes())
++
++
++if __name__ == "__main__":
++    unittest.main()
+

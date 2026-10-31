@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_release_live_equivalence.GenuineOfficialEquivalenceTests.test_fresh_inputs_replay_exact_candidate_without_v8_writes
+test_fresh_inputs_replay_exact_candidate_without_v8_writes (test_formal_release_live_equivalence.GenuineOfficialEquivalenceTests.test_fresh_inputs_replay_exact_candidate_without_v8_writes) ... 2026-10-14T19:43:53.877646+00:00 V9 equivalence: build signed 20-member official fixture
+2026-10-14T19:43:55.101259+00:00 V9 equivalence: fixture database: D:\Projects\AShareQiheng\.tmp\AShareQiheng\formal-feature-store-tests\tmpymd3bkk6\metric.sqlite
+2026-10-14T19:49:58.481378+00:00 V9 equivalence: complete real histories and current feature evidence
+2026-10-14T19:52:05.749208+00:00 V9 equivalence: audit original official coverage
+2026-10-14T19:55:42.253017+00:00 V9 equivalence: produce and persist original Stage D official candidate
+2026-10-14T21:09:36.213816+00:00 V9 equivalence: reload configured inputs and fresh coverage
+2026-10-14T21:16:56.952182+00:00 V9 equivalence: recompute genuine D1, D2, D3 and pool without persistence

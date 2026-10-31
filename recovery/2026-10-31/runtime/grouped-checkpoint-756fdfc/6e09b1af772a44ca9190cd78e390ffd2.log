@@ -1,0 +1,16 @@
+TEST_STARTED test_formal_release_live_equivalence.GenuineOfficialEquivalenceTests.test_fresh_inputs_replay_exact_candidate_without_v8_writes
+test_fresh_inputs_replay_exact_candidate_without_v8_writes (test_formal_release_live_equivalence.GenuineOfficialEquivalenceTests.test_fresh_inputs_replay_exact_candidate_without_v8_writes) ... 2026-10-19T04:14:05.877006+00:00 V9 equivalence: build signed 20-member official fixture
+2026-10-19T04:14:11.899124+00:00 V9 equivalence: fixture database: D:\Projects\AShareQiheng\.tmp\AShareQiheng\formal-feature-store-tests\tmpfkvcr8ea\metric.sqlite
+2026-10-19T04:31:12.310696+00:00 V9 equivalence: complete real histories and current feature evidence
+2026-10-19T04:37:09.310078+00:00 V9 equivalence: audit original official coverage
+2026-10-19T04:47:49.915273+00:00 V9 equivalence: produce and persist original Stage D official candidate
+2026-10-19T08:34:04.850686+00:00 V9 equivalence: reload configured inputs and fresh coverage
+2026-10-19T08:42:47.998733+00:00 V9 equivalence: recompute genuine D1, D2, D3 and pool without persistence
+2026-10-19T10:12:09.197203+00:00 V9 equivalence: exact four-artifact equivalence; unchanged V8; no V9 authority minted
+ok
+
+----------------------------------------------------------------------
+Ran 1 test in 21483.866s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_release_live_equivalence.GenuineOfficialEquivalenceTests.test_fresh_inputs_replay_exact_candidate_without_v8_writes"], "passed": ["test_formal_release_live_equivalence.GenuineOfficialEquivalenceTests.test_fresh_inputs_replay_exact_candidate_without_v8_writes"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

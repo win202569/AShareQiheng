@@ -1,0 +1,2196 @@
+# Review package: 9bc6fb7..a8bca109bce0d5e6a5bf953e99a067b3259f77ce
+
+## Commits
+a8bca10 feat: add formal feature contract and storage
+
+## Files changed
+ ashare_pipeline/formal_feature_contract.py | 1106 ++++++++++++++++++++++++++++
+ ashare_pipeline/formal_feature_store.py    |  325 ++++++++
+ tests/test_formal_feature_contract.py      |  483 ++++++++++++
+ tests/test_formal_feature_store.py         |  244 ++++++
+ 4 files changed, 2158 insertions(+)
+
+## Diff
+diff --git a/ashare_pipeline/formal_feature_contract.py b/ashare_pipeline/formal_feature_contract.py
+new file mode 100644
+index 0000000..4cd2daf
+--- /dev/null
++++ b/ashare_pipeline/formal_feature_contract.py
+@@ -0,0 +1,1106 @@
++"""Signed Formal V3 feature definitions and immutable feature-bundle records."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import date, datetime, timezone
++import hashlib
++import json
++import math
++import re
++import struct
++import uuid
++import weakref
++from typing import Literal
++
++from .formal_financial_schema import FormalFinancialFact
++from .formal_registry_manifest import FormalRegistryManifest
++from .formal_sources import RegistrySignatureVerifier
++from .formal_universe import canonical_security_id
++
++
++_SHA256 = re.compile(r"^[0-9a-f]{64}$")
++_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
++_QUARTER = re.compile(r"^[0-9]{4}Q[1-4]$")
++_TEMPLATES = ("bank", "broker", "general_nonfinancial", "insurance", "real_estate")
++_DIMENSIONS = frozenset({"G", "V", "M", "EQ", "FS", "CA", "T"})
++_UNITS = frozenset({"CNY", "shares", "ratio", "CNY_per_share"})
++_FORMULA_OPS = frozenset({"fact", "add", "subtract", "divide", "cagr", "median", "minimum"})
++_MISSING_STATUSES = frozenset({"missing", "blocked", "not_applicable"})
++_REGISTRY_KEYS = frozenset(
++    {
++        "schema_version",
++        "registry_role",
++        "contract_version",
++        "source_registry_hash",
++        "mapping_registry_hash",
++        "template_ids",
++        "slots",
++    }
++)
++_SLOT_KEYS = frozenset(
++    {"slot_id", "template_id", "dimension", "required", "unit", "formula", "formula_version"}
++)
++_EVIDENCE_KEYS = frozenset(
++    {
++        "formal_fact_id",
++        "source_snapshot_id",
++        "source_content_sha256",
++        "source_refresh_generation",
++        "source_field",
++        "raw_value_sha256",
++        "published_at_utc",
++        "published_precision",
++        "effective_at_utc",
++        "mapping_version",
++    }
++)
++_VALUE_KEYS = frozenset(
++    {"slot_id", "value", "unit", "status", "formula_version", "evidence", "missing_reason"}
++)
++_BUNDLE_KEYS = frozenset(
++    {
++        "schema_version",
++        "contract_version",
++        "security_id",
++        "as_of_utc",
++        "template_id",
++        "registry_manifest_hash",
++        "feature_registry_hash",
++        "input_hash",
++        "values",
++        "history_endpoints",
++        "comparable_quarter_keys",
++        "blockers",
++    }
++)
++
++
++class _DuplicateJsonKey(ValueError):
++    pass
++
++
++def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
++    result: dict[str, object] = {}
++    for key, value in pairs:
++        if key in result:
++            raise _DuplicateJsonKey(key)
++        result[key] = value
++    return result
++
++
++def _reject_json_constant(value: str) -> object:
++    raise ValueError(f"non-finite JSON value {value!r}")
++
++
++def _canonical_json_bytes(value: object) -> bytes:
++    return json.dumps(
++        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
++    ).encode("utf-8")
++
++
++def _snapshot_json(value: object, *, label: str = "value") -> object:
++    if value is None or type(value) in {bool, int, str}:
++        return value
++    if type(value) is float:
++        if not math.isfinite(value):
++            raise ValueError(f"{label} contains a non-finite value")
++        return value
++    if type(value) is list:
++        return [_snapshot_json(item, label=label) for item in value]
++    if type(value) is dict:
++        copied: dict[str, object] = {}
++        for key, item in value.items():
++            if type(key) is not str or key in copied:
++                raise ValueError(f"{label} must have unique exact string keys")
++            copied[key] = _snapshot_json(item, label=label)
++        return copied
++    raise ValueError(f"{label} must contain only JSON-native values")
++
++
++def _load_canonical_object(value: object, *, label: str) -> dict[str, object]:
++    if type(value) is not bytes:
++        raise ValueError(f"{label} must be UTF-8 bytes")
++    try:
++        text = value.decode("utf-8")
++    except UnicodeDecodeError as error:
++        raise ValueError(f"{label} must be UTF-8") from error
++    try:
++        parsed = json.loads(
++            text,
++            object_pairs_hook=_unique_json_object,
++            parse_constant=_reject_json_constant,
++        )
++    except _DuplicateJsonKey as error:
++        raise ValueError(f"{label} has duplicate JSON keys") from error
++    except (TypeError, ValueError, json.JSONDecodeError) as error:
++        raise ValueError(f"{label} must be valid JSON") from error
++    if type(parsed) is not dict:
++        raise ValueError(f"{label} must be a JSON object")
++    if _canonical_json_bytes(parsed) != value:
++        raise ValueError(f"{label} must be canonical JSON")
++    return parsed
++
++
++def _require_text(value: object, label: str, *, identifier: bool = False) -> str:
++    if type(value) is not str or not value or value != value.strip():
++        raise ValueError(f"{label} must be already-trimmed nonempty text")
++    if any(ord(character) < 32 or ord(character) == 127 for character in value):
++        raise ValueError(f"{label} must be control-free")
++    if identifier and _IDENTIFIER.fullmatch(value) is None:
++        raise ValueError(f"{label} must be a safe identifier")
++    return value
++
++
++def _require_hash(value: object, label: str) -> str:
++    if type(value) is not str or _SHA256.fullmatch(value) is None:
++        raise ValueError(f"{label} must be a lowercase SHA-256")
++    return value
++
++
++def _require_uuid(value: object, label: str) -> str:
++    if type(value) is not str:
++        raise ValueError(f"{label} must be a canonical UUID")
++    try:
++        parsed = uuid.UUID(value)
++    except (ValueError, AttributeError) as error:
++        raise ValueError(f"{label} must be a canonical UUID") from error
++    if str(parsed) != value:
++        raise ValueError(f"{label} must be a canonical UUID")
++    return value
++
++
++def _require_utc(value: object, label: str) -> str:
++    if type(value) is not str or not value.endswith("+00:00"):
++        raise ValueError(f"{label} must be a canonical UTC timestamp")
++    try:
++        parsed = datetime.fromisoformat(value)
++    except ValueError as error:
++        raise ValueError(f"{label} must be a canonical UTC timestamp") from error
++    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
++        raise ValueError(f"{label} must be a canonical UTC timestamp")
++    if parsed.isoformat() != value:
++        raise ValueError(f"{label} must be a canonical UTC timestamp")
++    return value
++
++
++def _require_date(value: object, label: str) -> str:
++    if type(value) is not str:
++        raise ValueError(f"{label} must be an ISO date")
++    try:
++        parsed = date.fromisoformat(value)
++    except ValueError as error:
++        raise ValueError(f"{label} must be an ISO date") from error
++    if parsed.isoformat() != value:
++        raise ValueError(f"{label} must be an ISO date")
++    return value
++
++
++def _require_exact_keys(value: object, expected: frozenset[str], label: str) -> dict[str, object]:
++    if type(value) is not dict:
++        raise ValueError(f"{label} must be an exact JSON object")
++    copied = _snapshot_json(value, label=label)
++    assert type(copied) is dict
++    if set(copied) != expected:
++        raise ValueError(f"{label} has unknown or missing keys")
++    return copied
++
++
++@dataclass(frozen=True, slots=True)
++class FormulaNode:
++    op: Literal["fact", "add", "subtract", "divide", "cagr", "median", "minimum"]
++    fact_key: str | None = None
++    period_key: str | None = None
++    left: "FormulaNode | None" = None
++    right: "FormulaNode | None" = None
++    items: tuple["FormulaNode", ...] = ()
++    intervals: int | None = None
++
++    def __post_init__(self) -> None:
++        _formula_to_dict(self, set())
++
++    @classmethod
++    def from_dict(cls, value: dict[str, object]) -> "FormulaNode":
++        if cls is not FormulaNode:
++            raise ValueError("FormulaNode must have exact type")
++        return _parse_formula(value, set())
++
++    def to_dict(self) -> dict[str, object]:
++        return _formula_to_dict(self, set())
++
++
++def _parse_formula(value: object, ancestors: set[int]) -> FormulaNode:
++    if type(value) is not dict:
++        raise ValueError("formula node must be an exact JSON object")
++    identity = id(value)
++    if identity in ancestors:
++        raise ValueError("formula node must not be cyclic")
++    ancestors.add(identity)
++    try:
++        op = value.get("op")
++        if type(op) is not str or op not in _FORMULA_OPS:
++            raise ValueError("formula op is invalid")
++        expected = {
++            "fact": {"op", "fact_key", "period_key"},
++            "add": {"op", "left", "right"},
++            "subtract": {"op", "left", "right"},
++            "divide": {"op", "left", "right"},
++            "cagr": {"op", "left", "right", "intervals"},
++            "median": {"op", "items"},
++            "minimum": {"op", "items"},
++        }[op]
++        if set(value) != expected or any(type(key) is not str for key in value):
++            raise ValueError("formula node has unknown or missing keys")
++        if op == "fact":
++            return FormulaNode(
++                op="fact",
++                fact_key=_require_text(value["fact_key"], "formula fact_key", identifier=True),
++                period_key=_require_text(value["period_key"], "formula period_key", identifier=True),
++            )
++        if op in {"add", "subtract", "divide", "cagr"}:
++            left = _parse_formula(value["left"], ancestors)
++            right = _parse_formula(value["right"], ancestors)
++            intervals: int | None = None
++            if op == "cagr":
++                supplied = value["intervals"]
++                if type(supplied) is not int or supplied <= 0:
++                    raise ValueError("cagr intervals must be a positive exact integer")
++                intervals = supplied
++            return FormulaNode(op=op, left=left, right=right, intervals=intervals)
++        supplied_items = value["items"]
++        if type(supplied_items) is not list:
++            raise ValueError(f"{op} items must be a JSON array")
++        items = tuple(_parse_formula(item, ancestors) for item in supplied_items)
++        return FormulaNode(op=op, items=items)
++    finally:
++        ancestors.remove(identity)
++
++
++def _formula_to_dict(node: object, ancestors: set[int]) -> dict[str, object]:
++    if type(node) is not FormulaNode:
++        raise ValueError("formula children must have exact type FormulaNode")
++    identity = id(node)
++    if identity in ancestors:
++        raise ValueError("formula node must not be cyclic")
++    ancestors.add(identity)
++    try:
++        if type(node.op) is not str or node.op not in _FORMULA_OPS:
++            raise ValueError("formula op is invalid")
++        if node.op == "fact":
++            if (
++                node.left is not None or node.right is not None or node.items != ()
++                or node.intervals is not None
++            ):
++                raise ValueError("fact formula has invalid children")
++            return {
++                "op": "fact",
++                "fact_key": _require_text(node.fact_key, "formula fact_key", identifier=True),
++                "period_key": _require_text(node.period_key, "formula period_key", identifier=True),
++            }
++        if node.fact_key is not None or node.period_key is not None:
++            raise ValueError("non-fact formula cannot contain fact fields")
++        if node.op in {"add", "subtract", "divide", "cagr"}:
++            if node.items != ():
++                raise ValueError("binary formula cannot contain items")
++            left = _formula_to_dict(node.left, ancestors)
++            right = _formula_to_dict(node.right, ancestors)
++            result: dict[str, object] = {"op": node.op, "left": left, "right": right}
++            if node.op == "cagr":
++                if type(node.intervals) is not int or node.intervals <= 0:
++                    raise ValueError("cagr intervals must be a positive exact integer")
++                result["intervals"] = node.intervals
++            elif node.intervals is not None:
++                raise ValueError("non-cagr binary formula cannot contain intervals")
++            return result
++        if node.left is not None or node.right is not None or node.intervals is not None:
++            raise ValueError("aggregate formula has invalid children")
++        if type(node.items) is not tuple or len(node.items) < 2:
++            raise ValueError(f"{node.op} requires at least two items")
++        items = [_formula_to_dict(item, ancestors) for item in node.items]
++        item_bytes = tuple(_canonical_json_bytes(item) for item in items)
++        if any(left >= right for left, right in zip(item_bytes, item_bytes[1:])):
++            raise ValueError(f"{node.op} items must be strictly sorted and unique")
++        return {"op": node.op, "items": items}
++    finally:
++        ancestors.remove(identity)
++
++
++@dataclass(frozen=True, slots=True)
++class FormalFeatureSlot:
++    slot_id: str
++    template_id: str
++    dimension: Literal["G", "V", "M", "EQ", "FS", "CA", "T"]
++    required: bool
++    unit: str
++    formula: FormulaNode
++    formula_version: str
++
++    def __post_init__(self) -> None:
++        _slot_to_dict(self)
++
++    @classmethod
++    def from_dict(cls, value: dict[str, object]) -> "FormalFeatureSlot":
++        if cls is not FormalFeatureSlot:
++            raise ValueError("FormalFeatureSlot must have exact type")
++        wire = _require_exact_keys(value, _SLOT_KEYS, "formal feature slot")
++        formula_wire = wire["formula"]
++        if type(formula_wire) is not dict:
++            raise ValueError("formal feature slot formula must be an object")
++        return cls(
++            slot_id=wire["slot_id"],
++            template_id=wire["template_id"],
++            dimension=wire["dimension"],
++            required=wire["required"],
++            unit=wire["unit"],
++            formula=FormulaNode.from_dict(formula_wire),
++            formula_version=wire["formula_version"],
++        )
++
++    def to_dict(self) -> dict[str, object]:
++        return _slot_to_dict(self)
++
++
++def _slot_to_dict(slot: object) -> dict[str, object]:
++    if type(slot) is not FormalFeatureSlot:
++        raise ValueError("formal feature slot must have exact type")
++    slot_id = _require_text(slot.slot_id, "feature slot_id", identifier=True)
++    if type(slot.template_id) is not str or slot.template_id not in _TEMPLATES:
++        raise ValueError("feature slot template_id is invalid")
++    if type(slot.dimension) is not str or slot.dimension not in _DIMENSIONS:
++        raise ValueError("feature slot dimension is invalid")
++    if type(slot.required) is not bool:
++        raise ValueError("feature slot required must be an exact bool")
++    if type(slot.unit) is not str or slot.unit not in _UNITS:
++        raise ValueError("feature slot unit is invalid")
++    formula_version = _require_text(
++        slot.formula_version, "feature slot formula_version", identifier=True
++    )
++    return {
++        "slot_id": slot_id,
++        "template_id": slot.template_id,
++        "dimension": slot.dimension,
++        "required": slot.required,
++        "unit": slot.unit,
++        "formula": _formula_to_dict(slot.formula, set()),
++        "formula_version": formula_version,
++    }
++
++
++def _parse_registry_bytes(
++    registry_bytes: object,
++) -> tuple[dict[str, object], tuple[FormalFeatureSlot, ...]]:
++    wire = _load_canonical_object(registry_bytes, label="formal feature registry")
++    if set(wire) != _REGISTRY_KEYS:
++        raise ValueError("formal feature registry has unknown or missing keys")
++    if wire["schema_version"] != "formal-feature-registry-v1":
++        raise ValueError("formal feature registry schema_version is invalid")
++    if wire["registry_role"] != "feature":
++        raise ValueError("formal feature registry role is invalid")
++    _require_text(wire["contract_version"], "feature contract_version", identifier=True)
++    _require_hash(wire["source_registry_hash"], "feature source_registry_hash")
++    _require_hash(wire["mapping_registry_hash"], "feature mapping_registry_hash")
++    template_values = wire["template_ids"]
++    if type(template_values) is not list or not template_values:
++        raise ValueError("feature template_ids must be a nonempty JSON array")
++    template_ids = tuple(template_values)
++    if any(type(item) is not str or item not in _TEMPLATES for item in template_ids):
++        raise ValueError("feature template_ids contain an invalid template")
++    if tuple(sorted(set(template_ids))) != template_ids:
++        raise ValueError("feature template_ids must be sorted and unique")
++    slot_values = wire["slots"]
++    if type(slot_values) is not list or not slot_values:
++        raise ValueError("formal feature registry slots must be a nonempty JSON array")
++    slots = tuple(FormalFeatureSlot.from_dict(item) for item in slot_values)
++    slot_ids = tuple(slot.slot_id for slot in slots)
++    if tuple(sorted(set(slot_ids))) != slot_ids:
++        raise ValueError("feature slot IDs must be globally sorted and unique")
++    declared_templates = set(template_ids)
++    if any(slot.template_id not in declared_templates for slot in slots):
++        raise ValueError("feature slot references an undeclared template")
++    if {slot.template_id for slot in slots} != declared_templates:
++        raise ValueError("every declared template must contain at least one explicit slot")
++    return wire, slots
++
++
++def _verify_registry_signature(
++    registry_bytes: object, signature: object, key_id: object, verifier: object
++) -> tuple[str, str]:
++    if type(registry_bytes) is not bytes:
++        raise ValueError("formal feature registry must be bytes")
++    signature_text = _require_text(signature, "formal feature registry signature")
++    key_text = _require_text(key_id, "formal feature registry key_id", identifier=True)
++    verify = getattr(verifier, "verify", None)
++    if not callable(verify):
++        raise ValueError("formal feature registry signature verifier is invalid")
++    try:
++        accepted = verify(registry_bytes, signature=signature_text, key_id=key_text)
++    except Exception as error:
++        raise ValueError("formal feature registry signature verification failed") from error
++    if accepted is not True:
++        raise ValueError("formal feature registry signature was rejected")
++    return signature_text, key_text
++
++
++def _validate_root(root: object) -> FormalRegistryManifest:
++    if type(root) is not FormalRegistryManifest:
++        raise ValueError("registry manifest must be an exact sealed FormalRegistryManifest")
++    try:
++        hashes = {
++            field: getattr(root, field)
++            for field in (
++                "source_registry_hash",
++                "mapping_registry_hash",
++                "feature_registry_hash",
++                "scoring_registry_hash",
++                "industry_registry_hash",
++                "cyclic_registry_hash",
++                "redline_registry_hash",
++                "status_registry_hash",
++                "event_registry_hash",
++            )
++        }
++        root.assert_member_hashes(**hashes)
++    except (AttributeError, TypeError, ValueError) as error:
++        raise ValueError("registry manifest is unsealed, forged, or mutated") from error
++    return root
++
++
++def _release_eligible(
++    wire: dict[str, object], registry_hash: str, root: FormalRegistryManifest | None
++) -> bool:
++    if root is None:
++        return False
++    manifest = _validate_root(root)
++    try:
++        manifest.require_official()
++    except ValueError:
++        if manifest.purpose == "test":
++            return False
++        raise
++    return (
++        manifest.feature_registry_hash == registry_hash
++        and manifest.source_registry_hash == wire["source_registry_hash"]
++        and manifest.mapping_registry_hash == wire["mapping_registry_hash"]
++        and tuple(wire["template_ids"]) == _TEMPLATES
++    )
++
++
++def _make_signed_registry_type() -> tuple[type[object], object]:
++    sensitive_fields = frozenset(
++        {
++            "canonical_json",
++            "registry_hash",
++            "signature",
++            "key_id",
++            "contract_version",
++            "source_registry_hash",
++            "mapping_registry_hash",
++            "template_ids",
++            "slots",
++            "release_eligible",
++        }
++    )
++
++    @dataclass(frozen=True)
++    class _Seal:
++        canonical_json: bytes
++        registry_hash: str
++        signature: str
++        key_id: str
++        contract_version: str
++        source_registry_hash: str
++        mapping_registry_hash: str
++        template_ids: tuple[str, ...]
++        slots: tuple[FormalFeatureSlot, ...]
++        slot_bytes: tuple[bytes, ...]
++        release_eligible: bool
++
++    records: dict[int, tuple[weakref.ReferenceType[object], _Seal]] = {}
++
++    def forget(identity: int) -> None:
++        records.pop(identity, None)
++
++    def fingerprint(registry: object) -> _Seal | None:
++        if type(registry) is not SignedFormalFeatureRegistry:
++            return None
++        try:
++            read = object.__getattribute__
++            values = (
++                read(registry, "canonical_json"),
++                read(registry, "registry_hash"),
++                read(registry, "signature"),
++                read(registry, "key_id"),
++                read(registry, "contract_version"),
++                read(registry, "source_registry_hash"),
++                read(registry, "mapping_registry_hash"),
++                read(registry, "template_ids"),
++                read(registry, "slots"),
++                read(registry, "release_eligible"),
++            )
++        except AttributeError:
++            return None
++        if (
++            type(values[0]) is not bytes
++            or any(type(value) is not str for value in values[1:7])
++            or type(values[7]) is not tuple
++            or any(type(item) is not str for item in values[7])
++            or type(values[8]) is not tuple
++            or any(type(item) is not FormalFeatureSlot for item in values[8])
++            or type(values[9]) is not bool
++        ):
++            return None
++        try:
++            slot_bytes = tuple(_canonical_json_bytes(item.to_dict()) for item in values[8])
++        except (TypeError, ValueError):
++            return None
++        return _Seal(*values[:9], slot_bytes, values[9])
++
++    def require_verified(registry: object) -> _Seal:
++        record = records.get(id(registry))
++        current = fingerprint(registry)
++        if record is None or current is None or record[0]() is not registry:
++            raise ValueError("signed formal feature registry was not verified or was mutated")
++        sealed = record[1]
++        if (
++            current.canonical_json != sealed.canonical_json
++            or current.registry_hash != sealed.registry_hash
++            or current.signature != sealed.signature
++            or current.key_id != sealed.key_id
++            or current.contract_version != sealed.contract_version
++            or current.source_registry_hash != sealed.source_registry_hash
++            or current.mapping_registry_hash != sealed.mapping_registry_hash
++            or current.template_ids is not sealed.template_ids
++            or current.slots is not sealed.slots
++            or current.slot_bytes != sealed.slot_bytes
++            or current.release_eligible is not sealed.release_eligible
++        ):
++            raise ValueError("signed formal feature registry was not verified or was mutated")
++        parsed, _ = _parse_registry_bytes(sealed.canonical_json)
++        if hashlib.sha256(sealed.canonical_json).hexdigest() != sealed.registry_hash:
++            raise ValueError("signed formal feature registry hash no longer matches")
++        if parsed["contract_version"] != sealed.contract_version:
++            raise ValueError("signed formal feature registry contract changed")
++        return sealed
++
++    @dataclass(frozen=True, slots=True, weakref_slot=True, init=False)
++    class SignedFormalFeatureRegistry:
++        canonical_json: bytes
++        registry_hash: str
++        signature: str
++        key_id: str
++        contract_version: str
++        source_registry_hash: str
++        mapping_registry_hash: str
++        template_ids: tuple[str, ...]
++        slots: tuple[FormalFeatureSlot, ...]
++        release_eligible: bool
++
++        def __init__(self, *_args: object, **_kwargs: object) -> None:
++            raise TypeError("SignedFormalFeatureRegistry must be loaded from signed bytes")
++
++        def __getattribute__(self, name: str) -> object:
++            if name in sensitive_fields:
++                return getattr(require_verified(self), name)
++            return object.__getattribute__(self, name)
++
++        def slots_for_template(self, template_id: str) -> tuple[FormalFeatureSlot, ...]:
++            sealed = require_verified(self)
++            if type(template_id) is not str or template_id not in sealed.template_ids:
++                raise ValueError("feature template is not declared")
++            _, effective_slots = _parse_registry_bytes(sealed.canonical_json)
++            return tuple(slot for slot in effective_slots if slot.template_id == template_id)
++
++        def require_release_eligible(self) -> None:
++            sealed = require_verified(self)
++            if sealed.release_eligible is not True:
++                raise ValueError("formal feature registry is not release eligible")
++
++    def construct(
++        *, canonical_json: bytes, registry_hash: str, signature: str, key_id: str,
++        wire: dict[str, object], slots: tuple[FormalFeatureSlot, ...], release_eligible: bool,
++    ) -> SignedFormalFeatureRegistry:
++        registry = object.__new__(SignedFormalFeatureRegistry)
++        for name, value in (
++            ("canonical_json", canonical_json),
++            ("registry_hash", registry_hash),
++            ("signature", signature),
++            ("key_id", key_id),
++            ("contract_version", wire["contract_version"]),
++            ("source_registry_hash", wire["source_registry_hash"]),
++            ("mapping_registry_hash", wire["mapping_registry_hash"]),
++            ("template_ids", tuple(wire["template_ids"])),
++            ("slots", slots),
++            ("release_eligible", release_eligible),
++        ):
++            object.__setattr__(registry, name, value)
++        sealed = fingerprint(registry)
++        assert sealed is not None
++        identity = id(registry)
++        records[identity] = (
++            weakref.ref(registry, lambda _reference, identity=identity: forget(identity)), sealed
++        )
++        return registry
++
++    return SignedFormalFeatureRegistry, construct
++
++
++SignedFormalFeatureRegistry, _construct_signed_registry = _make_signed_registry_type()
++del _make_signed_registry_type
++
++
++def _make_registry_loader(construct_registry: object) -> object:
++    def load_signed_feature_registry(
++        registry_bytes: bytes,
++        signature: str,
++        key_id: str,
++        verifier: RegistrySignatureVerifier,
++        *,
++        registry_manifest: FormalRegistryManifest | None = None,
++    ) -> SignedFormalFeatureRegistry:
++        wire, slots = _parse_registry_bytes(registry_bytes)
++        signature_text, key_text = _verify_registry_signature(
++            registry_bytes, signature, key_id, verifier
++        )
++        registry_hash = hashlib.sha256(registry_bytes).hexdigest()
++        eligible = _release_eligible(wire, registry_hash, registry_manifest)
++        return construct_registry(
++            canonical_json=registry_bytes,
++            registry_hash=registry_hash,
++            signature=signature_text,
++            key_id=key_text,
++            wire=wire,
++            slots=slots,
++            release_eligible=eligible,
++        )
++
++    return load_signed_feature_registry
++
++
++load_signed_feature_registry = _make_registry_loader(_construct_signed_registry)
++del _make_registry_loader, _construct_signed_registry
++
++
++def _make_evidence_type() -> type[object]:
++    fields = (
++        "formal_fact_id", "source_snapshot_id", "source_content_sha256",
++        "source_refresh_generation", "source_field", "raw_value_sha256",
++        "published_at_utc", "published_precision", "effective_at_utc", "mapping_version",
++    )
++    records: dict[int, tuple[weakref.ReferenceType[object], tuple[object, ...]]] = {}
++
++    def forget(identity: int) -> None:
++        records.pop(identity, None)
++
++    def validate(ref: object) -> tuple[object, ...]:
++        if type(ref) is not FormalEvidenceRef:
++            raise ValueError("formal evidence must have exact type")
++        try:
++            values = tuple(getattr(ref, field) for field in fields)
++        except AttributeError as error:
++            raise ValueError("formal evidence is incomplete") from error
++        if any(type(value) is not str for value in values):
++            raise ValueError("formal evidence fields must be exact strings")
++        _require_hash(values[0], "evidence formal_fact_id")
++        _require_uuid(values[1], "evidence source_snapshot_id")
++        _require_hash(values[2], "evidence source_content_sha256")
++        _require_text(values[3], "evidence source_refresh_generation")
++        _require_text(values[4], "evidence source_field")
++        _require_hash(values[5], "evidence raw_value_sha256")
++        published = _require_utc(values[6], "evidence published_at_utc")
++        if values[7] not in {"timestamp", "date_only"}:
++            raise ValueError("evidence published_precision is invalid")
++        effective = _require_utc(values[8], "evidence effective_at_utc")
++        if values[7] == "timestamp" and effective != published:
++            raise ValueError("timestamp evidence effective time must equal publication")
++        if values[7] == "date_only" and datetime.fromisoformat(effective) <= datetime.fromisoformat(published):
++            raise ValueError("date-only evidence effective time must follow publication")
++        _require_text(values[9], "evidence mapping_version", identifier=True)
++        return values
++
++    def remember(ref: object) -> None:
++        values = validate(ref)
++        identity = id(ref)
++        records[identity] = (
++            weakref.ref(ref, lambda _reference, identity=identity: forget(identity)), values
++        )
++
++    def require(ref: object) -> tuple[object, ...]:
++        record = records.get(id(ref))
++        current = validate(ref)
++        if record is None or record[0]() is not ref:
++            raise ValueError("formal evidence was not safely constructed or was mutated")
++        if any(type(left) is not type(right) or left != right for left, right in zip(current, record[1])):
++            raise ValueError("formal evidence was not safely constructed or was mutated")
++        return current
++
++    @dataclass(frozen=True, slots=True, weakref_slot=True)
++    class FormalEvidenceRef:
++        formal_fact_id: str
++        source_snapshot_id: str
++        source_content_sha256: str
++        source_refresh_generation: str
++        source_field: str
++        raw_value_sha256: str
++        published_at_utc: str
++        published_precision: Literal["timestamp", "date_only"]
++        effective_at_utc: str
++        mapping_version: str
++
++        def __post_init__(self) -> None:
++            remember(self)
++
++        @classmethod
++        def from_formal_fact(cls, fact: FormalFinancialFact) -> "FormalEvidenceRef":
++            if cls is not FormalEvidenceRef or type(fact) is not FormalFinancialFact:
++                raise ValueError("formal evidence requires an exact FormalFinancialFact")
++            values = fact.to_dict()
++            return cls(
++                formal_fact_id=values["id"],
++                source_snapshot_id=values["source_snapshot_id"],
++                source_content_sha256=values["source_content_sha256"],
++                source_refresh_generation=values["source_refresh_generation"],
++                source_field=values["source_field"],
++                raw_value_sha256=values["raw_value_sha256"],
++                published_at_utc=values["published_at_utc"],
++                published_precision=values["published_precision"],
++                effective_at_utc=values["effective_at_utc"],
++                mapping_version=values["mapping_version"],
++            )
++
++        @classmethod
++        def from_dict(cls, value: dict[str, object]) -> "FormalEvidenceRef":
++            if cls is not FormalEvidenceRef:
++                raise ValueError("FormalEvidenceRef must have exact type")
++            wire = _require_exact_keys(value, _EVIDENCE_KEYS, "formal evidence")
++            return cls(**wire)
++
++        def to_dict(self) -> dict[str, object]:
++            return dict(zip(fields, require(self), strict=True))
++
++    return FormalEvidenceRef
++
++
++FormalEvidenceRef = _make_evidence_type()
++del _make_evidence_type
++
++
++def _make_feature_value_type() -> type[object]:
++    records: dict[int, tuple[weakref.ReferenceType[object], tuple[object, ...]]] = {}
++
++    def forget(identity: int) -> None:
++        records.pop(identity, None)
++
++    def validate(item: object) -> tuple[object, ...]:
++        if type(item) is not FormalFeatureValue:
++            raise ValueError("formal feature value must have exact type")
++        slot_id = _require_text(item.slot_id, "feature value slot_id", identifier=True)
++        if type(item.unit) is not str or item.unit not in _UNITS:
++            raise ValueError("feature value unit is invalid")
++        formula_version = _require_text(
++            item.formula_version, "feature value formula_version", identifier=True
++        )
++        if type(item.status) is not str or item.status not in {"derived", *_MISSING_STATUSES}:
++            raise ValueError("feature value status is invalid")
++        if type(item.evidence) is not tuple:
++            raise ValueError("feature value evidence must be an immutable tuple")
++        evidence_bytes: list[bytes] = []
++        evidence_ids: list[str] = []
++        for ref in item.evidence:
++            if type(ref) is not FormalEvidenceRef:
++                raise ValueError("feature value evidence contains an invalid reference")
++            wire = ref.to_dict()
++            evidence_bytes.append(_canonical_json_bytes(wire))
++            evidence_ids.append(ref.formal_fact_id)
++        if evidence_ids != sorted(set(evidence_ids)):
++            raise ValueError("feature value evidence must be sorted and unique")
++        if item.status == "derived":
++            if type(item.value) is not float or not math.isfinite(item.value):
++                raise ValueError("derived feature value must be a finite float")
++            if not evidence_ids or item.missing_reason is not None:
++                raise ValueError("derived feature value requires evidence and no missing reason")
++        else:
++            if item.value is not None or evidence_ids:
++                raise ValueError("non-derived feature value must have null value and empty evidence")
++            _require_text(item.missing_reason, "feature value missing_reason")
++        value_fingerprint = (
++            ("float", struct.pack(">d", item.value)) if type(item.value) is float else ("none", None)
++        )
++        return (
++            slot_id,
++            value_fingerprint,
++            item.unit,
++            item.status,
++            formula_version,
++            item.evidence,
++            tuple(evidence_bytes),
++            item.missing_reason,
++        )
++
++    def remember(item: object) -> None:
++        sealed = validate(item)
++        identity = id(item)
++        records[identity] = (
++            weakref.ref(item, lambda _reference, identity=identity: forget(identity)), sealed
++        )
++
++    def require(item: object) -> tuple[object, ...]:
++        record = records.get(id(item))
++        current = validate(item)
++        if record is None or record[0]() is not item:
++            raise ValueError("formal feature value was not safely constructed or was mutated")
++        sealed = record[1]
++        if (
++            current[:5] != sealed[:5]
++            or current[5] is not sealed[5]
++            or current[6:] != sealed[6:]
++        ):
++            raise ValueError("formal feature value was not safely constructed or was mutated")
++        return current
++
++    @dataclass(frozen=True, slots=True, weakref_slot=True)
++    class FormalFeatureValue:
++        slot_id: str
++        value: float | None
++        unit: str
++        status: Literal["derived", "missing", "blocked", "not_applicable"]
++        formula_version: str
++        evidence: tuple[FormalEvidenceRef, ...]
++        missing_reason: str | None
++
++        def __post_init__(self) -> None:
++            if type(self.value) is bool:
++                raise ValueError("feature value must be finite numeric or null")
++            if type(self.value) is int:
++                try:
++                    normalized = float(self.value)
++                except OverflowError as error:
++                    raise ValueError("feature value must be finite") from error
++                object.__setattr__(self, "value", normalized)
++            if type(self.value) is float:
++                if not math.isfinite(self.value):
++                    raise ValueError("feature value must be finite")
++                if self.value == 0.0:
++                    object.__setattr__(self, "value", 0.0)
++            remember(self)
++
++        @classmethod
++        def from_dict(cls, value: dict[str, object]) -> "FormalFeatureValue":
++            if cls is not FormalFeatureValue:
++                raise ValueError("FormalFeatureValue must have exact type")
++            wire = _require_exact_keys(value, _VALUE_KEYS, "formal feature value")
++            raw_evidence = wire["evidence"]
++            if type(raw_evidence) is not list:
++                raise ValueError("formal feature value evidence must be a JSON array")
++            item = cls(
++                slot_id=wire["slot_id"],
++                value=wire["value"],
++                unit=wire["unit"],
++                status=wire["status"],
++                formula_version=wire["formula_version"],
++                evidence=tuple(FormalEvidenceRef.from_dict(ref) for ref in raw_evidence),
++                missing_reason=wire["missing_reason"],
++            )
++            if _canonical_json_bytes(item.to_dict()) != _canonical_json_bytes(wire):
++                raise ValueError("formal feature value wire is not canonical")
++            return item
++
++        def to_dict(self) -> dict[str, object]:
++            sealed = require(self)
++            return {
++                "slot_id": sealed[0],
++                "value": self.value,
++                "unit": sealed[2],
++                "status": sealed[3],
++                "formula_version": sealed[4],
++                "evidence": [ref.to_dict() for ref in self.evidence],
++                "missing_reason": sealed[7],
++            }
++
++    return FormalFeatureValue
++
++
++FormalFeatureValue = _make_feature_value_type()
++del _make_feature_value_type
++
++
++def _make_bundle_type() -> type[object]:
++    records: dict[int, tuple[weakref.ReferenceType[object], tuple[object, ...]]] = {}
++
++    def forget(identity: int) -> None:
++        records.pop(identity, None)
++
++    def validate(bundle: object) -> tuple[object, ...]:
++        if type(bundle) is not FormalFeatureBundle:
++            raise ValueError("formal feature bundle must have exact type")
++        if type(bundle.schema_version) is not int or bundle.schema_version != 1:
++            raise ValueError("formal feature bundle schema_version must be exact integer 1")
++        contract_version = _require_text(
++            bundle.contract_version, "feature bundle contract_version", identifier=True
++        )
++        if type(bundle.security_id) is not str or canonical_security_id(bundle.security_id) != bundle.security_id:
++            raise ValueError("feature bundle security_id must be canonical")
++        as_of_utc = _require_utc(bundle.as_of_utc, "feature bundle as_of_utc")
++        if type(bundle.template_id) is not str or bundle.template_id not in _TEMPLATES:
++            raise ValueError("feature bundle template_id is invalid")
++        registry_manifest_hash = _require_hash(
++            bundle.registry_manifest_hash, "feature bundle registry_manifest_hash"
++        )
++        feature_registry_hash = _require_hash(
++            bundle.feature_registry_hash, "feature bundle feature_registry_hash"
++        )
++        input_hash = _require_hash(bundle.input_hash, "feature bundle input_hash")
++        if type(bundle.values) is not tuple:
++            raise ValueError("feature bundle values must be an immutable tuple")
++        value_bytes: list[bytes] = []
++        slot_ids: list[str] = []
++        for item in bundle.values:
++            if type(item) is not FormalFeatureValue:
++                raise ValueError("feature bundle contains an invalid value")
++            value_bytes.append(_canonical_json_bytes(item.to_dict()))
++            slot_ids.append(item.slot_id)
++        if slot_ids != sorted(set(slot_ids)):
++            raise ValueError("feature bundle values must be sorted and unique by slot_id")
++        if type(bundle.history_endpoints) is not tuple:
++            raise ValueError("feature bundle history_endpoints must be an immutable tuple")
++        endpoints = tuple(_require_date(item, "feature history endpoint") for item in bundle.history_endpoints)
++        if endpoints != tuple(sorted(set(endpoints))):
++            raise ValueError("feature history endpoints must be sorted and unique")
++        if type(bundle.comparable_quarter_keys) is not tuple:
++            raise ValueError("feature comparable quarter keys must be an immutable tuple")
++        quarter_keys = bundle.comparable_quarter_keys
++        if any(type(item) is not str or _QUARTER.fullmatch(item) is None for item in quarter_keys):
++            raise ValueError("feature comparable quarter key is invalid")
++        if quarter_keys != tuple(sorted(set(quarter_keys))):
++            raise ValueError("feature comparable quarter keys must be sorted and unique")
++        if type(bundle.blockers) is not tuple:
++            raise ValueError("feature bundle blockers must be an immutable tuple")
++        blockers = tuple(_require_text(item, "feature blocker") for item in bundle.blockers)
++        if blockers != tuple(sorted(set(blockers))):
++            raise ValueError("feature blockers must be sorted and unique")
++        return (
++            bundle.schema_version,
++            contract_version,
++            bundle.security_id,
++            as_of_utc,
++            bundle.template_id,
++            registry_manifest_hash,
++            feature_registry_hash,
++            input_hash,
++            bundle.values,
++            tuple(value_bytes),
++            bundle.history_endpoints,
++            endpoints,
++            bundle.comparable_quarter_keys,
++            bundle.blockers,
++        )
++
++    def remember(bundle: object) -> None:
++        sealed = validate(bundle)
++        identity = id(bundle)
++        records[identity] = (
++            weakref.ref(bundle, lambda _reference, identity=identity: forget(identity)), sealed
++        )
++
++    def require(bundle: object) -> tuple[object, ...]:
++        record = records.get(id(bundle))
++        current = validate(bundle)
++        if record is None or record[0]() is not bundle:
++            raise ValueError("formal feature bundle was not safely constructed or was mutated")
++        sealed = record[1]
++        if (
++            current[:8] != sealed[:8]
++            or current[8] is not sealed[8]
++            or current[9] != sealed[9]
++            or current[10] is not sealed[10]
++            or current[11] != sealed[11]
++            or current[12] is not sealed[12]
++            or current[13] is not sealed[13]
++        ):
++            raise ValueError("formal feature bundle was not safely constructed or was mutated")
++        return current
++
++    @dataclass(frozen=True, slots=True, weakref_slot=True)
++    class FormalFeatureBundle:
++        schema_version: int
++        contract_version: str
++        security_id: str
++        as_of_utc: str
++        template_id: str
++        registry_manifest_hash: str
++        feature_registry_hash: str
++        input_hash: str
++        values: tuple[FormalFeatureValue, ...]
++        history_endpoints: tuple[str, ...]
++        comparable_quarter_keys: tuple[str, ...]
++        blockers: tuple[str, ...]
++
++        def __post_init__(self) -> None:
++            remember(self)
++
++        @classmethod
++        def from_dict(cls, value: dict[str, object]) -> "FormalFeatureBundle":
++            if cls is not FormalFeatureBundle:
++                raise ValueError("FormalFeatureBundle must have exact type")
++            wire = _require_exact_keys(value, _BUNDLE_KEYS, "formal feature bundle")
++            if type(wire["values"]) is not list:
++                raise ValueError("feature bundle values must be a JSON array")
++            for field in ("history_endpoints", "comparable_quarter_keys", "blockers"):
++                if type(wire[field]) is not list:
++                    raise ValueError(f"feature bundle {field} must be a JSON array")
++            bundle = cls(
++                schema_version=wire["schema_version"],
++                contract_version=wire["contract_version"],
++                security_id=wire["security_id"],
++                as_of_utc=wire["as_of_utc"],
++                template_id=wire["template_id"],
++                registry_manifest_hash=wire["registry_manifest_hash"],
++                feature_registry_hash=wire["feature_registry_hash"],
++                input_hash=wire["input_hash"],
++                values=tuple(FormalFeatureValue.from_dict(item) for item in wire["values"]),
++                history_endpoints=tuple(wire["history_endpoints"]),
++                comparable_quarter_keys=tuple(wire["comparable_quarter_keys"]),
++                blockers=tuple(wire["blockers"]),
++            )
++            if _canonical_json_bytes(bundle.to_dict()) != _canonical_json_bytes(wire):
++                raise ValueError("formal feature bundle wire is not canonical")
++            return bundle
++
++        def to_dict(self) -> dict[str, object]:
++            sealed = require(self)
++            return {
++                "schema_version": sealed[0],
++                "contract_version": sealed[1],
++                "security_id": sealed[2],
++                "as_of_utc": sealed[3],
++                "template_id": sealed[4],
++                "registry_manifest_hash": sealed[5],
++                "feature_registry_hash": sealed[6],
++                "input_hash": sealed[7],
++                "values": [item.to_dict() for item in self.values],
++                "history_endpoints": list(self.history_endpoints),
++                "comparable_quarter_keys": list(self.comparable_quarter_keys),
++                "blockers": list(self.blockers),
++            }
++
++        def canonical_bytes(self) -> bytes:
++            return _canonical_json_bytes(self.to_dict())
++
++        def bundle_hash(self) -> str:
++            return hashlib.sha256(self.canonical_bytes()).hexdigest()
++
++    return FormalFeatureBundle
++
++
++FormalFeatureBundle = _make_bundle_type()
++del _make_bundle_type
++
++
++__all__ = [
++    "FormulaNode",
++    "FormalFeatureSlot",
++    "FormalEvidenceRef",
++    "FormalFeatureValue",
++    "FormalFeatureBundle",
++    "SignedFormalFeatureRegistry",
++    "load_signed_feature_registry",
++]
+diff --git a/ashare_pipeline/formal_feature_store.py b/ashare_pipeline/formal_feature_store.py
+new file mode 100644
+index 0000000..99f72e6
+--- /dev/null
++++ b/ashare_pipeline/formal_feature_store.py
+@@ -0,0 +1,325 @@
++"""Immutable content-addressed filesystem storage for Formal V3 feature bundles."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import hashlib
++import os
++from pathlib import Path
++import uuid
++import weakref
++
++from .formal_feature_contract import (
++    FormalFeatureBundle,
++    _canonical_json_bytes,
++    _load_canonical_object,
++    _require_hash,
++)
++
++
++_MANIFEST_KEYS = frozenset(
++    {
++        "schema_version",
++        "kind",
++        "bundle_hash",
++        "input_hash",
++        "security_id",
++        "as_of_utc",
++        "template_id",
++        "registry_manifest_hash",
++        "feature_registry_hash",
++        "bundle_schema_version",
++        "contract_version",
++    }
++)
++
++
++def _make_receipt_type() -> tuple[type[object], object, object]:
++    fields = ("bundle_path", "manifest_path", "bundle_hash", "manifest_hash")
++    records: dict[int, tuple[weakref.ReferenceType[object], tuple[str, ...]]] = {}
++
++    def forget(identity: int) -> None:
++        records.pop(identity, None)
++
++    def validate(receipt: object) -> tuple[str, ...]:
++        if type(receipt) is not FormalStoredFeatureBundle:
++            raise ValueError("formal feature receipt must have exact type")
++        try:
++            values = tuple(getattr(receipt, field) for field in fields)
++        except AttributeError as error:
++            raise ValueError("formal feature receipt is incomplete") from error
++        if any(type(value) is not str for value in values):
++            raise ValueError("formal feature receipt fields must be exact strings")
++        for path_value in values[:2]:
++            path = Path(path_value)
++            normalized = Path(os.path.abspath(path_value))
++            if not path.is_absolute() or str(normalized) != path_value:
++                raise ValueError("formal feature receipt paths must be absolute and canonical")
++        _require_hash(values[2], "formal feature receipt bundle_hash")
++        _require_hash(values[3], "formal feature receipt manifest_hash")
++        return values
++
++    def require(receipt: object) -> tuple[str, ...]:
++        record = records.get(id(receipt))
++        current = validate(receipt)
++        if record is None or record[0]() is not receipt or current != record[1]:
++            raise ValueError("formal feature receipt was forged or mutated")
++        return current
++
++    @dataclass(frozen=True, slots=True, weakref_slot=True, init=False)
++    class FormalStoredFeatureBundle:
++        bundle_path: str
++        manifest_path: str
++        bundle_hash: str
++        manifest_hash: str
++
++        def __init__(self, *_args: object, **_kwargs: object) -> None:
++            raise TypeError("FormalStoredFeatureBundle is created only by the bundle store")
++
++    def construct(
++        bundle_path: str, manifest_path: str, bundle_hash: str, manifest_hash: str
++    ) -> FormalStoredFeatureBundle:
++        receipt = object.__new__(FormalStoredFeatureBundle)
++        for field, value in zip(
++            fields, (bundle_path, manifest_path, bundle_hash, manifest_hash), strict=True
++        ):
++            object.__setattr__(receipt, field, value)
++        sealed = validate(receipt)
++        identity = id(receipt)
++        records[identity] = (
++            weakref.ref(receipt, lambda _reference, identity=identity: forget(identity)), sealed
++        )
++        return receipt
++
++    return FormalStoredFeatureBundle, construct, require
++
++
++FormalStoredFeatureBundle, _construct_receipt, _require_receipt = _make_receipt_type()
++del _make_receipt_type
++
++
++def _is_link(path: Path) -> bool:
++    try:
++        if path.is_symlink():
++            return True
++        is_junction = getattr(os.path, "isjunction", None)
++        return bool(is_junction is not None and is_junction(path))
++    except OSError as error:
++        raise ValueError("formal feature path link inspection failed") from error
++
++
++def _manifest(bundle: FormalFeatureBundle, bundle_hash: str) -> dict[str, object]:
++    wire = bundle.to_dict()
++    return {
++        "schema_version": 1,
++        "kind": "formal_feature_bundle",
++        "bundle_hash": bundle_hash,
++        "input_hash": wire["input_hash"],
++        "security_id": wire["security_id"],
++        "as_of_utc": wire["as_of_utc"],
++        "template_id": wire["template_id"],
++        "registry_manifest_hash": wire["registry_manifest_hash"],
++        "feature_registry_hash": wire["feature_registry_hash"],
++        "bundle_schema_version": wire["schema_version"],
++        "contract_version": wire["contract_version"],
++    }
++
++
++def _make_store_type(construct_receipt: object, require_receipt: object) -> type[object]:
++    class FormalFeatureBundleStore:
++        __slots__ = ("_root", "_root_fingerprint")
++
++        def __init__(self, root: str | Path) -> None:
++            if type(root) not in {str, type(Path())}:
++                raise ValueError("formal feature store root must be an exact str or Path")
++            resolved = Path(root).resolve()
++            object.__setattr__(self, "_root", resolved)
++            object.__setattr__(self, "_root_fingerprint", str(resolved))
++
++        def _validated_root(self) -> Path:
++            try:
++                root = self._root
++                fingerprint = self._root_fingerprint
++            except AttributeError as error:
++                raise ValueError("formal feature store root is incomplete") from error
++            if type(root) is not type(Path()) or type(fingerprint) is not str or str(root) != fingerprint:
++                raise ValueError("formal feature store root was mutated")
++            if root.resolve() != root:
++                raise ValueError("formal feature store root is not canonical")
++            return root
++
++        def _directory(self, *, create: bool) -> Path:
++            root = self._validated_root()
++            current = root
++            if _is_link(current):
++                raise ValueError("formal feature store root must not be a link")
++            if create:
++                current.mkdir(parents=True, exist_ok=True)
++            for component in ("data", "formal", "features"):
++                current = current / component
++                if current.exists() or _is_link(current):
++                    if _is_link(current):
++                        raise ValueError("formal feature store path must not contain a link")
++                    if not current.is_dir():
++                        raise ValueError("formal feature store path component is not a directory")
++                elif create:
++                    current.mkdir()
++                else:
++                    raise ValueError("formal feature store directory does not exist")
++            if current.resolve() != current:
++                raise ValueError("formal feature store directory escaped its root")
++            return current
++
++        def _paths(self, bundle_hash: str, *, create: bool) -> tuple[Path, Path, Path]:
++            _require_hash(bundle_hash, "formal feature bundle hash")
++            directory = self._directory(create=create)
++            bundle_path = directory / f"{bundle_hash}.json"
++            manifest_path = directory / f"{bundle_hash}.manifest.json"
++            lock_path = directory / f"{bundle_hash}.lock"
++            for path in (bundle_path, manifest_path, lock_path):
++                if path.parent != directory or path.is_absolute() is False:
++                    raise ValueError("formal feature path escaped its root")
++            return bundle_path, manifest_path, lock_path
++
++        @staticmethod
++        def _require_regular_target(path: Path, label: str) -> None:
++            if _is_link(path):
++                raise ValueError(f"formal feature {label} must not be a link")
++            if not path.exists() or not path.is_file():
++                raise ValueError(f"formal feature {label} is missing or not a regular file")
++            if path.resolve() != path:
++                raise ValueError(f"formal feature {label} escaped its directory")
++
++        @staticmethod
++        def _read_target(path: Path, label: str) -> bytes:
++            FormalFeatureBundleStore._require_regular_target(path, label)
++            try:
++                value = path.read_bytes()
++            except OSError as error:
++                raise ValueError(f"formal feature {label} read failed") from error
++            FormalFeatureBundleStore._require_regular_target(path, label)
++            return value
++
++        @staticmethod
++        def _write_atomic(path: Path, value: bytes, expected_hash: str, label: str) -> None:
++            part = path.parent / f"{path.name}.{uuid.uuid4().hex}.part"
++            try:
++                with part.open("xb") as handle:
++                    handle.write(value)
++                    handle.flush()
++                    os.fsync(handle.fileno())
++                if _is_link(part) or part.read_bytes() != value:
++                    raise ValueError(f"formal feature {label} part verification failed")
++                if hashlib.sha256(value).hexdigest() != expected_hash:
++                    raise ValueError(f"formal feature {label} expected hash is invalid")
++                os.replace(part, path)
++                final = FormalFeatureBundleStore._read_target(path, label)
++                if final != value or hashlib.sha256(final).hexdigest() != expected_hash:
++                    raise ValueError(f"formal feature {label} final verification failed")
++            except ValueError:
++                raise
++            except OSError as error:
++                raise ValueError(f"formal feature {label} write failed") from error
++            finally:
++                try:
++                    if part.exists() or _is_link(part):
++                        part.unlink()
++                except OSError:
++                    pass
++
++        @staticmethod
++        def _validate_existing(path: Path, expected: bytes, expected_hash: str, label: str) -> None:
++            actual = FormalFeatureBundleStore._read_target(path, label)
++            if actual != expected or hashlib.sha256(actual).hexdigest() != expected_hash:
++                raise ValueError(f"formal feature {label} conflict")
++
++        def write(self, bundle: FormalFeatureBundle) -> FormalStoredFeatureBundle:
++            if type(bundle) is not FormalFeatureBundle:
++                raise ValueError("formal feature store requires an exact FormalFeatureBundle")
++            bundle_bytes = bundle.canonical_bytes()
++            bundle_hash = hashlib.sha256(bundle_bytes).hexdigest()
++            if bundle.bundle_hash() != bundle_hash:
++                raise ValueError("formal feature bundle hash is inconsistent")
++            manifest_bytes = _canonical_json_bytes(_manifest(bundle, bundle_hash))
++            manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
++            bundle_path, manifest_path, lock_path = self._paths(bundle_hash, create=True)
++            try:
++                lock_descriptor = os.open(
++                    lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
++                )
++            except FileExistsError as error:
++                raise ValueError("formal feature bundle lock already exists") from error
++            except OSError as error:
++                raise ValueError("formal feature bundle lock creation failed") from error
++            try:
++                with os.fdopen(lock_descriptor, "wb") as lock_handle:
++                    lock_handle.write(bundle_hash.encode("ascii"))
++                    lock_handle.flush()
++                    os.fsync(lock_handle.fileno())
++                bundle_exists = bundle_path.exists() or _is_link(bundle_path)
++                manifest_exists = manifest_path.exists() or _is_link(manifest_path)
++                if manifest_exists and not bundle_exists:
++                    raise ValueError("formal feature manifest-first state is invalid")
++                if bundle_exists:
++                    self._validate_existing(bundle_path, bundle_bytes, bundle_hash, "bundle")
++                else:
++                    self._write_atomic(bundle_path, bundle_bytes, bundle_hash, "bundle")
++                if manifest_exists:
++                    self._validate_existing(
++                        manifest_path, manifest_bytes, manifest_hash, "manifest"
++                    )
++                else:
++                    self._write_atomic(
++                        manifest_path, manifest_bytes, manifest_hash, "manifest"
++                    )
++                receipt = construct_receipt(
++                    str(bundle_path), str(manifest_path), bundle_hash, manifest_hash
++                )
++                self.read_verified(receipt)
++                return receipt
++            finally:
++                try:
++                    lock_path.unlink()
++                except FileNotFoundError:
++                    pass
++                except OSError as error:
++                    raise ValueError("formal feature bundle lock cleanup failed") from error
++
++        def read_verified(self, receipt: FormalStoredFeatureBundle) -> FormalFeatureBundle:
++            bundle_path_text, manifest_path_text, bundle_hash, manifest_hash = require_receipt(
++                receipt
++            )
++            bundle_path, manifest_path, _ = self._paths(bundle_hash, create=False)
++            if bundle_path_text != str(bundle_path) or manifest_path_text != str(manifest_path):
++                raise ValueError("formal feature receipt paths do not belong to this store")
++            manifest_bytes = self._read_target(manifest_path, "manifest")
++            if hashlib.sha256(manifest_bytes).hexdigest() != manifest_hash:
++                raise ValueError("formal feature manifest hash mismatch")
++            manifest_wire = _load_canonical_object(
++                manifest_bytes, label="formal feature manifest"
++            )
++            if set(manifest_wire) != _MANIFEST_KEYS:
++                raise ValueError("formal feature manifest has unknown or missing keys")
++            bundle_bytes = self._read_target(bundle_path, "bundle")
++            if hashlib.sha256(bundle_bytes).hexdigest() != bundle_hash:
++                raise ValueError("formal feature bundle hash mismatch")
++            bundle_wire = _load_canonical_object(bundle_bytes, label="formal feature bundle")
++            bundle = FormalFeatureBundle.from_dict(bundle_wire)
++            if bundle.canonical_bytes() != bundle_bytes or bundle.bundle_hash() != bundle_hash:
++                raise ValueError("formal feature bundle canonical hash mismatch")
++            expected_manifest = _manifest(bundle, bundle_hash)
++            expected_manifest_bytes = _canonical_json_bytes(expected_manifest)
++            if manifest_bytes != expected_manifest_bytes or manifest_wire != expected_manifest:
++                raise ValueError("formal feature manifest header mismatch")
++            if hashlib.sha256(expected_manifest_bytes).hexdigest() != manifest_hash:
++                raise ValueError("formal feature manifest hash mismatch")
++            return bundle
++
++    return FormalFeatureBundleStore
++
++
++FormalFeatureBundleStore = _make_store_type(_construct_receipt, _require_receipt)
++del _make_store_type, _construct_receipt, _require_receipt
++
++
++__all__ = ["FormalStoredFeatureBundle", "FormalFeatureBundleStore"]
+diff --git a/tests/test_formal_feature_contract.py b/tests/test_formal_feature_contract.py
+new file mode 100644
+index 0000000..308f443
+--- /dev/null
++++ b/tests/test_formal_feature_contract.py
+@@ -0,0 +1,483 @@
++"""Security and serialization tests for the Formal V3 feature contract."""
++
++from __future__ import annotations
++
++from dataclasses import replace
++import hashlib
++import json
++import math
++import unittest
++
++from ashare_pipeline.financial_schema import FinancialFact
++from ashare_pipeline.formal_financial_schema import FormalFinancialFact
++from ashare_pipeline.formal_registry_manifest import FormalRegistryManifest
++from ashare_pipeline.formal_feature_contract import (
++    FormalEvidenceRef,
++    FormalFeatureBundle,
++    FormalFeatureSlot,
++    FormalFeatureValue,
++    FormulaNode,
++    SignedFormalFeatureRegistry,
++    load_signed_feature_registry,
++)
++
++
++TEMPLATES = ("bank", "broker", "general_nonfinancial", "insurance", "real_estate")
++
++
++def canonical_bytes(value: object) -> bytes:
++    return json.dumps(
++        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
++    ).encode("utf-8")
++
++
++class AcceptingVerifier:
++    def verify(self, payload: bytes, *, signature: str, key_id: str) -> bool:
++        return signature == "fixture-signature" and key_id == "fixture-key"
++
++
++class RejectingVerifier:
++    def verify(self, payload: bytes, *, signature: str, key_id: str) -> bool:
++        return False
++
++
++class RaisingVerifier:
++    def verify(self, payload: bytes, *, signature: str, key_id: str) -> bool:
++        raise RuntimeError("fixture verifier unavailable")
++
++
++class IntegerVerifier:
++    def verify(self, payload: bytes, *, signature: str, key_id: str) -> int:
++        return 1
++
++
++class EqualitySpoof:
++    def __eq__(self, other: object) -> bool:
++        return True
++
++
++def fact_wire(fact_key: str = "income.revenue", period_key: str = "FY0") -> dict[str, object]:
++    return {"op": "fact", "fact_key": fact_key, "period_key": period_key}
++
++
++def slot_wire(template_id: str, *, suffix: str = "growth", **changes: object) -> dict[str, object]:
++    value: dict[str, object] = {
++        "slot_id": f"{template_id}.{suffix}",
++        "template_id": template_id,
++        "dimension": "G",
++        "required": True,
++        "unit": "ratio",
++        "formula": fact_wire(),
++        "formula_version": "formula-v1",
++    }
++    value.update(changes)
++    return value
++
++
++def feature_registry_bytes(
++    *, template_ids: tuple[str, ...] = TEMPLATES, slots: list[dict[str, object]] | None = None,
++    **changes: object,
++) -> bytes:
++    if slots is None:
++        slots = sorted((slot_wire(template) for template in template_ids), key=lambda item: item["slot_id"])
++    value: dict[str, object] = {
++        "schema_version": "formal-feature-registry-v1",
++        "registry_role": "feature",
++        "contract_version": "formal-features-v1",
++        "source_registry_hash": "1" * 64,
++        "mapping_registry_hash": "2" * 64,
++        "template_ids": list(template_ids),
++        "slots": slots,
++    }
++    value.update(changes)
++    return canonical_bytes(value)
++
++
++def registry_manifest(
++    child_bytes: bytes, *, purpose: str = "official", feature_hash: str | None = None,
++    source_hash: str = "1" * 64, mapping_hash: str = "2" * 64,
++) -> FormalRegistryManifest:
++    hashes = {
++        "source_registry_hash": source_hash,
++        "mapping_registry_hash": mapping_hash,
++        "feature_registry_hash": feature_hash or hashlib.sha256(child_bytes).hexdigest(),
++        "scoring_registry_hash": "3" * 64,
++        "industry_registry_hash": "4" * 64,
++        "cyclic_registry_hash": "5" * 64,
++        "redline_registry_hash": "6" * 64,
++        "status_registry_hash": "7" * 64,
++        "event_registry_hash": "8" * 64,
++    }
++    raw = canonical_bytes(
++        {
++            "schema_version": "formal-registry-manifest-v1",
++            "purpose": purpose,
++            "approval_id": "approval-1" if purpose == "official" else None,
++            **hashes,
++        }
++    )
++    return FormalRegistryManifest.from_signed_bytes(
++        raw, "fixture-signature", "fixture-key", AcceptingVerifier()
++    )
++
++
++def load_registry(raw: bytes, manifest: FormalRegistryManifest | None = None):
++    return load_signed_feature_registry(
++        raw,
++        "fixture-signature",
++        "fixture-key",
++        AcceptingVerifier(),
++        registry_manifest=manifest,
++    )
++
++
++def formal_fact(**changes: object) -> FormalFinancialFact:
++    values: dict[str, object] = {
++        "security_id": "SH600001",
++        "statement": "income",
++        "metric_key": "revenue",
++        "period_start": "2025-01-01",
++        "period_end": "2025-12-31",
++        "period_kind": "FY",
++        "value": 100.0,
++        "unit": "CNY",
++        "nature": "duration",
++        "accounting_basis": "consolidated",
++        "published_at_utc": "2026-03-20T08:00:00+00:00",
++        "published_precision": "timestamp",
++        "effective_at_utc": "2026-03-20T08:00:00+00:00",
++        "effective_time_evidence_hash": None,
++        "source_updated_at_utc": "2026-03-20T08:30:00+00:00",
++        "captured_at_utc": "2026-09-04T00:00:00+00:00",
++        "source_snapshot_id": "11111111-1111-4111-8111-111111111111",
++        "source_content_sha256": "a" * 64,
++        "source_refresh_generation": "refresh-v1",
++        "source_producing_task_id": "task-1",
++        "source_field": "REVENUE",
++        "raw_value_sha256": "b" * 64,
++        "parser_id": "parser-v1",
++        "parser_version": "parser-version-v1",
++        "mapping_version": "mapping-v1",
++        "created_at_utc": "2026-09-04T00:00:00+00:00",
++    }
++    values.update(changes)
++    return FormalFinancialFact.create(**values)
++
++
++def evidence(**fact_changes: object) -> FormalEvidenceRef:
++    return FormalEvidenceRef.from_formal_fact(formal_fact(**fact_changes))
++
++
++def feature_value(**changes: object) -> FormalFeatureValue:
++    value: dict[str, object] = {
++        "slot_id": "general_nonfinancial.growth",
++        "value": 0.25,
++        "unit": "ratio",
++        "status": "derived",
++        "formula_version": "formula-v1",
++        "evidence": (evidence(),),
++        "missing_reason": None,
++    }
++    value.update(changes)
++    return FormalFeatureValue(**value)
++
++
++def feature_bundle(**changes: object) -> FormalFeatureBundle:
++    values: dict[str, object] = {
++        "schema_version": 1,
++        "contract_version": "formal-features-v1",
++        "security_id": "SH600001",
++        "as_of_utc": "2026-09-04T00:00:00+00:00",
++        "template_id": "general_nonfinancial",
++        "registry_manifest_hash": "c" * 64,
++        "feature_registry_hash": "d" * 64,
++        "input_hash": "e" * 64,
++        "values": (feature_value(),),
++        "history_endpoints": ("2024-12-31", "2025-12-31"),
++        "comparable_quarter_keys": ("2025Q1", "2025Q2"),
++        "blockers": (),
++    }
++    values.update(changes)
++    return FormalFeatureBundle(**values)
++
++
++class FormalFeatureContractTests(unittest.TestCase):
++    def test_registry_requires_canonical_unique_json_and_exact_signature_true(self) -> None:
++        raw = feature_registry_bytes(template_ids=("general_nonfinancial",))
++        invalid = (
++            b" " + raw,
++            raw[:-1] + b',"slots":[]}',
++            raw.replace(b'"feature"', b'"mapping"'),
++            raw.replace(b'"formal-feature-registry-v1"', b'"other"'),
++            b'\xff',
++            b'{"contract_version":NaN}',
++        )
++        for candidate in invalid:
++            with self.subTest(candidate=candidate[:24]), self.assertRaises(ValueError):
++                load_signed_feature_registry(
++                    candidate, "fixture-signature", "fixture-key", AcceptingVerifier()
++                )
++        for verifier in (RejectingVerifier(), RaisingVerifier(), IntegerVerifier()):
++            with self.subTest(verifier=type(verifier).__name__), self.assertRaisesRegex(
++                ValueError, "signature"
++            ):
++                load_signed_feature_registry(
++                    raw, "fixture-signature", "fixture-key", verifier
++                )
++
++    def test_registry_has_no_defaults_and_validates_every_signed_slot(self) -> None:
++        one_template = ("general_nonfinancial",)
++        valid = load_registry(feature_registry_bytes(template_ids=one_template))
++        self.assertFalse(valid.release_eligible)
++        self.assertEqual(len(valid.slots_for_template("general_nonfinancial")), 1)
++        invalid = (
++            feature_registry_bytes(template_ids=()),
++            feature_registry_bytes(template_ids=("general_nonfinancial", "general_nonfinancial")),
++            feature_registry_bytes(template_ids=("unknown",)),
++            feature_registry_bytes(template_ids=one_template, slots=[]),
++            feature_registry_bytes(
++                template_ids=one_template,
++                slots=[slot_wire("general_nonfinancial"), slot_wire("general_nonfinancial")],
++            ),
++            feature_registry_bytes(template_ids=one_template, slots=[slot_wire("bank")]),
++            feature_registry_bytes(template_ids=one_template, slots=[slot_wire("general_nonfinancial", required=1)]),
++            feature_registry_bytes(template_ids=one_template, slots=[slot_wire("general_nonfinancial", dimension="X")]),
++            feature_registry_bytes(template_ids=one_template, slots=[slot_wire("general_nonfinancial", unit="USD")]),
++        )
++        for raw in invalid:
++            with self.subTest(raw=hashlib.sha256(raw).hexdigest()), self.assertRaises(ValueError):
++                load_registry(raw)
++
++    def test_registry_release_eligibility_is_bound_to_exact_official_root(self) -> None:
++        raw = feature_registry_bytes()
++        official = registry_manifest(raw)
++        registry = load_registry(raw, official)
++        self.assertTrue(registry.release_eligible)
++        registry.require_release_eligible()
++        self.assertEqual(tuple(slot.template_id for slot in registry.slots), TEMPLATES)
++
++        roots = (
++            None,
++            registry_manifest(raw, purpose="test"),
++            registry_manifest(raw, feature_hash="f" * 64),
++            registry_manifest(raw, source_hash="9" * 64),
++            registry_manifest(raw, mapping_hash="9" * 64),
++        )
++        for root in roots:
++            with self.subTest(root=root):
++                self.assertFalse(load_registry(raw, root).release_eligible)
++
++        incomplete = feature_registry_bytes(template_ids=("general_nonfinancial",))
++        self.assertFalse(load_registry(incomplete, registry_manifest(incomplete)).release_eligible)
++
++    def test_registry_provenance_rejects_direct_forged_mutated_and_spoofed_objects(self) -> None:
++        raw = feature_registry_bytes()
++        registry = load_registry(raw, registry_manifest(raw))
++        with self.assertRaises(TypeError):
++            SignedFormalFeatureRegistry()
++        forged = object.__new__(SignedFormalFeatureRegistry)
++        with self.assertRaises(ValueError):
++            forged.slots_for_template("bank")
++
++        object.__setattr__(registry, "contract_version", EqualitySpoof())
++        with self.assertRaises(ValueError):
++            registry.slots_for_template("bank")
++        self.assertFalse(hasattr(registry, "verifier"))
++
++        healthy = load_registry(raw, registry_manifest(raw))
++        object.__setattr__(healthy, "release_eligible", False)
++        with self.assertRaises(ValueError):
++            _ = healthy.release_eligible
++        with self.assertRaises(ValueError):
++            healthy.require_release_eligible()
++
++    def test_registry_rejects_forged_or_mutated_root_instead_of_downgrading(self) -> None:
++        raw = feature_registry_bytes()
++        root = registry_manifest(raw)
++        forged = object.__new__(FormalRegistryManifest)
++        for field in (
++            "manifest_hash", "purpose", "approval_id", "canonical_json", "signature", "key_id",
++            "source_registry_hash", "mapping_registry_hash", "feature_registry_hash",
++            "scoring_registry_hash", "industry_registry_hash", "cyclic_registry_hash",
++            "redline_registry_hash", "status_registry_hash", "event_registry_hash",
++        ):
++            object.__setattr__(forged, field, getattr(root, field))
++        with self.assertRaises(ValueError):
++            load_registry(raw, forged)
++        object.__setattr__(root, "feature_registry_hash", EqualitySpoof())
++        with self.assertRaises(ValueError):
++            load_registry(raw, root)
++
++    def test_formula_accepts_every_closed_operation_and_roundtrips(self) -> None:
++        a = fact_wire("income.a")
++        b = fact_wire("income.b")
++        wires = (
++            a,
++            {"op": "add", "left": a, "right": b},
++            {"op": "subtract", "left": a, "right": b},
++            {"op": "divide", "left": a, "right": b},
++            {"op": "cagr", "left": a, "right": b, "intervals": 3},
++            {"op": "median", "items": [a, b]},
++            {"op": "minimum", "items": [a, b]},
++        )
++        for wire in wires:
++            with self.subTest(op=wire["op"]):
++                node = FormulaNode.from_dict(wire)
++                self.assertEqual(node.to_dict(), wire)
++
++    def test_formula_rejects_unknown_keys_executable_or_malformed_children(self) -> None:
++        a = fact_wire("income.a")
++        b = fact_wire("income.b")
++        cycle: dict[str, object] = {"op": "add", "right": b}
++        cycle["left"] = cycle
++        invalid: tuple[object, ...] = (
++            "__import__('os').system('x')",
++            lambda: None,
++            {"op": "unknown"},
++            {"op": "fact", "fact_key": " income.a", "period_key": "FY0"},
++            {"op": "fact", "fact_key": "income.a", "period_key": "FY0", "extra": 1},
++            {"op": "divide", "left": a},
++            {"op": "divide", "left": "income.a", "right": b},
++            {"op": "cagr", "left": a, "right": b, "intervals": 0},
++            {"op": "cagr", "left": a, "right": b, "intervals": True},
++            {"op": "cagr", "left": a, "right": b, "intervals": -1},
++            {"op": "cagr", "left": a, "right": b, "intervals": math.inf},
++            {"op": "median", "items": [a]},
++            {"op": "median", "items": [a, a]},
++            {"op": "minimum", "items": [b, a]},
++            cycle,
++        )
++        for wire in invalid:
++            with self.subTest(wire=repr(wire)[:80]), self.assertRaises(ValueError):
++                FormulaNode.from_dict(wire)  # type: ignore[arg-type]
++
++    def test_evidence_copies_every_sealed_fact_lineage_field(self) -> None:
++        fact = formal_fact()
++        ref = FormalEvidenceRef.from_formal_fact(fact)
++        self.assertEqual(
++            ref.to_dict(),
++            {
++                "formal_fact_id": fact.id,
++                "source_snapshot_id": "11111111-1111-4111-8111-111111111111",
++                "source_content_sha256": "a" * 64,
++                "source_refresh_generation": "refresh-v1",
++                "source_field": "REVENUE",
++                "raw_value_sha256": "b" * 64,
++                "published_at_utc": "2026-03-20T08:00:00+00:00",
++                "published_precision": "timestamp",
++                "effective_at_utc": "2026-03-20T08:00:00+00:00",
++                "mapping_version": "mapping-v1",
++            },
++        )
++        self.assertEqual(FormalEvidenceRef.from_dict(ref.to_dict()), ref)
++
++    def test_evidence_rejects_legacy_generic_fact_and_low_level_mutation(self) -> None:
++        with self.assertRaises(ValueError):
++            FormalEvidenceRef.from_formal_fact({})
++        with self.assertRaises(ValueError):
++            FormalEvidenceRef.from_formal_fact(object.__new__(FinancialFact))
++        fact = formal_fact()
++        object.__setattr__(fact, "source_refresh_generation", "changed")
++        with self.assertRaises(ValueError):
++            FormalEvidenceRef.from_formal_fact(fact)
++        ref = evidence()
++        object.__setattr__(ref, "source_field", "OTHER")
++        with self.assertRaises(ValueError):
++            ref.to_dict()
++
++    def test_feature_value_enforces_every_status_shape_and_canonical_float_wire(self) -> None:
++        derived = feature_value(value=1)
++        self.assertIs(type(derived.value), float)
++        for status in ("missing", "blocked", "not_applicable"):
++            item = feature_value(
++                slot_id=f"general_nonfinancial.{status}",
++                value=None,
++                status=status,
++                evidence=(),
++                missing_reason="not available",
++            )
++            self.assertEqual(item.status, status)
++        invalid = (
++            {"value": None},
++            {"evidence": ()},
++            {"missing_reason": "reason"},
++            {"value": math.nan},
++            {"value": math.inf},
++            {"value": True},
++            {"status": "missing", "value": 1.0, "evidence": (), "missing_reason": "reason"},
++            {"status": "blocked", "value": None, "evidence": (evidence(),), "missing_reason": "reason"},
++            {"status": "not_applicable", "value": None, "evidence": (), "missing_reason": None},
++        )
++        for changes in invalid:
++            with self.subTest(changes=changes), self.assertRaises(ValueError):
++                feature_value(**changes)
++        wire = feature_value(value=1.0).to_dict()
++        wire["value"] = 1
++        with self.assertRaises(ValueError):
++            FormalFeatureValue.from_dict(wire)
++        wire["value"] = -0.0
++        with self.assertRaises(ValueError):
++            FormalFeatureValue.from_dict(wire)
++
++    def test_feature_value_requires_sorted_unique_exact_evidence(self) -> None:
++        refs = tuple(sorted(
++            (evidence(raw_value_sha256="b" * 64), evidence(raw_value_sha256="c" * 64)),
++            key=lambda item: item.formal_fact_id,
++        ))
++        self.assertEqual(feature_value(evidence=refs).evidence, refs)
++        for supplied in ((refs[1], refs[0]), (refs[0], refs[0]), [refs[0]]):
++            with self.subTest(supplied=supplied), self.assertRaises(ValueError):
++                feature_value(evidence=supplied)
++
++    def test_bundle_roundtrip_hash_and_exact_non_scoring_wire(self) -> None:
++        bundle = feature_bundle()
++        wire = bundle.to_dict()
++        self.assertEqual(FormalFeatureBundle.from_dict(wire), bundle)
++        self.assertEqual(bundle.bundle_hash(), hashlib.sha256(bundle.canonical_bytes()).hexdigest())
++        self.assertEqual(bundle.canonical_bytes(), canonical_bytes(wire))
++        self.assertTrue({"score", "confidence", "pool", "percentile"}.isdisjoint(wire))
++
++    def test_bundle_validates_identity_time_hashes_order_and_exact_wire_types(self) -> None:
++        for security_id in ("SH600001", "SZ000001", "BJ430001"):
++            self.assertEqual(feature_bundle(security_id=security_id).security_id, security_id)
++        invalid = (
++            {"schema_version": True},
++            {"schema_version": 2},
++            {"security_id": "sh600001"},
++            {"security_id": "HK000001"},
++            {"as_of_utc": "2026-09-04T08:00:00+08:00"},
++            {"template_id": "fallback"},
++            {"registry_manifest_hash": "A" * 64},
++            {"feature_registry_hash": "d" * 63},
++            {"values": [feature_value()]},
++            {"values": (feature_value(), feature_value())},
++            {"history_endpoints": ("2025-12-31", "2024-12-31")},
++            {"history_endpoints": ("2025-12-31", "2025-12-31")},
++            {"comparable_quarter_keys": ("2025Q2", "2025Q1")},
++            {"comparable_quarter_keys": ("2025Q5",)},
++            {"blockers": ("z", "a")},
++            {"blockers": ("same", "same")},
++        )
++        for changes in invalid:
++            with self.subTest(changes=changes), self.assertRaises(ValueError):
++                feature_bundle(**changes)
++
++        wire = feature_bundle().to_dict()
++        wire["extra"] = None
++        with self.assertRaises(ValueError):
++            FormalFeatureBundle.from_dict(wire)
++
++    def test_bundle_and_value_detect_valid_looking_low_level_mutation(self) -> None:
++        item = feature_value()
++        object.__setattr__(item, "slot_id", "general_nonfinancial.changed")
++        with self.assertRaises(ValueError):
++            item.to_dict()
++        bundle = feature_bundle()
++        object.__setattr__(bundle, "security_id", "SZ000001")
++        for action in (bundle.to_dict, bundle.canonical_bytes, bundle.bundle_hash):
++            with self.subTest(action=action.__name__), self.assertRaises(ValueError):
++                action()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_formal_feature_store.py b/tests/test_formal_feature_store.py
+new file mode 100644
+index 0000000..ec6d039
+--- /dev/null
++++ b/tests/test_formal_feature_store.py
+@@ -0,0 +1,244 @@
++"""Filesystem-boundary tests for immutable Formal V3 feature bundles."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import patch
++
++from ashare_pipeline.formal_feature_contract import (
++    FormalEvidenceRef,
++    FormalFeatureBundle,
++    FormalFeatureValue,
++)
++from ashare_pipeline.formal_feature_store import (
++    FormalFeatureBundleStore,
++    FormalStoredFeatureBundle,
++)
++
++
++def canonical_bytes(value: object) -> bytes:
++    return json.dumps(
++        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
++    ).encode("utf-8")
++
++
++def fixture_bundle(**changes: object) -> FormalFeatureBundle:
++    evidence = FormalEvidenceRef(
++        formal_fact_id="1" * 64,
++        source_snapshot_id="11111111-1111-4111-8111-111111111111",
++        source_content_sha256="2" * 64,
++        source_refresh_generation="refresh-v1",
++        source_field="REVENUE",
++        raw_value_sha256="3" * 64,
++        published_at_utc="2026-03-20T08:00:00+00:00",
++        published_precision="timestamp",
++        effective_at_utc="2026-03-20T08:00:00+00:00",
++        mapping_version="mapping-v1",
++    )
++    feature = FormalFeatureValue(
++        slot_id="general_nonfinancial.growth",
++        value=0.25,
++        unit="ratio",
++        status="derived",
++        formula_version="formula-v1",
++        evidence=(evidence,),
++        missing_reason=None,
++    )
++    values: dict[str, object] = {
++        "schema_version": 1,
++        "contract_version": "formal-features-v1",
++        "security_id": "SH600001",
++        "as_of_utc": "2026-09-04T00:00:00+00:00",
++        "template_id": "general_nonfinancial",
++        "registry_manifest_hash": "4" * 64,
++        "feature_registry_hash": "5" * 64,
++        "input_hash": "6" * 64,
++        "values": (feature,),
++        "history_endpoints": ("2024-12-31", "2025-12-31"),
++        "comparable_quarter_keys": ("2025Q1", "2025Q2"),
++        "blockers": (),
++    }
++    values.update(changes)
++    return FormalFeatureBundle(**values)
++
++
++class FormalFeatureStoreTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.tempdir = tempfile.TemporaryDirectory()
++        self.root = Path(self.tempdir.name)
++        self.store = FormalFeatureBundleStore(self.root)
++        self.bundle = fixture_bundle()
++
++    def tearDown(self) -> None:
++        self.tempdir.cleanup()
++
++    def expected_paths(self) -> tuple[Path, Path, Path]:
++        directory = self.root.resolve() / "data" / "formal" / "features"
++        bundle_hash = self.bundle.bundle_hash()
++        return (
++            directory / f"{bundle_hash}.json",
++            directory / f"{bundle_hash}.manifest.json",
++            directory / f"{bundle_hash}.lock",
++        )
++
++    def test_write_and_verified_read_use_exact_content_addressed_files(self) -> None:
++        saved = self.store.write(self.bundle)
++        bundle_path, manifest_path, _ = self.expected_paths()
++
++        self.assertEqual(saved.bundle_path, str(bundle_path))
++        self.assertEqual(saved.manifest_path, str(manifest_path))
++        self.assertEqual(saved.bundle_hash, self.bundle.bundle_hash())
++        self.assertEqual(bundle_path.read_bytes(), self.bundle.canonical_bytes())
++        manifest_bytes = manifest_path.read_bytes()
++        self.assertEqual(saved.manifest_hash, hashlib.sha256(manifest_bytes).hexdigest())
++        self.assertEqual(self.store.read_verified(saved), self.bundle)
++        manifest = json.loads(manifest_bytes)
++        self.assertEqual(
++            set(manifest),
++            {
++                "schema_version", "kind", "bundle_hash", "input_hash", "security_id",
++                "as_of_utc", "template_id", "registry_manifest_hash",
++                "feature_registry_hash", "bundle_schema_version", "contract_version",
++            },
++        )
++        self.assertNotIn("path", repr(manifest))
++        self.assertNotIn("created", repr(manifest))
++
++    def test_repeated_identical_write_is_idempotent(self) -> None:
++        first = self.store.write(self.bundle)
++        bundle_path, manifest_path, _ = self.expected_paths()
++        before = (bundle_path.read_bytes(), manifest_path.read_bytes())
++
++        second = self.store.write(self.bundle)
++
++        self.assertEqual(second, first)
++        self.assertEqual((bundle_path.read_bytes(), manifest_path.read_bytes()), before)
++
++    def test_read_rejects_tampered_bundle_or_manifest(self) -> None:
++        for target in ("bundle", "manifest"):
++            with self.subTest(target=target), tempfile.TemporaryDirectory() as root:
++                store = FormalFeatureBundleStore(root)
++                saved = store.write(self.bundle)
++                path = Path(saved.bundle_path if target == "bundle" else saved.manifest_path)
++                path.write_bytes(b'{"tampered":true}')
++                with self.assertRaisesRegex(ValueError, target):
++                    store.read_verified(saved)
++
++    def test_existing_bundle_conflict_never_overwrites_bytes(self) -> None:
++        bundle_path, manifest_path, _ = self.expected_paths()
++        bundle_path.parent.mkdir(parents=True)
++        bundle_path.write_bytes(b"conflicting bundle")
++
++        with self.assertRaisesRegex(ValueError, "bundle conflict"):
++            self.store.write(self.bundle)
++
++        self.assertEqual(bundle_path.read_bytes(), b"conflicting bundle")
++        self.assertFalse(manifest_path.exists())
++
++    def test_existing_manifest_conflict_never_overwrites_bytes(self) -> None:
++        bundle_path, manifest_path, _ = self.expected_paths()
++        bundle_path.parent.mkdir(parents=True)
++        bundle_path.write_bytes(self.bundle.canonical_bytes())
++        manifest_path.write_bytes(b"conflicting manifest")
++
++        with self.assertRaisesRegex(ValueError, "manifest conflict"):
++            self.store.write(self.bundle)
++
++        self.assertEqual(bundle_path.read_bytes(), self.bundle.canonical_bytes())
++        self.assertEqual(manifest_path.read_bytes(), b"conflicting manifest")
++
++    def test_orphan_complete_bundle_can_finish_manifest_but_manifest_first_is_rejected(self) -> None:
++        bundle_path, manifest_path, _ = self.expected_paths()
++        bundle_path.parent.mkdir(parents=True)
++        bundle_path.write_bytes(self.bundle.canonical_bytes())
++        saved = self.store.write(self.bundle)
++        self.assertTrue(manifest_path.exists())
++        self.assertEqual(self.store.read_verified(saved), self.bundle)
++
++        with tempfile.TemporaryDirectory() as root:
++            store = FormalFeatureBundleStore(root)
++            other = fixture_bundle(input_hash="7" * 64)
++            directory = Path(root).resolve() / "data" / "formal" / "features"
++            directory.mkdir(parents=True)
++            manifest_first = directory / f"{other.bundle_hash()}.manifest.json"
++            manifest_first.write_bytes(b"premature manifest")
++            with self.assertRaisesRegex(ValueError, "manifest-first"):
++                store.write(other)
++            self.assertFalse((directory / f"{other.bundle_hash()}.json").exists())
++
++    def test_active_or_stale_lock_fails_without_waiting_or_deleting_lock(self) -> None:
++        bundle_path, manifest_path, lock_path = self.expected_paths()
++        lock_path.parent.mkdir(parents=True)
++        lock_path.write_bytes(b"active writer")
++
++        with self.assertRaisesRegex(ValueError, "lock"):
++            self.store.write(self.bundle)
++
++        self.assertEqual(lock_path.read_bytes(), b"active writer")
++        self.assertFalse(bundle_path.exists())
++        self.assertFalse(manifest_path.exists())
++
++    def test_orphan_part_is_not_trusted_and_own_failure_parts_are_cleaned(self) -> None:
++        bundle_path, manifest_path, lock_path = self.expected_paths()
++        bundle_path.parent.mkdir(parents=True)
++        orphan = bundle_path.parent / f"{self.bundle.bundle_hash()}.orphan.part"
++        orphan.write_bytes(b"untrusted partial")
++        saved = self.store.write(self.bundle)
++        self.assertEqual(self.store.read_verified(saved), self.bundle)
++        self.assertEqual(orphan.read_bytes(), b"untrusted partial")
++
++        with tempfile.TemporaryDirectory() as root:
++            store = FormalFeatureBundleStore(root)
++            failed_bundle = fixture_bundle(input_hash="8" * 64)
++            directory = Path(root).resolve() / "data" / "formal" / "features"
++            with patch("ashare_pipeline.formal_feature_store.os.replace", side_effect=OSError("disk failure")):
++                with self.assertRaisesRegex(ValueError, "write failed"):
++                    store.write(failed_bundle)
++            self.assertEqual(list(directory.glob("*.part")), [])
++            self.assertEqual(list(directory.glob("*.lock")), [])
++            self.assertEqual(list(directory.glob("*.json")), [])
++        self.assertFalse(lock_path.exists())
++
++    def test_forged_or_mutated_receipt_and_wrong_store_root_are_rejected(self) -> None:
++        saved = self.store.write(self.bundle)
++        with self.assertRaises(TypeError):
++            FormalStoredFeatureBundle(
++                saved.bundle_path, saved.manifest_path, saved.bundle_hash, saved.manifest_hash
++            )
++        forged = object.__new__(FormalStoredFeatureBundle)
++        for field in ("bundle_path", "manifest_path", "bundle_hash", "manifest_hash"):
++            object.__setattr__(forged, field, getattr(saved, field))
++        with self.assertRaises(ValueError):
++            self.store.read_verified(forged)
++
++        object.__setattr__(saved, "bundle_path", str(self.root.parent / "escape.json"))
++        with self.assertRaises(ValueError):
++            self.store.read_verified(saved)
++
++        healthy = self.store.write(self.bundle)
++        with tempfile.TemporaryDirectory() as other_root:
++            with self.assertRaises(ValueError):
++                FormalFeatureBundleStore(other_root).read_verified(healthy)
++
++    def test_symlinked_bundle_is_rejected_when_platform_allows_symlinks(self) -> None:
++        saved = self.store.write(self.bundle)
++        bundle_path = Path(saved.bundle_path)
++        external = self.root / "external.json"
++        external.write_bytes(self.bundle.canonical_bytes())
++        bundle_path.unlink()
++        try:
++            os.symlink(external, bundle_path)
++        except OSError as error:
++            self.skipTest(f"symlinks unavailable: {error}")
++
++        with self.assertRaisesRegex(ValueError, "link"):
++            self.store.read_verified(saved)
++
++
++if __name__ == "__main__":
++    unittest.main()
+

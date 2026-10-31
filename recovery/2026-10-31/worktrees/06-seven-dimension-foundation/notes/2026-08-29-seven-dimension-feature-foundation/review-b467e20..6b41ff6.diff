@@ -1,0 +1,946 @@
+# Review package: b467e2086f88088c834eee23898e10643aadae3a..6b41ff648ab8e6753b72c821f84ee7e60c1cc596
+
+## Commits
+6b41ff6 fix: bind frozen deep work to evidence ownership
+
+## Files changed
+ ashare_pipeline/deep_worker.py | 269 ++++++++++++++++++++----------------
+ tests/test_deep_worker.py      | 299 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 455 insertions(+), 113 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/deep_worker.py b/ashare_pipeline/deep_worker.py
+index 97fe340..33694bd 100644
+--- a/ashare_pipeline/deep_worker.py
++++ b/ashare_pipeline/deep_worker.py
+@@ -481,38 +481,72 @@ def frozen_snapshot_payload(snapshot: SnapshotRef | None) -> dict[str, str] | No
+     if not isinstance(snapshot, SnapshotRef):
+         raise TypeError("snapshot must be SnapshotRef or None")
+     return {
+         "source_snapshot_id": _require_nonempty_text(
+             snapshot.id, "source_snapshot_id"
+         ),
+         "payload_hash": _require_sha256(snapshot.payload_hash, "payload_hash"),
+     }
+ 
+ 
++def _validate_statement_snapshot_ref(
++    snapshot: SnapshotRef,
++    *,
++    dataset: str,
++    security_id: str,
++    report_period: str,
++) -> None:
++    expected_fingerprint = canonical_sha256(
++        _statement_request(security_id, report_period)
++    )
++    if (
++        snapshot.source != "akshare"
++        or snapshot.dataset != dataset
++        or snapshot.request_fingerprint != expected_fingerprint
++    ):
++        raise ValueError("statement snapshot does not match its frozen slot")
++
++
+ def feature_build_payload(
+     *,
+     security_id: str,
+     report_period: str,
+     as_of_utc: str,
+     context: CandidateContext,
+     statement_snapshots: Mapping[str, SnapshotRef | None],
+     trade_calendar_snapshot: SnapshotRef | None,
+ ) -> dict[str, object]:
+     if not isinstance(context, CandidateContext):
+         raise TypeError("context must be CandidateContext")
+     security = _require_security_id(security_id)
+     if security not in context.members:
+         raise ValueError("security_id is not a current candidate")
+     period = _require_iso_date(report_period, "report_period")
+     as_of = require_aware_utc(as_of_utc, "as_of_utc")
+     if not isinstance(statement_snapshots, Mapping):
+         raise TypeError("statement_snapshots must be a mapping")
++    seen_snapshot_ids: set[str] = set()
++    for dataset in STATEMENT_DATASETS:
++        snapshot = statement_snapshots.get(dataset)
++        if snapshot is None:
++            continue
++        if not isinstance(snapshot, SnapshotRef):
++            raise TypeError("statement snapshots must contain SnapshotRef or None")
++        _validate_statement_snapshot_ref(
++            snapshot,
++            dataset=dataset,
++            security_id=security,
++            report_period=period,
++        )
++        if snapshot.id in seen_snapshot_ids:
++            raise ValueError("statement snapshot cannot occupy multiple slots")
++        seen_snapshot_ids.add(snapshot.id)
+     return {
+         "security_id": security,
+         "report_period": period,
+         "as_of_utc": as_of,
+         "candidate_set_hash": context.candidate_set_hash,
+         "industry": context.industries[security],
+         "reported_target_period": context.reported_target_period[security],
+         "performance_input_hash": context.performance_input_hashes[security],
+         "statement_snapshots": {
+             dataset: frozen_snapshot_payload(statement_snapshots.get(dataset))
+@@ -892,20 +926,48 @@ def _resolve_frozen_snapshot(
+         raise ValueError("frozen snapshot payload must be a mapping")
+     snapshot = snapshots.get(value["source_snapshot_id"])
+     if snapshot is None:
+         raise ValueError("frozen snapshot id does not exist")
+     if snapshot.payload_hash != value["payload_hash"]:
+         raise ValueError("frozen snapshot payload hash does not match repository")
+     snapshots.read_verified(snapshot)
+     return snapshot
+ 
+ 
++def _resolve_frozen_statement_snapshot(
++    snapshots: SnapshotRepository,
++    value: object,
++    *,
++    dataset: str,
++    security_id: str,
++    report_period: str,
++) -> SnapshotRef | None:
++    snapshot = _resolve_frozen_snapshot(snapshots, value)
++    if snapshot is None:
++        return None
++    _validate_statement_snapshot_ref(
++        snapshot,
++        dataset=dataset,
++        security_id=security_id,
++        report_period=report_period,
++    )
++    verified = snapshots.read_verified(snapshot)
++    expected_request = _statement_request(security_id, report_period)
++    if (
++        verified.batch.source != "akshare"
++        or verified.batch.dataset != dataset
++        or verified.batch.request != expected_request
++    ):
++        raise ValueError("verified statement snapshot does not match its frozen slot")
++    return snapshot
++
++
+ def _lease_next_at_logical_time(
+     store: StateStore,
+     kinds: list[str],
+     worker_id: str,
+     lease_seconds: int,
+     logical_now_utc: str,
+ ) -> dict[str, object] | None:
+     logical = datetime.fromisoformat(require_aware_utc(logical_now_utc, "logical_now_utc"))
+     wall = datetime.now(timezone.utc)
+     clock_skew = max(0, math.ceil((wall - logical).total_seconds()))
+@@ -1039,96 +1101,114 @@ def _write_and_store_feature_bundle(
+                     pass
+         raise
+     return relative_path, bundle_hash, database_created
+ 
+ 
+ def _execute_feature_job(
+     *,
+     root: Path,
+     store: StateStore,
+     snapshots: SnapshotRepository,
++    context: CandidateContext,
+     job: Mapping[str, object],
+     worker_id: str,
+ ) -> tuple[bool, Mapping[str, object]]:
+     payload = _validate_feature_payload(job["payload"])
+     security_id = payload["security_id"]
+     report_period = payload["report_period"]
+     if not isinstance(security_id, str) or not isinstance(report_period, str):
+         raise ValueError("feature identity must contain string values")
++    if security_id not in context.members:
++        raise ValueError("feature security is not in the candidate context")
++    if (
++        payload["candidate_set_hash"] != context.candidate_set_hash
++        or payload["performance_input_hash"]
++        != context.performance_input_hashes[security_id]
++        or payload["industry"] != context.industries[security_id]
++        or payload["reported_target_period"]
++        != context.reported_target_period[security_id]
++    ):
++        raise ValueError("feature payload does not match candidate context")
+     frozen_statement_payloads = payload["statement_snapshots"]
+     if not isinstance(frozen_statement_payloads, Mapping):
+         raise ValueError("statement_snapshots must be a mapping")
+     statement_refs = {
+-        dataset: _resolve_frozen_snapshot(
+-            snapshots, frozen_statement_payloads[dataset]
++        dataset: _resolve_frozen_statement_snapshot(
++            snapshots,
++            frozen_statement_payloads[dataset],
++            dataset=dataset,
++            security_id=security_id,
++            report_period=report_period,
+         )
+         for dataset in STATEMENT_DATASETS
+     }
++    statement_ids = [
++        snapshot.id for snapshot in statement_refs.values() if snapshot is not None
++    ]
++    if len(statement_ids) != len(set(statement_ids)):
++        raise ValueError("statement snapshot cannot occupy multiple slots")
+     calendar_ref = _resolve_frozen_snapshot(
+         snapshots, payload["trade_calendar_snapshot"]
+     )
++    statement_hashes = {
++        dataset: (
++            statement_refs[dataset].payload_hash
++            if statement_refs[dataset] is not None
++            else None
++        )
++        for dataset in STATEMENT_DATASETS
++    }
++    expected_input_hash = feature_input_hash(
++        security_id=security_id,
++        report_period=report_period,
++        as_of_utc=payload["as_of_utc"],
++        candidate_set_hash=payload["candidate_set_hash"],
++        statement_snapshot_hashes=statement_hashes,
++        trade_calendar_snapshot_hash=(
++            calendar_ref.payload_hash if calendar_ref is not None else None
++        ),
++    )
++    expected_key = feature_build_key(
++        security_id, report_period, expected_input_hash
++    )
++    if job.get("idempotency_key") != expected_key:
++        raise ValueError("feature-build key does not match frozen payload")
+     trading_days = _verified_calendar_days(snapshots, calendar_ref)
+ 
+     issue_codes: set[str] = set()
+     for dataset in STATEMENT_DATASETS:
+         snapshot = statement_refs[dataset]
+         if snapshot is None:
+             continue
+         _facts, issues = _normalize_statement_snapshot(
+             store=store,
+             snapshots=snapshots,
+             snapshot=snapshot,
+             security_id=security_id,
+             trading_days=trading_days,
+             record_issues=False,
+         )
+         issue_codes.update(issue.code for issue in issues)
+ 
+-    statement_ids = [
+-        snapshot.id for snapshot in statement_refs.values() if snapshot is not None
+-    ]
+     facts = store.list_financial_facts(
+         security_id,
+         source_snapshot_ids=statement_ids,
+     )
+     selection = select_visible_facts(
+         facts,
+         as_of_utc=payload["as_of_utc"],
+         snapshot_fetched_at={
+             snapshot.id: snapshot.fetched_at
+             for snapshot in statement_refs.values()
+             if snapshot is not None
+         },
+     )
+-    statement_hashes = {
+-        dataset: (
+-            statement_refs[dataset].payload_hash
+-            if statement_refs[dataset] is not None
+-            else None
+-        )
+-        for dataset in STATEMENT_DATASETS
+-    }
+-    expected_input_hash = feature_input_hash(
+-        security_id=security_id,
+-        report_period=report_period,
+-        as_of_utc=payload["as_of_utc"],
+-        candidate_set_hash=payload["candidate_set_hash"],
+-        statement_snapshot_hashes=statement_hashes,
+-        trade_calendar_snapshot_hash=(
+-            calendar_ref.payload_hash if calendar_ref is not None else None
+-        ),
+-    )
+-    expected_key = feature_build_key(
+-        security_id, report_period, expected_input_hash
+-    )
+-    if job.get("idempotency_key") != expected_key:
+-        raise ValueError("feature-build key does not match frozen payload")
+     bundle = build_feature_bundle(
+         security_id=security_id,
+         report_period=report_period,
+         as_of_utc=payload["as_of_utc"],
+         candidate_set_hash=payload["candidate_set_hash"],
+         source_industry_name=payload["industry"],
+         facts=selection.facts,
+         fact_blockers=tuple(sorted(set(selection.blockers) | issue_codes)),
+         statement_snapshot_hashes=statement_hashes,
+         trade_calendar_snapshot_hash=(
+@@ -1159,20 +1239,21 @@ def _execute_feature_job(
+             "outcome": "feature_built" if created else "feature_reused",
+         }
+     )
+ 
+ 
+ def _process_feature_jobs(
+     *,
+     root: Path,
+     store: StateStore,
+     snapshots: SnapshotRepository,
++    context: CandidateContext,
+     logical_now_utc: str,
+     worker_id: str,
+     lease_seconds: int,
+     items: list[Mapping[str, object]],
+ ) -> int:
+     created_count = 0
+     while True:
+         job = _lease_next_at_logical_time(
+             store,
+             ["feature_build"],
+@@ -1180,20 +1261,21 @@ def _process_feature_jobs(
+             lease_seconds,
+             logical_now_utc,
+         )
+         if job is None:
+             return created_count
+         try:
+             created, item = _execute_feature_job(
+                 root=root,
+                 store=store,
+                 snapshots=snapshots,
++                context=context,
+                 job=job,
+                 worker_id=worker_id,
+             )
+         except BaseException as error:
+             retryable = not isinstance(error, ValueError)
+             try:
+                 store.fail_job_with_followups(
+                     job["id"],
+                     worker_id,
+                     {"error_classification": "feature_build_error"},
+@@ -1310,20 +1392,21 @@ def execute_queued_deep_work(
+         if not isinstance(trade_calendar_snapshot, SnapshotRef):
+             raise TypeError("trade_calendar_snapshot must be SnapshotRef or None")
+         _verified_calendar_days(snapshots, trade_calendar_snapshot)
+ 
+     logical_now_utc = normalized_now.astimezone(timezone.utc).isoformat()
+     items: list[Mapping[str, object]] = []
+     feature_sets_written = _process_feature_jobs(
+         root=data_root,
+         store=store,
+         snapshots=snapshots,
++        context=context,
+         logical_now_utc=logical_now_utc,
+         worker_id=worker,
+         lease_seconds=lease_seconds,
+         items=items,
+     )
+     counters = {
+         "remote_attempts": 0,
+         "snapshots_reused": 0,
+         "statements_succeeded": 0,
+         "retryable_failed": 0,
+@@ -1399,146 +1482,104 @@ def execute_queued_deep_work(
+                 counters["snapshots_reused"] += 1
+             else:
+                 heartbeat = _LeaseHeartbeat(
+                     store,
+                     job["id"],
+                     worker,
+                     lease_seconds,
+                     heartbeat_seconds,
+                 )
+                 batch = None
+-                try:
+-                    with heartbeat:
+-                        if not heartbeat.lost.is_set():
+-                            counters["remote_attempts"] += 1
++                source_error: (
++                    SourceBlocked | RetryableSourceError | TerminalSourceError | None
++                ) = None
++                with heartbeat:
++                    if not heartbeat.lost.is_set():
++                        counters["remote_attempts"] += 1
++                        try:
+                             batch = source.fetch_financial_statement(
+                                 security_id, dataset, report_period
+                             )
+-                except SourceBlocked:
+-                    followup = _statement_followup(
+-                        context=context,
+-                        snapshots=snapshots,
+-                        security_id=security_id,
+-                        report_period=report_period,
+-                        as_of_utc=logical_now_utc,
+-                        trade_calendar_snapshot=trade_calendar_snapshot,
+-                    )
+-                    store.fail_job_with_followups(
+-                        job["id"],
+-                        worker,
+-                        {"error_classification": "source_blocked"},
+-                        True,
+-                        (normalized_now.astimezone(timezone.utc) + timedelta(hours=6)).isoformat(),
+-                        (followup,),
+-                    )
+-                    counters["retryable_failed"] += 1
++                        except (
++                            SourceBlocked,
++                            RetryableSourceError,
++                            TerminalSourceError,
++                        ) as error:
++                            source_error = error
++                if heartbeat.lost.is_set():
+                     items.append(
+                         _statement_item(
+                             security_id=security_id,
+                             dataset=dataset,
+-                            outcome="retryable_failed",
+-                            error_classification="source_blocked",
++                            outcome="lease_lost",
++                            error_classification="lease_lost",
+                         )
+                     )
+-                    circuits.append("akshare")
+-                    feature_sets_written += _process_feature_jobs(
+-                        root=data_root,
+-                        store=store,
+-                        snapshots=snapshots,
+-                        logical_now_utc=logical_now_utc,
+-                        worker_id=worker,
+-                        lease_seconds=lease_seconds,
+-                        items=items,
+-                    )
+                     break
+-                except RetryableSourceError:
+-                    followup = _statement_followup(
+-                        context=context,
+-                        snapshots=snapshots,
+-                        security_id=security_id,
+-                        report_period=report_period,
+-                        as_of_utc=logical_now_utc,
+-                        trade_calendar_snapshot=trade_calendar_snapshot,
+-                    )
+-                    store.fail_job_with_followups(
+-                        job["id"],
+-                        worker,
+-                        {"error_classification": "retryable_source"},
+-                        True,
+-                        (normalized_now.astimezone(timezone.utc) + timedelta(hours=6)).isoformat(),
+-                        (followup,),
+-                    )
+-                    counters["retryable_failed"] += 1
+-                    items.append(
+-                        _statement_item(
+-                            security_id=security_id,
+-                            dataset=dataset,
+-                            outcome="retryable_failed",
+-                            error_classification="retryable_source",
+-                        )
++                if source_error is not None:
++                    blocked = isinstance(source_error, SourceBlocked)
++                    retryable = blocked or isinstance(
++                        source_error, RetryableSourceError
+                     )
+-                    feature_sets_written += _process_feature_jobs(
+-                        root=data_root,
+-                        store=store,
+-                        snapshots=snapshots,
+-                        logical_now_utc=logical_now_utc,
+-                        worker_id=worker,
+-                        lease_seconds=lease_seconds,
+-                        items=items,
++                    classification = (
++                        "source_blocked"
++                        if blocked
++                        else "retryable_source"
++                        if retryable
++                        else "terminal_source"
+                     )
+-                    continue
+-                except TerminalSourceError:
+                     followup = _statement_followup(
+                         context=context,
+                         snapshots=snapshots,
+                         security_id=security_id,
+                         report_period=report_period,
+                         as_of_utc=logical_now_utc,
+                         trade_calendar_snapshot=trade_calendar_snapshot,
+                     )
+                     store.fail_job_with_followups(
+                         job["id"],
+                         worker,
+-                        {"error_classification": "terminal_source"},
+-                        False,
+-                        None,
++                        {"error_classification": classification},
++                        retryable,
++                        (
++                            normalized_now.astimezone(timezone.utc)
++                            + timedelta(hours=6)
++                        ).isoformat()
++                        if retryable
++                        else None,
+                         (followup,),
+                     )
+-                    counters["terminal_failed"] += 1
++                    counter = "retryable_failed" if retryable else "terminal_failed"
++                    counters[counter] += 1
+                     items.append(
+                         _statement_item(
+                             security_id=security_id,
+                             dataset=dataset,
+-                            outcome="terminal_failed",
+-                            error_classification="terminal_source",
++                            outcome=counter,
++                            error_classification=classification,
+                         )
+                     )
++                    if blocked:
++                        circuits.append("akshare")
+                     feature_sets_written += _process_feature_jobs(
+                         root=data_root,
+                         store=store,
+                         snapshots=snapshots,
++                        context=context,
+                         logical_now_utc=logical_now_utc,
+                         worker_id=worker,
+                         lease_seconds=lease_seconds,
+                         items=items,
+                     )
++                    if blocked:
++                        break
+                     continue
+-                if heartbeat.lost.is_set():
+-                    items.append(
+-                        _statement_item(
+-                            security_id=security_id,
+-                            dataset=dataset,
+-                            outcome="lease_lost",
+-                            error_classification="lease_lost",
+-                        )
+-                    )
+-                    break
+                 if batch is None:
+                     raise RuntimeError("remote statement request produced no batch")
+                 if (
+                     batch.source != "akshare"
+                     or batch.dataset != dataset
+                     or batch.request != request
+                 ):
+                     followup = _statement_followup(
+                         context=context,
+                         snapshots=snapshots,
+@@ -1561,20 +1602,21 @@ def execute_queued_deep_work(
+                             security_id=security_id,
+                             dataset=dataset,
+                             outcome="terminal_failed",
+                             error_classification="mismatched_source_batch",
+                         )
+                     )
+                     feature_sets_written += _process_feature_jobs(
+                         root=data_root,
+                         store=store,
+                         snapshots=snapshots,
++                        context=context,
+                         logical_now_utc=logical_now_utc,
+                         worker_id=worker,
+                         lease_seconds=lease_seconds,
+                         items=items,
+                     )
+                     continue
+                 snapshot, _created = snapshots.persist(batch)
+                 verified = snapshots.read_verified(snapshot)
+                 facts, issues = _normalize_statement_snapshot(
+                     store=store,
+@@ -1663,20 +1705,21 @@ def execute_queued_deep_work(
+                         security_id=security_id,
+                         dataset=dataset,
+                         snapshot_hash=snapshot.payload_hash,
+                         outcome="snapshot_reused" if same_refresh else "statement_succeeded",
+                     )
+                 )
+             feature_sets_written += _process_feature_jobs(
+                 root=data_root,
+                 store=store,
+                 snapshots=snapshots,
++                context=context,
+                 logical_now_utc=logical_now_utc,
+                 worker_id=worker,
+                 lease_seconds=lease_seconds,
+                 items=items,
+             )
+         except (SourceBlocked, RetryableSourceError, TerminalSourceError):
+             raise
+         except BaseException:
+             # Unexpected local errors are allowed to surface only after the owned
+             # job is safely transitioned when its lease is still valid.
+diff --git a/tests/test_deep_worker.py b/tests/test_deep_worker.py
+index 9685cb4..42ba7e5 100644
+--- a/tests/test_deep_worker.py
++++ b/tests/test_deep_worker.py
+@@ -208,20 +208,149 @@ class DeepWorkerTestCase(unittest.TestCase):
+             for item in statement_job_specs(
+                 context,
+                 security_id=security_id,
+                 report_period=REPORT_PERIOD,
+                 as_of_cn_date=refresh_date,
+             )
+             if item.payload["dataset"] == dataset
+         )
+         return self.store.enqueue_job(spec.kind, spec.idempotency_key, spec.payload)
+ 
++    def _enqueue_direct_feature_payload(self, payload: dict[str, object]) -> str:
++        statements = payload["statement_snapshots"]
++        calendar = payload["trade_calendar_snapshot"]
++        input_hash = feature_input_hash(
++            security_id=payload["security_id"],
++            report_period=payload["report_period"],
++            as_of_utc=payload["as_of_utc"],
++            candidate_set_hash=payload["candidate_set_hash"],
++            statement_snapshot_hashes={
++                dataset: (
++                    statements[dataset]["payload_hash"]
++                    if statements[dataset] is not None
++                    else None
++                )
++                for dataset in STATEMENT_DATASETS
++            },
++            trade_calendar_snapshot_hash=(
++                calendar["payload_hash"] if calendar is not None else None
++            ),
++        )
++        return self.store.enqueue_job(
++            "feature_build",
++            feature_build_key(
++                payload["security_id"], payload["report_period"], input_hash
++            ),
++            payload,
++        )
++
++    def _assert_no_feature_artifacts(self) -> None:
++        self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
++        feature_root = self.data_root / "curated" / "formal_features"
++        self.assertEqual(list(feature_root.rglob("*.json")), [])
++        with closing(sqlite3.connect(self.store.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
++                0,
++            )
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM financial_fact").fetchone()[0],
++                0,
++            )
++
++    def _assert_candidate_payload_tamper_is_terminal(
++        self, field: str, value: object
++    ) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        context = load_candidate_context(self.data_root)
++        payload = deep_worker_module.feature_build_payload(
++            security_id="SH600001",
++            report_period=REPORT_PERIOD,
++            as_of_utc="2026-08-29T12:00:00+00:00",
++            context=context,
++            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
++            trade_calendar_snapshot=None,
++        )
++        payload[field] = value
++        job_id = self._enqueue_direct_feature_payload(payload)
++
++        self._run(source=None, online=False)
++
++        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
++        self._assert_no_feature_artifacts()
++
++    def _assert_periodic_heartbeat_loss_wins_over_source_error(
++        self,
++        error: BaseException,
++        *,
++        transfer_owner: bool,
++    ) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        job_id = self._enqueue_statement()
++        calendar = self._calendar_ref()
++        entered = threading.Event()
++        release = threading.Event()
++        source = FakeStatementSource(
++            failures={"balance_sheet": error},
++            entered=entered,
++            release=release,
++        )
++        real_renew = self.store.renew_job_lease
++        renewal_count = 0
++
++        def renew(*args, **kwargs):
++            nonlocal renewal_count
++            renewal_count += 1
++            if renewal_count == 1:
++                return real_renew(*args, **kwargs)
++            if transfer_owner:
++                with closing(sqlite3.connect(self.store.db_path)) as connection:
++                    connection.execute(
++                        """UPDATE job SET lease_worker = ?, lease_expires_at = ?
++                           WHERE id = ?""",
++                        ("worker-b", "2099-01-01T00:00:00+00:00", job_id),
++                    )
++                    connection.commit()
++            release.set()
++            raise ValueError("periodic renewal failed")
++
++        with patch.object(self.store, "renew_job_lease", side_effect=renew):
++            summary = self._run(
++                source=source,
++                trade_calendar_snapshot=calendar,
++                limit=1,
++                heartbeat_seconds=0.01,
++            )
++
++        job = self.store.get_job(job_id)
++        self.assertTrue(entered.is_set())
++        self.assertGreaterEqual(renewal_count, 2)
++        self.assertEqual(summary.remote_attempts, 1)
++        self.assertEqual(summary.circuit_breakers, ())
++        self.assertEqual(
++            [item["outcome"] for item in summary.items if "dataset" in item],
++            ["lease_lost"],
++        )
++        self.assertEqual(job["status"], "running")
++        self.assertEqual(
++            job["lease_worker"], "worker-b" if transfer_owner else "worker-a"
++        )
++        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
++        self.assertIsNone(
++            self.repository.find_exact(
++                "akshare",
++                "balance_sheet",
++                {"symbol": "SH600001", "report_period": REPORT_PERIOD},
++            )
++        )
++        self._assert_no_feature_artifacts()
++
+     def _run(
+         self,
+         *,
+         source=None,
+         now_cn: datetime | None = None,
+         online: bool = True,
+         limit: int = 3,
+         trade_calendar_snapshot=None,
+         lease_seconds: int = 2,
+         heartbeat_seconds: float = 0.05,
+@@ -417,20 +546,160 @@ class DeepWorkerTestCase(unittest.TestCase):
+             "feature_build",
+             feature_build_key("SH600001", REPORT_PERIOD, "0" * 64),
+             payload,
+         )
+ 
+         self._run(source=None, online=False, trade_calendar_snapshot=calendar)
+ 
+         self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
+         self.assertIsNone(self.store.latest_feature_set("SH600001", REPORT_PERIOD))
+ 
++    def test_feature_executor_rejects_wrong_key_before_fact_insertion(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        context = load_candidate_context(self.data_root)
++        balance = self.repository.persist(fixture_statement_batch("balance_sheet"))[0]
++        payload = deep_worker_module.feature_build_payload(
++            security_id="SH600001",
++            report_period=REPORT_PERIOD,
++            as_of_utc="2026-08-29T12:00:00+00:00",
++            context=context,
++            statement_snapshots={
++                "balance_sheet": balance,
++                "profit_sheet": None,
++                "cash_flow_sheet": None,
++            },
++            trade_calendar_snapshot=self._calendar_ref(),
++        )
++        job_id = self.store.enqueue_job(
++            "feature_build",
++            feature_build_key("SH600001", REPORT_PERIOD, "0" * 64),
++            payload,
++        )
++
++        self._run(source=None, online=False)
++
++        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
++        self._assert_no_feature_artifacts()
++
++    def test_enqueue_feature_build_rejects_snapshot_in_wrong_statement_slot(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        context = load_candidate_context(self.data_root)
++        profit = self.repository.persist(fixture_statement_batch("profit_sheet"))[0]
++
++        with self.assertRaisesRegex(ValueError, "statement snapshot"):
++            deep_worker_module.enqueue_feature_build(
++                self.store,
++                security_id="SH600001",
++                report_period=REPORT_PERIOD,
++                as_of_utc="2026-08-29T12:00:00+00:00",
++                candidate_context=context,
++                statement_snapshots={
++                    "balance_sheet": profit,
++                    "profit_sheet": None,
++                    "cash_flow_sheet": None,
++                },
++                trade_calendar_snapshot=None,
++            )
++
++        self.assertEqual(self.store.list_jobs(["feature_build"]), [])
++
++    def test_feature_executor_rejects_snapshot_in_wrong_statement_slot(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        context = load_candidate_context(self.data_root)
++        profit = self.repository.persist(fixture_statement_batch("profit_sheet"))[0]
++        payload = deep_worker_module.feature_build_payload(
++            security_id="SH600001",
++            report_period=REPORT_PERIOD,
++            as_of_utc="2026-08-29T12:00:00+00:00",
++            context=context,
++            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
++            trade_calendar_snapshot=None,
++        )
++        payload["statement_snapshots"]["balance_sheet"] = (
++            deep_worker_module.frozen_snapshot_payload(profit)
++        )
++        job_id = self._enqueue_direct_feature_payload(payload)
++
++        self._run(source=None, online=False)
++
++        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
++        self._assert_no_feature_artifacts()
++
++    def test_feature_executor_rejects_snapshot_for_wrong_security_request(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        context = load_candidate_context(self.data_root)
++        other_security = self.repository.persist(
++            fixture_statement_batch("balance_sheet", security_id="SH600002")
++        )[0]
++        payload = deep_worker_module.feature_build_payload(
++            security_id="SH600001",
++            report_period=REPORT_PERIOD,
++            as_of_utc="2026-08-29T12:00:00+00:00",
++            context=context,
++            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
++            trade_calendar_snapshot=None,
++        )
++        payload["statement_snapshots"]["balance_sheet"] = (
++            deep_worker_module.frozen_snapshot_payload(other_security)
++        )
++        job_id = self._enqueue_direct_feature_payload(payload)
++
++        self._run(source=None, online=False)
++
++        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
++        self._assert_no_feature_artifacts()
++
++    def test_feature_executor_rejects_duplicate_snapshot_across_statement_slots(self) -> None:
++        self._write_candidates({"SH600001": "包装印刷"})
++        context = load_candidate_context(self.data_root)
++        balance = self.repository.persist(fixture_statement_batch("balance_sheet"))[0]
++        frozen = deep_worker_module.frozen_snapshot_payload(balance)
++        payload = deep_worker_module.feature_build_payload(
++            security_id="SH600001",
++            report_period=REPORT_PERIOD,
++            as_of_utc="2026-08-29T12:00:00+00:00",
++            context=context,
++            statement_snapshots={dataset: None for dataset in STATEMENT_DATASETS},
++            trade_calendar_snapshot=None,
++        )
++        payload["statement_snapshots"]["balance_sheet"] = frozen
++        payload["statement_snapshots"]["profit_sheet"] = dict(frozen)
++        job_id = self._enqueue_direct_feature_payload(payload)
++
++        self._run(source=None, online=False)
++
++        self.assertEqual(self.store.get_job(job_id)["status"], "terminal_failed")
++        self._assert_no_feature_artifacts()
++
++    def test_feature_executor_rejects_security_outside_candidate_context(self) -> None:
++        self._assert_candidate_payload_tamper_is_terminal(
++            "security_id", "SH600002"
++        )
++
++    def test_feature_executor_rejects_candidate_set_hash_context_mismatch(self) -> None:
++        self._assert_candidate_payload_tamper_is_terminal(
++            "candidate_set_hash", "9" * 64
++        )
++
++    def test_feature_executor_rejects_performance_hash_context_mismatch(self) -> None:
++        self._assert_candidate_payload_tamper_is_terminal(
++            "performance_input_hash", "9" * 64
++        )
++
++    def test_feature_executor_rejects_industry_context_mismatch(self) -> None:
++        self._assert_candidate_payload_tamper_is_terminal("industry", "银行")
++
++    def test_feature_executor_rejects_reported_flag_context_mismatch(self) -> None:
++        self._assert_candidate_payload_tamper_is_terminal(
++            "reported_target_period", False
++        )
++
+     def test_remote_job_renews_lease_while_source_call_is_blocked(self) -> None:
+         self._write_candidates({"SH600001": "包装印刷"})
+         self._enqueue_statement()
+         calendar = self._calendar_ref()
+         entered = threading.Event()
+         release = threading.Event()
+         source = FakeStatementSource(entered=entered, release=release)
+         renewals: list[str] = []
+         real_renew = self.store.renew_job_lease
+ 
+@@ -470,20 +739,50 @@ class DeepWorkerTestCase(unittest.TestCase):
+                 trade_calendar_snapshot=calendar,
+                 limit=1,
+                 heartbeat_seconds=0.001,
+             )
+ 
+         self.assertEqual(summary.statements_succeeded, 0)
+         self.assertEqual(source.calls, [])
+         self.assertNotEqual(self.store.get_job(job_id)["status"], "succeeded")
+         self.assertEqual(self.store.list_jobs(["feature_build"]), [])
+ 
++    def test_periodic_lease_transfer_wins_over_source_blocked(self) -> None:
++        self._assert_periodic_heartbeat_loss_wins_over_source_error(
++            SourceBlocked("blocked"), transfer_owner=True
++        )
++
++    def test_periodic_lease_transfer_wins_over_retryable_source_error(self) -> None:
++        self._assert_periodic_heartbeat_loss_wins_over_source_error(
++            RetryableSourceError("retry"), transfer_owner=True
++        )
++
++    def test_periodic_lease_transfer_wins_over_terminal_source_error(self) -> None:
++        self._assert_periodic_heartbeat_loss_wins_over_source_error(
++            deep_worker_module.TerminalSourceError("terminal"), transfer_owner=True
++        )
++
++    def test_transient_periodic_renewal_failure_wins_over_source_blocked(self) -> None:
++        self._assert_periodic_heartbeat_loss_wins_over_source_error(
++            SourceBlocked("blocked"), transfer_owner=False
++        )
++
++    def test_transient_periodic_renewal_failure_wins_over_retryable_source_error(self) -> None:
++        self._assert_periodic_heartbeat_loss_wins_over_source_error(
++            RetryableSourceError("retry"), transfer_owner=False
++        )
++
++    def test_transient_periodic_renewal_failure_wins_over_terminal_source_error(self) -> None:
++        self._assert_periodic_heartbeat_loss_wins_over_source_error(
++            deep_worker_module.TerminalSourceError("terminal"), transfer_owner=False
++        )
++
+     def test_run_recovers_expired_statement_lease_before_processing(self) -> None:
+         self._write_candidates({"SH600001": "包装印刷"})
+         job_id = self._enqueue_statement()
+         self.store.lease_next_job(
+             ["deep_statement"],
+             "dead-worker",
+             1,
+             "2026-08-29T10:00:00+00:00",
+         )
+         calendar = self._calendar_ref()

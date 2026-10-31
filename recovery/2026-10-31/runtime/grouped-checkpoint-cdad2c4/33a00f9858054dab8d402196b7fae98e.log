@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_integration.GenuineFullChainTests.test_final_recheck_revocation_leaves_no_torn_run_or_revoked_bc
+test_final_recheck_revocation_leaves_no_torn_run_or_revoked_bc (test_formal_final_integration.GenuineFullChainTests.test_final_recheck_revocation_leaves_no_torn_run_or_revoked_bc) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 3739.822s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_integration.GenuineFullChainTests.test_final_recheck_revocation_leaves_no_torn_run_or_revoked_bc"], "passed": ["test_formal_final_integration.GenuineFullChainTests.test_final_recheck_revocation_leaves_no_torn_run_or_revoked_bc"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

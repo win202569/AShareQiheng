@@ -1,0 +1,938 @@
+# Task 1 review package
+
+Base: f2efe84aa36f5bb609b162cfc8e5c4e216286aae
+Head: stable working tree (no commit yet; parent commits after review)
+Allowed files: formal_scoring_registry.py, fixture JSON, its tests, minimal Context wrapper compatibility and Context tests.
+No data, SQLite, WAL/SHM, production configuration, or progress artifacts are part of this diff.
+
+## Full diff with context
+
+diff --git a/ashare_pipeline/formal_context_schema.py b/ashare_pipeline/formal_context_schema.py
+index 315f8be..a671eb3 100644
+--- a/ashare_pipeline/formal_context_schema.py
++++ b/ashare_pipeline/formal_context_schema.py
+@@ -549,22 +549,29 @@ def _trusted_context_types():
+ 
+         @classmethod
+         def load(cls, state_store, registry_signature_verifier, registry_manifest_hash):
+             from .state_store import StateStore
+             if cls is not Registry or type(state_store) is not StateStore:
+                 raise ValueError("Context registry requires exact StateStore")
+             bundle = FormalRegistryBundleLoader(state_store, registry_signature_verifier).load(registry_manifest_hash)
+             bundle.require_official()
+             scoring = bundle.blob("scoring")
+             wire = _load(scoring.canonical_json)
+-            _keys(wire, ("registry_role", "schema_version", "descriptors"))
+-            if wire["registry_role"] != "scoring" or wire["schema_version"] != "formal-context-registry-v1":
++            if wire.get("schema_version") == "formal-scoring-registry-v1":
++                _keys(wire, ("registry_role", "schema_version", "descriptors", "scoring"))
++                if type(wire["scoring"]) is not dict:
++                    raise ValueError("Context scoring wrapper must contain a scoring object")
++            else:
++                _keys(wire, ("registry_role", "schema_version", "descriptors"))
++            if wire["registry_role"] != "scoring" or wire["schema_version"] not in (
++                "formal-context-registry-v1", "formal-scoring-registry-v1"
++            ):
+                 raise ValueError("unsupported Context registry wrapper")
+             if type(wire["descriptors"]) is not list:
+                 raise ValueError("Context descriptors must be a canonical array")
+             seen = set()
+             for descriptor in wire["descriptors"]:
+                 _descriptor(descriptor)
+                 identity = (descriptor["context_kind"], descriptor["scope_key"], descriptor["security_scope"])
+                 if identity in seen:
+                     raise ValueError("duplicate Context descriptor")
+                 seen.add(identity)
+diff --git a/tests/test_formal_context_repository.py b/tests/test_formal_context_repository.py
+index 1cb3142..92130e5 100644
+--- a/tests/test_formal_context_repository.py
++++ b/tests/test_formal_context_repository.py
+@@ -57,20 +57,60 @@ class FixtureNormalizer:
+             registry_manifest_hash=request.registry_manifest_hash, evidence=request.evidence)
+         # Independent canonical fixture computation; the self-referential field is not yet present.
+         digest = hashlib.sha256(canonical(dict(schema_version="formal-context-normalization-input-v1",
+             descriptor_id=request.descriptor_id, normalizer_version=request.normalizer_version,
+             request=request.to_dict(), source_snapshot_manifest_sha256=snapshot.manifest_sha256,
+             source_content_sha256=snapshot.content_sha256, fact=wire))).hexdigest()
+         wire["evidence"]["normalization_input_hash"] = digest
+         return (FormalContextFact.create(**wire),)
+ 
+ 
++class ScoringWrapperIntegrationTests(unittest.TestCase):
++    def load_wrapper(self, mutate=None):
++        from tests.test_formal_scoring_registry import signed_graph
++        from ashare_pipeline.formal_context_schema import FormalContextRegistry, SignedContextRequestResolver
++        bundle, _, repository, verifier = signed_graph(context=True, mutate=mutate)
++        temp = tempfile.TemporaryDirectory()
++        self.addCleanup(temp.cleanup)
++        store = StateStore(Path(temp.name) / "context.sqlite", registry_signature_verifier=verifier)
++        store.initialize()
++        for blob in repository.blobs.values():
++            store.put_formal_registry_blob(blob)
++        store.put_formal_registry_manifest(repository.manifest)
++        registry = FormalContextRegistry.load(store, verifier, bundle.manifest.manifest_hash)
++        resolver = SignedContextRequestResolver(store, verifier)
++        request = resolver.resolve(context_kind="security_state", scope_key="fixture-state", security_id="SZ000001",
++            as_of_utc=FREEZE, registry_manifest_hash=bundle.manifest.manifest_hash, upstream_generation="wrapper-test")
++        return registry.descriptor_for(request), request
++
++    def test_combined_scoring_wrapper_preserves_legacy_descriptor_identity(self):
++        def legacy(docs):
++            docs["scoring"].pop("scoring")
++            docs["scoring"]["schema_version"] = "formal-context-registry-v1"
++        old_descriptor, old_request = self.load_wrapper(legacy)
++        try:
++            new_descriptor, new_request = self.load_wrapper()
++        except ValueError as error:
++            self.fail(f"the explicitly versioned combined wrapper must be accepted: {error}")
++        self.assertEqual(old_descriptor, new_descriptor)
++        self.assertEqual(old_request.descriptor_id, new_request.descriptor_id)
++        self.assertEqual(new_request.official_request.dataset, "fixture-state")
++
++    def test_combined_wrapper_rejects_unknown_keys_versions_and_invalid_descriptors(self):
++        for mutation in (lambda d: d["scoring"].update(extra=True),
++            lambda d: d["scoring"].update(schema_version="formal-scoring-registry-v2"),
++            lambda d: d["scoring"].update(scoring=[]),
++            lambda d: d["scoring"]["descriptors"][0].update(extra=True)):
++            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
++                self.load_wrapper(mutation)
++
++
+ class ContextIntegrationTests(unittest.TestCase):
+     def setUp(self):
+         self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_context_repository"))
+         self.api = importlib.import_module("ashare_pipeline.formal_context_repository")
+         self.schema = importlib.import_module("ashare_pipeline.formal_context_schema")
+         self.temp = tempfile.TemporaryDirectory()
+         self.addCleanup(self.temp.cleanup)
+         self.root = Path(self.temp.name)
+         self.db = self.root / "state.sqlite"
+         self.verifier = DigestVerifier()
+
+diff --git a/ashare_pipeline/formal_scoring_registry.py b/ashare_pipeline/formal_scoring_registry.py
+new file mode 100644
+index 0000000..0953920
+--- /dev/null
++++ b/ashare_pipeline/formal_scoring_registry.py
+@@ -0,0 +1,496 @@
++"""V3 scoring definitions bound to a verified nine-child registry graph.
++
++The v1 adapter ranks an already-derived V6 feature. Its original formula remains
++inspectable; this module does not invent financial equivalents or execute policy.
++Official input is exclusively the scoring child of an exact verified bundle.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import dataclass, fields
++from decimal import Decimal, InvalidOperation
++import hashlib
++import json
++from pathlib import Path
++import re
++from types import MappingProxyType
++from typing import Literal
++import weakref
++
++from .formal_feature_contract import FormalFeatureSlot, SignedFormalFeatureRegistry
++from .formal_registry_manifest import VerifiedRegistryBundle
++
++
++class RegistryValidationError(ValueError):
++    """A scoring contract or its signed graph proof is incomplete or invalid."""
++
++
++_TEMPLATES = ("general_nonfinancial", "bank", "broker", "insurance", "real_estate")
++_DIMENSIONS = ("G", "V", "M", "EQ", "FS", "CA", "T")
++_WEIGHTS = tuple(map(Decimal, ("0.18", "0.18", "0.18", "0.12", "0.08", "0.16", "0.10")))
++_INTERNAL = (("0.35", "0.25", "0.25", "0.15"), ("0.45", "0.25", "0.30"),
++    ("0.40", "0.30", "0.30"), ("0.35", "0.25", "0.20", "0.20"),
++    ("0.40", "0.35", "0.25"), ("0.35", "0.30", "0.20", "0.15"), ("0.35", "0.25", "0.25", "0.15"))
++_SLOTS = (
++    ("operating_profit_per_share_cagr_3y", "operating_profit_per_share_yoy", "operating_revenue_cagr_3y", "operating_revenue_yoy"),
++    ("normalized_earnings_yield", "normalized_free_cash_flow_yield", "enterprise_value_or_sustainable_roe"),
++    ("return_persistence", "margin_persistence", "cash_conversion_or_asset_efficiency"),
++    ("cash_flow_to_operating_profit", "accrual_quality", "core_profit_share", "working_capital_quality"),
++    ("leverage_or_regulatory_capital", "liquidity_or_interest_coverage", "asset_or_contingent_risk"),
++    ("return_persistence", "incremental_capital_return", "shareholder_return_and_dilution", "capital_discipline"),
++    ("historical_valuation", "price_trend_and_volatility", "expectation_change", "quantified_event_and_liquidity"),
++)
++_POLICY_ROLES = ("cyclic", "redline", "status", "event")
++_ROLES = ("source", "mapping", "feature", "scoring", "industry", *_POLICY_ROLES)
++
++
++def _keys(value, expected, label):
++    if type(value) is not dict:
++        raise RegistryValidationError(f"{label} must be an object")
++    missing, extra = set(expected) - set(value), set(value) - set(expected)
++    if missing or extra:
++        raise RegistryValidationError(f"{label}: missing {sorted(missing)}; unknown {sorted(extra)}")
++
++
++def _text(value, label):
++    if type(value) is not str or not value or value != value.strip():
++        raise RegistryValidationError(f"{label} must be a nonempty trimmed string")
++    return value
++
++
++def _texts(value, label, *, allow_empty=False):
++    if type(value) is not list or (not value and not allow_empty):
++        raise RegistryValidationError(f"{label} must be an explicit array")
++    result = tuple(_text(item, label) for item in value)
++    if len(set(result)) != len(result):
++        raise RegistryValidationError(f"{label} must be unique")
++    return result
++
++
++def _hash(value, label):
++    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
++        raise RegistryValidationError(f"{label} must be a SHA-256")
++    return value
++
++
++def _decimal(value, label):
++    _text(value, label)
++    try:
++        parsed = Decimal(value)
++    except InvalidOperation as error:
++        raise RegistryValidationError(f"{label} must be a decimal string") from error
++    if not parsed.is_finite() or re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", value) is None:
++        raise RegistryValidationError(f"{label} must be a finite nonnegative decimal string")
++    return parsed
++
++
++def _canonical(value):
++    # JSON numbers are parsed as Decimal, never rounded through binary floats.
++    if type(value) is dict:
++        return "{" + ",".join(_canonical(k) + ":" + _canonical(value[k]) for k in sorted(value)) + "}"
++    if type(value) is list:
++        return "[" + ",".join(_canonical(v) for v in value) + "]"
++    if type(value) is Decimal:
++        if not value.is_finite():
++            raise RegistryValidationError("nonfinite JSON")
++        return str(value)
++    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
++
++
++def _load(raw):
++    def unique(pairs):
++        result = {}
++        for key, value in pairs:
++            if key in result:
++                raise RegistryValidationError("duplicate JSON key")
++            result[key] = value
++        return result
++
++    def invalid(value):
++        raise RegistryValidationError(f"nonfinite JSON {value}")
++
++    if type(raw) is not bytes:
++        raise RegistryValidationError("canonical JSON must be immutable UTF-8 bytes")
++    try:
++        value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique, parse_float=Decimal, parse_constant=invalid)
++        if type(value) is not dict or _canonical(value).encode("utf-8") != raw:
++            raise RegistryValidationError("registry must be a canonical JSON object")
++    except (UnicodeError, ValueError, TypeError, RecursionError) as error:
++        raise RegistryValidationError(f"invalid canonical JSON: {error}") from error
++    return value
++
++
++def _freeze(value):
++    if type(value) is dict:
++        return MappingProxyType({k: _freeze(v) for k, v in value.items()})
++    if type(value) is list:
++        return tuple(_freeze(v) for v in value)
++    return value
++
++
++@dataclass(frozen=True, slots=True)
++class RegistryApproval:
++    purpose: Literal["test", "official"]
++    approved_content_sha256: str | None
++    approval_id: str | None
++
++    @classmethod
++    def for_test_fixture(cls):
++        return cls("test", None, None)
++
++
++@dataclass(frozen=True, slots=True)
++class MetricDefinition:
++    metric_id: str
++    dimension: Literal["G", "V", "M", "EQ", "FS", "CA", "T"]
++    internal_weight: Decimal
++    direction: Literal["higher", "lower"]
++    required_feature_keys: tuple[str, ...]
++    formula_version: str
++    field_map_version: str
++    denominator_rule: str | None
++    formula: Mapping[str, str]
++    original_formula: Mapping[str, object]
++    field_map: Mapping[str, str]
++    unit_rule: str
++    period_rule: tuple[str, ...]
++    invalid_denominator_rule: str
++    equivalence_description: str
++    source_evidence_categories: tuple[str, ...]
++    policy_refs: tuple[Mapping[str, str], ...]
++
++
++@dataclass(frozen=True, slots=True)
++class TemplateDefinition:
++    template_id: str
++    metrics: Mapping[str, tuple[MetricDefinition, ...]]
++
++
++@dataclass(frozen=True, slots=True)
++class RedlineDefinition:
++    rule_id: str
++    policy_role: str
++    registry_hash: str
++    registry_version: str
++    source_evidence_categories: tuple[str, ...]
++    rule: Mapping[str, object]
++
++
++@dataclass(frozen=True, slots=True)
++class StatusRule(RedlineDefinition):
++    pass
++
++
++def _feature_slots(feature_registry, bundle):
++    if type(feature_registry) is not SignedFormalFeatureRegistry:
++        raise RegistryValidationError("official feature vocabulary must be an exact sealed SignedFormalFeatureRegistry")
++    feature_registry.require_release_eligible()
++    feature = bundle.blob("feature")
++    if (feature_registry.canonical_json != feature.canonical_json or feature_registry.registry_hash != feature.registry_hash
++        or feature_registry.source_registry_hash != bundle.blob("source").registry_hash
++        or feature_registry.mapping_registry_hash != bundle.blob("mapping").registry_hash):
++        raise RegistryValidationError("feature vocabulary differs from registry manifest graph")
++    return {t: {slot.slot_id: slot for slot in feature_registry.slots_for_template(t)} for t in _TEMPLATES}
++
++
++def _graph(bundle):
++    if type(bundle) is not VerifiedRegistryBundle:
++        raise RegistryValidationError("official scoring requires an exact verified registry bundle")
++    bundle.require_official()
++    result = {}
++    for role in _ROLES:
++        blob = bundle.blob(role)
++        digest = hashlib.sha256(blob.canonical_json).hexdigest()
++        if digest != blob.registry_hash or digest != getattr(bundle.manifest, role + "_registry_hash"):
++            raise RegistryValidationError(f"registry manifest {role} hash mismatch")
++        result[role] = digest
++    return result
++
++
++def _policies(scoring, bundle, purpose):
++    contracts = scoring["policy_contracts"]
++    _keys(contracts, _POLICY_ROLES, "policy_contracts")
++    if purpose == "test":
++        _keys(scoring["fixture_policies"], _POLICY_ROLES, "fixture_policies")
++    policies = {}
++    for role in _POLICY_ROLES:
++        contract = contracts[role]
++        _keys(contract, ("registry_hash", "registry_version", "source_evidence_categories"), f"policy_contracts.{role}")
++        digest = _hash(contract["registry_hash"], "policy registry_hash")
++        raw = bundle.blob(role).canonical_json if bundle is not None else _canonical(scoring["fixture_policies"][role]).encode()
++        if hashlib.sha256(raw).hexdigest() != digest:
++            raise RegistryValidationError(f"policy {role} registry_hash differs from manifest child")
++        policy = _load(raw)
++        _keys(policy, ("registry_role", "schema_version", "purpose", "registry_version", "source_evidence_categories", "rules"), f"policy {role}")
++        if policy["registry_role"] != role or policy["schema_version"] != "formal-scoring-policy-v1" or policy["purpose"] != purpose:
++            raise RegistryValidationError(f"policy {role} role, version, or purpose mismatch")
++        version = _text(policy["registry_version"], "policy registry_version")
++        categories = _texts(policy["source_evidence_categories"], "policy source_evidence_categories")
++        if version != contract["registry_version"] or categories != _texts(contract["source_evidence_categories"], "policy source_evidence_categories"):
++            raise RegistryValidationError(f"policy {role} version or categories mismatch")
++        if type(policy["rules"]) is not dict or not policy["rules"]:
++            raise RegistryValidationError(f"policy {role} rules must be nonempty")
++        for key, rule in policy["rules"].items():
++            _text(key, "policy rule_id")
++            if type(rule) is not dict or not rule:
++                raise RegistryValidationError("policy rule must be an explicit object")
++        policies[role] = policy
++    return policies
++
++
++def _rule(reference, policies, contracts, allowed_roles, cls=StatusRule):
++    _keys(reference, ("policy_role", "rule_id"), "policy reference")
++    role, rule_id = reference["policy_role"], reference["rule_id"]
++    _text(role, "policy_role")
++    _text(rule_id, "rule_id")
++    if role not in allowed_roles or rule_id not in policies[role]["rules"]:
++        raise RegistryValidationError("policy role or rule_id reference is not registered")
++    policy = policies[role]
++    return cls(rule_id, role, contracts[role]["registry_hash"], policy["registry_version"],
++        tuple(policy["source_evidence_categories"]), _freeze(policy["rules"][rule_id]))
++
++
++def _formula_requirements(formula):
++    periods, ops = set(), set()
++
++    def visit(node):
++        ops.add(node["op"])
++        if node["op"] == "fact":
++            periods.add(node["period_key"])
++        for key in ("left", "right"):
++            if key in node:
++                visit(node[key])
++        for item in node.get("items", []):
++            visit(item)
++
++    visit(formula)
++    denominator = {
++        (False, False): "not_applicable",
++        (True, False): "nonzero",
++        (False, True): "positive_endpoints",
++        (True, True): "nonzero_divisors_and_positive_cagr_endpoints",
++    }[("divide" in ops, "cagr" in ops)]
++    return tuple(sorted(periods)), denominator
++
++
++def _metric(wire, template_id, dimension, metric_id, weight, slots, policies, contracts):
++    expected = {field.name for field in fields(MetricDefinition)} - {"original_formula"}
++    _keys(wire, expected, f"metric {template_id}.{dimension}.{metric_id}")
++    if wire["metric_id"] != metric_id or wire["dimension"] != dimension or _decimal(wire["internal_weight"], "internal_weight") != weight:
++        raise RegistryValidationError("metric slot identity or internal_weight differs from V3")
++    if wire["direction"] not in ("higher", "lower"):
++        raise RegistryValidationError("metric direction must be higher or lower")
++    keys = _texts(wire["required_feature_keys"], "required_feature_keys")
++    _keys(wire["formula"], ("op", "feature_key"), "formula")
++    _keys(wire["field_map"], ("value",), "field_map")
++    if len(keys) != 1 or wire["formula"] != {"op": "feature", "feature_key": keys[0]} or wire["field_map"]["value"] != keys[0]:
++        raise RegistryValidationError("formula and field_map must reference the sole required feature key")
++    slot = slots.get(keys[0])
++    if slot is None or slot.template_id != template_id or slot.dimension != dimension or slot.required is not True:
++        raise RegistryValidationError("required feature key is absent or incompatible within this template")
++    original = slot.to_dict()["formula"]
++    periods, denominator = _formula_requirements(original)
++    if (_text(wire["formula_version"], "formula_version") != slot.formula_version
++        or _text(wire["unit_rule"], "unit_rule") != slot.unit
++        or _texts(wire["period_rule"], "period_rule") != periods
++        or wire["denominator_rule"] != denominator or wire["invalid_denominator_rule"] != "block"):
++        raise RegistryValidationError("formula_version, unit_rule, period_rule or denominator_rule differs from signed feature formula")
++    _text(wire["field_map_version"], "field_map_version")
++    _text(wire["equivalence_description"], "equivalence_description")
++    _texts(wire["source_evidence_categories"], "source_evidence_categories")
++    if type(wire["policy_refs"]) is not list or not wire["policy_refs"]:
++        raise RegistryValidationError("metric policy_refs must be explicit")
++    for reference in wire["policy_refs"]:
++        _rule(reference, policies, contracts, _POLICY_ROLES)
++    values = {key: _freeze(value) for key, value in wire.items()}
++    values.update(internal_weight=weight, original_formula=_freeze(original))
++    return MetricDefinition(**values)
++
++
++def _parse(raw, approval, bundle, feature_registry):
++    wrapper = _load(raw)
++    _keys(wrapper, ("registry_role", "schema_version", "descriptors", "scoring"), "scoring wrapper")
++    if wrapper["registry_role"] != "scoring" or wrapper["schema_version"] != "formal-scoring-registry-v1":
++        raise RegistryValidationError("unsupported scoring wrapper")
++    if type(wrapper["descriptors"]) is not list:
++        raise RegistryValidationError("descriptors must be an array")
++    scoring = wrapper["scoring"]
++    if type(scoring) is not dict or scoring.get("purpose") not in ("test", "official"):
++        raise RegistryValidationError("scoring purpose must be test or official")
++    purpose = scoring["purpose"]
++    expected = {"contract_version", "purpose", "dimension_weights", "internal_weights", "templates", "policy_contracts",
++        "cyclic_rule", "redlines", "status_rules", "market_liquidity_rule"}
++    if purpose == "test":
++        expected |= {"fixture_feature_slots", "fixture_policies"}
++    _keys(scoring, expected, "scoring")
++    if scoring["contract_version"] != "V3":
++        raise RegistryValidationError("scoring contract_version must be V3")
++    if type(approval) is not RegistryApproval or approval.purpose != purpose:
++        raise RegistryValidationError("official or test approval purpose differs from content")
++    digest = hashlib.sha256(raw).hexdigest()
++    if purpose == "official":
++        role_hashes = _graph(bundle)
++        if (approval.approved_content_sha256 != digest or type(approval.approved_content_sha256) is not str
++            or _text(approval.approval_id, "approval_id") != bundle.manifest.approval_id):
++            raise RegistryValidationError("official approval hash or approval_id mismatch")
++        if raw != bundle.blob("scoring").canonical_json:
++            raise RegistryValidationError("scoring bytes differ from registry manifest")
++        slots = _feature_slots(feature_registry, bundle)
++    else:
++        if bundle is not None or approval.approved_content_sha256 is not None or approval.approval_id is not None or feature_registry is not None:
++            raise RegistryValidationError("test fixture cannot use an official bundle or approval")
++        role_hashes = {}
++        values = scoring["fixture_feature_slots"]
++        if type(values) is not list or not values:
++            raise RegistryValidationError("fixture_feature_slots must be explicit")
++        slots = {t: {} for t in _TEMPLATES}
++        for value in values:
++            slot = FormalFeatureSlot.from_dict(value)
++            if slot.slot_id in slots[slot.template_id]:
++                raise RegistryValidationError("duplicate fixture feature slot")
++            slots[slot.template_id][slot.slot_id] = slot
++    _keys(scoring["dimension_weights"], _DIMENSIONS, "dimension_weights")
++    weights = {d: _decimal(scoring["dimension_weights"][d], "dimension_weights") for d in _DIMENSIONS}
++    if tuple(weights.values()) != _WEIGHTS or sum(weights.values()) != Decimal("1.00"):
++        raise RegistryValidationError("dimension_weights must match exact V3 weights")
++    _keys(scoring["internal_weights"], _DIMENSIONS, "internal_weights")
++    internal = {}
++    for d, expected_weights in zip(_DIMENSIONS, _INTERNAL):
++        values = scoring["internal_weights"][d]
++        if type(values) is not list:
++            raise RegistryValidationError("internal_weights must be arrays")
++        internal[d] = tuple(_decimal(w, "internal_weights") for w in values)
++        if internal[d] != tuple(map(Decimal, expected_weights)):
++            raise RegistryValidationError("internal_weights differ from V3")
++    policies = _policies(scoring, bundle, purpose)
++    contracts = scoring["policy_contracts"]
++    _keys(scoring["templates"], _TEMPLATES, "templates")
++    templates = {}
++    for t in _TEMPLATES:
++        template = scoring["templates"][t]
++        _keys(template, ("template_id", "metrics"), "template")
++        if template["template_id"] != t:
++            raise RegistryValidationError("template_id mismatch")
++        _keys(template["metrics"], _DIMENSIONS, "template metrics")
++        metrics = {}
++        for d, metric_ids in zip(_DIMENSIONS, _SLOTS):
++            values = template["metrics"][d]
++            if type(values) is not list or len(values) != len(metric_ids):
++                raise RegistryValidationError(f"template {t}.{d} must contain every V3 slot")
++            metrics[d] = tuple(_metric(w, t, d, m, weight, slots[t], policies, contracts)
++                for w, m, weight in zip(values, metric_ids, internal[d]))
++        templates[t] = TemplateDefinition(t, MappingProxyType(metrics))
++    cyclic = _rule(scoring["cyclic_rule"], policies, contracts, ("cyclic",))
++    cyclic_wire = policies["cyclic"]["rules"][cyclic.rule_id]
++    _keys(cyclic_wire, ("secondary_industries",), "cyclic classification")
++    industries = frozenset(_texts(cyclic_wire["secondary_industries"], "cyclic secondary_industries", allow_empty=True))
++    references = {}
++    for name, roles, cls in (("redlines", ("redline",), RedlineDefinition), ("status_rules", ("status", "event"), StatusRule)):
++        if type(scoring[name]) is not list or not scoring[name]:
++            raise RegistryValidationError(f"{name} must be explicit nonempty rules")
++        rules = tuple(_rule(ref, policies, contracts, roles, cls) for ref in scoring[name])
++        if len({(rule.policy_role, rule.rule_id) for rule in rules}) != len(rules) or {r.policy_role for r in rules} != set(roles):
++            raise RegistryValidationError(f"{name} requires unique rules for every role")
++        references[name] = rules
++    market = _rule(scoring["market_liquidity_rule"], policies, contracts, ("status",))
++    return dict(contract_version="V3", content_sha256=digest, templates=MappingProxyType(templates),
++        dimension_weights=MappingProxyType(weights), internal_weights=MappingProxyType(internal),
++        cyclic_secondary_industries=industries, cyclic_rule=cyclic, market_liquidity_rule=market,
++        policy_contracts=_freeze(contracts), approval=RegistryApproval(approval.purpose, approval.approved_content_sha256, approval.approval_id),
++        registry_manifest_hash=bundle.manifest.manifest_hash if bundle is not None else None,
++        role_hashes=MappingProxyType(role_hashes), **references)
++
++
++def _trusted_registry():
++    seals = {}
++
++    def fingerprint(value):
++        if type(value) in (str, bytes, int, bool, Decimal, type(None)):
++            return (type(value), value)
++        if type(value) in (tuple, frozenset):
++            return (type(value), tuple(fingerprint(v) for v in (sorted(value) if type(value) is frozenset else value)))
++        if type(value) is MappingProxyType:
++            return (MappingProxyType, tuple((fingerprint(k), fingerprint(v)) for k, v in value.items()))
++        if type(value) in (FormalScoringRegistry, RegistryApproval, TemplateDefinition, MetricDefinition, RedlineDefinition, StatusRule):
++            return (type(value), tuple(fingerprint(object.__getattribute__(value, f.name)) for f in fields(value)))
++        raise RegistryValidationError("registry contains forged or mutable records")
++
++    def sealed(registry):
++        record = seals.get(id(registry))
++        try:
++            valid = type(registry) is FormalScoringRegistry and record is not None and record[0]() is registry and record[1] == fingerprint(registry)
++        except (AttributeError, TypeError, ValueError, RecursionError):
++            valid = False
++        if not valid:
++            raise RegistryValidationError("scoring registry is forged, copied, or mutated")
++        return record
++
++    @dataclass(frozen=True, slots=True, weakref_slot=True, init=False)
++    class FormalScoringRegistry:
++        contract_version: str
++        content_sha256: str
++        templates: Mapping[str, TemplateDefinition]
++        dimension_weights: Mapping[str, Decimal]
++        internal_weights: Mapping[str, tuple[Decimal, ...]]
++        cyclic_secondary_industries: frozenset[str]
++        redlines: tuple[RedlineDefinition, ...]
++        status_rules: tuple[StatusRule, ...]
++        cyclic_rule: StatusRule
++        market_liquidity_rule: StatusRule
++        policy_contracts: Mapping[str, Mapping[str, object]]
++        approval: RegistryApproval
++        registry_manifest_hash: str | None
++        role_hashes: Mapping[str, str]
++
++        def __init__(self, *args, **kwargs):
++            raise RegistryValidationError("FormalScoringRegistry requires load_formal_registry")
++
++        def template_for(self, template_id):
++            sealed(self)
++            if type(template_id) is not str or template_id not in self.templates:
++                raise RegistryValidationError("unknown template_id")
++            return self.templates[template_id]
++
++        def require_official(self, registry_bundle):
++            record = sealed(self)
++            if self.approval.purpose != "official":
++                raise RegistryValidationError("test registry cannot run official scoring")
++            try:
++                hashes = _graph(registry_bundle)
++                if registry_bundle.manifest.manifest_hash != self.registry_manifest_hash or hashes != dict(self.role_hashes):
++                    raise RegistryValidationError("registry manifest graph differs from loaded scoring registry")
++                if registry_bundle.blob("scoring").canonical_json != record[2]:
++                    raise RegistryValidationError("scoring content differs from registry manifest")
++                _feature_slots(record[3], registry_bundle)
++            except (ValueError, TypeError, AttributeError) as error:
++                raise RegistryValidationError(f"official registry manifest proof failed: {error}") from error
++
++    def load_formal_registry(source, approval, *, feature_registry=None):
++        try:
++            bundle = source if type(source) is VerifiedRegistryBundle else None
++            if type(approval) is not RegistryApproval:
++                raise RegistryValidationError("approval must be an exact RegistryApproval")
++            if approval.purpose == "official" and bundle is None:
++                raise RegistryValidationError("official scoring must load from registry_bundle.blob('scoring')")
++            raw = bundle.blob("scoring").canonical_json if bundle is not None else source if type(source) is bytes else Path(source).read_bytes()
++            values = _parse(raw, approval, bundle, feature_registry)
++            registry = object.__new__(FormalScoringRegistry)
++            for name, value in values.items():
++                object.__setattr__(registry, name, value)
++            identity = id(registry)
++            seals[identity] = (weakref.ref(registry, lambda _: seals.pop(identity, None)), fingerprint(registry), raw, feature_registry)
++            if bundle is not None:
++                registry.require_official(bundle)
++            return registry
++        except (OSError, ValueError, TypeError, AttributeError, KeyError, RecursionError) as error:
++            raise RegistryValidationError(f"invalid scoring registry: {error}") from error
++
++    return FormalScoringRegistry, load_formal_registry
++
++
++FormalScoringRegistry, load_formal_registry = _trusted_registry()
++del _trusted_registry
++
++__all__ = ["FormalScoringRegistry", "TemplateDefinition", "MetricDefinition", "RedlineDefinition",
++    "StatusRule", "RegistryApproval", "RegistryValidationError", "load_formal_registry"]
+
+diff --git a/tests/fixtures/formal_v3_test_registry.json b/tests/fixtures/formal_v3_test_registry.json
+new file mode 100644
+index 0000000..715eb69
+--- /dev/null
++++ b/tests/fixtures/formal_v3_test_registry.json
+@@ -0,0 +1 @@
++{"descriptors":[],"registry_role":"scoring","schema_version":"formal-scoring-registry-v1","scoring":{"contract_version":"V3","cyclic_rule":{"policy_role":"cyclic","rule_id":"classification"},"dimension_weights":{"CA":"0.16","EQ":"0.12","FS":"0.08","G":"0.18","M":"0.18","T":"0.10","V":"0.18"},"fixture_feature_slots":[{"dimension":"CA","formula":{"fact_key":"fixture.bank.capital_discipline","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.CA.capital_discipline","template_id":"bank","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.bank.incremental_capital_return","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.CA.incremental_capital_return","template_id":"bank","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.bank.return_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.CA.return_persistence","template_id":"bank","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.bank.shareholder_return_and_dilution","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.CA.shareholder_return_and_dilution","template_id":"bank","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.bank.accrual_quality","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.EQ.accrual_quality","template_id":"bank","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.bank.cash_flow_to_operating_profit","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.EQ.cash_flow_to_operating_profit","template_id":"bank","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.bank.core_profit_share","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.EQ.core_profit_share","template_id":"bank","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.bank.working_capital_quality","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.EQ.working_capital_quality","template_id":"bank","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.bank.asset_or_contingent_risk","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.FS.asset_or_contingent_risk","template_id":"bank","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.bank.leverage_or_regulatory_capital","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.FS.leverage_or_regulatory_capital","template_id":"bank","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.bank.liquidity_or_interest_coverage","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.FS.liquidity_or_interest_coverage","template_id":"bank","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.bank.operating_profit_per_share_cagr_3y","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.G.operating_profit_per_share_cagr_3y","template_id":"bank","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.bank.operating_profit_per_share_yoy","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.G.operating_profit_per_share_yoy","template_id":"bank","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.bank.operating_revenue_cagr_3y","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.G.operating_revenue_cagr_3y","template_id":"bank","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.bank.operating_revenue_yoy","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.G.operating_revenue_yoy","template_id":"bank","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.bank.cash_conversion_or_asset_efficiency","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.M.cash_conversion_or_asset_efficiency","template_id":"bank","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.bank.margin_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.M.margin_persistence","template_id":"bank","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.bank.return_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.M.return_persistence","template_id":"bank","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.bank.expectation_change","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.T.expectation_change","template_id":"bank","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.bank.historical_valuation","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.T.historical_valuation","template_id":"bank","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.bank.price_trend_and_volatility","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.T.price_trend_and_volatility","template_id":"bank","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.bank.quantified_event_and_liquidity","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.T.quantified_event_and_liquidity","template_id":"bank","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.bank.enterprise_value_or_sustainable_roe","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.V.enterprise_value_or_sustainable_roe","template_id":"bank","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.bank.normalized_earnings_yield","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.V.normalized_earnings_yield","template_id":"bank","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.bank.normalized_free_cash_flow_yield","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"bank.V.normalized_free_cash_flow_yield","template_id":"bank","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.broker.capital_discipline","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.CA.capital_discipline","template_id":"broker","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.broker.incremental_capital_return","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.CA.incremental_capital_return","template_id":"broker","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.broker.return_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.CA.return_persistence","template_id":"broker","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.broker.shareholder_return_and_dilution","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.CA.shareholder_return_and_dilution","template_id":"broker","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.broker.accrual_quality","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.EQ.accrual_quality","template_id":"broker","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.broker.cash_flow_to_operating_profit","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.EQ.cash_flow_to_operating_profit","template_id":"broker","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.broker.core_profit_share","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.EQ.core_profit_share","template_id":"broker","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.broker.working_capital_quality","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.EQ.working_capital_quality","template_id":"broker","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.broker.asset_or_contingent_risk","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.FS.asset_or_contingent_risk","template_id":"broker","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.broker.leverage_or_regulatory_capital","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.FS.leverage_or_regulatory_capital","template_id":"broker","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.broker.liquidity_or_interest_coverage","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.FS.liquidity_or_interest_coverage","template_id":"broker","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.broker.operating_profit_per_share_cagr_3y","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.G.operating_profit_per_share_cagr_3y","template_id":"broker","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.broker.operating_profit_per_share_yoy","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.G.operating_profit_per_share_yoy","template_id":"broker","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.broker.operating_revenue_cagr_3y","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.G.operating_revenue_cagr_3y","template_id":"broker","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.broker.operating_revenue_yoy","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.G.operating_revenue_yoy","template_id":"broker","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.broker.cash_conversion_or_asset_efficiency","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.M.cash_conversion_or_asset_efficiency","template_id":"broker","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.broker.margin_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.M.margin_persistence","template_id":"broker","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.broker.return_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.M.return_persistence","template_id":"broker","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.broker.expectation_change","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.T.expectation_change","template_id":"broker","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.broker.historical_valuation","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.T.historical_valuation","template_id":"broker","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.broker.price_trend_and_volatility","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.T.price_trend_and_volatility","template_id":"broker","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.broker.quantified_event_and_liquidity","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.T.quantified_event_and_liquidity","template_id":"broker","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.broker.enterprise_value_or_sustainable_roe","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.V.enterprise_value_or_sustainable_roe","template_id":"broker","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.broker.normalized_earnings_yield","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.V.normalized_earnings_yield","template_id":"broker","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.broker.normalized_free_cash_flow_yield","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"broker.V.normalized_free_cash_flow_yield","template_id":"broker","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.general_nonfinancial.capital_discipline","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.CA.capital_discipline","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.general_nonfinancial.incremental_capital_return","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.CA.incremental_capital_return","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.general_nonfinancial.return_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.CA.return_persistence","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.general_nonfinancial.shareholder_return_and_dilution","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.CA.shareholder_return_and_dilution","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.general_nonfinancial.accrual_quality","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.EQ.accrual_quality","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.general_nonfinancial.cash_flow_to_operating_profit","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.EQ.cash_flow_to_operating_profit","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.general_nonfinancial.core_profit_share","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.EQ.core_profit_share","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.general_nonfinancial.working_capital_quality","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.EQ.working_capital_quality","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.general_nonfinancial.asset_or_contingent_risk","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.FS.asset_or_contingent_risk","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.general_nonfinancial.leverage_or_regulatory_capital","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.FS.leverage_or_regulatory_capital","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.general_nonfinancial.liquidity_or_interest_coverage","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.FS.liquidity_or_interest_coverage","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.general_nonfinancial.operating_profit_per_share_cagr_3y","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.G.operating_profit_per_share_cagr_3y","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.general_nonfinancial.operating_profit_per_share_yoy","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.G.operating_profit_per_share_yoy","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.general_nonfinancial.operating_revenue_cagr_3y","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.G.operating_revenue_cagr_3y","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.general_nonfinancial.operating_revenue_yoy","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.G.operating_revenue_yoy","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.general_nonfinancial.cash_conversion_or_asset_efficiency","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.M.cash_conversion_or_asset_efficiency","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.general_nonfinancial.margin_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.M.margin_persistence","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.general_nonfinancial.return_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.M.return_persistence","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.general_nonfinancial.expectation_change","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.T.expectation_change","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.general_nonfinancial.historical_valuation","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.T.historical_valuation","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.general_nonfinancial.price_trend_and_volatility","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.T.price_trend_and_volatility","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.general_nonfinancial.quantified_event_and_liquidity","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.T.quantified_event_and_liquidity","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.general_nonfinancial.enterprise_value_or_sustainable_roe","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.V.enterprise_value_or_sustainable_roe","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.general_nonfinancial.normalized_earnings_yield","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.V.normalized_earnings_yield","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.general_nonfinancial.normalized_free_cash_flow_yield","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"general_nonfinancial.V.normalized_free_cash_flow_yield","template_id":"general_nonfinancial","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.insurance.capital_discipline","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.CA.capital_discipline","template_id":"insurance","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.insurance.incremental_capital_return","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.CA.incremental_capital_return","template_id":"insurance","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.insurance.return_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.CA.return_persistence","template_id":"insurance","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.insurance.shareholder_return_and_dilution","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.CA.shareholder_return_and_dilution","template_id":"insurance","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.insurance.accrual_quality","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.EQ.accrual_quality","template_id":"insurance","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.insurance.cash_flow_to_operating_profit","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.EQ.cash_flow_to_operating_profit","template_id":"insurance","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.insurance.core_profit_share","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.EQ.core_profit_share","template_id":"insurance","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.insurance.working_capital_quality","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.EQ.working_capital_quality","template_id":"insurance","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.insurance.asset_or_contingent_risk","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.FS.asset_or_contingent_risk","template_id":"insurance","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.insurance.leverage_or_regulatory_capital","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.FS.leverage_or_regulatory_capital","template_id":"insurance","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.insurance.liquidity_or_interest_coverage","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.FS.liquidity_or_interest_coverage","template_id":"insurance","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.insurance.operating_profit_per_share_cagr_3y","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.G.operating_profit_per_share_cagr_3y","template_id":"insurance","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.insurance.operating_profit_per_share_yoy","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.G.operating_profit_per_share_yoy","template_id":"insurance","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.insurance.operating_revenue_cagr_3y","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.G.operating_revenue_cagr_3y","template_id":"insurance","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.insurance.operating_revenue_yoy","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.G.operating_revenue_yoy","template_id":"insurance","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.insurance.cash_conversion_or_asset_efficiency","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.M.cash_conversion_or_asset_efficiency","template_id":"insurance","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.insurance.margin_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.M.margin_persistence","template_id":"insurance","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.insurance.return_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.M.return_persistence","template_id":"insurance","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.insurance.expectation_change","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.T.expectation_change","template_id":"insurance","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.insurance.historical_valuation","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.T.historical_valuation","template_id":"insurance","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.insurance.price_trend_and_volatility","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.T.price_trend_and_volatility","template_id":"insurance","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.insurance.quantified_event_and_liquidity","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.T.quantified_event_and_liquidity","template_id":"insurance","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.insurance.enterprise_value_or_sustainable_roe","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.V.enterprise_value_or_sustainable_roe","template_id":"insurance","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.insurance.normalized_earnings_yield","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.V.normalized_earnings_yield","template_id":"insurance","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.insurance.normalized_free_cash_flow_yield","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"insurance.V.normalized_free_cash_flow_yield","template_id":"insurance","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.real_estate.capital_discipline","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.CA.capital_discipline","template_id":"real_estate","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.real_estate.incremental_capital_return","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.CA.incremental_capital_return","template_id":"real_estate","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.real_estate.return_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.CA.return_persistence","template_id":"real_estate","unit":"ratio"},{"dimension":"CA","formula":{"fact_key":"fixture.real_estate.shareholder_return_and_dilution","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.CA.shareholder_return_and_dilution","template_id":"real_estate","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.real_estate.accrual_quality","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.EQ.accrual_quality","template_id":"real_estate","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.real_estate.cash_flow_to_operating_profit","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.EQ.cash_flow_to_operating_profit","template_id":"real_estate","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.real_estate.core_profit_share","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.EQ.core_profit_share","template_id":"real_estate","unit":"ratio"},{"dimension":"EQ","formula":{"fact_key":"fixture.real_estate.working_capital_quality","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.EQ.working_capital_quality","template_id":"real_estate","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.real_estate.asset_or_contingent_risk","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.FS.asset_or_contingent_risk","template_id":"real_estate","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.real_estate.leverage_or_regulatory_capital","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.FS.leverage_or_regulatory_capital","template_id":"real_estate","unit":"ratio"},{"dimension":"FS","formula":{"fact_key":"fixture.real_estate.liquidity_or_interest_coverage","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.FS.liquidity_or_interest_coverage","template_id":"real_estate","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.real_estate.operating_profit_per_share_cagr_3y","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.G.operating_profit_per_share_cagr_3y","template_id":"real_estate","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.real_estate.operating_profit_per_share_yoy","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.G.operating_profit_per_share_yoy","template_id":"real_estate","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.real_estate.operating_revenue_cagr_3y","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.G.operating_revenue_cagr_3y","template_id":"real_estate","unit":"ratio"},{"dimension":"G","formula":{"fact_key":"fixture.real_estate.operating_revenue_yoy","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.G.operating_revenue_yoy","template_id":"real_estate","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.real_estate.cash_conversion_or_asset_efficiency","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.M.cash_conversion_or_asset_efficiency","template_id":"real_estate","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.real_estate.margin_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.M.margin_persistence","template_id":"real_estate","unit":"ratio"},{"dimension":"M","formula":{"fact_key":"fixture.real_estate.return_persistence","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.M.return_persistence","template_id":"real_estate","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.real_estate.expectation_change","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.T.expectation_change","template_id":"real_estate","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.real_estate.historical_valuation","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.T.historical_valuation","template_id":"real_estate","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.real_estate.price_trend_and_volatility","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.T.price_trend_and_volatility","template_id":"real_estate","unit":"ratio"},{"dimension":"T","formula":{"fact_key":"fixture.real_estate.quantified_event_and_liquidity","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.T.quantified_event_and_liquidity","template_id":"real_estate","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.real_estate.enterprise_value_or_sustainable_roe","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.V.enterprise_value_or_sustainable_roe","template_id":"real_estate","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.real_estate.normalized_earnings_yield","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.V.normalized_earnings_yield","template_id":"real_estate","unit":"ratio"},{"dimension":"V","formula":{"fact_key":"fixture.real_estate.normalized_free_cash_flow_yield","op":"fact","period_key":"FY0"},"formula_version":"fixture-feature-formula-v1","required":true,"slot_id":"real_estate.V.normalized_free_cash_flow_yield","template_id":"real_estate","unit":"ratio"}],"fixture_policies":{"cyclic":{"purpose":"test","registry_role":"cyclic","registry_version":"fixture-policy-v1","rules":{"classification":{"secondary_industries":["fixture-cyclic"]}},"schema_version":"formal-scoring-policy-v1","source_evidence_categories":["fixture-verified-evidence"]},"event":{"purpose":"test","registry_role":"event","registry_version":"fixture-policy-v1","rules":{"event":{"evidence_kind":"fixture-event"}},"schema_version":"formal-scoring-policy-v1","source_evidence_categories":["fixture-verified-evidence"]},"redline":{"purpose":"test","registry_role":"redline","registry_version":"fixture-policy-v1","rules":{"redline":{"evidence_kind":"fixture-redline"}},"schema_version":"formal-scoring-policy-v1","source_evidence_categories":["fixture-verified-evidence"]},"status":{"purpose":"test","registry_role":"status","registry_version":"fixture-policy-v1","rules":{"market_liquidity":{"evidence_kind":"fixture-market"},"status":{"evidence_kind":"fixture-status"}},"schema_version":"formal-scoring-policy-v1","source_evidence_categories":["fixture-verified-evidence"]}},"internal_weights":{"CA":["0.35","0.30","0.20","0.15"],"EQ":["0.35","0.25","0.20","0.20"],"FS":["0.40","0.35","0.25"],"G":["0.35","0.25","0.25","0.15"],"M":["0.40","0.30","0.30"],"T":["0.35","0.25","0.25","0.15"],"V":["0.45","0.25","0.30"]},"market_liquidity_rule":{"policy_role":"status","rule_id":"market_liquidity"},"policy_contracts":{"cyclic":{"registry_hash":"e7ec64743f4a33df78d3173f00db6dda1617fc5d8ef72795b2f1a21bc9f65944","registry_version":"fixture-policy-v1","source_evidence_categories":["fixture-verified-evidence"]},"event":{"registry_hash":"1600ae96b19fe32c039261788b657193b5c35175ef7b5afd66e5f0ae49a95f6b","registry_version":"fixture-policy-v1","source_evidence_categories":["fixture-verified-evidence"]},"redline":{"registry_hash":"1bf956385a2091f64f3dd50f6c7b5c292acb63592ca8e175d5e0857729752d17","registry_version":"fixture-policy-v1","source_evidence_categories":["fixture-verified-evidence"]},"status":{"registry_hash":"3f18fb8ef94c2282407c08a64d1eed74c01320d10fe544bd98f7070e3ba5ba47","registry_version":"fixture-policy-v1","source_evidence_categories":["fixture-verified-evidence"]}},"purpose":"test","redlines":[{"policy_role":"redline","rule_id":"redline"}],"status_rules":[{"policy_role":"status","rule_id":"status"},{"policy_role":"event","rule_id":"event"}],"templates":{"bank":{"metrics":{"CA":[{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic bank equivalent for return_persistence; not investment policy","field_map":{"value":"bank.CA.return_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.CA.return_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"return_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.CA.return_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic bank equivalent for incremental_capital_return; not investment policy","field_map":{"value":"bank.CA.incremental_capital_return"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.CA.incremental_capital_return","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"incremental_capital_return","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.CA.incremental_capital_return"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic bank equivalent for shareholder_return_and_dilution; not investment policy","field_map":{"value":"bank.CA.shareholder_return_and_dilution"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.CA.shareholder_return_and_dilution","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"shareholder_return_and_dilution","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.CA.shareholder_return_and_dilution"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic bank equivalent for capital_discipline; not investment policy","field_map":{"value":"bank.CA.capital_discipline"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.CA.capital_discipline","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"capital_discipline","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.CA.capital_discipline"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"EQ":[{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic bank equivalent for cash_flow_to_operating_profit; not investment policy","field_map":{"value":"bank.EQ.cash_flow_to_operating_profit"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.EQ.cash_flow_to_operating_profit","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"cash_flow_to_operating_profit","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.EQ.cash_flow_to_operating_profit"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic bank equivalent for accrual_quality; not investment policy","field_map":{"value":"bank.EQ.accrual_quality"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.EQ.accrual_quality","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"accrual_quality","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.EQ.accrual_quality"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic bank equivalent for core_profit_share; not investment policy","field_map":{"value":"bank.EQ.core_profit_share"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.EQ.core_profit_share","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"core_profit_share","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.EQ.core_profit_share"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic bank equivalent for working_capital_quality; not investment policy","field_map":{"value":"bank.EQ.working_capital_quality"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.EQ.working_capital_quality","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"working_capital_quality","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.EQ.working_capital_quality"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"FS":[{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic bank equivalent for leverage_or_regulatory_capital; not investment policy","field_map":{"value":"bank.FS.leverage_or_regulatory_capital"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.FS.leverage_or_regulatory_capital","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.40","invalid_denominator_rule":"block","metric_id":"leverage_or_regulatory_capital","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.FS.leverage_or_regulatory_capital"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic bank equivalent for liquidity_or_interest_coverage; not investment policy","field_map":{"value":"bank.FS.liquidity_or_interest_coverage"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.FS.liquidity_or_interest_coverage","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"liquidity_or_interest_coverage","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.FS.liquidity_or_interest_coverage"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic bank equivalent for asset_or_contingent_risk; not investment policy","field_map":{"value":"bank.FS.asset_or_contingent_risk"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.FS.asset_or_contingent_risk","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"asset_or_contingent_risk","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.FS.asset_or_contingent_risk"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"G":[{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic bank equivalent for operating_profit_per_share_cagr_3y; not investment policy","field_map":{"value":"bank.G.operating_profit_per_share_cagr_3y"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.G.operating_profit_per_share_cagr_3y","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"operating_profit_per_share_cagr_3y","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.G.operating_profit_per_share_cagr_3y"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic bank equivalent for operating_profit_per_share_yoy; not investment policy","field_map":{"value":"bank.G.operating_profit_per_share_yoy"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.G.operating_profit_per_share_yoy","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"operating_profit_per_share_yoy","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.G.operating_profit_per_share_yoy"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic bank equivalent for operating_revenue_cagr_3y; not investment policy","field_map":{"value":"bank.G.operating_revenue_cagr_3y"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.G.operating_revenue_cagr_3y","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"operating_revenue_cagr_3y","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.G.operating_revenue_cagr_3y"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic bank equivalent for operating_revenue_yoy; not investment policy","field_map":{"value":"bank.G.operating_revenue_yoy"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.G.operating_revenue_yoy","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"operating_revenue_yoy","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.G.operating_revenue_yoy"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"M":[{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic bank equivalent for return_persistence; not investment policy","field_map":{"value":"bank.M.return_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.M.return_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.40","invalid_denominator_rule":"block","metric_id":"return_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.M.return_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic bank equivalent for margin_persistence; not investment policy","field_map":{"value":"bank.M.margin_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.M.margin_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"margin_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.M.margin_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic bank equivalent for cash_conversion_or_asset_efficiency; not investment policy","field_map":{"value":"bank.M.cash_conversion_or_asset_efficiency"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.M.cash_conversion_or_asset_efficiency","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"cash_conversion_or_asset_efficiency","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.M.cash_conversion_or_asset_efficiency"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"T":[{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic bank equivalent for historical_valuation; not investment policy","field_map":{"value":"bank.T.historical_valuation"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.T.historical_valuation","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"historical_valuation","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.T.historical_valuation"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic bank equivalent for price_trend_and_volatility; not investment policy","field_map":{"value":"bank.T.price_trend_and_volatility"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.T.price_trend_and_volatility","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"price_trend_and_volatility","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.T.price_trend_and_volatility"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic bank equivalent for expectation_change; not investment policy","field_map":{"value":"bank.T.expectation_change"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.T.expectation_change","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"expectation_change","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.T.expectation_change"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic bank equivalent for quantified_event_and_liquidity; not investment policy","field_map":{"value":"bank.T.quantified_event_and_liquidity"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.T.quantified_event_and_liquidity","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"quantified_event_and_liquidity","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.T.quantified_event_and_liquidity"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"V":[{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic bank equivalent for normalized_earnings_yield; not investment policy","field_map":{"value":"bank.V.normalized_earnings_yield"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.V.normalized_earnings_yield","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.45","invalid_denominator_rule":"block","metric_id":"normalized_earnings_yield","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.V.normalized_earnings_yield"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic bank equivalent for normalized_free_cash_flow_yield; not investment policy","field_map":{"value":"bank.V.normalized_free_cash_flow_yield"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.V.normalized_free_cash_flow_yield","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"normalized_free_cash_flow_yield","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.V.normalized_free_cash_flow_yield"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic bank equivalent for enterprise_value_or_sustainable_roe; not investment policy","field_map":{"value":"bank.V.enterprise_value_or_sustainable_roe"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"bank.V.enterprise_value_or_sustainable_roe","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"enterprise_value_or_sustainable_roe","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["bank.V.enterprise_value_or_sustainable_roe"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}]},"template_id":"bank"},"broker":{"metrics":{"CA":[{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic broker equivalent for return_persistence; not investment policy","field_map":{"value":"broker.CA.return_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.CA.return_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"return_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.CA.return_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic broker equivalent for incremental_capital_return; not investment policy","field_map":{"value":"broker.CA.incremental_capital_return"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.CA.incremental_capital_return","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"incremental_capital_return","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.CA.incremental_capital_return"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic broker equivalent for shareholder_return_and_dilution; not investment policy","field_map":{"value":"broker.CA.shareholder_return_and_dilution"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.CA.shareholder_return_and_dilution","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"shareholder_return_and_dilution","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.CA.shareholder_return_and_dilution"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic broker equivalent for capital_discipline; not investment policy","field_map":{"value":"broker.CA.capital_discipline"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.CA.capital_discipline","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"capital_discipline","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.CA.capital_discipline"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"EQ":[{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic broker equivalent for cash_flow_to_operating_profit; not investment policy","field_map":{"value":"broker.EQ.cash_flow_to_operating_profit"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.EQ.cash_flow_to_operating_profit","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"cash_flow_to_operating_profit","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.EQ.cash_flow_to_operating_profit"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic broker equivalent for accrual_quality; not investment policy","field_map":{"value":"broker.EQ.accrual_quality"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.EQ.accrual_quality","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"accrual_quality","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.EQ.accrual_quality"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic broker equivalent for core_profit_share; not investment policy","field_map":{"value":"broker.EQ.core_profit_share"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.EQ.core_profit_share","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"core_profit_share","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.EQ.core_profit_share"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic broker equivalent for working_capital_quality; not investment policy","field_map":{"value":"broker.EQ.working_capital_quality"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.EQ.working_capital_quality","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"working_capital_quality","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.EQ.working_capital_quality"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"FS":[{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic broker equivalent for leverage_or_regulatory_capital; not investment policy","field_map":{"value":"broker.FS.leverage_or_regulatory_capital"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.FS.leverage_or_regulatory_capital","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.40","invalid_denominator_rule":"block","metric_id":"leverage_or_regulatory_capital","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.FS.leverage_or_regulatory_capital"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic broker equivalent for liquidity_or_interest_coverage; not investment policy","field_map":{"value":"broker.FS.liquidity_or_interest_coverage"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.FS.liquidity_or_interest_coverage","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"liquidity_or_interest_coverage","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.FS.liquidity_or_interest_coverage"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic broker equivalent for asset_or_contingent_risk; not investment policy","field_map":{"value":"broker.FS.asset_or_contingent_risk"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.FS.asset_or_contingent_risk","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"asset_or_contingent_risk","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.FS.asset_or_contingent_risk"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"G":[{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic broker equivalent for operating_profit_per_share_cagr_3y; not investment policy","field_map":{"value":"broker.G.operating_profit_per_share_cagr_3y"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.G.operating_profit_per_share_cagr_3y","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"operating_profit_per_share_cagr_3y","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.G.operating_profit_per_share_cagr_3y"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic broker equivalent for operating_profit_per_share_yoy; not investment policy","field_map":{"value":"broker.G.operating_profit_per_share_yoy"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.G.operating_profit_per_share_yoy","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"operating_profit_per_share_yoy","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.G.operating_profit_per_share_yoy"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic broker equivalent for operating_revenue_cagr_3y; not investment policy","field_map":{"value":"broker.G.operating_revenue_cagr_3y"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.G.operating_revenue_cagr_3y","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"operating_revenue_cagr_3y","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.G.operating_revenue_cagr_3y"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic broker equivalent for operating_revenue_yoy; not investment policy","field_map":{"value":"broker.G.operating_revenue_yoy"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.G.operating_revenue_yoy","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"operating_revenue_yoy","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.G.operating_revenue_yoy"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"M":[{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic broker equivalent for return_persistence; not investment policy","field_map":{"value":"broker.M.return_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.M.return_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.40","invalid_denominator_rule":"block","metric_id":"return_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.M.return_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic broker equivalent for margin_persistence; not investment policy","field_map":{"value":"broker.M.margin_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.M.margin_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"margin_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.M.margin_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic broker equivalent for cash_conversion_or_asset_efficiency; not investment policy","field_map":{"value":"broker.M.cash_conversion_or_asset_efficiency"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.M.cash_conversion_or_asset_efficiency","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"cash_conversion_or_asset_efficiency","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.M.cash_conversion_or_asset_efficiency"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"T":[{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic broker equivalent for historical_valuation; not investment policy","field_map":{"value":"broker.T.historical_valuation"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.T.historical_valuation","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"historical_valuation","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.T.historical_valuation"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic broker equivalent for price_trend_and_volatility; not investment policy","field_map":{"value":"broker.T.price_trend_and_volatility"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.T.price_trend_and_volatility","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"price_trend_and_volatility","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.T.price_trend_and_volatility"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic broker equivalent for expectation_change; not investment policy","field_map":{"value":"broker.T.expectation_change"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.T.expectation_change","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"expectation_change","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.T.expectation_change"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic broker equivalent for quantified_event_and_liquidity; not investment policy","field_map":{"value":"broker.T.quantified_event_and_liquidity"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.T.quantified_event_and_liquidity","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"quantified_event_and_liquidity","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.T.quantified_event_and_liquidity"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"V":[{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic broker equivalent for normalized_earnings_yield; not investment policy","field_map":{"value":"broker.V.normalized_earnings_yield"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.V.normalized_earnings_yield","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.45","invalid_denominator_rule":"block","metric_id":"normalized_earnings_yield","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.V.normalized_earnings_yield"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic broker equivalent for normalized_free_cash_flow_yield; not investment policy","field_map":{"value":"broker.V.normalized_free_cash_flow_yield"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.V.normalized_free_cash_flow_yield","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"normalized_free_cash_flow_yield","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.V.normalized_free_cash_flow_yield"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic broker equivalent for enterprise_value_or_sustainable_roe; not investment policy","field_map":{"value":"broker.V.enterprise_value_or_sustainable_roe"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"broker.V.enterprise_value_or_sustainable_roe","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"enterprise_value_or_sustainable_roe","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["broker.V.enterprise_value_or_sustainable_roe"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}]},"template_id":"broker"},"general_nonfinancial":{"metrics":{"CA":[{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for return_persistence; not investment policy","field_map":{"value":"general_nonfinancial.CA.return_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.CA.return_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"return_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.CA.return_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for incremental_capital_return; not investment policy","field_map":{"value":"general_nonfinancial.CA.incremental_capital_return"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.CA.incremental_capital_return","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"incremental_capital_return","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.CA.incremental_capital_return"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for shareholder_return_and_dilution; not investment policy","field_map":{"value":"general_nonfinancial.CA.shareholder_return_and_dilution"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.CA.shareholder_return_and_dilution","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"shareholder_return_and_dilution","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.CA.shareholder_return_and_dilution"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for capital_discipline; not investment policy","field_map":{"value":"general_nonfinancial.CA.capital_discipline"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.CA.capital_discipline","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"capital_discipline","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.CA.capital_discipline"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"EQ":[{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for cash_flow_to_operating_profit; not investment policy","field_map":{"value":"general_nonfinancial.EQ.cash_flow_to_operating_profit"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.EQ.cash_flow_to_operating_profit","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"cash_flow_to_operating_profit","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.EQ.cash_flow_to_operating_profit"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for accrual_quality; not investment policy","field_map":{"value":"general_nonfinancial.EQ.accrual_quality"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.EQ.accrual_quality","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"accrual_quality","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.EQ.accrual_quality"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for core_profit_share; not investment policy","field_map":{"value":"general_nonfinancial.EQ.core_profit_share"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.EQ.core_profit_share","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"core_profit_share","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.EQ.core_profit_share"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for working_capital_quality; not investment policy","field_map":{"value":"general_nonfinancial.EQ.working_capital_quality"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.EQ.working_capital_quality","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"working_capital_quality","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.EQ.working_capital_quality"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"FS":[{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for leverage_or_regulatory_capital; not investment policy","field_map":{"value":"general_nonfinancial.FS.leverage_or_regulatory_capital"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.FS.leverage_or_regulatory_capital","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.40","invalid_denominator_rule":"block","metric_id":"leverage_or_regulatory_capital","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.FS.leverage_or_regulatory_capital"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for liquidity_or_interest_coverage; not investment policy","field_map":{"value":"general_nonfinancial.FS.liquidity_or_interest_coverage"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.FS.liquidity_or_interest_coverage","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"liquidity_or_interest_coverage","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.FS.liquidity_or_interest_coverage"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for asset_or_contingent_risk; not investment policy","field_map":{"value":"general_nonfinancial.FS.asset_or_contingent_risk"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.FS.asset_or_contingent_risk","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"asset_or_contingent_risk","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.FS.asset_or_contingent_risk"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"G":[{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for operating_profit_per_share_cagr_3y; not investment policy","field_map":{"value":"general_nonfinancial.G.operating_profit_per_share_cagr_3y"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.G.operating_profit_per_share_cagr_3y","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"operating_profit_per_share_cagr_3y","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.G.operating_profit_per_share_cagr_3y"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for operating_profit_per_share_yoy; not investment policy","field_map":{"value":"general_nonfinancial.G.operating_profit_per_share_yoy"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.G.operating_profit_per_share_yoy","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"operating_profit_per_share_yoy","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.G.operating_profit_per_share_yoy"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for operating_revenue_cagr_3y; not investment policy","field_map":{"value":"general_nonfinancial.G.operating_revenue_cagr_3y"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.G.operating_revenue_cagr_3y","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"operating_revenue_cagr_3y","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.G.operating_revenue_cagr_3y"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for operating_revenue_yoy; not investment policy","field_map":{"value":"general_nonfinancial.G.operating_revenue_yoy"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.G.operating_revenue_yoy","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"operating_revenue_yoy","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.G.operating_revenue_yoy"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"M":[{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for return_persistence; not investment policy","field_map":{"value":"general_nonfinancial.M.return_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.M.return_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.40","invalid_denominator_rule":"block","metric_id":"return_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.M.return_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for margin_persistence; not investment policy","field_map":{"value":"general_nonfinancial.M.margin_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.M.margin_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"margin_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.M.margin_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for cash_conversion_or_asset_efficiency; not investment policy","field_map":{"value":"general_nonfinancial.M.cash_conversion_or_asset_efficiency"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.M.cash_conversion_or_asset_efficiency","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"cash_conversion_or_asset_efficiency","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.M.cash_conversion_or_asset_efficiency"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"T":[{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for historical_valuation; not investment policy","field_map":{"value":"general_nonfinancial.T.historical_valuation"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.T.historical_valuation","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"historical_valuation","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.T.historical_valuation"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for price_trend_and_volatility; not investment policy","field_map":{"value":"general_nonfinancial.T.price_trend_and_volatility"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.T.price_trend_and_volatility","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"price_trend_and_volatility","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.T.price_trend_and_volatility"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for expectation_change; not investment policy","field_map":{"value":"general_nonfinancial.T.expectation_change"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.T.expectation_change","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"expectation_change","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.T.expectation_change"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for quantified_event_and_liquidity; not investment policy","field_map":{"value":"general_nonfinancial.T.quantified_event_and_liquidity"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.T.quantified_event_and_liquidity","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"quantified_event_and_liquidity","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.T.quantified_event_and_liquidity"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"V":[{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for normalized_earnings_yield; not investment policy","field_map":{"value":"general_nonfinancial.V.normalized_earnings_yield"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.V.normalized_earnings_yield","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.45","invalid_denominator_rule":"block","metric_id":"normalized_earnings_yield","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.V.normalized_earnings_yield"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for normalized_free_cash_flow_yield; not investment policy","field_map":{"value":"general_nonfinancial.V.normalized_free_cash_flow_yield"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.V.normalized_free_cash_flow_yield","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"normalized_free_cash_flow_yield","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.V.normalized_free_cash_flow_yield"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic general_nonfinancial equivalent for enterprise_value_or_sustainable_roe; not investment policy","field_map":{"value":"general_nonfinancial.V.enterprise_value_or_sustainable_roe"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"general_nonfinancial.V.enterprise_value_or_sustainable_roe","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"enterprise_value_or_sustainable_roe","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["general_nonfinancial.V.enterprise_value_or_sustainable_roe"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}]},"template_id":"general_nonfinancial"},"insurance":{"metrics":{"CA":[{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic insurance equivalent for return_persistence; not investment policy","field_map":{"value":"insurance.CA.return_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.CA.return_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"return_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.CA.return_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic insurance equivalent for incremental_capital_return; not investment policy","field_map":{"value":"insurance.CA.incremental_capital_return"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.CA.incremental_capital_return","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"incremental_capital_return","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.CA.incremental_capital_return"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic insurance equivalent for shareholder_return_and_dilution; not investment policy","field_map":{"value":"insurance.CA.shareholder_return_and_dilution"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.CA.shareholder_return_and_dilution","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"shareholder_return_and_dilution","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.CA.shareholder_return_and_dilution"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic insurance equivalent for capital_discipline; not investment policy","field_map":{"value":"insurance.CA.capital_discipline"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.CA.capital_discipline","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"capital_discipline","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.CA.capital_discipline"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"EQ":[{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic insurance equivalent for cash_flow_to_operating_profit; not investment policy","field_map":{"value":"insurance.EQ.cash_flow_to_operating_profit"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.EQ.cash_flow_to_operating_profit","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"cash_flow_to_operating_profit","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.EQ.cash_flow_to_operating_profit"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic insurance equivalent for accrual_quality; not investment policy","field_map":{"value":"insurance.EQ.accrual_quality"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.EQ.accrual_quality","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"accrual_quality","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.EQ.accrual_quality"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic insurance equivalent for core_profit_share; not investment policy","field_map":{"value":"insurance.EQ.core_profit_share"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.EQ.core_profit_share","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"core_profit_share","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.EQ.core_profit_share"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic insurance equivalent for working_capital_quality; not investment policy","field_map":{"value":"insurance.EQ.working_capital_quality"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.EQ.working_capital_quality","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"working_capital_quality","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.EQ.working_capital_quality"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"FS":[{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic insurance equivalent for leverage_or_regulatory_capital; not investment policy","field_map":{"value":"insurance.FS.leverage_or_regulatory_capital"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.FS.leverage_or_regulatory_capital","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.40","invalid_denominator_rule":"block","metric_id":"leverage_or_regulatory_capital","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.FS.leverage_or_regulatory_capital"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic insurance equivalent for liquidity_or_interest_coverage; not investment policy","field_map":{"value":"insurance.FS.liquidity_or_interest_coverage"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.FS.liquidity_or_interest_coverage","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"liquidity_or_interest_coverage","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.FS.liquidity_or_interest_coverage"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic insurance equivalent for asset_or_contingent_risk; not investment policy","field_map":{"value":"insurance.FS.asset_or_contingent_risk"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.FS.asset_or_contingent_risk","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"asset_or_contingent_risk","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.FS.asset_or_contingent_risk"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"G":[{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic insurance equivalent for operating_profit_per_share_cagr_3y; not investment policy","field_map":{"value":"insurance.G.operating_profit_per_share_cagr_3y"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.G.operating_profit_per_share_cagr_3y","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"operating_profit_per_share_cagr_3y","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.G.operating_profit_per_share_cagr_3y"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic insurance equivalent for operating_profit_per_share_yoy; not investment policy","field_map":{"value":"insurance.G.operating_profit_per_share_yoy"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.G.operating_profit_per_share_yoy","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"operating_profit_per_share_yoy","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.G.operating_profit_per_share_yoy"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic insurance equivalent for operating_revenue_cagr_3y; not investment policy","field_map":{"value":"insurance.G.operating_revenue_cagr_3y"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.G.operating_revenue_cagr_3y","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"operating_revenue_cagr_3y","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.G.operating_revenue_cagr_3y"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic insurance equivalent for operating_revenue_yoy; not investment policy","field_map":{"value":"insurance.G.operating_revenue_yoy"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.G.operating_revenue_yoy","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"operating_revenue_yoy","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.G.operating_revenue_yoy"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"M":[{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic insurance equivalent for return_persistence; not investment policy","field_map":{"value":"insurance.M.return_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.M.return_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.40","invalid_denominator_rule":"block","metric_id":"return_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.M.return_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic insurance equivalent for margin_persistence; not investment policy","field_map":{"value":"insurance.M.margin_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.M.margin_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"margin_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.M.margin_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic insurance equivalent for cash_conversion_or_asset_efficiency; not investment policy","field_map":{"value":"insurance.M.cash_conversion_or_asset_efficiency"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.M.cash_conversion_or_asset_efficiency","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"cash_conversion_or_asset_efficiency","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.M.cash_conversion_or_asset_efficiency"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"T":[{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic insurance equivalent for historical_valuation; not investment policy","field_map":{"value":"insurance.T.historical_valuation"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.T.historical_valuation","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"historical_valuation","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.T.historical_valuation"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic insurance equivalent for price_trend_and_volatility; not investment policy","field_map":{"value":"insurance.T.price_trend_and_volatility"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.T.price_trend_and_volatility","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"price_trend_and_volatility","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.T.price_trend_and_volatility"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic insurance equivalent for expectation_change; not investment policy","field_map":{"value":"insurance.T.expectation_change"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.T.expectation_change","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"expectation_change","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.T.expectation_change"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic insurance equivalent for quantified_event_and_liquidity; not investment policy","field_map":{"value":"insurance.T.quantified_event_and_liquidity"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.T.quantified_event_and_liquidity","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"quantified_event_and_liquidity","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.T.quantified_event_and_liquidity"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"V":[{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic insurance equivalent for normalized_earnings_yield; not investment policy","field_map":{"value":"insurance.V.normalized_earnings_yield"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.V.normalized_earnings_yield","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.45","invalid_denominator_rule":"block","metric_id":"normalized_earnings_yield","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.V.normalized_earnings_yield"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic insurance equivalent for normalized_free_cash_flow_yield; not investment policy","field_map":{"value":"insurance.V.normalized_free_cash_flow_yield"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.V.normalized_free_cash_flow_yield","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"normalized_free_cash_flow_yield","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.V.normalized_free_cash_flow_yield"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic insurance equivalent for enterprise_value_or_sustainable_roe; not investment policy","field_map":{"value":"insurance.V.enterprise_value_or_sustainable_roe"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"insurance.V.enterprise_value_or_sustainable_roe","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"enterprise_value_or_sustainable_roe","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["insurance.V.enterprise_value_or_sustainable_roe"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}]},"template_id":"insurance"},"real_estate":{"metrics":{"CA":[{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for return_persistence; not investment policy","field_map":{"value":"real_estate.CA.return_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.CA.return_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"return_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.CA.return_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for incremental_capital_return; not investment policy","field_map":{"value":"real_estate.CA.incremental_capital_return"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.CA.incremental_capital_return","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"incremental_capital_return","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.CA.incremental_capital_return"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for shareholder_return_and_dilution; not investment policy","field_map":{"value":"real_estate.CA.shareholder_return_and_dilution"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.CA.shareholder_return_and_dilution","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"shareholder_return_and_dilution","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.CA.shareholder_return_and_dilution"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"CA","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for capital_discipline; not investment policy","field_map":{"value":"real_estate.CA.capital_discipline"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.CA.capital_discipline","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"capital_discipline","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.CA.capital_discipline"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"EQ":[{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for cash_flow_to_operating_profit; not investment policy","field_map":{"value":"real_estate.EQ.cash_flow_to_operating_profit"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.EQ.cash_flow_to_operating_profit","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"cash_flow_to_operating_profit","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.EQ.cash_flow_to_operating_profit"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for accrual_quality; not investment policy","field_map":{"value":"real_estate.EQ.accrual_quality"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.EQ.accrual_quality","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"accrual_quality","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.EQ.accrual_quality"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for core_profit_share; not investment policy","field_map":{"value":"real_estate.EQ.core_profit_share"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.EQ.core_profit_share","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"core_profit_share","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.EQ.core_profit_share"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"EQ","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for working_capital_quality; not investment policy","field_map":{"value":"real_estate.EQ.working_capital_quality"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.EQ.working_capital_quality","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.20","invalid_denominator_rule":"block","metric_id":"working_capital_quality","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.EQ.working_capital_quality"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"FS":[{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for leverage_or_regulatory_capital; not investment policy","field_map":{"value":"real_estate.FS.leverage_or_regulatory_capital"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.FS.leverage_or_regulatory_capital","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.40","invalid_denominator_rule":"block","metric_id":"leverage_or_regulatory_capital","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.FS.leverage_or_regulatory_capital"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for liquidity_or_interest_coverage; not investment policy","field_map":{"value":"real_estate.FS.liquidity_or_interest_coverage"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.FS.liquidity_or_interest_coverage","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"liquidity_or_interest_coverage","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.FS.liquidity_or_interest_coverage"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"FS","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for asset_or_contingent_risk; not investment policy","field_map":{"value":"real_estate.FS.asset_or_contingent_risk"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.FS.asset_or_contingent_risk","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"asset_or_contingent_risk","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.FS.asset_or_contingent_risk"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"G":[{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for operating_profit_per_share_cagr_3y; not investment policy","field_map":{"value":"real_estate.G.operating_profit_per_share_cagr_3y"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.G.operating_profit_per_share_cagr_3y","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"operating_profit_per_share_cagr_3y","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.G.operating_profit_per_share_cagr_3y"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for operating_profit_per_share_yoy; not investment policy","field_map":{"value":"real_estate.G.operating_profit_per_share_yoy"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.G.operating_profit_per_share_yoy","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"operating_profit_per_share_yoy","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.G.operating_profit_per_share_yoy"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for operating_revenue_cagr_3y; not investment policy","field_map":{"value":"real_estate.G.operating_revenue_cagr_3y"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.G.operating_revenue_cagr_3y","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"operating_revenue_cagr_3y","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.G.operating_revenue_cagr_3y"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"G","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for operating_revenue_yoy; not investment policy","field_map":{"value":"real_estate.G.operating_revenue_yoy"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.G.operating_revenue_yoy","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"operating_revenue_yoy","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.G.operating_revenue_yoy"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"M":[{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for return_persistence; not investment policy","field_map":{"value":"real_estate.M.return_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.M.return_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.40","invalid_denominator_rule":"block","metric_id":"return_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.M.return_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for margin_persistence; not investment policy","field_map":{"value":"real_estate.M.margin_persistence"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.M.margin_persistence","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"margin_persistence","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.M.margin_persistence"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"M","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for cash_conversion_or_asset_efficiency; not investment policy","field_map":{"value":"real_estate.M.cash_conversion_or_asset_efficiency"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.M.cash_conversion_or_asset_efficiency","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"cash_conversion_or_asset_efficiency","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.M.cash_conversion_or_asset_efficiency"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"T":[{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for historical_valuation; not investment policy","field_map":{"value":"real_estate.T.historical_valuation"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.T.historical_valuation","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.35","invalid_denominator_rule":"block","metric_id":"historical_valuation","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.T.historical_valuation"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for price_trend_and_volatility; not investment policy","field_map":{"value":"real_estate.T.price_trend_and_volatility"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.T.price_trend_and_volatility","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"price_trend_and_volatility","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.T.price_trend_and_volatility"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for expectation_change; not investment policy","field_map":{"value":"real_estate.T.expectation_change"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.T.expectation_change","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"expectation_change","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.T.expectation_change"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"T","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for quantified_event_and_liquidity; not investment policy","field_map":{"value":"real_estate.T.quantified_event_and_liquidity"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.T.quantified_event_and_liquidity","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.15","invalid_denominator_rule":"block","metric_id":"quantified_event_and_liquidity","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.T.quantified_event_and_liquidity"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}],"V":[{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for normalized_earnings_yield; not investment policy","field_map":{"value":"real_estate.V.normalized_earnings_yield"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.V.normalized_earnings_yield","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.45","invalid_denominator_rule":"block","metric_id":"normalized_earnings_yield","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.V.normalized_earnings_yield"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for normalized_free_cash_flow_yield; not investment policy","field_map":{"value":"real_estate.V.normalized_free_cash_flow_yield"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.V.normalized_free_cash_flow_yield","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.25","invalid_denominator_rule":"block","metric_id":"normalized_free_cash_flow_yield","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.V.normalized_free_cash_flow_yield"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"},{"denominator_rule":"not_applicable","dimension":"V","direction":"higher","equivalence_description":"Synthetic real_estate equivalent for enterprise_value_or_sustainable_roe; not investment policy","field_map":{"value":"real_estate.V.enterprise_value_or_sustainable_roe"},"field_map_version":"fixture-field-map-v1","formula":{"feature_key":"real_estate.V.enterprise_value_or_sustainable_roe","op":"feature"},"formula_version":"fixture-feature-formula-v1","internal_weight":"0.30","invalid_denominator_rule":"block","metric_id":"enterprise_value_or_sustainable_roe","period_rule":["FY0"],"policy_refs":[{"policy_role":"redline","rule_id":"redline"}],"required_feature_keys":["real_estate.V.enterprise_value_or_sustainable_roe"],"source_evidence_categories":["fixture-verified-evidence"],"unit_rule":"ratio"}]},"template_id":"real_estate"}}}}
+\ No newline at end of file
+
+diff --git a/tests/test_formal_scoring_registry.py b/tests/test_formal_scoring_registry.py
+new file mode 100644
+index 0000000..71b0c82
+--- /dev/null
++++ b/tests/test_formal_scoring_registry.py
+@@ -0,0 +1,308 @@
++"""Offline scoring registry contract and signed graph boundary tests."""
++
++import copy
++import hashlib
++import hmac
++import importlib
++import json
++from dataclasses import replace
++from decimal import Decimal
++from pathlib import Path
++import unittest
++
++from ashare_pipeline.formal_feature_contract import load_signed_feature_registry
++from ashare_pipeline.formal_registry_manifest import (
++    FormalRegistryBundleLoader, FormalRegistryManifest, VerifiedRegistryBlob,
++)
++from tests.test_formal_registry_manifest import InMemoryRepository, ROLES
++
++
++FIXTURE = Path(__file__).parent / "fixtures" / "formal_v3_test_registry.json"
++TEMPLATES = ("general_nonfinancial", "bank", "broker", "insurance", "real_estate")
++WEIGHTS = {"G": "0.18", "V": "0.18", "M": "0.18", "EQ": "0.12", "FS": "0.08", "CA": "0.16", "T": "0.10"}
++INTERNAL = {"G": ("0.35", "0.25", "0.25", "0.15"), "V": ("0.45", "0.25", "0.30"),
++    "M": ("0.40", "0.30", "0.30"), "EQ": ("0.35", "0.25", "0.20", "0.20"),
++    "FS": ("0.40", "0.35", "0.25"), "CA": ("0.35", "0.30", "0.20", "0.15"),
++    "T": ("0.35", "0.25", "0.25", "0.15")}
++
++
++def canonical(value):
++    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
++
++
++def fixture_wire():
++    return json.loads(FIXTURE.read_bytes())
++
++
++class HmacVerifier:
++    """A real byte-sensitive offline signature verifier with a test-only key."""
++    def sign(self, raw):
++        return hmac.new(b"scoring-contract-test-only-key", raw, hashlib.sha256).hexdigest()
++
++    def verify(self, raw, *, signature, key_id):
++        return key_id == "scoring-test-key" and hmac.compare_digest(self.sign(raw), signature)
++
++
++def signed_graph(*, mutate=None, context=False):
++    """Author one complete synthetic official-wire graph, never promote the test registry by approval."""
++    verifier = HmacVerifier()
++    wrapper = fixture_wire()
++    scoring = wrapper["scoring"]
++    slots = scoring.pop("fixture_feature_slots")
++    policies = scoring.pop("fixture_policies")
++    scoring["purpose"] = "official"
++    configs = []
++    if context:
++        from tests.test_formal_context_repository import descriptor
++        from tests.test_formal_sources import config
++        wrapper["descriptors"] = [descriptor()]
++        configs = [config(dataset="fixture-state", exchange_scope="SZ")]
++    documents = {role: dict(registry_role=role, schema_version="fixture-v1") for role in ROLES}
++    documents["source"] = dict(registry_role="source", schema_version="formal-source-registry-v1", configs=configs)
++    documents["feature"] = dict(registry_role="feature", schema_version="formal-feature-registry-v1",
++        contract_version="formal-features-v1", source_registry_hash=hashlib.sha256(canonical(documents["source"])).hexdigest(),
++        mapping_registry_hash=hashlib.sha256(canonical(documents["mapping"])).hexdigest(),
++        template_ids=sorted(TEMPLATES), slots=sorted(slots, key=lambda s: s["slot_id"]))
++    for role, policy in policies.items():
++        policy["purpose"] = "official"
++        documents[role] = policy
++        scoring["policy_contracts"][role]["registry_hash"] = hashlib.sha256(canonical(policy)).hexdigest()
++    documents["scoring"] = wrapper
++    if mutate:
++        mutate(documents)
++    raws = {role: canonical(doc) for role, doc in documents.items()}
++    hashes = {role + "_registry_hash": hashlib.sha256(raw).hexdigest() for role, raw in raws.items()}
++    root = canonical(dict(schema_version="formal-registry-manifest-v1", purpose="official", approval_id="test-graph-approval", **hashes))
++    manifest = FormalRegistryManifest.from_signed_bytes(root, verifier.sign(root), "scoring-test-key", verifier)
++    blobs = {}
++    for role, raw in raws.items():
++        digest = hashlib.sha256(raw).hexdigest()
++        binding = canonical(dict(child_sha256=digest, registry_manifest_hash=manifest.manifest_hash, registry_role=role))
++        blobs[digest] = VerifiedRegistryBlob(role, digest, raw, verifier.sign(raw), "scoring-test-key",
++            manifest.approval_id, manifest.manifest_hash, verifier.sign(binding), "scoring-test-key")
++    repository = InMemoryRepository(manifest, blobs)
++    bundle = FormalRegistryBundleLoader(repository, verifier).load(manifest.manifest_hash)
++    feature = bundle.blob("feature")
++    vocabulary = load_signed_feature_registry(feature.canonical_json, feature.signature, feature.key_id, verifier, registry_manifest=bundle.manifest)
++    return bundle, vocabulary, repository, verifier
++
++
++class FormalScoringRegistryTests(unittest.TestCase):
++    def setUp(self):
++        self.api = importlib.import_module("ashare_pipeline.formal_scoring_registry")
++
++    def load_test(self, wire=None):
++        return self.api.load_formal_registry(FIXTURE if wire is None else canonical(wire), self.api.RegistryApproval.for_test_fixture())
++
++    def load_official(self, bundle, vocabulary, approval=None):
++        approval = approval or self.api.RegistryApproval("official", bundle.manifest.scoring_registry_hash, bundle.manifest.approval_id)
++        return self.api.load_formal_registry(bundle, approval, feature_registry=vocabulary)
++
++    def test_all_five_templates_preserve_exact_seven_dimension_slots_and_weights(self):
++        registry = self.load_test()
++        self.assertEqual(tuple(registry.templates), TEMPLATES)
++        self.assertEqual(registry.dimension_weights, {k: Decimal(v) for k, v in WEIGHTS.items()})
++        self.assertEqual(registry.internal_weights, {k: tuple(map(Decimal, v)) for k, v in INTERNAL.items()})
++        for template in TEMPLATES:
++            for dimension, weights in INTERNAL.items():
++                metrics = registry.template_for(template).metrics[dimension]
++                self.assertEqual(tuple(m.internal_weight for m in metrics), tuple(map(Decimal, weights)))
++                for metric in metrics:
++                    self.assertEqual(metric.required_feature_keys, (metric.field_map["value"],))
++                    self.assertEqual(metric.formula["feature_key"], metric.field_map["value"])
++                    self.assertEqual(metric.original_formula["period_key"], "FY0")
++                    self.assertEqual(metric.period_rule, ("FY0",))
++        self.assertEqual(registry.cyclic_secondary_industries, frozenset({"fixture-cyclic"}))
++        with self.assertRaises(self.api.RegistryValidationError):
++            registry.template_for("unknown")
++
++    def test_complete_official_graph_is_accepted_and_all_nine_children_are_bound(self):
++        bundle, vocabulary, _, _ = signed_graph()
++        registry = self.load_official(bundle, vocabulary)
++        registry.require_official(bundle)
++        self.assertEqual(registry.content_sha256, hashlib.sha256(bundle.blob("scoring").canonical_json).hexdigest())
++        self.assertEqual(registry.registry_manifest_hash, bundle.manifest.manifest_hash)
++        self.assertEqual(set(registry.role_hashes), set(ROLES))
++        self.assertEqual(registry.redlines[0].rule["evidence_kind"], "fixture-redline")
++
++    def test_test_purpose_cannot_be_promoted_by_official_approval(self):
++        bundle, vocabulary, _, _ = signed_graph()
++        with self.assertRaisesRegex(self.api.RegistryValidationError, "official"):
++            self.load_test().require_official(bundle)
++        raw = FIXTURE.read_bytes()
++        approval = self.api.RegistryApproval("official", hashlib.sha256(raw).hexdigest(), "test-graph-approval")
++        with self.assertRaisesRegex(self.api.RegistryValidationError, "bundle|official"):
++            self.api.load_formal_registry(raw, approval, feature_registry=vocabulary)
++        def test_scoring(docs):
++            docs["scoring"]["scoring"]["purpose"] = "test"
++        test_bundle, _, _, _ = signed_graph(mutate=test_scoring)
++        with self.assertRaises(self.api.RegistryValidationError):
++            self.load_official(test_bundle, vocabulary)
++
++    def test_official_approval_requires_matching_hash_id_and_purpose(self):
++        bundle, vocabulary, _, _ = signed_graph()
++        for approval in (self.api.RegistryApproval("official", None, "test-graph-approval"),
++            self.api.RegistryApproval("official", "0" * 64, "test-graph-approval"),
++            self.api.RegistryApproval("official", bundle.manifest.scoring_registry_hash, None),
++            self.api.RegistryApproval("official", bundle.manifest.scoring_registry_hash, "another"),
++            self.api.RegistryApproval.for_test_fixture()):
++            with self.subTest(approval=approval), self.assertRaises(self.api.RegistryValidationError):
++                self.load_official(bundle, vocabulary, approval)
++
++    def test_metric_missing_contract_fields_fail_closed(self):
++        fields = ("field_map", "formula", "formula_version", "field_map_version", "direction", "unit_rule", "period_rule",
++            "denominator_rule", "invalid_denominator_rule", "required_feature_keys", "equivalence_description", "source_evidence_categories", "policy_refs")
++        for field in fields:
++            wire = fixture_wire()
++            del wire["scoring"]["templates"]["bank"]["metrics"]["V"][0][field]
++            with self.subTest(field=field), self.assertRaisesRegex(self.api.RegistryValidationError, field):
++                self.load_test(wire)
++
++    def test_slot_weight_identity_or_template_deletion_is_rejected(self):
++        for mutation in (lambda s: s["templates"].pop("insurance"),
++            lambda s: s["templates"]["bank"]["metrics"]["V"].pop(),
++            lambda s: s["dimension_weights"].update(G="0.19", V="0.17"),
++            lambda s: s["internal_weights"]["G"].__setitem__(0, "0.34"),
++            lambda s: s["templates"]["bank"]["metrics"]["G"][0].update(internal_weight="0.34"),
++            lambda s: s["templates"]["bank"]["metrics"]["G"][0].update(metric_id="wrong_concept")):
++            wire = fixture_wire()
++            mutation(wire["scoring"])
++            with self.subTest(mutation=mutation), self.assertRaises(self.api.RegistryValidationError):
++                self.load_test(wire)
++
++    def test_unknown_or_cross_template_feature_and_mismatched_contract_are_rejected(self):
++        for change in ({"required_feature_keys": ["unknown"]}, {"field_map": {"value": "general_nonfinancial.G.operating_profit_per_share_cagr_3y"}},
++            {"formula_version": "other-v2"}, {"unit_rule": "CNY"}, {"period_rule": ["FY1"]},
++            {"denominator_rule": "positive"}, {"invalid_denominator_rule": "zero"},
++            {"formula": {"op": "constant", "value": "100"}}, {"direction": "unknown"}):
++            wire = fixture_wire()
++            wire["scoring"]["templates"]["bank"]["metrics"]["G"][0].update(change)
++            with self.subTest(change=change), self.assertRaises(self.api.RegistryValidationError):
++                self.load_test(wire)
++
++    def test_signed_divide_and_cagr_preserve_actual_v6_denominator_semantics(self):
++        left = {"op": "fact", "fact_key": "fixture.numerator", "period_key": "FY0"}
++        right = {"op": "fact", "fact_key": "fixture.denominator", "period_key": "FY1"}
++        divide = {"op": "divide", "left": left, "right": right}
++        cagr = {"op": "cagr", "left": left, "right": right, "intervals": 3}
++        cases = ((divide, "nonzero"), (cagr, "positive_endpoints"),
++            ({"op": "divide", "left": cagr, "right": right}, "nonzero_divisors_and_positive_cagr_endpoints"))
++        for formula, rule in cases:
++            def mutate(docs, formula=formula, rule=rule):
++                metric = docs["scoring"]["scoring"]["templates"]["bank"]["metrics"]["G"][0]
++                key = metric["required_feature_keys"][0]
++                slot = next(s for s in docs["feature"]["slots"] if s["slot_id"] == key)
++                slot["formula"] = formula
++                metric.update(period_rule=["FY0", "FY1"], denominator_rule=rule)
++            bundle, vocabulary, _, _ = signed_graph(mutate=mutate)
++            with self.subTest(rule=rule):
++                try:
++                    registry = self.load_official(bundle, vocabulary)
++                except self.api.RegistryValidationError as error:
++                    self.fail(f"the registry must preserve V6 {rule} semantics: {error}")
++                metric = registry.template_for("bank").metrics["G"][0]
++                self.assertEqual(metric.denominator_rule, rule)
++                self.assertEqual(metric.original_formula["left"]["op"], formula["left"]["op"])
++
++    def test_high_precision_decimal_weights_are_not_rounded_into_valid_weights(self):
++        wire = fixture_wire()
++        wire["scoring"]["dimension_weights"]["G"] = "0.18000000000000000000000000000000001"
++        wire["scoring"]["dimension_weights"]["V"] = "0.17999999999999999999999999999999999"
++        with self.assertRaises(self.api.RegistryValidationError):
++            self.load_test(wire)
++
++    def test_official_feature_vocabulary_must_be_exact_sealed_and_same_graph(self):
++        bundle, vocabulary, _, _ = signed_graph()
++        def different_feature(docs):
++            docs["feature"]["contract_version"] = "formal-features-v2"
++        _, other, _, _ = signed_graph(mutate=different_feature)
++        for candidate in (None, object(), copy.copy(vocabulary), other):
++            with self.subTest(candidate=type(candidate)), self.assertRaises(self.api.RegistryValidationError):
++                self.load_official(bundle, candidate)
++        object.__setattr__(vocabulary, "registry_hash", "0" * 64)
++        with self.assertRaises(self.api.RegistryValidationError):
++            self.load_official(bundle, vocabulary)
++
++    def test_official_required_key_must_exist_in_its_signed_template(self):
++        def missing_slot(docs):
++            docs["feature"]["slots"].pop()
++        bundle, vocabulary, _, _ = signed_graph(mutate=missing_slot)
++        with self.assertRaisesRegex(self.api.RegistryValidationError, "feature"):
++            self.load_official(bundle, vocabulary)
++
++    def test_mixed_root_and_mutated_bundle_are_rejected_on_reuse(self):
++        bundle, vocabulary, _, _ = signed_graph()
++        registry = self.load_official(bundle, vocabulary)
++        other, _, _, _ = signed_graph(mutate=lambda d: d["industry"].update(version="other"))
++        with self.assertRaisesRegex(self.api.RegistryValidationError, "manifest"):
++            registry.require_official(other)
++        object.__setattr__(bundle.blob("event"), "canonical_json", b"{}")
++        with self.assertRaises(self.api.RegistryValidationError):
++            registry.require_official(bundle)
++
++    def test_every_policy_role_binds_hash_version_categories_purpose_and_rule_ids(self):
++        for role in ("cyclic", "redline", "status", "event"):
++            for field in ("registry_hash", "registry_version", "source_evidence_categories"):
++                wire = fixture_wire()
++                del wire["scoring"]["policy_contracts"][role][field]
++                with self.subTest(role=role, field=field), self.assertRaisesRegex(self.api.RegistryValidationError, field):
++                    self.load_test(wire)
++            for field, value in (("registry_hash", "0" * 64), ("registry_version", "other"), ("source_evidence_categories", ["other"])):
++                wire = fixture_wire()
++                wire["scoring"]["policy_contracts"][role][field] = value
++                with self.subTest(role=role, field=field), self.assertRaises(self.api.RegistryValidationError):
++                    self.load_test(wire)
++        for role in ("cyclic", "redline", "status", "event"):
++            for field, value in (("purpose", "test"), ("rules", {}), ("registry_version", ""), ("source_evidence_categories", []), ("registry_role", "other")):
++                def mutate(docs, role=role, field=field, value=value):
++                    docs[role][field] = value
++                    docs["scoring"]["scoring"]["policy_contracts"][role]["registry_hash"] = hashlib.sha256(canonical(docs[role])).hexdigest()
++                if field == "registry_role":
++                    with self.assertRaises(ValueError):
++                        signed_graph(mutate=mutate)
++                    continue
++                bundle, vocabulary, _, _ = signed_graph(mutate=mutate)
++                with self.subTest(role=role, field=field), self.assertRaises(self.api.RegistryValidationError):
++                    self.load_official(bundle, vocabulary)
++
++    def test_noncanonical_duplicate_nonfinite_and_malformed_json_are_rejected(self):
++        raw = FIXTURE.read_bytes()
++        for bad in (b" " + raw, raw + b"\n", b"\xff", b"[]", b'{"a":NaN}', b'{"a":Infinity}',
++            b'{"a":1,"a":2}', raw.replace(b'"0.18"', b'0.18', 1)):
++            with self.subTest(raw=bad[:25]), self.assertRaises(self.api.RegistryValidationError):
++                self.api.load_formal_registry(bad, self.api.RegistryApproval.for_test_fixture())
++
++    def test_nested_records_are_immutable_and_forced_mutation_invalidates_seal(self):
++        bundle, vocabulary, _, _ = signed_graph()
++        registry = self.load_official(bundle, vocabulary)
++        metric = registry.template_for("bank").metrics["V"][0]
++        for mutate in (lambda: registry.templates.__setitem__("bank", None),
++            lambda: metric.field_map.__setitem__("value", "unknown"),
++            lambda: metric.original_formula.__setitem__("period_key", "FY1"),
++            lambda: registry.redlines[0].rule.__setitem__("x", "1")):
++            with self.assertRaises((AttributeError, TypeError)):
++                mutate()
++        object.__setattr__(metric, "direction", "lower")
++        with self.assertRaises(self.api.RegistryValidationError):
++            registry.require_official(bundle)
++
++    def test_copied_forged_and_approval_mutated_registries_cannot_be_official(self):
++        bundle, vocabulary, _, _ = signed_graph()
++        registry = self.load_official(bundle, vocabulary)
++        for fake in (copy.copy(registry), object.__new__(self.api.FormalScoringRegistry)):
++            with self.assertRaises(self.api.RegistryValidationError):
++                fake.require_official(bundle)
++        object.__setattr__(registry.approval, "approved_content_sha256", "0" * 64)
++        with self.assertRaises(self.api.RegistryValidationError):
++            registry.require_official(bundle)
++
++    def test_outer_child_binding_signature_is_verified_before_scoring(self):
++        bundle, _, repository, verifier = signed_graph()
++        blob = bundle.blob("redline")
++        repository.blobs[blob.registry_hash] = replace(blob, binding_signature=verifier.sign(b"wrong-root"))
++        with self.assertRaisesRegex(ValueError, "signature"):
++            FormalRegistryBundleLoader(repository, verifier).load(bundle.manifest.manifest_hash)
++
++
++if __name__ == "__main__":
++    unittest.main()
+

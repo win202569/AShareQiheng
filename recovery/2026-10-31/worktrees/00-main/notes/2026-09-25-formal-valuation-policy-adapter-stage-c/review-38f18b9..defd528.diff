@@ -1,0 +1,229 @@
+# Review package: 38f18b9..defd528
+
+## Commits
+defd528 Pin scoring feature verifier across official checks
+
+## Files changed
+ ashare_pipeline/formal_scoring_registry.py | 15 ++++++++-----
+ tests/test_formal_scoring_registry.py      | 35 ++++++++++++++++++++++++++++++
+ 2 files changed, 44 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_scoring_registry.py b/ashare_pipeline/formal_scoring_registry.py
+index 59c6470..2d02ef0 100644
+--- a/ashare_pipeline/formal_scoring_registry.py
++++ b/ashare_pipeline/formal_scoring_registry.py
+@@ -176,24 +176,26 @@ class RedlineDefinition:
+     registry_version: str
+     source_evidence_categories: tuple[str, ...]
+     rule: Mapping[str, object]
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class StatusRule(RedlineDefinition):
+     pass
+ 
+ 
+-def _feature_slots(feature_registry, bundle, *, materialize=True):
++def _feature_slots(feature_registry, bundle, *, verifier, materialize=True):
+     if type(feature_registry) is not SignedFormalFeatureRegistry:
+         raise RegistryValidationError("official feature vocabulary must be an exact sealed SignedFormalFeatureRegistry")
+-    feature_registry.require_release_eligible()
++    if SignedFormalFeatureRegistry.require_release_eligible is not verifier:
++        raise RegistryValidationError("official feature verifier binding changed")
++    verifier(feature_registry)
+     feature = bundle.blob("feature")
+     # The original verifier has checked the whole sealed feature object above.
+     # Read its four graph fields directly so each comparison does not repeat
+     # that full fingerprint (including all slot formulas).
+     read = object.__getattribute__
+     if (read(feature_registry, "canonical_json") != feature.canonical_json
+         or read(feature_registry, "registry_hash") != feature.registry_hash
+         or read(feature_registry, "source_registry_hash") != bundle.blob("source").registry_hash
+         or read(feature_registry, "mapping_registry_hash") != bundle.blob("mapping").registry_hash):
+         raise RegistryValidationError("feature vocabulary differs from registry manifest graph")
+@@ -362,21 +364,21 @@ def _consensus_links(wrapper, templates):
+             raise RegistryValidationError("input alternative descriptor_id is absent")
+         if (linked["context_kind"], linked["security_scope"], linked["request_security"], linked["period_rule"]) != (
+                 "consensus_snapshot", "security", "input_security", "freeze_date_cn"):
+             raise RegistryValidationError("input alternative descriptor has incompatible Context semantics")
+         result[template_id] = _freeze(dict(alternative, context_kind=linked["context_kind"], scope_key=linked["scope_key"]))
+     if template_ids != sorted(template_ids) or len(set(template_ids)) != len(template_ids):
+         raise RegistryValidationError("input alternatives must be unique and sorted by template_id")
+     return MappingProxyType(result)
+ 
+ 
+-def _parse(raw, approval, bundle, feature_registry):
++def _parse(raw, approval, bundle, feature_registry, feature_verifier):
+     wrapper = _load(raw)
+     version = wrapper.get("schema_version")
+     expected_wrapper = ("registry_role", "schema_version", "descriptors", "scoring")
+     if version == "formal-scoring-registry-v2":
+         expected_wrapper += ("input_alternatives",)
+     _keys(wrapper, expected_wrapper, "scoring wrapper")
+     if wrapper["registry_role"] != "scoring" or version not in ("formal-scoring-registry-v1", "formal-scoring-registry-v2"):
+         raise RegistryValidationError("unsupported scoring wrapper")
+     if type(wrapper["descriptors"]) is not list:
+         raise RegistryValidationError("descriptors must be an array")
+@@ -394,21 +396,21 @@ def _parse(raw, approval, bundle, feature_registry):
+     if type(approval) is not RegistryApproval or approval.purpose != purpose:
+         raise RegistryValidationError("official or test approval purpose differs from content")
+     digest = hashlib.sha256(raw).hexdigest()
+     if purpose == "official":
+         role_hashes = _graph(bundle)
+         if (approval.approved_content_sha256 != digest or type(approval.approved_content_sha256) is not str
+             or _text(approval.approval_id, "approval_id") != bundle.manifest.approval_id):
+             raise RegistryValidationError("official approval hash or approval_id mismatch")
+         if raw != bundle.blob("scoring").canonical_json:
+             raise RegistryValidationError("scoring bytes differ from registry manifest")
+-        slots = _feature_slots(feature_registry, bundle)
++        slots = _feature_slots(feature_registry, bundle, verifier=feature_verifier)
+     else:
+         if bundle is not None or approval.approved_content_sha256 is not None or approval.approval_id is not None or feature_registry is not None:
+             raise RegistryValidationError("test fixture cannot use an official bundle or approval")
+         role_hashes = {}
+         values = scoring["fixture_feature_slots"]
+         if type(values) is not list or not values:
+             raise RegistryValidationError("fixture_feature_slots must be explicit")
+         slots = {t: {} for t in _TEMPLATES}
+         for value in values:
+             slot = FormalFeatureSlot.from_dict(value)
+@@ -464,20 +466,21 @@ def _parse(raw, approval, bundle, feature_registry):
+     return dict(contract_version="V3", content_sha256=digest, templates=MappingProxyType(templates),
+         dimension_weights=MappingProxyType(weights), internal_weights=MappingProxyType(internal),
+         cyclic_secondary_industries=industries, cyclic_rule=cyclic, market_liquidity_rule=market,
+         policy_contracts=_freeze(contracts), approval=RegistryApproval(approval.purpose, approval.approved_content_sha256, approval.approval_id),
+         registry_manifest_hash=bundle.manifest.manifest_hash if bundle is not None else None,
+         role_hashes=MappingProxyType(role_hashes), consensus_no_coverage_links=consensus_links, **references)
+ 
+ 
+ def _trusted_registry():
+     seals = {}
++    feature_verifier = SignedFormalFeatureRegistry.require_release_eligible
+ 
+     def fingerprint(value):
+         if type(value) in (str, bytes, int, bool, Decimal, type(None)):
+             return (type(value), value)
+         if type(value) in (tuple, frozenset):
+             return (type(value), tuple(fingerprint(v) for v in (sorted(value) if type(value) is frozenset else value)))
+         if type(value) is MappingProxyType:
+             return (MappingProxyType, tuple((fingerprint(k), fingerprint(v)) for k, v in value.items()))
+         if type(value) in (FormalScoringRegistry, RegistryApproval, TemplateDefinition, MetricDefinition, RedlineDefinition, StatusRule):
+             return (type(value), tuple(fingerprint(object.__getattribute__(value, f.name)) for f in fields(value)))
+@@ -523,33 +526,33 @@ def _trusted_registry():
+         def require_official(self, registry_bundle):
+             record = sealed(self)
+             if self.approval.purpose != "official":
+                 raise RegistryValidationError("test registry cannot run official scoring")
+             try:
+                 hashes = _graph(registry_bundle)
+                 if registry_bundle.manifest.manifest_hash != self.registry_manifest_hash or hashes != dict(self.role_hashes):
+                     raise RegistryValidationError("registry manifest graph differs from loaded scoring registry")
+                 if registry_bundle.blob("scoring").canonical_json != record[2]:
+                     raise RegistryValidationError("scoring content differs from registry manifest")
+-                _feature_slots(record[3], registry_bundle, materialize=False)
++                _feature_slots(record[3], registry_bundle, verifier=feature_verifier, materialize=False)
+             except (ValueError, TypeError, AttributeError) as error:
+                 raise RegistryValidationError(f"official registry manifest proof failed: {error}") from error
+ 
+     def load_formal_registry(source, approval, *, feature_registry=None):
+         try:
+             bundle = source if type(source) is VerifiedRegistryBundle else None
+             if type(approval) is not RegistryApproval:
+                 raise RegistryValidationError("approval must be an exact RegistryApproval")
+             if approval.purpose == "official" and bundle is None:
+                 raise RegistryValidationError("official scoring must load from registry_bundle.blob('scoring')")
+             raw = bundle.blob("scoring").canonical_json if bundle is not None else source if type(source) is bytes else Path(source).read_bytes()
+-            values = _parse(raw, approval, bundle, feature_registry)
++            values = _parse(raw, approval, bundle, feature_registry, feature_verifier)
+             registry = object.__new__(FormalScoringRegistry)
+             for name, value in values.items():
+                 object.__setattr__(registry, name, value)
+             identity = id(registry)
+             seals[identity] = (weakref.ref(registry, lambda _: seals.pop(identity, None)), fingerprint(registry), raw, feature_registry)
+             if bundle is not None:
+                 registry.require_official(bundle)
+             return registry
+         except (OSError, ValueError, TypeError, AttributeError, KeyError, RecursionError) as error:
+             raise RegistryValidationError(f"invalid scoring registry: {error}") from error
+diff --git a/tests/test_formal_scoring_registry.py b/tests/test_formal_scoring_registry.py
+index 5c30530..05d0279 100644
+--- a/tests/test_formal_scoring_registry.py
++++ b/tests/test_formal_scoring_registry.py
+@@ -3,20 +3,21 @@
+ import copy
+ import hashlib
+ import hmac
+ import importlib
+ import json
+ import sys
+ from dataclasses import replace
+ from decimal import Decimal
+ from pathlib import Path
+ import unittest
++from unittest.mock import patch
+ 
+ from ashare_pipeline.formal_feature_contract import load_signed_feature_registry
+ from ashare_pipeline.formal_registry_manifest import (
+     FormalRegistryBundleLoader, FormalRegistryManifest, VerifiedRegistryBlob,
+ )
+ from tests.test_formal_registry_manifest import InMemoryRepository, ROLES
+ 
+ 
+ FIXTURE = Path(__file__).parent / "fixtures" / "formal_v3_test_registry.json"
+ TEMPLATES = ("general_nonfinancial", "bank", "broker", "insurance", "real_estate")
+@@ -292,20 +293,54 @@ class FormalScoringRegistryTests(unittest.TestCase):
+         for target, field, replacement in mutations:
+             original = object.__getattribute__(target, field)
+             try:
+                 object.__setattr__(target, field, replacement)
+                 with self.subTest(field=field), self.assertRaises(self.api.RegistryValidationError):
+                     registry.require_official(bundle)
+             finally:
+                 object.__setattr__(target, field, original)
+             registry.require_official(bundle)
+ 
++    def test_warmed_official_proof_rejects_replaced_feature_verifier_and_slot_mutation(self):
++        bundle, vocabulary, _, _ = signed_graph()
++        registry = self.load_official(bundle, vocabulary)
++        registry.require_official(bundle)
++        slot = object.__getattribute__(vocabulary, "slots")[0]
++        original = object.__getattribute__(slot, "unit")
++        try:
++            object.__setattr__(slot, "unit", "changed")
++            with patch.object(type(vocabulary), "require_release_eligible", lambda self: None):
++                with self.assertRaises(self.api.RegistryValidationError):
++                    registry.require_official(bundle)
++            with self.assertRaises(self.api.RegistryValidationError):
++                registry.require_official(bundle)
++        finally:
++            object.__setattr__(slot, "unit", original)
++        registry.require_official(bundle)
++
++    def test_first_official_load_rejects_replaced_verifier_and_restored_polluted_feature(self):
++        bundle, vocabulary, _, _ = signed_graph()
++        slot = object.__getattribute__(vocabulary, "slots")[0]
++        original = object.__getattribute__(slot, "unit")
++        try:
++            with patch.object(type(vocabulary), "require_release_eligible", lambda self: None):
++                with self.assertRaises(self.api.RegistryValidationError):
++                    self.load_official(bundle, vocabulary)
++                object.__setattr__(slot, "unit", "changed")
++                with self.assertRaises(self.api.RegistryValidationError):
++                    self.load_official(bundle, vocabulary)
++            with self.assertRaises(self.api.RegistryValidationError):
++                self.load_official(bundle, vocabulary)
++        finally:
++            object.__setattr__(slot, "unit", original)
++        self.load_official(bundle, vocabulary).require_official(bundle)
++
+     def test_official_required_key_must_exist_in_its_signed_template(self):
+         def missing_slot(docs):
+             docs["feature"]["slots"].pop()
+         bundle, vocabulary, _, _ = signed_graph(mutate=missing_slot)
+         with self.assertRaisesRegex(self.api.RegistryValidationError, "feature"):
+             self.load_official(bundle, vocabulary)
+ 
+     def test_mixed_root_and_mutated_bundle_are_rejected_on_reuse(self):
+         bundle, vocabulary, _, _ = signed_graph()
+         registry = self.load_official(bundle, vocabulary)

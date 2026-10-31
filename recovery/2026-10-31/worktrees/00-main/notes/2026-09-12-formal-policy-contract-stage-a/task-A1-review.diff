@@ -1,0 +1,1534 @@
+# A1 review package
+
+Base: b9b367d64d1204985ddbea77e7ca6f7832694ae8
+Head: exact frozen staged snapshot; not committed until task review passes.
+Commits in this task: none yet; controller owns commit after review.
+Production SHA256: 77CDEB4EA5F850CDB7C1BC6F6CA7BE38E9CAF69B31D2DC97890C1ADD54CA6469
+Tests SHA256: 29723C44C527D02408F47EEEB38480FC4A2E851F1F46396418BC0FA4BAF8225F
+Fixture SHA256: 828E48D68F53F784E07F634B243E68462F7118B15485DA298DC0037D1E208BEA
+
+
+diff --git a/ashare_pipeline/formal_policy_contract.py b/ashare_pipeline/formal_policy_contract.py
+new file mode 100644
+index 0000000..8674ab9
+--- /dev/null
++++ b/ashare_pipeline/formal_policy_contract.py
+@@ -0,0 +1,777 @@
++"""Detached, non-authoritative syntax values for formal policy contracts."""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import dataclass
++from decimal import Decimal, InvalidOperation
++import json
++import re
++from types import MappingProxyType
++
++
++class PolicyContractError(ValueError):
++    """A detached policy declaration has invalid or unsupported syntax."""
++
++    def __init__(self, message, *, code="malformed_contract", path="contract"):
++        self.code, self.path = code, path
++        super().__init__(f"{code}:{path}: {message}")
++
++
++@dataclass(frozen=True, slots=True)
++class PolicyRule:
++    role: str
++    rule_id: str
++    kind: str
++    semantic_id: str
++    template_id: str
++    inputs: Mapping[str, object]
++    parameters: Mapping[str, object]
++    outcomes: Mapping[str, object]
++
++
++@dataclass(frozen=True, slots=True)
++class ParsedPolicyContract:
++    rules: tuple[PolicyRule, ...]
++    role_versions: Mapping[str, str]
++    evidence_categories: Mapping[str, tuple[str, ...]]
++    canonical_json: bytes
++
++
++_ROLES = ("cyclic", "redline", "status", "event")
++_TEMPLATES = (
++    "general_nonfinancial",
++    "bank",
++    "broker",
++    "insurance",
++    "real_estate",
++)
++_FY_ENDS = tuple(f"{year}-12-31" for year in range(2021, 2026))
++_RULE_KINDS = {
++    "numeric_redline": ("redline",),
++    "boolean_state": ("status", "event"),
++    "enum_state": ("status", "event"),
++    "cyclic_protection": ("cyclic",),
++    "market_liquidity": ("status",),
++}
++_CONTEXT_FIELDS = {
++    ("security_state", "is_st"): ("bool", False, False),
++    ("security_state", "is_star_st"): ("bool", False, False),
++    ("security_state", "forced_delist_risk"): ("bool", False, False),
++    ("security_state", "suspended"): ("bool", False, False),
++    ("security_state", "listing_status"): ("enum", False, False),
++    ("regulatory_state", "active"): ("bool", True, False),
++    ("event_calendar", "event"): ("event_record", True, True),
++    ("market_close", "record"): ("market_record", False, False),
++    ("trading_calendar", "record"): ("calendar_record", False, False),
++}
++_SHA256 = re.compile(r"[0-9a-f]{64}")
++_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*")
++_DECIMAL = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
++_DIMENSIONS = ("G", "V", "M", "EQ", "FS", "CA", "T")
++_LISTING_VALUES = ("listed", "delisting_arrangement", "delisted")
++
++
++def _canonical(value):
++    if type(value) is dict:
++        return "{" + ",".join(
++            _canonical(key) + ":" + _canonical(value[key]) for key in sorted(value)
++        ) + "}"
++    if type(value) is list:
++        return "[" + ",".join(_canonical(item) for item in value) + "]"
++    if type(value) is Decimal:
++        if not value.is_finite():
++            raise ValueError("nonfinite JSON")
++        return str(value)
++    return json.dumps(
++        value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
++    )
++
++
++def _load(raw, path):
++    def unique(pairs):
++        result = {}
++        for key, value in pairs:
++            if key in result:
++                raise ValueError("duplicate JSON key")
++            result[key] = value
++        return result
++
++    def invalid(value):
++        raise ValueError(f"nonfinite JSON {value}")
++
++    if type(raw) is not bytes:
++        raise PolicyContractError(
++            "canonical JSON must be immutable UTF-8 bytes", path=path
++        )
++    try:
++        value = json.loads(
++            raw.decode("utf-8"),
++            object_pairs_hook=unique,
++            parse_float=Decimal,
++            parse_constant=invalid,
++        )
++        if type(value) is not dict or _canonical(value).encode("utf-8") != raw:
++            raise ValueError("canonical JSON object required")
++    except (UnicodeError, ValueError, TypeError, RecursionError) as error:
++        raise PolicyContractError("invalid canonical JSON", path=path) from error
++    return value
++
++
++def _exact_keys(value, expected, path):
++    if type(value) is not dict or set(value) != set(expected):
++        raise PolicyContractError("unknown or missing object fields", path=path)
++
++
++def _text(value, path):
++    if type(value) is not str or not value or value != value.strip():
++        raise PolicyContractError("nonempty trimmed string required", path=path)
++    return value
++
++
++def _identifier(value, path):
++    _text(value, path)
++    if _IDENTIFIER.fullmatch(value) is None:
++        raise PolicyContractError("identifier required", path=path)
++    return value
++
++
++def _decimal_parameter(value, path):
++    if type(value) is not str or _DECIMAL.fullmatch(value) is None:
++        raise PolicyContractError("finite decimal string required", path=path)
++    try:
++        number = Decimal(value)
++    except InvalidOperation as error:
++        raise PolicyContractError("invalid decimal", path=path) from error
++    if not number.is_finite():
++        raise PolicyContractError("nonfinite decimal", path=path)
++    return number
++
++
++def _ordered_texts(value, path, *, expected=None):
++    if type(value) is not list or not value:
++        raise PolicyContractError("nonempty string array required", path=path)
++    result = tuple(_text(item, f"{path}[{index}]") for index, item in enumerate(value))
++    if result != tuple(sorted(set(result))):
++        raise PolicyContractError("array must be sorted and unique", path=path)
++    if expected is not None and result != tuple(expected):
++        raise PolicyContractError("array has unsupported fixed values", path=path)
++    return result
++
++
++def _text_array(value, path):
++    if type(value) is not list or not value:
++        raise PolicyContractError("nonempty string array required", path=path)
++    result = tuple(_text(item, f"{path}[{index}]") for index, item in enumerate(value))
++    if len(set(result)) != len(result):
++        raise PolicyContractError("array values must be unique", path=path)
++    return result
++
++
++def _feature_selector(value, path, template_id):
++    _exact_keys(
++        value,
++        (
++            "kind",
++            "template_id",
++            "feature_key",
++            "expected_unit",
++            "formula_version",
++            "period_keys",
++        ),
++        path,
++    )
++    if value["kind"] != "feature":
++        raise PolicyContractError("feature selector required", path=f"{path}.kind")
++    if value["template_id"] != template_id:
++        raise PolicyContractError(
++            "selector template differs from rule", path=f"{path}.template_id"
++        )
++    for field in ("feature_key", "expected_unit", "formula_version"):
++        _text(value[field], f"{path}.{field}")
++    _ordered_texts(value["period_keys"], f"{path}.period_keys")
++
++
++def _context_selector(value, path):
++    _exact_keys(
++        value,
++        (
++            "kind",
++            "descriptor_id",
++            "context_kind",
++            "scope_key",
++            "field",
++            "entry_id",
++            "expected_type",
++            "expected_unit",
++        ),
++        path,
++    )
++    if value["kind"] != "context":
++        raise PolicyContractError("Context selector required", path=f"{path}.kind")
++    if type(value["descriptor_id"]) is not str or _SHA256.fullmatch(
++        value["descriptor_id"]
++    ) is None:
++        raise PolicyContractError(
++            "lowercase SHA-256 required", path=f"{path}.descriptor_id"
++        )
++    _text(value["scope_key"], f"{path}.scope_key")
++    context_kind = _text(value["context_kind"], f"{path}.context_kind")
++    field = _text(value["field"], f"{path}.field")
++    if context_kind not in {kind for kind, _ in _CONTEXT_FIELDS}:
++        raise PolicyContractError(
++            "unsupported Context kind",
++            code="unsupported_contract",
++            path=f"{path}.context_kind",
++        )
++    signature = _CONTEXT_FIELDS.get((context_kind, field))
++    if signature is None:
++        raise PolicyContractError(
++            "unsupported Context field", path=f"{path}.field"
++        )
++    expected_type, needs_entry, needs_unit = signature
++    if value["expected_type"] != expected_type:
++        raise PolicyContractError(
++            "Context expected_type differs from field", path=f"{path}.expected_type"
++        )
++    if needs_entry:
++        _text(value["entry_id"], f"{path}.entry_id")
++    elif value["entry_id"] is not None:
++        raise PolicyContractError("entry_id must be null", path=f"{path}.entry_id")
++    if needs_unit:
++        _text(value["expected_unit"], f"{path}.expected_unit")
++    elif value["expected_unit"] is not None:
++        raise PolicyContractError(
++            "expected_unit must be null", path=f"{path}.expected_unit"
++        )
++    return expected_type
++
++
++def _selector(value, path, template_id, *, expected_kind=None):
++    if type(value) is not dict:
++        raise PolicyContractError("selector object required", path=path)
++    kind = value.get("kind")
++    if kind == "feature":
++        _feature_selector(value, path, template_id)
++    elif kind == "annual_series":
++        _exact_keys(value, ("kind", "observations"), path)
++        observations = value["observations"]
++        if type(observations) is not list:
++            raise PolicyContractError(
++                "observations must be an array", path=f"{path}.observations"
++            )
++        years = []
++        for index, observation in enumerate(observations):
++            item_path = f"{path}.observations[{index}]"
++            _exact_keys(observation, ("fy_end", "selector"), item_path)
++            years.append(observation["fy_end"])
++            _feature_selector(
++                observation["selector"], f"{item_path}.selector", template_id
++            )
++        if tuple(years) != _FY_ENDS:
++            raise PolicyContractError(
++                "exact ordered FY2021-FY2025 observations required",
++                path=f"{path}.observations",
++            )
++    elif kind == "context":
++        actual_type = _context_selector(value, path)
++        if expected_kind is not None and expected_kind != actual_type:
++            raise PolicyContractError(
++                "Context selector has incompatible value type", path=f"{path}.expected_type"
++            )
++    else:
++        raise PolicyContractError(
++            "unsupported selector kind", code="unsupported_contract", path=f"{path}.kind"
++        )
++    if expected_kind in ("feature", "annual_series") and kind != expected_kind:
++        raise PolicyContractError(
++            f"{expected_kind} selector required", path=f"{path}.kind"
++        )
++
++
++def _valuation_dependencies(value, path, semantic_id):
++    if type(value) is not list or not value:
++        raise PolicyContractError("nonempty valuation dependency array required", path=path)
++    metric_ids = []
++    fields = (
++        "metric_id",
++        "policy_dependency",
++        "profit_semantic_id",
++        "adapter_id",
++        "adapter_version",
++        "definition_basis",
++    )
++    for index, dependency in enumerate(value):
++        item_path = f"{path}[{index}]"
++        _exact_keys(dependency, fields, item_path)
++        metric_id = _identifier(dependency["metric_id"], f"{item_path}.metric_id")
++        if not metric_id.startswith("V.") or len(metric_id) == 2:
++            raise PolicyContractError(
++                "valuation dependency metric_id must identify a V leaf",
++                path=f"{item_path}.metric_id",
++            )
++        metric_ids.append(metric_id)
++        _text(dependency["definition_basis"], f"{item_path}.definition_basis")
++        policy_dependency = dependency["policy_dependency"]
++        identity_fields = ("profit_semantic_id", "adapter_id", "adapter_version")
++        if policy_dependency == "affected":
++            if dependency["profit_semantic_id"] != semantic_id:
++                raise PolicyContractError(
++                    "affected profit semantic must reference this cyclic rule",
++                    path=f"{item_path}.profit_semantic_id",
++                )
++            for field in identity_fields:
++                _identifier(dependency[field], f"{item_path}.{field}")
++        elif policy_dependency == "unaffected":
++            if any(dependency[field] is not None for field in identity_fields):
++                raise PolicyContractError(
++                    "unaffected dependency identities must be null", path=item_path
++                )
++        else:
++            raise PolicyContractError(
++                "policy_dependency must be affected or unaffected",
++                path=f"{item_path}.policy_dependency",
++            )
++    if tuple(metric_ids) != tuple(sorted(set(metric_ids))):
++        raise PolicyContractError(
++            "valuation dependencies must be sorted and unique by metric_id", path=path
++        )
++
++
++def _validate_parameters(kind, value, path, semantic_id):
++    if kind == "numeric_redline":
++        _exact_keys(value, ("comparator", "threshold"), path)
++        if value["comparator"] not in ("lt", "lte", "gt", "gte", "eq"):
++            raise PolicyContractError(
++                "unsupported comparator", path=f"{path}.comparator"
++            )
++        _decimal_parameter(value["threshold"], f"{path}.threshold")
++    elif kind == "boolean_state":
++        _exact_keys(value, ("expected",), path)
++        if type(value["expected"]) is not bool:
++            raise PolicyContractError("exact bool required", path=f"{path}.expected")
++    elif kind == "enum_state":
++        _exact_keys(value, ("values",), path)
++        values = _ordered_texts(value["values"], f"{path}.values")
++        if not set(values).issubset(_LISTING_VALUES):
++            raise PolicyContractError(
++                "unsupported listing enum value", path=f"{path}.values"
++            )
++    elif kind == "cyclic_protection":
++        _exact_keys(
++            value,
++            (
++                "fy_ends",
++                "quantile_method",
++                "quantile_level",
++                "median_method",
++                "profit_basis_method",
++                "valuation_dependencies",
++            ),
++            path,
++        )
++        _ordered_texts(value["fy_ends"], f"{path}.fy_ends", expected=_FY_ENDS)
++        if value["quantile_method"] not in (
++            "linear_type7_v1",
++            "nearest_rank_v1",
++        ):
++            raise PolicyContractError(
++                "unsupported quantile method",
++                code="unsupported_contract",
++                path=f"{path}.quantile_method",
++            )
++        for field, expected in (
++            ("quantile_level", "0.80"),
++            ("median_method", "ordered_middle_v1"),
++            ("profit_basis_method", "minimum_current_and_five_fy_median_v1"),
++        ):
++            if value[field] != expected:
++                raise PolicyContractError(
++                    "unsupported fixed cyclic parameter", path=f"{path}.{field}"
++                )
++        _valuation_dependencies(
++            value["valuation_dependencies"],
++            f"{path}.valuation_dependencies",
++            semantic_id,
++        )
++    else:
++        _exact_keys(
++            value,
++            (
++                "effective_trade_method",
++                "veto_trading_days",
++                "close_search_trading_days",
++                "required_evidence_capability",
++            ),
++            path,
++        )
++        expected = {
++            "effective_trade_method": "exchange_allows_and_positive_volume_turnover_v1",
++            "veto_trading_days": 20,
++            "close_search_trading_days": 250,
++            "required_evidence_capability": "verified_market_window_v1",
++        }
++        for field, required in expected.items():
++            actual = value[field]
++            if type(required) is int:
++                valid = type(actual) is int and actual == required
++            else:
++                valid = actual == required
++            if not valid:
++                raise PolicyContractError(
++                    "unsupported fixed market parameter", path=f"{path}.{field}"
++                )
++
++
++def _validate_effect(effect, path, semantic_id):
++    if type(effect) is not dict:
++        raise PolicyContractError("effect object required", path=path)
++    kind = effect.get("kind")
++    if kind == "dimension_cap":
++        _exact_keys(effect, ("kind", "dimension", "maximum"), path)
++        if effect["dimension"] not in _DIMENSIONS:
++            raise PolicyContractError(
++                "unknown scoring dimension", path=f"{path}.dimension"
++            )
++        maximum = _decimal_parameter(effect["maximum"], f"{path}.maximum")
++        if maximum < 0 or maximum > 100:
++            raise PolicyContractError(
++                "dimension cap must be between 0 and 100", path=f"{path}.maximum"
++            )
++    elif kind == "pool_prohibition":
++        _exact_keys(effect, ("kind", "pool"), path)
++        if effect["pool"] not in ("strong", "wait", "both"):
++            raise PolicyContractError("unknown pool", path=f"{path}.pool")
++    elif kind == "valuation_profit_basis":
++        _exact_keys(effect, ("kind", "profit_semantic_id"), path)
++        if effect["profit_semantic_id"] != semantic_id:
++            raise PolicyContractError(
++                "profit basis must reference this rule",
++                path=f"{path}.profit_semantic_id",
++            )
++    elif kind == "independent_status":
++        _exact_keys(effect, ("kind", "status_code"), path)
++        _identifier(effect["status_code"], f"{path}.status_code")
++        if effect["status_code"] != semantic_id:
++            raise PolicyContractError(
++                "independent status must identify this rule",
++                path=f"{path}.status_code",
++            )
++    elif kind == "pending_evidence":
++        _exact_keys(effect, ("kind", "reason_code"), path)
++        _identifier(effect["reason_code"], f"{path}.reason_code")
++    else:
++        raise PolicyContractError(
++            "unsupported policy effect",
++            code="unsupported_contract",
++            path=f"{path}.kind",
++        )
++
++
++def _validate_outcomes(kind, value, path, semantic_id):
++    _exact_keys(
++        value,
++        ("on_match", "on_clear", "on_missing", "on_conflict"),
++        path,
++    )
++    effects = value["on_match"]
++    if type(effects) is not list or not effects:
++        raise PolicyContractError("on_match must be a nonempty effect array", path=f"{path}.on_match")
++    effect_bytes = []
++    for index, effect in enumerate(effects):
++        if (
++            type(effect) is dict
++            and effect.get("kind") == "valuation_profit_basis"
++            and kind != "cyclic_protection"
++        ):
++            raise PolicyContractError(
++                "valuation profit basis is cyclic-only",
++                path=f"{path}.on_match[{index}].kind",
++            )
++        _validate_effect(effect, f"{path}.on_match[{index}]", semantic_id)
++        effect_bytes.append(_canonical(effect).encode("utf-8"))
++    if tuple(effect_bytes) != tuple(sorted(set(effect_bytes))):
++        raise PolicyContractError(
++            "effects must be canonically sorted and unique", path=f"{path}.on_match"
++        )
++    if type(value["on_clear"]) is not list or value["on_clear"]:
++        raise PolicyContractError("on_clear must be an empty array", path=f"{path}.on_clear")
++    for field in ("on_missing", "on_conflict"):
++        if value[field] != "pending_evidence":
++            raise PolicyContractError(
++                "missing and conflict dispositions must be pending_evidence",
++                path=f"{path}.{field}",
++            )
++    if kind == "cyclic_protection":
++        required = (
++            any(
++                effect.get("kind") == "dimension_cap"
++                and effect.get("dimension") == dimension
++                and _decimal_parameter(effect.get("maximum"), f"{path}.on_match") == 80
++                for effect in effects
++            )
++            for dimension in ("G", "M")
++        )
++        has_g, has_m = required
++        has_profit = any(effect.get("kind") == "valuation_profit_basis" for effect in effects)
++        has_status = any(
++            effect.get("kind") == "independent_status"
++            and effect.get("status_code") == "cyclic_top"
++            for effect in effects
++        )
++        has_pool = any(effect.get("kind") == "pool_prohibition" for effect in effects)
++        if not (has_g and has_m and has_profit and has_status and has_pool):
++            raise PolicyContractError(
++                "cyclic rule lacks required G/M caps, profit basis, status, or pool restriction",
++                path=f"{path}.on_match",
++            )
++    elif kind == "market_liquidity" and not any(
++        effect.get("kind") == "pool_prohibition" and effect.get("pool") == "both"
++        for effect in effects
++    ):
++        raise PolicyContractError(
++            "market liquidity rule must prohibit both pools", path=f"{path}.on_match"
++        )
++
++
++def _frozen(value):
++    if type(value) is dict:
++        return MappingProxyType({key: _frozen(item) for key, item in value.items()})
++    if type(value) is list:
++        return tuple(_frozen(item) for item in value)
++    return value
++
++
++def parse_policy_rule(role: str, rule_id: str, raw: bytes) -> PolicyRule:
++    """Parse one detached policy rule; no source authenticity is implied."""
++    root = f"{role}.rules.{rule_id}"
++    _text(role, "role")
++    _text(rule_id, f"{role}.rule_id")
++    if role not in _ROLES:
++        raise PolicyContractError("unsupported policy role", path="role")
++    wire = _load(raw, root)
++    _exact_keys(
++        wire,
++        (
++            "schema_version",
++            "kind",
++            "semantic_id",
++            "template_id",
++            "inputs",
++            "parameters",
++            "outcomes",
++        ),
++        root,
++    )
++    if wire["schema_version"] != "formal-policy-rule-v1":
++        raise PolicyContractError(
++            "unsupported rule schema_version",
++            code="unsupported_contract",
++            path=f"{root}.schema_version",
++        )
++    kind = wire["kind"]
++    if type(kind) is not str:
++        raise PolicyContractError("rule kind must be text", path=f"{root}.kind")
++    allowed_roles = _RULE_KINDS.get(kind)
++    if allowed_roles is None:
++        raise PolicyContractError(
++            "unsupported rule kind", code="unsupported_contract", path=f"{root}.kind"
++        )
++    if role not in allowed_roles:
++        raise PolicyContractError("rule kind is invalid for role", path=f"{root}.kind")
++    _text(wire["semantic_id"], f"{root}.semantic_id")
++    if wire["template_id"] not in _TEMPLATES:
++        raise PolicyContractError("unsupported template", path=f"{root}.template_id")
++    inputs = wire["inputs"]
++    if kind == "numeric_redline":
++        _exact_keys(inputs, ("value",), f"{root}.inputs")
++        _selector(
++            inputs["value"], f"{root}.inputs.value", wire["template_id"], expected_kind="feature"
++        )
++    elif kind in ("boolean_state", "enum_state"):
++        _exact_keys(inputs, ("value",), f"{root}.inputs")
++        _selector(
++            inputs["value"],
++            f"{root}.inputs.value",
++            wire["template_id"],
++            expected_kind="bool" if kind == "boolean_state" else "enum",
++        )
++    elif kind == "cyclic_protection":
++        _exact_keys(
++            inputs,
++            (
++                "current_roe",
++                "current_margin",
++                "current_profit",
++                "annual_roe",
++                "annual_margin",
++                "annual_profit",
++            ),
++            f"{root}.inputs",
++        )
++        for name in ("current_roe", "current_margin", "current_profit"):
++            _selector(
++                inputs[name],
++                f"{root}.inputs.{name}",
++                wire["template_id"],
++                expected_kind="feature",
++            )
++        for name in ("annual_roe", "annual_margin", "annual_profit"):
++            _selector(
++                inputs[name],
++                f"{root}.inputs.{name}",
++                wire["template_id"],
++                expected_kind="annual_series",
++            )
++    else:
++        _exact_keys(inputs, ("market", "calendar"), f"{root}.inputs")
++        _selector(
++            inputs["market"],
++            f"{root}.inputs.market",
++            wire["template_id"],
++            expected_kind="market_record",
++        )
++        _selector(
++            inputs["calendar"],
++            f"{root}.inputs.calendar",
++            wire["template_id"],
++            expected_kind="calendar_record",
++        )
++    _validate_parameters(
++        kind, wire["parameters"], f"{root}.parameters", wire["semantic_id"]
++    )
++    _validate_outcomes(
++        kind, wire["outcomes"], f"{root}.outcomes", wire["semantic_id"]
++    )
++    return PolicyRule(
++        role,
++        rule_id,
++        wire["kind"],
++        wire["semantic_id"],
++        wire["template_id"],
++        _frozen(wire["inputs"]),
++        _frozen(wire["parameters"]),
++        _frozen(wire["outcomes"]),
++    )
++
++
++def iter_rule_selectors(rule: PolicyRule) -> tuple[Mapping[str, object], ...]:
++    if type(rule) is not PolicyRule:
++        raise PolicyContractError("exact PolicyRule required", path="rule")
++    return tuple(rule.inputs[key] for key in sorted(rule.inputs))
++
++
++def parse_policy_contract(children: Mapping[str, bytes]) -> ParsedPolicyContract:
++    """Parse all four detached policy children without authenticating their source."""
++    _exact_keys(children, _ROLES, "children")
++    parsed_children = {}
++    role_versions = {}
++    evidence_categories = {}
++    rules = []
++    semantic_paths = {}
++    shared_purpose = None
++    wrapper_fields = (
++        "registry_role",
++        "schema_version",
++        "purpose",
++        "registry_version",
++        "source_evidence_categories",
++        "rules",
++    )
++    execution_fields = ("schema_version", "role", "rule_ids")
++    for role in _ROLES:
++        child_path = f"children.{role}"
++        wrapper = _load(children[role], child_path)
++        _exact_keys(wrapper, wrapper_fields, child_path)
++        if wrapper["registry_role"] != role:
++            raise PolicyContractError(
++                "policy wrapper role mismatch", path=f"{child_path}.registry_role"
++            )
++        if wrapper["schema_version"] != "formal-scoring-policy-v1":
++            raise PolicyContractError(
++                "unsupported policy wrapper schema_version",
++                code="unsupported_contract",
++                path=f"{child_path}.schema_version",
++            )
++        purpose = _text(wrapper["purpose"], f"{child_path}.purpose")
++        if shared_purpose is None:
++            shared_purpose = purpose
++        elif purpose != shared_purpose:
++            raise PolicyContractError(
++                "all policy wrapper purposes must agree", path=f"{child_path}.purpose"
++            )
++        role_versions[role] = _text(
++            wrapper["registry_version"], f"{child_path}.registry_version"
++        )
++        evidence_categories[role] = _text_array(
++            wrapper["source_evidence_categories"],
++            f"{child_path}.source_evidence_categories",
++        )
++        raw_rules = wrapper["rules"]
++        if type(raw_rules) is not dict or not raw_rules:
++            raise PolicyContractError(
++                "rules must be a nonempty object", path=f"{child_path}.rules"
++            )
++        for rule_id, rule_wire in raw_rules.items():
++            _text(rule_id, f"{child_path}.rules.rule_id")
++            if type(rule_wire) is not dict or not rule_wire:
++                raise PolicyContractError(
++                    "every rule must be a nonempty object",
++                    path=f"{child_path}.rules.{rule_id}",
++                )
++        execution = raw_rules.get("execution_contract")
++        if execution is None:
++            raise PolicyContractError(
++                "execution_contract entry is required",
++                path=f"{child_path}.rules.execution_contract",
++            )
++        execution_path = f"{child_path}.rules.execution_contract"
++        _exact_keys(execution, execution_fields, execution_path)
++        if execution["schema_version"] != "formal-policy-execution-contract-v1":
++            raise PolicyContractError(
++                "unsupported execution contract schema_version",
++                code="unsupported_contract",
++                path=f"{execution_path}.schema_version",
++            )
++        if execution["role"] != role:
++            raise PolicyContractError(
++                "execution contract role mismatch", path=f"{execution_path}.role"
++            )
++        active_ids = _ordered_texts(
++            execution["rule_ids"], f"{execution_path}.rule_ids"
++        )
++        if "execution_contract" in active_ids:
++            raise PolicyContractError(
++                "execution contract cannot activate itself",
++                path=f"{execution_path}.rule_ids",
++            )
++        for rule_id in active_ids:
++            rule_wire = raw_rules.get(rule_id)
++            if type(rule_wire) is not dict:
++                raise PolicyContractError(
++                    "active rule_id is missing from this role",
++                    path=f"{execution_path}.rule_ids",
++                )
++            rule = parse_policy_rule(role, rule_id, _canonical(rule_wire).encode("utf-8"))
++            semantic_key = (rule.template_id, rule.semantic_id)
++            if semantic_key in semantic_paths:
++                raise PolicyContractError(
++                    "semantic_id is duplicated for this template across active roles",
++                    path=f"{role}.rules.{rule_id}.semantic_id",
++                )
++            semantic_paths[semantic_key] = f"{role}.rules.{rule_id}.semantic_id"
++            rules.append(rule)
++        parsed_children[role] = wrapper
++    rules.sort(key=lambda rule: (rule.role, rule.rule_id))
++    canonical_json = _canonical(
++        {
++            "schema_version": "formal-policy-parsed-v1",
++            "children": parsed_children,
++        }
++    ).encode("utf-8")
++    return ParsedPolicyContract(
++        tuple(rules),
++        MappingProxyType(role_versions),
++        MappingProxyType(evidence_categories),
++        canonical_json,
++    )
+diff --git a/tests/formal_policy_fixtures.py b/tests/formal_policy_fixtures.py
+new file mode 100644
+index 0000000..c6898ee
+--- /dev/null
++++ b/tests/formal_policy_fixtures.py
+@@ -0,0 +1,209 @@
++"""Synthetic policy rule declarations for pure grammar tests."""
++
++from tests.test_formal_scoring_registry import canonical
++
++
++FY_ENDS = [f"{year}-12-31" for year in range(2021, 2026)]
++
++
++def feature_selector(template_id, name, period_key, unit):
++    return dict(
++        kind="feature",
++        template_id=template_id,
++        feature_key=f"{template_id}.policy.{name}",
++        expected_unit=unit,
++        formula_version="fixture-policy-v1",
++        period_keys=[period_key],
++    )
++
++
++def numeric_rule(template_id="bank"):
++    return dict(
++        schema_version="formal-policy-rule-v1",
++        kind="numeric_redline",
++        semantic_id="nonpositive_equity",
++        template_id=template_id,
++        inputs={
++            "value": feature_selector(template_id, "equity", "FY0", "CNY")
++        },
++        parameters={"comparator": "lte", "threshold": "0"},
++        outcomes={
++            "on_match": [{"kind": "pool_prohibition", "pool": "both"}],
++            "on_clear": [],
++            "on_missing": "pending_evidence",
++            "on_conflict": "pending_evidence",
++        },
++    )
++
++
++def annual_selector(template_id, name, unit="ratio"):
++    return {
++        "kind": "annual_series",
++        "observations": [
++            {
++                "fy_end": fy_end,
++                "selector": feature_selector(
++                    template_id, f"{name}_{fy_end[:4]}", f"FY{fy_end[:4]}", unit
++                ),
++            }
++            for fy_end in FY_ENDS
++        ],
++    }
++
++
++def context_selector(
++    context_kind="security_state",
++    field="is_st",
++    expected_type="bool",
++    *,
++    entry_id=None,
++    expected_unit=None,
++):
++    return {
++        "kind": "context",
++        "descriptor_id": "a" * 64,
++        "context_kind": context_kind,
++        "scope_key": "fixture-security",
++        "field": field,
++        "entry_id": entry_id,
++        "expected_type": expected_type,
++        "expected_unit": expected_unit,
++    }
++
++
++def boolean_rule(template_id="bank", *, role="status"):
++    del role
++    return {
++        "schema_version": "formal-policy-rule-v1",
++        "kind": "boolean_state",
++        "semantic_id": "st",
++        "template_id": template_id,
++        "inputs": {"value": context_selector()},
++        "parameters": {"expected": True},
++        "outcomes": {
++            "on_match": [{"kind": "pool_prohibition", "pool": "both"}],
++            "on_clear": [],
++            "on_missing": "pending_evidence",
++            "on_conflict": "pending_evidence",
++        },
++    }
++
++
++def enum_rule(template_id="bank"):
++    wire = boolean_rule(template_id)
++    wire.update(kind="enum_state", semantic_id="delisting_arrangement")
++    wire["inputs"] = {
++        "value": context_selector(field="listing_status", expected_type="enum")
++    }
++    wire["parameters"] = {"values": ["delisting_arrangement"]}
++    return wire
++
++
++def cyclic_rule(template_id="bank", *, quantile_method="linear_type7_v1"):
++    outcomes = [
++        {"kind": "dimension_cap", "dimension": "G", "maximum": "80"},
++        {"kind": "dimension_cap", "dimension": "M", "maximum": "80"},
++        {"kind": "valuation_profit_basis", "profit_semantic_id": "cyclic_top"},
++        {"kind": "independent_status", "status_code": "cyclic_top"},
++        {"kind": "pool_prohibition", "pool": "wait"},
++    ]
++    return {
++        "schema_version": "formal-policy-rule-v1",
++        "kind": "cyclic_protection",
++        "semantic_id": "cyclic_top",
++        "template_id": template_id,
++        "inputs": {
++            "current_roe": feature_selector(template_id, "roe", "FY0", "ratio"),
++            "current_margin": feature_selector(template_id, "margin", "FY0", "ratio"),
++            "current_profit": feature_selector(template_id, "profit", "FY0", "CNY"),
++            "annual_roe": annual_selector(template_id, "roe"),
++            "annual_margin": annual_selector(template_id, "margin"),
++            "annual_profit": annual_selector(template_id, "profit", "CNY"),
++        },
++        "parameters": {
++            "fy_ends": list(FY_ENDS),
++            "quantile_method": quantile_method,
++            "quantile_level": "0.80",
++            "median_method": "ordered_middle_v1",
++            "profit_basis_method": "minimum_current_and_five_fy_median_v1",
++            "valuation_dependencies": [
++                {
++                    "metric_id": "V.enterprise_value",
++                    "policy_dependency": "unaffected",
++                    "profit_semantic_id": None,
++                    "adapter_id": None,
++                    "adapter_version": None,
++                    "definition_basis": "fixture enterprise-value definition",
++                },
++                {
++                    "metric_id": "V.normalized_earnings_yield",
++                    "policy_dependency": "affected",
++                    "profit_semantic_id": "cyclic_top",
++                    "adapter_id": "fixture-normalized-profit",
++                    "adapter_version": "fixture-adapter-v1",
++                    "definition_basis": "fixture normalized-profit definition",
++                },
++            ],
++        },
++        "outcomes": {
++            "on_match": sorted(outcomes, key=canonical),
++            "on_clear": [],
++            "on_missing": "pending_evidence",
++            "on_conflict": "pending_evidence",
++        },
++    }
++
++
++def market_rule(template_id="bank"):
++    return {
++        "schema_version": "formal-policy-rule-v1",
++        "kind": "market_liquidity",
++        "semantic_id": "no_effective_trade_20d",
++        "template_id": template_id,
++        "inputs": {
++            "market": context_selector("market_close", "record", "market_record"),
++            "calendar": context_selector(
++                "trading_calendar", "record", "calendar_record"
++            ),
++        },
++        "parameters": {
++            "effective_trade_method": "exchange_allows_and_positive_volume_turnover_v1",
++            "veto_trading_days": 20,
++            "close_search_trading_days": 250,
++            "required_evidence_capability": "verified_market_window_v1",
++        },
++        "outcomes": {
++            "on_match": [{"kind": "pool_prohibition", "pool": "both"}],
++            "on_clear": [],
++            "on_missing": "pending_evidence",
++            "on_conflict": "pending_evidence",
++        },
++    }
++
++
++def policy_wrapper(role, rules, active_ids=None):
++    active_ids = sorted(rules) if active_ids is None else active_ids
++    all_rules = dict(rules)
++    all_rules["execution_contract"] = {
++        "schema_version": "formal-policy-execution-contract-v1",
++        "role": role,
++        "rule_ids": active_ids,
++    }
++    return {
++        "registry_role": role,
++        "schema_version": "formal-scoring-policy-v1",
++        "purpose": "official",
++        "registry_version": f"fixture-{role}-v1",
++        "source_evidence_categories": [f"fixture-{role}"],
++        "rules": all_rules,
++    }
++
++
++def policy_children():
++    wrappers = {
++        "cyclic": policy_wrapper("cyclic", {"bank_cyclic": cyclic_rule()}),
++        "redline": policy_wrapper("redline", {"bank_equity": numeric_rule()}),
++        "status": policy_wrapper("status", {"bank_market": market_rule()}),
++        "event": policy_wrapper("event", {"bank_st": boolean_rule()}),
++    }
++    return {role: canonical(wrapper) for role, wrapper in wrappers.items()}
+diff --git a/tests/test_formal_policy_contract.py b/tests/test_formal_policy_contract.py
+new file mode 100644
+index 0000000..47b6328
+--- /dev/null
++++ b/tests/test_formal_policy_contract.py
+@@ -0,0 +1,519 @@
++"""Pure syntax tests for detached formal policy declarations."""
++
++import json
++import unittest
++
++from ashare_pipeline.formal_policy_contract import (
++    PolicyContractError,
++    iter_rule_selectors,
++    parse_policy_contract,
++    parse_policy_rule,
++)
++from tests.formal_policy_fixtures import (
++    FY_ENDS,
++    boolean_rule,
++    canonical,
++    context_selector,
++    cyclic_rule,
++    enum_rule,
++    market_rule,
++    numeric_rule,
++    policy_children,
++)
++
++
++class PolicySyntaxTests(unittest.TestCase):
++    def test_numeric_rule_is_detached_and_deeply_immutable(self):
++        wire = numeric_rule()
++        rule = parse_policy_rule("redline", "bank_equity", canonical(wire))
++        self.assertEqual(rule.semantic_id, "nonpositive_equity")
++        with self.assertRaises(TypeError):
++            rule.inputs["value"]["period_keys"][0] = "FY1"
++        self.assertFalse(hasattr(rule, "require_verified"))
++        self.assertFalse(hasattr(rule, "pool_eligible"))
++
++
++class PolicySelectorSyntaxTests(unittest.TestCase):
++    def assert_rule_rejected(self, wire, *, role="redline", rule_id="fixture"):
++        with self.assertRaises(PolicyContractError):
++            parse_policy_rule(role, rule_id, canonical(wire))
++
++    def test_feature_selector_requires_exact_sorted_nonempty_periods(self):
++        mutations = (
++            lambda selector: selector.update(extra=True),
++            lambda selector: selector.update(period_keys=[]),
++            lambda selector: selector.update(period_keys=["FY1", "FY0"]),
++            lambda selector: selector.update(period_keys=["FY0", "FY0"]),
++            lambda selector: selector.update(period_keys=[True]),
++            lambda selector: selector.update(template_id="broker"),
++        )
++        for mutate in mutations:
++            wire = numeric_rule()
++            mutate(wire["inputs"]["value"])
++            with self.subTest(selector=wire["inputs"]["value"]):
++                self.assert_rule_rejected(wire)
++
++    def test_annual_series_requires_the_exact_five_ordered_fiscal_years(self):
++        for change in ("missing", "duplicate", "unordered"):
++            wire = cyclic_rule()
++            series = wire["inputs"]["annual_roe"]
++            if change == "missing":
++                series["observations"].pop()
++            elif change == "duplicate":
++                series["observations"][-1]["fy_end"] = FY_ENDS[-2]
++            else:
++                series["observations"][0], series["observations"][1] = (
++                    series["observations"][1],
++                    series["observations"][0],
++                )
++            with self.subTest(change=change):
++                self.assert_rule_rejected(wire, role="cyclic")
++
++    def test_context_selector_enforces_the_finite_field_type_unit_matrix(self):
++        valid = (
++            context_selector(),
++            context_selector(field="listing_status", expected_type="enum"),
++            context_selector("regulatory_state", "active", "bool", entry_id="audit-qualified"),
++            context_selector("market_close", "record", "market_record"),
++            context_selector("trading_calendar", "record", "calendar_record"),
++        )
++        for selector in valid:
++            wire = boolean_rule()
++            wire["inputs"]["value"] = selector
++            if selector["expected_type"] != "bool":
++                wire["kind"] = "enum_state"
++                wire["parameters"] = {"values": ["listed"]}
++            if selector["expected_type"] in ("event_record", "market_record", "calendar_record"):
++                wire["kind"] = "market_liquidity"
++                wire["inputs"] = {
++                    "market": context_selector("market_close", "record", "market_record"),
++                    "calendar": context_selector("trading_calendar", "record", "calendar_record"),
++                }
++                wire["parameters"] = {
++                    "effective_trade_method": "exchange_allows_and_positive_volume_turnover_v1",
++                    "veto_trading_days": 20,
++                    "close_search_trading_days": 250,
++                    "required_evidence_capability": "verified_market_window_v1",
++                }
++            role = "status"
++            with self.subTest(selector=selector):
++                parse_policy_rule(role, "context", canonical(wire))
++
++        invalid = (
++            context_selector(field="unknown"),
++            context_selector(field="listing_status", expected_type="bool"),
++            context_selector("regulatory_state", "active", "bool"),
++            context_selector("market_close", "record", "market_record", entry_id="forbidden"),
++            context_selector(
++                "event_calendar", "event", "event_record", entry_id="event", expected_unit=None
++            ),
++        )
++        for selector in invalid:
++            wire = boolean_rule()
++            wire["inputs"]["value"] = selector
++            with self.subTest(selector=selector):
++                self.assert_rule_rejected(wire, role="status")
++
++    def test_unknown_selector_kind_reports_the_input_path(self):
++        wire = numeric_rule()
++        wire["inputs"]["value"]["kind"] = "jsonpath"
++        with self.assertRaises(PolicyContractError) as caught:
++            parse_policy_rule("redline", "bank_equity", canonical(wire))
++        self.assertEqual(caught.exception.code, "unsupported_contract")
++        self.assertEqual(caught.exception.path, "redline.rules.bank_equity.inputs.value.kind")
++
++    def test_malformed_context_discriminators_raise_contract_errors(self):
++        for field, value in (("context_kind", []), ("field", [])):
++            wire = boolean_rule()
++            wire["inputs"]["value"][field] = value
++            with self.subTest(field=field), self.assertRaises(PolicyContractError):
++                parse_policy_rule("status", "malformed_context", canonical(wire))
++
++    def test_iter_rule_selectors_keeps_annual_series_grouped(self):
++        wire = numeric_rule()
++        rule = parse_policy_rule("redline", "bank_equity", canonical(wire))
++        selectors = iter_rule_selectors(rule)
++        self.assertEqual(len(selectors), 1)
++        self.assertEqual(selectors[0]["kind"], "feature")
++
++    def test_noncanonical_duplicate_non_utf8_and_mutable_raw_are_rejected(self):
++        valid = canonical(numeric_rule())
++        cases = (
++            b" " + valid,
++            b'{"schema_version":"formal-policy-rule-v1","schema_version":"formal-policy-rule-v1"}',
++            b"\xff",
++            bytearray(valid),
++        )
++        for raw in cases:
++            with self.subTest(raw=raw), self.assertRaises(PolicyContractError):
++                parse_policy_rule("redline", "bank_equity", raw)
++
++
++class PolicyRuleFamilyTests(unittest.TestCase):
++    def assert_rejected(self, role, wire, *, rule_id="fixture"):
++        with self.assertRaises(PolicyContractError):
++            parse_policy_rule(role, rule_id, canonical(wire))
++
++    def test_unknown_keys_nondecimal_thresholds_and_pending_dispositions_are_rejected(self):
++        mutations = (
++            lambda wire: wire.update(extra=True),
++            lambda wire: wire["parameters"].update(threshold=True),
++            lambda wire: wire["parameters"].update(threshold="NaN"),
++            lambda wire: wire["outcomes"].update(on_missing="clear"),
++        )
++        for mutate in mutations:
++            wire = numeric_rule()
++            mutate(wire)
++            with self.subTest(wire=wire):
++                self.assert_rejected("redline", wire)
++
++    def test_numeric_comparator_and_signed_decimal_string_boundaries(self):
++        for comparator in ("lt", "lte", "gt", "gte", "eq"):
++            for threshold in ("-1", "-0.5", "0", "0.0", "1", "1.25"):
++                wire = numeric_rule()
++                wire["parameters"] = {
++                    "comparator": comparator,
++                    "threshold": threshold,
++                }
++                with self.subTest(comparator=comparator, threshold=threshold):
++                    parse_policy_rule("redline", "numeric", canonical(wire))
++
++        for comparator, threshold in (
++            ("ne", "0"),
++            ("lte", "+1"),
++            ("lte", "01"),
++            ("lte", "-.5"),
++            ("lte", ".5"),
++            ("lte", "1."),
++            ("lte", "Infinity"),
++        ):
++            wire = numeric_rule()
++            wire["parameters"] = {"comparator": comparator, "threshold": threshold}
++            with self.subTest(comparator=comparator, threshold=threshold):
++                self.assert_rejected("redline", wire)
++
++    def test_boolean_and_enum_parameters_have_exact_types_and_values(self):
++        for value in (1, "true", None):
++            wire = boolean_rule()
++            wire["parameters"]["expected"] = value
++            with self.subTest(expected=value):
++                self.assert_rejected("status", wire)
++
++        for values in (
++            [],
++            ["suspended"],
++            ["listed", "delisted"],
++            ["listed", "listed"],
++        ):
++            wire = enum_rule()
++            wire["parameters"]["values"] = values
++            with self.subTest(values=values):
++                self.assert_rejected("status", wire)
++
++    def test_both_explicit_quantile_algorithms_are_supported_without_a_default(self):
++        for method in ("linear_type7_v1", "nearest_rank_v1"):
++            with self.subTest(method=method):
++                parse_policy_rule("cyclic", "cyclic_top", canonical(cyclic_rule(quantile_method=method)))
++
++        wire = cyclic_rule()
++        del wire["parameters"]["quantile_method"]
++        self.assert_rejected("cyclic", wire)
++        wire = cyclic_rule(quantile_method="implicit_default")
++        with self.assertRaises(PolicyContractError) as caught:
++            parse_policy_rule("cyclic", "cyclic_top", canonical(wire))
++        self.assertEqual(caught.exception.code, "unsupported_contract")
++
++    def test_cyclic_fixed_parameters_and_valuation_dependencies_are_enforced(self):
++        mutations = (
++            lambda wire: wire["parameters"].update(fy_ends=FY_ENDS[:-1]),
++            lambda wire: wire["parameters"].update(quantile_level="0.8"),
++            lambda wire: wire["parameters"].update(median_method="average_middle_v1"),
++            lambda wire: wire["parameters"].update(profit_basis_method="current_only_v1"),
++            lambda wire: wire["parameters"]["valuation_dependencies"].reverse(),
++            lambda wire: wire["parameters"]["valuation_dependencies"][0].update(
++                metric_id="G.enterprise_value"
++            ),
++            lambda wire: wire["parameters"]["valuation_dependencies"][0].update(
++                adapter_id="forbidden"
++            ),
++            lambda wire: wire["parameters"]["valuation_dependencies"][1].update(
++                profit_semantic_id="other"
++            ),
++        )
++        for mutate in mutations:
++            wire = cyclic_rule()
++            mutate(wire)
++            with self.subTest(parameters=wire["parameters"]):
++                self.assert_rejected("cyclic", wire)
++
++    def test_cyclic_requires_exact_g_and_m_caps_profit_basis_status_and_pool_effects(self):
++        def effect(wire, kind, **fields):
++            return next(
++                item
++                for item in wire["outcomes"]["on_match"]
++                if item["kind"] == kind and all(item.get(key) == value for key, value in fields.items())
++            )
++
++        mutations = (
++            lambda wire: effect(wire, "dimension_cap", dimension="G").update(maximum="81"),
++            lambda wire: wire["outcomes"]["on_match"].remove(
++                effect(wire, "dimension_cap", dimension="M")
++            ),
++            lambda wire: effect(wire, "valuation_profit_basis").update(
++                profit_semantic_id="other"
++            ),
++            lambda wire: effect(wire, "independent_status").update(status_code="other"),
++            lambda wire: wire["outcomes"]["on_match"].remove(
++                effect(wire, "pool_prohibition")
++            ),
++        )
++        for mutate in mutations:
++            wire = cyclic_rule()
++            mutate(wire)
++            wire["outcomes"]["on_match"].sort(key=canonical)
++            with self.subTest(outcomes=wire["outcomes"]):
++                self.assert_rejected("cyclic", wire)
++
++    def test_effects_reject_caps_outside_dimensions_and_any_score_or_rank_override(self):
++        invalid_effects = (
++            {"kind": "dimension_cap", "dimension": "total", "maximum": "80"},
++            {"kind": "dimension_cap", "dimension": "G", "maximum": "101"},
++            {"kind": "dimension_cap", "dimension": "G", "maximum": "-1"},
++            {
++                "kind": "valuation_profit_basis",
++                "profit_semantic_id": "nonpositive_equity",
++            },
++            {"kind": "score_override", "score": "80"},
++            {"kind": "rank_override", "rank": 1},
++        )
++        for candidate in invalid_effects:
++            wire = numeric_rule()
++            wire["outcomes"]["on_match"] = [candidate]
++            with self.subTest(candidate=candidate):
++                self.assert_rejected("redline", wire)
++
++    def test_effects_are_canonical_sorted_unique_and_exact(self):
++        pending = {"kind": "pending_evidence", "reason_code": "fixture-evidence"}
++        prohibition = {"kind": "pool_prohibition", "pool": "both"}
++        cases = (
++            [prohibition, pending],
++            [prohibition, prohibition],
++            [{"kind": "pool_prohibition", "pool": "both", "extra": True}],
++            [{"kind": "independent_status", "status_code": ""}],
++            [{"kind": "pending_evidence", "reason_code": "bad code"}],
++        )
++        for effects in cases:
++            wire = numeric_rule()
++            wire["outcomes"]["on_match"] = effects
++            with self.subTest(effects=effects):
++                self.assert_rejected("redline", wire)
++
++    def test_pending_evidence_effect_does_not_mint_a_required_veto_in_a1(self):
++        wire = numeric_rule()
++        wire["outcomes"]["on_match"] = [
++            {"kind": "pending_evidence", "reason_code": "equity-source-missing"}
++        ]
++        rule = parse_policy_rule("redline", "nonpositive_equity", canonical(wire))
++        self.assertEqual(rule.outcomes["on_match"][0]["kind"], "pending_evidence")
++
++    def test_market_liquidity_constants_and_both_pool_veto_are_fixed(self):
++        mutations = (
++            lambda wire: wire["parameters"].update(veto_trading_days=19),
++            lambda wire: wire["parameters"].update(veto_trading_days=True),
++            lambda wire: wire["parameters"].update(close_search_trading_days=249),
++            lambda wire: wire["parameters"].update(effective_trade_method="weekdays_v1"),
++            lambda wire: wire["parameters"].update(required_evidence_capability="market_record_v1"),
++            lambda wire: wire["outcomes"]["on_match"][0].update(pool="strong"),
++        )
++        for mutate in mutations:
++            wire = market_rule()
++            mutate(wire)
++            with self.subTest(wire=wire):
++                self.assert_rejected("status", wire)
++
++    def test_rule_kind_role_template_and_schema_are_closed(self):
++        cases = (
++            ("event", numeric_rule()),
++            ("redline", boolean_rule()),
++            ("status", cyclic_rule()),
++            ("cyclic", market_rule()),
++        )
++        for role, wire in cases:
++            with self.subTest(role=role, kind=wire["kind"]):
++                self.assert_rejected(role, wire)
++
++        wire = numeric_rule()
++        wire["template_id"] = "commodities"
++        self.assert_rejected("redline", wire)
++        wire = numeric_rule()
++        wire["schema_version"] = "formal-policy-rule-v2"
++        with self.assertRaises(PolicyContractError) as caught:
++            parse_policy_rule("redline", "fixture", canonical(wire))
++        self.assertEqual(caught.exception.code, "unsupported_contract")
++        wire = numeric_rule()
++        wire["kind"] = []
++        self.assert_rejected("redline", wire)
++
++    def test_empty_event_entry_and_illegal_listing_enum_are_rejected(self):
++        wire = boolean_rule()
++        wire["inputs"]["value"] = context_selector(
++            "regulatory_state", "active", "bool", entry_id=""
++        )
++        self.assert_rejected("event", wire)
++
++        wire = enum_rule()
++        wire["parameters"]["values"] = ["suspended"]
++        self.assert_rejected("status", wire)
++
++
++class PolicyEntryPointTests(unittest.TestCase):
++    def mutate_wrapper(self, children, role, mutate):
++        wrapper = json.loads(children[role])
++        mutate(wrapper)
++        children[role] = canonical(wrapper)
++
++    def assert_contract_rejected(self, children):
++        with self.assertRaises(PolicyContractError):
++            parse_policy_contract(children)
++
++    def test_four_role_contract_is_deterministic_detached_and_deeply_immutable(self):
++        children = policy_children()
++        parsed = parse_policy_contract(children)
++        self.assertEqual(
++            tuple((rule.role, rule.rule_id) for rule in parsed.rules),
++            (
++                ("cyclic", "bank_cyclic"),
++                ("event", "bank_st"),
++                ("redline", "bank_equity"),
++                ("status", "bank_market"),
++            ),
++        )
++        self.assertEqual(parsed.role_versions["cyclic"], "fixture-cyclic-v1")
++        self.assertEqual(parsed.evidence_categories["status"], ("fixture-status",))
++        expected_children = {
++            role: json.loads(raw.decode("utf-8")) for role, raw in children.items()
++        }
++        self.assertEqual(
++            parsed.canonical_json,
++            canonical(
++                {
++                    "schema_version": "formal-policy-parsed-v1",
++                    "children": expected_children,
++                }
++            ),
++        )
++        with self.assertRaises(TypeError):
++            parsed.role_versions["cyclic"] = "other"
++        with self.assertRaises(TypeError):
++            parsed.rules[0].outcomes["on_match"][0]["kind"] = "other"
++        self.assertFalse(hasattr(parsed, "require_verified"))
++        self.assertFalse(hasattr(parsed, "policy_ready"))
++
++    def test_children_and_wrappers_have_exact_closed_fields_and_versions(self):
++        cases = []
++        children = policy_children()
++        del children["event"]
++        cases.append(children)
++        children = policy_children()
++        children["other"] = children["event"]
++        cases.append(children)
++        children = policy_children()
++        self.mutate_wrapper(children, "redline", lambda wrapper: wrapper.update(extra=True))
++        cases.append(children)
++        children = policy_children()
++        self.mutate_wrapper(
++            children,
++            "redline",
++            lambda wrapper: wrapper.update(schema_version="formal-scoring-policy-v2"),
++        )
++        cases.append(children)
++        children = policy_children()
++        self.mutate_wrapper(children, "redline", lambda wrapper: wrapper.update(purpose=" "))
++        cases.append(children)
++        for children in cases:
++            with self.subTest(children=children):
++                self.assert_contract_rejected(children)
++
++    def test_all_four_wrapper_purposes_must_agree_without_granting_official_status(self):
++        children = policy_children()
++        self.mutate_wrapper(
++            children, "event", lambda wrapper: wrapper.update(purpose="test")
++        )
++        self.assert_contract_rejected(children)
++
++    def test_every_execution_entry_is_present_exact_nonempty_and_role_bound(self):
++        mutations = (
++            lambda rules: rules.pop("execution_contract"),
++            lambda rules: rules["execution_contract"].update(extra=True),
++            lambda rules: rules["execution_contract"].update(rule_ids=[]),
++            lambda rules: rules["execution_contract"].update(role="event"),
++            lambda rules: rules["execution_contract"].update(
++                schema_version="formal-policy-execution-contract-v2"
++            ),
++        )
++        for mutate in mutations:
++            children = policy_children()
++            self.mutate_wrapper(children, "redline", lambda wrapper: mutate(wrapper["rules"]))
++            with self.subTest(children=children):
++                self.assert_contract_rejected(children)
++
++    def test_active_ids_reject_duplicates_disorder_self_reference_dangling_and_cross_role(self):
++        active_lists = (
++            ["bank_equity", "bank_equity"],
++            ["z_rule", "bank_equity"],
++            ["execution_contract"],
++            ["missing"],
++            ["bank_market"],
++        )
++        for active_ids in active_lists:
++            children = policy_children()
++
++            def change(wrapper):
++                if "z_rule" in active_ids:
++                    extra = numeric_rule()
++                    extra["semantic_id"] = "additional_redline"
++                    wrapper["rules"]["z_rule"] = extra
++                wrapper["rules"]["execution_contract"]["rule_ids"] = active_ids
++
++            self.mutate_wrapper(children, "redline", change)
++            with self.subTest(active_ids=active_ids):
++                self.assert_contract_rejected(children)
++
++    def test_active_semantic_ids_are_unique_per_template_across_roles(self):
++        children = policy_children()
++
++        def duplicate(wrapper):
++            wrapper["rules"]["bank_st"]["semantic_id"] = "nonpositive_equity"
++
++        self.mutate_wrapper(children, "event", duplicate)
++        self.assert_contract_rejected(children)
++
++    def test_inactive_legacy_rule_is_not_parsed_but_remains_in_content_identity(self):
++        baseline = parse_policy_contract(policy_children())
++        children = policy_children()
++
++        def add_legacy(wrapper):
++            wrapper["rules"]["legacy_rule"] = {
++                "schema_version": "legacy-policy-v0",
++                "opaque": ["preserved", 1],
++            }
++
++        self.mutate_wrapper(children, "redline", add_legacy)
++        changed = parse_policy_contract(children)
++        self.assertEqual(
++            tuple((rule.role, rule.rule_id) for rule in changed.rules),
++            tuple((rule.role, rule.rule_id) for rule in baseline.rules),
++        )
++        self.assertNotEqual(changed.canonical_json, baseline.canonical_json)
++
++    def test_children_must_be_exact_bytes_and_child_json_must_be_canonical(self):
++        children = policy_children()
++        children["event"] = bytearray(children["event"])
++        self.assert_contract_rejected(children)
++        children = policy_children()
++        children["event"] = b" " + children["event"]
++        self.assert_contract_rejected(children)
++
++
++if __name__ == "__main__":
++    unittest.main()
+

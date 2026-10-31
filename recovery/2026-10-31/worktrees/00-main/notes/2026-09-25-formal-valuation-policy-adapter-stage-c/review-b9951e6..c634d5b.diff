@@ -1,0 +1,100 @@
+# Review package: b9951e68..c634d5b6
+
+## Commits
+c634d5b Seal legacy range catalog field dependency
+
+## Files changed
+ ashare_pipeline/formal_range_contract.py |  9 ++++++---
+ tests/test_formal_range_contract.py      | 27 +++++++++++++++++++++++++++
+ 2 files changed, 33 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_range_contract.py b/ashare_pipeline/formal_range_contract.py
+index 3ec7493..f4cf9d8 100644
+--- a/ashare_pipeline/formal_range_contract.py
++++ b/ashare_pipeline/formal_range_contract.py
+@@ -70,26 +70,29 @@ def _build_range_bindings_contract():
+     from .formal_range_format import RangeConfig, parse_range_entry, _range_config_to_dict
+     from . import formal_range_format as format_module
+     from . import formal_context_schema as context_module
+ 
+     require_bundle = bundle_type.require_official
+     blob_for = bundle_type.blob
+     require_scoring = scoring_type.require_official
+     policy_bytes_for = policy_type.canonical_bytes
+ 
+     module_globals = globals()
+-    # parse_range_entry -> _bridge/_context_selector, _request_template and its
+-    # text/tree helpers, numeric validators and _freeze. The serializer used by
++    # _range_catalog_from_source reads _load_canonical_object and the immutable
++    # _LEGACY_CONFIG_FIELDS global; its parser/type/serializer are captured
++    # closure references. parse_range_entry -> _bridge/_context_selector,
++    # _request_template and its text/tree helpers, numeric validators and
++    # _freeze. The serializer used by
+     # current checks -> _thaw (recursive). Inventory every non-builtin global
+     # reached by those call chains, including the module aliases they use.
+     dependencies = tuple((module_globals, name, module_globals[name]) for name in (
+-        "_load_canonical_object", "_canonical", "_freeze", "_text", "_exchange",
++        "_load_canonical_object", "_LEGACY_CONFIG_FIELDS", "_canonical", "_freeze", "_text", "_exchange",
+         "RangeConfig", "parse_range_entry", "MappingProxyType", "json", "hashlib", "weakref",
+     )) + tuple((vars(format_module), name, vars(format_module)[name]) for name in (
+         "RangeConfig", "parse_range_entry", "_range_config_to_dict", "_canonical",
+         "_text", "_hash", "_exchange", "_positive_number", "_positive_integer",
+         "_https_url", "_placeholder_text", "_template_tree", "_request_template",
+         "_walk_strings", "_context_selector", "_bridge", "_freeze", "_thaw",
+         "Mapping", "MappingProxyType", "json", "hashlib", "math", "re",
+         "_SOURCES", "_EXCHANGES", "_IDENTIFIER", "_VERSION_IDENTIFIER", "_SHA256",
+         "_PLACEHOLDER", "_PLACEHOLDERS", "_RANGE_FIELDS", "_RANGE_FIELD_SET",
+         "_CONTEXT_SELECTOR_FIELDS",
+diff --git a/tests/test_formal_range_contract.py b/tests/test_formal_range_contract.py
+index 7bfc378..78da271 100644
+--- a/tests/test_formal_range_contract.py
++++ b/tests/test_formal_range_contract.py
+@@ -14,20 +14,47 @@ from unittest.mock import patch
+ 
+ from ashare_pipeline.formal_evidence import OfficialRequest
+ from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
+ from ashare_pipeline.formal_sources import SignedSourceRegistry
+ from tests.formal_range_fixtures import range_entry, range_graph
+ from tests.test_formal_scoring_registry import HmacVerifier, canonical
+ from tests.test_formal_sources import config
+ 
+ 
+ class FormalRangeContractTests(unittest.TestCase):
++    def test_equal_identity_replacement_of_legacy_fields_before_load_is_rejected(self):
++        from ashare_pipeline import formal_range_contract as contract
++
++        bundle, vocabulary, scoring, *_ = range_graph()
++        policy = load_formal_policy_registry(
++            bundle, scoring_registry=scoring, feature_registry=vocabulary)
++        replacement = frozenset(list(contract._LEGACY_CONFIG_FIELDS))
++        self.assertEqual(replacement, contract._LEGACY_CONFIG_FIELDS)
++        self.assertIsNot(replacement, contract._LEGACY_CONFIG_FIELDS)
++        with patch.object(contract, "_LEGACY_CONFIG_FIELDS", replacement):
++            with self.assertRaises(ValueError):
++                contract.load_policy_range_bindings(
++                    bundle, scoring_registry=scoring, policy_registry=policy)
++
++    def test_empty_legacy_fields_after_warmup_revoke_current_and_owner_read(self):
++        from ashare_pipeline import formal_range_contract as contract
++
++        bindings, *_ = self._load()
++        binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
++        _, owner_read = contract._range_binding_planning_authority()
++        with patch.object(contract, "_LEGACY_CONFIG_FIELDS", frozenset()):
++            with self.assertRaises(ValueError):
++                binding.require_current()
++            with self.assertRaises(ValueError):
++                owner_read(binding)
++        binding.require_current()
++
+     def test_current_revalidates_sources_without_rederiving_range_graph(self):
+         from ashare_pipeline import formal_range_contract as contract
+ 
+         bindings, *_ = self._load()
+         binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
+         _, owner_read = contract._range_binding_planning_authority()
+         counts = {}
+ 
+         def profile(frame, event, _arg):
+             if event == "call":

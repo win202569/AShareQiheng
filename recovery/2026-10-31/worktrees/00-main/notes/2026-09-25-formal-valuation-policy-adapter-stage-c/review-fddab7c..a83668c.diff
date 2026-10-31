@@ -1,0 +1,272 @@
+# Review package: fddab7c..a83668c
+
+## Commits
+a83668c fix: seal metric definition dependency chain
+
+## Files changed
+ ashare_pipeline/formal_metric_engine.py            | 93 ++++++++++++++--------
+ .../formal_valuation_adapter_contract.py           | 15 ++--
+ tests/test_formal_valuation_adapter_contract.py    | 41 ++++++++++
+ 3 files changed, 111 insertions(+), 38 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_metric_engine.py b/ashare_pipeline/formal_metric_engine.py
+index 16445b4..fc7b3ac 100644
+--- a/ashare_pipeline/formal_metric_engine.py
++++ b/ashare_pipeline/formal_metric_engine.py
+@@ -32,61 +32,90 @@ def percentile_rank(raw_value, values, *, direction):
+             or raw_value not in values or direction not in ("higher", "lower")):
+         raise ValueError("percentile requires finite Decimal peers, their focal value and a signed direction")
+     with localcontext(_arithmetic_context()):
+         below = sum(value < raw_value for value in values)
+         tied = sum(value == raw_value for value in values)
+         rank = Decimal(below) + (Decimal(tied) + 1) / 2
+         percentile = 100 * (rank - Decimal("0.5")) / len(values)
+         return rank, 100 - percentile if direction == "lower" else percentile
+ 
+ 
+-def _plain(value):
+-    if isinstance(value, (dict, MappingProxyType)):
+-        return {key: _plain(item) for key, item in value.items()}
+-    if type(value) in (tuple, list):
+-        return [_plain(item) for item in value]
+-    return str(value) if type(value) is Decimal else value
+-
+-
+-def _canonical(value):
+-    return json.dumps(_plain(value), sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+-
+-
+-def _digest(value, _encoder=_canonical, _sha256=hashlib.sha256):
+-    return _sha256(_encoder(value)).hexdigest()
+-
+-
+ def _freeze(value):
+     if type(value) is dict:
+         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+     if type(value) in (tuple, list):
+         result = tuple(_freeze(item) for item in value)
+         return value if type(value) is tuple and all(a is b for a, b in zip(value, result, strict=True)) else result
+     return value
+ 
+ 
+-def _scoring_metric_definitions(scoring, _definition_digest=_digest,
+-        _template_for=FormalScoringRegistry.template_for):
+-    result = {}
+-    for tid in scoring.templates:
+-        template = _template_for(scoring, tid)
+-        result[tid] = {}
+-        for dimension, metrics in template.metrics.items():
+-            for metric in metrics:
+-                key = dimension + "." + metric.metric_id
+-                definition = {field.name: _plain(getattr(metric, field.name)) for field in fields(metric)}
+-                payload = dict(template_id=tid, metric_id=key, definition=definition,
+-                    registry_manifest_hash=scoring.registry_manifest_hash,
+-                    scoring_registry_hash=scoring.content_sha256, feature_registry_hash=scoring.role_hashes["feature"])
+-                payload["definition_hash"] = _definition_digest(payload)
+-                result[tid][key] = payload
+-    return result
++def _install_metric_definition_producer():
++    """Close the complete metric-definition encoding chain over original dependencies."""
++    owner = globals()
++    mapping_type, decimal_type, field_reader = MappingProxyType, Decimal, fields
++    json_module, hash_module, scoring_type = json, hashlib, FormalScoringRegistry
++    dumps, sha256, template_for = json_module.dumps, hash_module.sha256, scoring_type.template_for
++    dict_type, tuple_type, list_type = dict, tuple, list
++    type_of, is_instance, as_text, read_field = type, isinstance, str, getattr
++
++    def plain(value):
++        if is_instance(value, (dict_type, mapping_type)):
++            return {key: plain(item) for key, item in value.items()}
++        if type_of(value) in (tuple_type, list_type):
++            return [plain(item) for item in value]
++        return as_text(value) if type_of(value) is decimal_type else value
++
++    def canonical(value):
++        return dumps(plain(value), sort_keys=True, ensure_ascii=False,
++            separators=(",", ":"), allow_nan=False).encode()
++
++    def digest(value):
++        return sha256(canonical(value)).hexdigest()
++
++    def definitions(scoring):
++        result = {}
++        for tid in scoring.templates:
++            template = template_for(scoring, tid)
++            result[tid] = {}
++            for dimension, metrics in template.metrics.items():
++                for metric in metrics:
++                    key = dimension + "." + metric.metric_id
++                    definition = {field.name: plain(read_field(metric, field.name))
++                        for field in field_reader(metric)}
++                    payload = dict_type(template_id=tid, metric_id=key, definition=definition,
++                        registry_manifest_hash=scoring.registry_manifest_hash,
++                        scoring_registry_hash=scoring.content_sha256,
++                        feature_registry_hash=scoring.role_hashes["feature"])
++                    payload["definition_hash"] = digest(payload)
++                    result[tid][key] = payload
++        return result
++
++    def dependency_changes():
++        bindings = (
++            (owner, "MappingProxyType", mapping_type), (owner, "Decimal", decimal_type),
++            (owner, "fields", field_reader), (owner, "json", json_module),
++            (owner, "hashlib", hash_module), (owner, "FormalScoringRegistry", scoring_type),
++            (owner, "_plain", plain), (owner, "_canonical", canonical),
++            (owner, "_digest", digest), (owner, "_scoring_metric_definitions", definitions),
++            (owner, "_metric_definition_dependency_changes", dependency_changes),
++            (vars(json_module), "dumps", dumps), (vars(hash_module), "sha256", sha256),
++            (vars(scoring_type), "template_for", template_for),
++        )
++        return tuple(name for source, name, original in bindings
++            if source.get(name) is not original)
++
++    return plain, canonical, digest, definitions, dependency_changes
++
++
++(_plain, _canonical, _digest, _scoring_metric_definitions,
++ _metric_definition_dependency_changes) = _install_metric_definition_producer()
++del _install_metric_definition_producer
+ 
+ 
+ def _install_engine():
+     repositories, proofs = {}, {}
+     context_type = FormalMetricContextRepository
+     feature_read = FormalFeatureRepository.select_current_verified_metric_feature_state
+     require_feature = _require_authentic_metric_feature_repository
+     batch_guard = _metric_batch_guard
+     load_root = FormalRegistryBundleLoader.load
+     decimal_context = _arithmetic_context
+diff --git a/ashare_pipeline/formal_valuation_adapter_contract.py b/ashare_pipeline/formal_valuation_adapter_contract.py
+index b9f077d..ea7359e 100644
+--- a/ashare_pipeline/formal_valuation_adapter_contract.py
++++ b/ashare_pipeline/formal_valuation_adapter_contract.py
+@@ -65,38 +65,41 @@ def _entries(value, keys, path):
+         if type(entry) is not dict or set(entry) != keys:
+             _fail(f"{path}[{index}]", "has wrong fields")
+     return value
+ 
+ 
+ def _install_registry():
+     records = {}
+     bundle_type, scoring_type, policy_type = VerifiedRegistryBundle, FormalScoringRegistry, FormalPolicyRegistry
+     require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
+     require_scoring, require_policy = scoring_type.require_official, policy_type.require_verified
+-    template_for = scoring_type.template_for
+     definitions = _scoring_metric_definitions
+-    metric_encoder = metric_module._canonical
++    metric_owner = metric_module
++    definition_guard = metric_owner._metric_definition_dependency_changes
+     definition_type, serialize_definition = ValuationAdapterDefinition, asdict
+     dumps, loads, sha256 = json.dumps, json.loads, hashlib.sha256
+     parse = _load_canonical_object
+ 
+     def canonical(value):
+         return dumps(value, sort_keys=True, ensure_ascii=False,
+             separators=(",", ":"), allow_nan=False).encode("utf-8")
+ 
+     def sources(bundle, scoring, policy):
+         if type(bundle) is not bundle_type or type(scoring) is not scoring_type or type(policy) is not policy_type:
+             _fail("graph", "requires exact verified source types")
+-        if vars(scoring_type).get("template_for") is not template_for:
+-            _fail("graph.template_for", "scoring template reader changed")
+-        if vars(metric_module).get("_canonical") is not metric_encoder:
+-            _fail("graph.encoder", "metric definition encoder changed")
++        if (globals().get("metric_module") is not metric_owner
++                or vars(metric_owner).get("_metric_definition_dependency_changes") is not definition_guard):
++            _fail("graph.definition dependencies", "metric definition encoder or producer guard changed")
++        changes = definition_guard()
++        if changes:
++            _fail("graph.definition dependencies",
++                "metric definition encoder or producer changed: " + ", ".join(changes))
+         require_bundle(bundle)
+         if bundle.manifest.schema_version != "formal-registry-manifest-v2":
+             raise ValueError("valuation_adapter role is unavailable for this manifest version")
+         require_scoring(scoring, bundle)
+         require_policy(policy)
+         if (policy.registry_manifest_hash != bundle.manifest.manifest_hash
+                 or policy.role_hashes != {role: scoring.role_hashes[role] for role in policy.role_hashes}):
+             _fail("graph", "policy and scoring have different roots")
+         blob = blob_for(bundle, "valuation_adapter")
+         if (sha256(blob.canonical_json).hexdigest() != blob.registry_hash
+diff --git a/tests/test_formal_valuation_adapter_contract.py b/tests/test_formal_valuation_adapter_contract.py
+index 0466f73..6079b34 100644
+--- a/tests/test_formal_valuation_adapter_contract.py
++++ b/tests/test_formal_valuation_adapter_contract.py
+@@ -1,14 +1,15 @@
+ """Signed valuation adapter definitions bind exactly to same-root policy and metrics."""
+ 
+ import copy
+ from dataclasses import asdict, replace
++from types import SimpleNamespace
+ import unittest
+ from unittest.mock import patch
+ 
+ import ashare_pipeline.formal_valuation_adapter_contract as adapter_module
+ import ashare_pipeline.formal_metric_engine as metric_engine
+ from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
+ from ashare_pipeline.formal_valuation_adapter_contract import (
+     FormalValuationAdapterRegistry, load_formal_valuation_adapter_registry,
+ )
+ from tests.formal_policy_fixtures import policy_graph
+@@ -228,20 +229,60 @@ class ValuationAdapterContractTests(unittest.TestCase):
+ 
+     def test_existing_adapter_rejects_a_swapped_metric_encoder(self):
+         bundle, scoring, policy = load_graph()
+         registry = load_formal_valuation_adapter_registry(bundle,
+             scoring_registry=scoring, policy_registry=policy)
+         with patch.object(metric_engine, "_canonical", lambda value: b"wrong"):
+             with self.assertRaisesRegex(ValueError, "valuation adapter.*encoder"):
+                 registry.require_official(bundle)
+         registry.require_official(bundle)
+ 
++    def _metric_dependency_substitutions(self):
++        plain = metric_engine._plain
++        fields = metric_engine.fields
++
++        def poisoned_plain(value):
++            return "lower" if value == "higher" else plain(value)
++
++        def omitted_direction(value):
++            return tuple(field for field in fields(value) if field.name != "direction")
++
++        return (
++            ("_plain", poisoned_plain),
++            ("fields", omitted_direction),
++            ("json", SimpleNamespace(dumps=lambda *args, **kwargs: '"poisoned"')),
++        )
++
++    def test_all_definition_dependencies_reject_poisoned_public_loads_after_restore(self):
++        bundle, scoring, policy = load_graph()
++        for name, replacement in self._metric_dependency_substitutions():
++            with self.subTest(dependency=name):
++                try:
++                    with patch.object(metric_engine, name, replacement):
++                        registry = load_formal_valuation_adapter_registry(bundle,
++                            scoring_registry=scoring, policy_registry=policy)
++                except ValueError as error:
++                    self.assertRegex(str(error), "valuation adapter.*definition dependencies")
++                else:
++                    with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
++                        registry.require_official(bundle)
++
++    def test_existing_registry_rejects_every_active_definition_dependency_swap(self):
++        bundle, scoring, policy = load_graph()
++        registry = load_formal_valuation_adapter_registry(bundle,
++            scoring_registry=scoring, policy_registry=policy)
++        for name, replacement in self._metric_dependency_substitutions():
++            with self.subTest(dependency=name), patch.object(metric_engine, name, replacement):
++                with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
++                    registry.require_official(bundle)
++        registry.require_official(bundle)
++
+     def test_v1_graph_cannot_load_a_formal_valuation_adapter(self):
+         bundle, vocabulary, scoring, _, _ = policy_graph(
+             manifest_version="formal-registry-manifest-v1")
+         policy = load_formal_policy_registry(bundle, scoring_registry=scoring,
+             feature_registry=vocabulary)
+         with self.assertRaisesRegex(ValueError, "valuation_adapter role is unavailable"):
+             load_formal_valuation_adapter_registry(bundle, scoring_registry=scoring,
+                 policy_registry=policy)
+ 
+     def test_fixture_requires_a_stage_c_root_for_adapter_document(self):

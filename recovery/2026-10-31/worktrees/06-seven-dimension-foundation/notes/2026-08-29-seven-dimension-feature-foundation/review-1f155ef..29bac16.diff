@@ -1,0 +1,227 @@
+# Review package: 1f155ef1a037079939c9a2c7fb1d093bf0b071e9..29bac16fc1ee0f690a4ca8eeec6ff213c69bda69
+
+## Commits
+29bac16 fix: fence terminal serialization expiry
+
+## Files changed
+ ashare_pipeline/state_store.py |  6 ++--
+ progress.md                    |  6 ++++
+ tests/test_state_store.py      | 81 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 91 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index ac13d15..deba330 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -585,28 +585,29 @@ class StateStore:
+         self,
+         job_id: str,
+         worker_id: str,
+         result: dict,
+         followups: Iterable[JobSpec],
+     ) -> None:
+         with self._transaction(immediate=True) as connection:
+             now = _utc_now()
+             self._require_unexpired_job_owner(connection, job_id, worker_id, now)
+             self._insert_followups(connection, followups, now)
++            result_json = _json(result)
+             transition_now = _utc_now()
+             cursor = connection.execute(
+                 """UPDATE job SET status = 'succeeded', result_json = ?,
+                 last_error_json = NULL, next_retry_at = NULL,
+                 lease_worker = NULL, lease_expires_at = NULL, updated_at = ?
+                 WHERE id = ? AND status = 'running' AND lease_worker = ?
+                 AND lease_expires_at > ?""",
+-                (_json(result), transition_now, job_id, worker_id, transition_now),
++                (result_json, transition_now, job_id, worker_id, transition_now),
+             )
+             if cursor.rowcount != 1:
+                 raise ValueError(
+                     "job is not held by the current unexpired lease owner"
+                 )
+ 
+     def fail_job_with_followups(
+         self,
+         job_id: str,
+         worker_id: str,
+@@ -614,29 +615,30 @@ class StateStore:
+         retryable: bool,
+         next_retry_at: str | None,
+         followups: Iterable[JobSpec],
+     ) -> None:
+         state = "retryable_failed" if retryable else "terminal_failed"
+         retry_at = _utc_iso(next_retry_at) if retryable and next_retry_at else None
+         with self._transaction(immediate=True) as connection:
+             now = _utc_now()
+             self._require_unexpired_job_owner(connection, job_id, worker_id, now)
+             self._insert_followups(connection, followups, now)
++            error_json = _json(error)
+             transition_now = _utc_now()
+             cursor = connection.execute(
+                 """UPDATE job SET status = ?, last_error_json = ?, next_retry_at = ?,
+                 lease_worker = NULL, lease_expires_at = NULL, updated_at = ?
+                 WHERE id = ? AND status = 'running' AND lease_worker = ?
+                 AND lease_expires_at > ?""",
+                 (
+                     state,
+-                    _json(error),
++                    error_json,
+                     retry_at,
+                     transition_now,
+                     job_id,
+                     worker_id,
+                     transition_now,
+                 ),
+             )
+             if cursor.rowcount != 1:
+                 raise ValueError(
+                     "job is not held by the current unexpired lease owner"
+diff --git a/progress.md b/progress.md
+index 1752f99..34414e4 100644
+--- a/progress.md
++++ b/progress.md
+@@ -114,10 +114,16 @@
+ 
+ - StateStore transaction 现仅在 `BEGIN` 成功后执行 attempt cleanup 与 rollback；未取得 writer lock 的 ownerless snapshot caller 不再删除另一个未提交合法 winner 已采用的 immutable payload，同时所有 post-BEGIN body/end-check/commit cleanup 顺序保持不变。
+ - 本轮 focused 6/6、受影响模块 182/182、fresh full offline `unittest` 421/421 通过；未执行网络、runtime/tracked data、schema/migration、scoring/readiness、正式股票池或 operational `120/114`。
+ - `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。
+ 
+ ### Final whole-branch fix wave（2026-09-01）
+ 
+ - 默认 lease renewal 现仅在取得 `BEGIN IMMEDIATE` writer lock 后采样授权时间；显式 `now_utc` 仍保持确定性逻辑时钟语义。owned complete/fail 在事务内完成首次 owner 检查，并在 follow-up 准备完成后、guarded terminal UPDATE 前重新采样，过期时整笔事务回滚且不遗留 follow-up。
+ - 本轮 focused lease 13/13、受影响 StateStore/DeepWorker 模块 163/163、staged-tree fresh full offline `unittest` 424/424 通过；未执行网络、runtime/tracked data、schema/migration、scoring/readiness、正式股票池或 operational `120/114`。
+ - `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。
++
++### Authorized terminal-serialization micro-fix（2026-09-01）
++
++- owned complete/fail 现先完成 exact result/error JSON serialization，再采样 guarded terminal UPDATE 的最终授权时间；序列化跨越租约到期时，zero-row guard 回滚同一事务内的全部 follow-up，作业保持 running。
++- 本轮 exact RED regression 2/2、focused lease 15/15、受影响 StateStore/DeepWorker 模块 165/165、staged-tree fresh full offline `unittest` 426/426 通过；未执行网络、runtime/tracked data、schema/migration、scoring/readiness、正式股票池或 operational `120/114`。
++- `formal_score_ready=false`、`seven_dimension_ready=false`；正式等待价格池与正式强烈关注池继续关闭且为空。
+diff --git a/tests/test_state_store.py b/tests/test_state_store.py
+index 3a96d69..f85ce3d 100644
+--- a/tests/test_state_store.py
++++ b/tests/test_state_store.py
+@@ -3,20 +3,21 @@ import math
+ import sqlite3
+ import tempfile
+ import threading
+ import unittest
+ from contextlib import closing
+ from dataclasses import FrozenInstanceError, replace
+ from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+ from unittest.mock import patch
+ 
++import ashare_pipeline.state_store as state_store_module
+ from ashare_pipeline.feature_contract import (
+     CONTRACT_VERSION,
+     DIMENSIONS,
+     FINANCIAL_DIMENSIONS,
+     ConfidenceInputs,
+     DimensionInput,
+     EvidenceRef,
+     FeatureBundle,
+     FeatureValue,
+     IndustryContext,
+@@ -1857,20 +1858,100 @@ class StateStoreTestCase(unittest.TestCase):
+                     next(
+                         (
+                             item
+                             for item in self.store.list_jobs(["feature_build"])
+                             if item["idempotency_key"] == followup.idempotency_key
+                         ),
+                         None,
+                     )
+                 )
+ 
++    def _assert_terminal_serialization_resamples_before_update(
++        self, action: str
++    ) -> None:
++        job_id = self.store.enqueue_job(
++            "deep_statement", f"{action}:serialization-time-boundary", {}
++        )
++        self.store.lease_next_job(["deep_statement"], "worker-a", 10, utc_at(0))
++        job_before = self.store.get_job(job_id)
++        followup = JobSpec(
++            "feature_build", f"followup:{action}:serialization-time-boundary", {}
++        )
++        payload = {"outcome": "late"} if action == "complete" else {"reason": "late"}
++        serialization_entered = threading.Event()
++        release_serialization = threading.Event()
++        after_expiry = threading.Event()
++        errors: list[BaseException] = []
++        real_json = state_store_module._json
++
++        def controlled_now():
++            return utc_at(11) if after_expiry.is_set() else utc_at(9)
++
++        def blocked_json(value):
++            if value is payload:
++                serialization_entered.set()
++                if not release_serialization.wait(timeout=5):
++                    raise RuntimeError("test did not release terminal serialization")
++            return real_json(value)
++
++        def transition():
++            try:
++                if action == "complete":
++                    self.store.complete_job_with_followups(
++                        job_id, "worker-a", payload, (followup,)
++                    )
++                else:
++                    self.store.fail_job_with_followups(
++                        job_id,
++                        "worker-a",
++                        payload,
++                        False,
++                        None,
++                        (followup,),
++                    )
++            except BaseException as error:
++                errors.append(error)
++
++        with (
++            patch("ashare_pipeline.state_store._utc_now", side_effect=controlled_now),
++            patch("ashare_pipeline.state_store._json", side_effect=blocked_json),
++        ):
++            worker = threading.Thread(target=transition)
++            worker.start()
++            try:
++                self.assertTrue(serialization_entered.wait(timeout=5))
++                after_expiry.set()
++            finally:
++                release_serialization.set()
++            worker.join(timeout=10)
++
++        self.assertFalse(worker.is_alive())
++        self.assertEqual(len(errors), 1)
++        self.assertIsInstance(errors[0], ValueError)
++        self.assertEqual(self.store.get_job(job_id), job_before)
++        self.assertIsNone(
++            next(
++                (
++                    item
++                    for item in self.store.list_jobs(["feature_build"])
++                    if item["idempotency_key"] == followup.idempotency_key
++                ),
++                None,
++            )
++        )
++
++    def test_complete_resamples_after_result_serialization(self) -> None:
++        self._assert_terminal_serialization_resamples_before_update("complete")
++
++    def test_fail_resamples_after_error_serialization(self) -> None:
++        self._assert_terminal_serialization_resamples_before_update("fail")
++
+     def test_owned_job_transaction_fences_wrong_expired_and_valid_owners(self) -> None:
+         valid_id = self.store.enqueue_job("deep_statement", "owned-mutation:valid", {})
+         self.store.lease_next_job(["deep_statement"], "worker-a", 3600)
+ 
+         with self.assertRaisesRegex(ValueError, "lease owner"):
+             with self.store.owned_job_transaction(valid_id, "worker-b") as connection:
+                 connection.execute(
+                     "INSERT INTO quality_issue VALUES (?,?,?,?,?,?,?)",
+                     ("wrong", None, None, "warning", "wrong", "{}", utc_at(1)),
+                 )

@@ -1,0 +1,1051 @@
+# Review package: 7dd8139..f399d07
+
+## Commits
+f399d07 docs: record Stage C implementation evidence
+f196952 Retire copied binding lease contexts
+
+## Files changed
+ ashare_pipeline/formal_range_contract.py           | 94 ++++++++++++++++++----
+ ...9-25-formal-valuation-policy-adapter-stage-c.md | 64 +++++++--------
+ tests/test_formal_policy_market_binding_lease.py   | 55 ++++++++++++-
+ 3 files changed, 165 insertions(+), 48 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_range_contract.py b/ashare_pipeline/formal_range_contract.py
+index 3433e10..58e18f6 100644
+--- a/ashare_pipeline/formal_range_contract.py
++++ b/ashare_pipeline/formal_range_contract.py
+@@ -492,39 +492,54 @@ def _build_range_bindings_contract():
+ 
+     def _binding_record(value: object, *, current: bool = False) -> _BindingRecord:
+         record = _binding_records.get(id(value))
+         if type(value) is not RangeBinding or record is None or record.reference() is not value:
+             raise ValueError("range binding is forged, copied, or unregistered")
+         parent = record.parent()
+         if parent is None or object.__getattribute__(value, "_RangeBinding__parent") is not parent:
+             raise ValueError("range binding parent changed")
+         lease = _binding_read_lease.get() if current else None
+         if lease is not None:
++            _require_live_lease(lease)
+             parent_record = _bindings_record(parent)
+             identity = (parent_record.snapshot.root_hash, record.binding_hash, record.key)
+             exact_binding = identity == lease[2]
++            exact_only = _sibling_exact_only.get()
++            if exact_only is not None:
++                _require_live_context(_exact_records, exact_only, 2, 3,
++                                      "exact sibling mask")
++                if exact_only[1] is not lease:
++                    raise ValueError("exact sibling mask belongs to another owner lease")
+             sibling = (_sibling_request_read.get()
+-                       if not exact_binding and _sibling_exact_only.get() is None else None)
++                       if not exact_binding and exact_only is None else None)
++            if sibling is not None:
++                _require_live_context(_sibling_records, sibling, 12, 13,
++                                      "sibling request read")
+             target = _sibling_target_read.get() if sibling is not None else None
++            if target is not None:
++                _require_live_context(_target_records, target, 6, 7,
++                                      "sibling target read")
+             sibling_matches = (
+                 sibling is not None
+                 and target is not None
+                 and sibling[0] is lease
+                 and sibling[1] == get_thread_identity()
+                 and sibling[2] is lease[1]
+                 and sibling[3:5] == tuple(lease[7:9])
+                 and parent_record.snapshot == lease[5]
+                 and parent_record.snapshot.root_hash == sibling[7]
+                 and next(digest for role, _, digest in parent_record.snapshot.roles
+                          if role == "source") == sibling[6]
+                 and record.key[1] == sibling[8]
+                 and target[0] == get_thread_identity()
++                and target[3] is lease
++                and target[4:6] == tuple(lease[7:9])
+                 and (target[1] == sibling[9]
+                      or (type(sibling[11]) is dict
+                          and sibling[11].get("task_id") == target[2]))
+                 and (record.calendar_bytes if sibling[10] == "calendar_range"
+                      else record.market_bytes) == sibling[5]
+             )
+             if (get_thread_identity() != lease[0]
+                     or parent_record.snapshot != lease[5]
+                     or (not exact_binding and not sibling_matches)):
+                 raise ValueError("range binding lease is cross-thread, cross-binding, or stale")
+@@ -593,20 +608,45 @@ def _build_range_bindings_contract():
+             raise TypeError("sibling targets require their sealed range Store")
+ 
+ 
+     class _SiblingExactOnly:
+         __slots__ = ("__weakref__",)
+ 
+         def __init__(self, *_args, **_kwargs):
+             raise TypeError("exact sibling masks require their sealed range Store")
+ 
+ 
++    def _require_live_lease(state):
++        if type(state) is not list or len(state) != 14:
++            raise ValueError("range binding read lease is unpublished or stale")
++        capability, generation = state[12:14]
++        saved = _lease_records.get(id(capability))
++        if (type(capability) is not _BindingReadLease or saved is None
++                or saved[0]() is not capability or saved[1] is not state
++                or saved[3] is not False or saved[4] is not True
++                or saved[5] is not generation):
++            raise ValueError("range binding read lease is unpublished or stale")
++        return saved
++
++
++    def _require_live_context(records, state, capability_index, generation_index, label):
++        if type(state) is not tuple or len(state) <= generation_index:
++            raise ValueError(label + " is unpublished or stale")
++        capability = state[capability_index]
++        generation = state[generation_index]
++        saved = records.get(id(capability))
++        if (saved is None or saved[0]() is not capability or saved[1] is not state
++                or saved[3] is not True or saved[4] is not generation):
++            raise ValueError(label + " is unpublished or stale")
++        return saved
++
++
+     def install_sibling_request_read(
+             prover, selector_code, read_code, current_code, recheck_code):
+         caller = get_frame(1)
+         if (caller.f_code.co_name != "_build_range_store_type"
+                 or caller.f_globals.get("__name__") != "ashare_pipeline.formal_range_store"
+                 or _sibling_request_prover[0] is not None
+                 or not callable(prover)
+                 or type(selector_code) is not type(install_sibling_request_read.__code__)
+                 or type(read_code) is not type(install_sibling_request_read.__code__)
+                 or type(current_code) is not type(install_sibling_request_read.__code__)
+@@ -627,84 +667,99 @@ def _build_range_bindings_contract():
+     def enter_sibling_target_read(request_fingerprint, task_id):
+         codes = _sibling_store_codes[0]
+         caller = get_frame(1)
+         if codes is None or caller.f_code not in (codes[1], codes[3]):
+             raise ValueError("sibling targets require their fixed range Store entry")
+         if (type(request_fingerprint) is not str or len(request_fingerprint) != 64
+                 or any(character not in "0123456789abcdef"
+                        for character in request_fingerprint)
+                 or type(task_id) is not str or not task_id):
+             raise ValueError("sibling target identity is invalid")
+-        state = (get_thread_identity(), request_fingerprint, task_id)
+-        context_token = _sibling_target_read.set(state)
++        lease = _binding_read_lease.get()
++        if lease is not None:
++            _require_live_lease(lease)
+         result = object.__new__(_SiblingTargetRead)
++        generation = object()
++        state = (get_thread_identity(), request_fingerprint, task_id,
++                 lease, None if lease is None else lease[7],
++                 None if lease is None else lease[8], result, generation)
++        context_token = _sibling_target_read.set(state)
+         identity = id(result)
+         reference = weakref.ref(result, lambda ref, key=identity:
+             _target_records.pop(key, None)
+             if _target_records.get(key) is not None
+             and _target_records[key][0] is ref else None)
+-        _target_records[identity] = [reference, state, context_token, True]
++        _target_records[identity] = [reference, state, context_token, True, generation]
+         return result
+ 
+ 
+     def close_sibling_target_read(capability):
+         saved = _target_records.get(id(capability))
+         if (type(capability) is not _SiblingTargetRead or saved is None
+                 or saved[0]() is not capability or saved[3] is not True):
+             raise ValueError("sibling target read is forged, copied, or closed")
+         state, token = saved[1:3]
+         if (get_thread_identity() != state[0]
+                 or _sibling_target_read.get() is not state):
+             raise ValueError("sibling target read is cross-thread or out of order")
+         _sibling_target_read.reset(token)
+         saved[3] = False
++        _target_records.pop(id(capability), None)
+ 
+ 
+     def enter_sibling_exact_only():
+         codes = _sibling_store_codes[0]
+         caller = get_frame(1)
+         if codes is None or caller.f_code not in (codes[0], codes[3]):
+             raise ValueError("exact sibling masks require their fixed range Store entry")
+-        state = (get_thread_identity(), _binding_read_lease.get())
+-        context_token = _sibling_exact_only.set(state)
++        lease = _binding_read_lease.get()
++        if lease is not None:
++            _require_live_lease(lease)
+         result = object.__new__(_SiblingExactOnly)
++        generation = object()
++        state = (get_thread_identity(), lease, result, generation)
++        context_token = _sibling_exact_only.set(state)
+         identity = id(result)
+         reference = weakref.ref(result, lambda ref, key=identity:
+             _exact_records.pop(key, None)
+             if _exact_records.get(key) is not None
+             and _exact_records[key][0] is ref else None)
+-        _exact_records[identity] = [reference, state, context_token, True]
++        _exact_records[identity] = [reference, state, context_token, True, generation]
+         return result
+ 
+ 
+     def close_sibling_exact_only(capability):
+         saved = _exact_records.get(id(capability))
+         if (type(capability) is not _SiblingExactOnly or saved is None
+                 or saved[0]() is not capability or saved[3] is not True):
+             raise ValueError("exact sibling mask is forged, copied, or closed")
+         state, token = saved[1:3]
+         if (get_thread_identity() != state[0]
+                 or _sibling_exact_only.get() is not state
+                 or _binding_read_lease.get() is not state[1]):
+             raise ValueError("exact sibling mask is cross-thread or out of order")
+         _sibling_exact_only.reset(token)
+         saved[3] = False
++        _exact_records.pop(id(capability), None)
+ 
+ 
+     def _open_sibling_description(
+             request_description, request_fingerprint, *, require_owner_binding):
+         lease = _binding_read_lease.get()
+         if lease is None:
+             return None
++        _require_live_lease(lease)
+         prior = _sibling_request_read.get()
+         prior_capability = None
+         if prior is not None:
++            _require_live_context(_sibling_records, prior, 12, 13,
++                                  "sibling request read")
+             if prior[0] is not lease:
+                 raise ValueError("sibling request read belongs to another owner lease")
+             prior_capability = lease[11]
+         current_owner, current_epoch, current_phase = validate_lease_scope(lease[1])
+         if ((current_owner, current_epoch, current_phase) != tuple(lease[6:9])
+                 or get_thread_identity() != lease[0]):
+             raise ValueError("sibling request read owner phase changed")
+         if (type(request_description) is not dict
+                 or set(request_description) != {"request", "config", "source_registry_hash",
+                                                 "binding_hash", "parent"}
+@@ -743,32 +798,34 @@ def _build_range_bindings_contract():
+              and request_description["binding_hash"] != owner_record.binding_hash),
+             ("source", request_description["source_registry_hash"] != source_hash),
+             ("root", request.get("registry_manifest_hash") != lease[2][0]),
+             ("exchange", request.get("exchange") != owner_record.key[1]),
+             ("range_config", request.get("range_config_id") != expected_config.entry_id),
+         ) if changed)
+         if differences:
+             raise ValueError(
+                 "sibling request differs from owner binding contract: "
+                 + ",".join(differences))
++        result = object.__new__(_SiblingRequestRead)
++        generation = object()
+         state = (lease, get_thread_identity(), lease[1], current_epoch, current_phase,
+                  config_bytes, source_hash, lease[2][0], owner_record.key[1],
+-                 request_fingerprint, kind, request_description["parent"])
++                 request_fingerprint, kind, request_description["parent"],
++                 result, generation)
+         context_token = _sibling_request_read.set(state)
+-        result = object.__new__(_SiblingRequestRead)
+         identity = id(result)
+         reference = weakref.ref(result, lambda ref, key=identity:
+             _sibling_records.pop(key, None)
+             if _sibling_records.get(key) is not None
+             and _sibling_records[key][0] is ref else None)
+         _sibling_records[identity] = [
+-            reference, state, context_token, True, prior_capability]
++            reference, state, context_token, True, generation, prior_capability]
+         lease[11] = result
+         return result
+ 
+ 
+     def open_sibling_request_read(request_value, request_fingerprint):
+         """Authorize one genuine request to read an identical persisted sibling."""
+         _check_dependencies()
+         _require_sibling_store_entry(0)
+         prover = _sibling_request_prover[0]
+         if prover is None:
+@@ -815,21 +872,22 @@ def _build_range_bindings_contract():
+         if (type(capability) is not _SiblingRequestRead or saved is None
+                 or saved[0]() is not capability or saved[3] is not True):
+             raise ValueError("sibling request read is forged, copied, or closed")
+         state, token = saved[1:3]
+         if (get_thread_identity() != state[1]
+                 or _sibling_request_read.get() is not state
+                 or _binding_read_lease.get() is not state[0]):
+             raise ValueError("sibling request read is cross-thread or out of order")
+         _sibling_request_read.reset(token)
+         saved[3] = False
+-        state[0][11] = saved[4]
++        state[0][11] = saved[5]
++        _sibling_records.pop(id(capability), None)
+ 
+ 
+     def open_current_binding_read_lease(value, owner_scope, operation_key):
+         """Open one bounded owner operation; the returned token has no public behavior."""
+         _check_dependencies()
+         caller = get_frame(1)
+         owner, epoch, phase = validate_lease_scope(owner_scope)
+         owner_type = type(owner)
+         calendar_code = vars(owner_type).get("select_calendar_batch_ticket")
+         market_code = vars(owner_type).get("select_current_batch_ticket")
+@@ -840,20 +898,21 @@ def _build_range_bindings_contract():
+             raise ValueError("range binding lease cannot be nested, copied, or unbound")
+         expected_key = (("calendar", caller.f_locals.get("as_of_utc"))
+                         if caller.f_code is calendar_code else
+                         ("market", caller.f_locals.get("security_id"),
+                          caller.f_locals.get("as_of_utc")))
+         if (operation_key != expected_key or any(type(item) is not str or not item
+                                                   for item in expected_key)):
+             raise ValueError("range binding lease operation key is not owner-derived")
+         active = _binding_read_lease.get()
+         if active is not None:
++            _require_live_lease(active)
+             _binding_record(value, current=True)
+             nested = (caller.f_code is calendar_code and active[1] is owner_scope
+                       and active[3][0] == "market"
+                       and operation_key == ("calendar", active[3][-1])
+                       and active[6] is owner and active[7] is epoch
+                       and active[8] == phase and active[9] is False
+                       and active[10] is False)
+             if not nested:
+                 raise ValueError("range binding lease cannot be nested, copied, or unbound")
+             active[9] = True
+@@ -865,31 +924,36 @@ def _build_range_bindings_contract():
+             parent = child.parent()
+             parent_record = _bindings_record(parent)
+             entry = _capture_graph_snapshot(
+                 parent_record.bundle, parent_record.scoring_registry,
+                 parent_record.policy_registry
+             )
+             if entry != parent_record.snapshot:
+                 raise ValueError("range binding sources changed before owner operation")
+             _lightweight_current(parent_record)
+             identity = (parent_record.snapshot.root_hash, child.binding_hash, child.key)
++            lease = object.__new__(_BindingReadLease)
++            generation = object()
+             state = [get_thread_identity(), owner_scope, identity, operation_key,
+-                     parent_record, entry, owner, epoch, phase, False, False, None]
++                     parent_record, entry, owner, epoch, phase, False, False, None,
++                     lease, generation]
+             token = _binding_read_lease.set(state)
+             nested = False
+-        lease = object.__new__(_BindingReadLease)
++        if nested:
++            lease = object.__new__(_BindingReadLease)
++            generation = object()
+         identity = id(lease)
+         reference = weakref.ref(lease, lambda ref, key=identity:
+             _lease_records.pop(key, None)
+             if _lease_records.get(key) is not None
+             and _lease_records[key][0] is ref else None)
+-        _lease_records[identity] = [reference, state, token, nested, True]
++        _lease_records[identity] = [reference, state, token, nested, True, generation]
+         return lease
+ 
+ 
+     def close_current_binding_read_lease(lease):
+         saved = _lease_records.get(id(lease))
+         if (type(lease) is not _BindingReadLease or saved is None
+                 or saved[0]() is not lease or saved[4] is not True):
+             raise ValueError("range binding read lease is forged, copied, or closed")
+         state, token, nested = saved[1:4]
+         if get_thread_identity() != state[0] or _binding_read_lease.get() is not state:
+@@ -902,40 +966,42 @@ def _build_range_bindings_contract():
+         except BaseException as error:
+             pending = error
+         if nested:
+             if state[10] is not True:
+                 raise ValueError("range binding calendar child lease is out of order")
+             while state[11] is not None:
+                 close_sibling_request_read(state[11])
+             _binding_read_lease.reset(token)
+             state[10] = False
+             saved[4] = False
++            _lease_records.pop(id(lease), None)
+             if pending is not None:
+                 raise pending
+             return
+         if state[10] is not False:
+             raise ValueError("range binding outer lease still owns a calendar child")
+         while state[11] is not None:
+             close_sibling_request_read(state[11])
+         parent_record, entry = state[4:6]
+         try:
+             exit_snapshot = _capture_graph_snapshot(
+                 parent_record.bundle, parent_record.scoring_registry,
+                 parent_record.policy_registry
+             )
+             if exit_snapshot != entry or exit_snapshot != parent_record.snapshot:
+                 raise ValueError("range binding sources changed during owner operation")
+         except BaseException as error:
+             if pending is None:
+                 pending = error
+         _binding_read_lease.reset(token)
+         saved[4] = False
++        _lease_records.pop(id(lease), None)
+         if pending is not None:
+             raise pending
+ 
+ 
+     class RangeBinding:
+         """A current, same-root M/C/Bx configuration authorization."""
+ 
+         __slots__ = ("__parent", "__weakref__")
+ 
+         def __init__(self, *_args: object, **_kwargs: object) -> None:
+diff --git a/docs/superpowers/plans/2026-09-25-formal-valuation-policy-adapter-stage-c.md b/docs/superpowers/plans/2026-09-25-formal-valuation-policy-adapter-stage-c.md
+index 02b6fac..0ad7166 100644
+--- a/docs/superpowers/plans/2026-09-25-formal-valuation-policy-adapter-stage-c.md
++++ b/docs/superpowers/plans/2026-09-25-formal-valuation-policy-adapter-stage-c.md
+@@ -56,48 +56,48 @@
+ 
+ **Files:**
+ - Modify: `ashare_pipeline/formal_registry_manifest.py:24-35,154-210,218-260,377-488,560-727`
+ - Modify: `tests/test_formal_registry_manifest.py`
+ - Modify: `tests/test_formal_scoring_registry.py:46-86`
+ 
+ **Interfaces:**
+ - Consumes: 现有规范 JSON、根签名、child 签名和外层 root/child/role binding。
+ - Produces: `formal-registry-manifest-v2`；`FormalRegistryManifest.schema_version: str`；`FormalRegistryManifest.valuation_adapter_registry_hash: str | None`；`VerifiedRegistryBundle.roles: tuple[str, ...]`；v1 精确九角色、v2 精确十角色。
+ 
+-- [ ] **Step 1: 写 v1/v2 失败测试。**
++- [x] **Step 1: 写 v1/v2 失败测试。**
+ 
+ ```python
+ def test_v1_bundle_remains_valid_but_has_no_valuation_adapter_role(self):
+     repository, manifest, _ = fixture_repository(schema_version="formal-registry-manifest-v1")
+     bundle = FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(manifest.manifest_hash)
+     self.assertEqual(len(bundle.roles), 9)
+     self.assertIsNone(bundle.manifest.valuation_adapter_registry_hash)
+     with self.assertRaisesRegex(ValueError, "role is unavailable for this manifest version"):
+         bundle.blob("valuation_adapter")
+ 
+ def test_v2_requires_exact_ten_roles_and_signed_adapter_binding(self):
+     repository, manifest, _ = fixture_repository(schema_version="formal-registry-manifest-v2")
+     bundle = FormalRegistryBundleLoader(repository, AcceptingVerifier()).load(manifest.manifest_hash)
+     self.assertEqual(bundle.roles[-1], "valuation_adapter")
+     self.assertEqual(bundle.blob("valuation_adapter").registry_hash,
+                      manifest.valuation_adapter_registry_hash)
+ ```
+ 
+ 同时加入：v2 缺 child、重复 child hash、adapter child 自报错 role、错 root binding、错 approval ID、v1 偷带第十字段、未知 v3 schema、`object.__setattr__` 修改 schema/adapter hash 后 seal 失效。
+ 
+-- [ ] **Step 2: 运行 RED。**
++- [x] **Step 2: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_registry_manifest -v`
+ 
+ Expected: 新 v2 测试因 schema 和字段不存在而失败；既有 v1 测试仍通过到原断言位置。
+ 
+-- [ ] **Step 3: 实现版本化角色集合。**
++- [x] **Step 3: 实现版本化角色集合。**
+ 
+ ```python
+ _ROLE_FIELDS_V1 = {
+     "source": "source_registry_hash", "mapping": "mapping_registry_hash",
+     "feature": "feature_registry_hash", "scoring": "scoring_registry_hash",
+     "industry": "industry_registry_hash", "cyclic": "cyclic_registry_hash",
+     "redline": "redline_registry_hash", "status": "status_registry_hash",
+     "event": "event_registry_hash",
+ }
+ _ROLE_FIELDS_V2 = dict(_ROLE_FIELDS_V1,
+@@ -109,21 +109,21 @@ _ROLE_FIELDS_BY_SCHEMA = {
+ 
+ def role_fields_for_schema(schema_version):
+     fields = _ROLE_FIELDS_BY_SCHEMA.get(schema_version)
+     if fields is None:
+         raise ValueError("registry manifest schema_version is invalid")
+     return fields
+ ```
+ 
+ 把 schema_version 和可空 adapter hash 纳入 manifest snapshot/fingerprint；`from_signed_bytes` 先读 schema 再计算精确 keys；v1 构造时 adapter hash 固定为 `None`，v2 必须是唯一 SHA-256。bundle 的 `roles` 从 manifest schema 导出，`require_official`、`blob`、`load` 和 `assert_member_hashes` 只接受该 schema 的精确角色集合。
+ 
+-- [ ] **Step 4: 更新签名图夹具，保持默认 v1。**
++- [x] **Step 4: 更新签名图夹具，保持默认 v1。**
+ 
+ ```python
+ def signed_graph(*, mutate=None, context=False,
+                  manifest_version="formal-registry-manifest-v1"):
+     verifier = HmacVerifier()
+     wrapper = fixture_wire()
+     scoring = wrapper["scoring"]
+     slots = scoring.pop("fixture_feature_slots")
+     policies = scoring.pop("fixture_policies")
+     scoring["purpose"] = "official"
+@@ -181,47 +181,47 @@ def signed_graph(*, mutate=None, context=False,
+         manifest.manifest_hash)
+     feature = bundle.blob("feature")
+     vocabulary = load_signed_feature_registry(
+         feature.canonical_json, feature.signature, feature.key_id, verifier,
+         registry_manifest=bundle.manifest)
+     return bundle, vocabulary, repository, verifier
+ ```
+ 
+ 默认参数必须让现有测试继续得到 v1；v2 的 mutate 必须显式加入 `documents["valuation_adapter"]`，否则精确集合检查失败。
+ 
+-- [ ] **Step 5: 运行 GREEN 和旧图回归。**
++- [x] **Step 5: 运行 GREEN 和旧图回归。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_registry_manifest tests.test_formal_scoring_registry tests.test_formal_policy_registry tests.test_formal_feature_contract tests.test_formal_sources -v`
+ 
+ Expected: 全部 PASS；v1 和 v2 的角色数、签名、seal 与篡改路径均有明确断言。
+ 
+-- [ ] **Step 6: 提交 C1。**
++- [x] **Step 6: 提交 C1。**
+ 
+ ```powershell
+ git add ashare_pipeline/formal_registry_manifest.py tests/test_formal_registry_manifest.py tests/test_formal_scoring_registry.py
+ git commit -m "feat: version the formal registry root for valuation adapters"
+ ```
+ 
+ ### Task 2: Signed valuation adapter contract
+ 
+ **Files:**
+ - Create: `ashare_pipeline/formal_valuation_adapter_contract.py`
+ - Create: `tests/test_formal_valuation_adapter_contract.py`
+ - Modify: `ashare_pipeline/formal_metric_engine.py:166-180`
+ - Modify: `tests/test_formal_metric_engine.py`
+ - Modify: `tests/formal_policy_fixtures.py:225-347`
+ 
+ **Interfaces:**
+ - Consumes: genuine v2 `VerifiedRegistryBundle`、`FormalScoringRegistry`、`FormalPolicyRegistry` 和 `valuation_adapter` child 原始规范字节。
+ - Produces: `ValuationAdapterDefinition`；`FormalValuationAdapterRegistry`；`load_formal_valuation_adapter_registry(bundle, *, scoring_registry, policy_registry) -> FormalValuationAdapterRegistry`；`.dependency_for(template_id, metric_id)`；`.adapter_for(template_id, metric_id)`；`.require_official(bundle)`；`.to_dict()`；fixture helper `add_valuation_adapter_document(documents) -> None`。
+ 
+-- [ ] **Step 1: 写合同 RED 测试和十角色 fixture 文档。**
++- [x] **Step 1: 写合同 RED 测试和十角色 fixture 文档。**
+ 
+ ```python
+ def valuation_adapter_document(scoring, cyclic_rules):
+     adapters = []
+     coverage = []
+     for template_id in sorted(scoring["templates"]):
+         rule = cyclic_rules[template_id]
+         by_metric = {item["metric_id"]: item
+                      for item in rule["parameters"]["valuation_dependencies"]}
+         for metric in scoring["templates"][template_id]["metrics"]["V"]:
+@@ -245,27 +245,27 @@ def valuation_adapter_document(scoring, cyclic_rules):
+                     definition_basis=dependency["definition_basis"]))
+     return dict(registry_role="valuation_adapter",
+                 schema_version="formal-valuation-adapter-registry-v1",
+                 purpose="official", registry_version="fixture-adapter-v1",
+                 coverage=sorted(coverage, key=lambda x: (x["template_id"], x["metric_id"])),
+                 adapters=sorted(adapters, key=lambda x: (x["template_id"], x["metric_id"])))
+ ```
+ 
+ 测试精确覆盖五模板 × 三 V 指标、每个 affected 唯一 adapter、unaffected 不得有 adapter、operation 白名单、定义哈希、利润语义、rule/template/metric/unit、Decimal contract 和 preconditions。逐项 mutation 必须报稳定的合同错误。
+ 
+-- [ ] **Step 2: 运行 RED。**
++- [x] **Step 2: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_adapter_contract -v`
+ 
+ Expected: FAIL with `ModuleNotFoundError: ashare_pipeline.formal_valuation_adapter_contract`。
+ 
+-- [ ] **Step 3: 实现严格 parser 和不可伪造 registry。**
++- [x] **Step 3: 实现严格 parser 和不可伪造 registry。**
+ 
+ ```python
+ @dataclass(frozen=True, slots=True)
+ class ValuationAdapterDefinition:
+     template_id: str
+     metric_id: str
+     adapter_id: str
+     adapter_version: str
+     operation: Literal["profit_ratio_rescale_v1"]
+     original_definition_hash: str
+@@ -307,57 +307,57 @@ def policy_graph(*, version="v1", manifest_version="formal-registry-manifest-v1"
+     bundle, vocabulary, repository, verifier = values[:4]
+     approval = RegistryApproval("official",
+         bundle.manifest.scoring_registry_hash, bundle.manifest.approval_id)
+     scoring = load_formal_registry(bundle, approval,
+                                    feature_registry=vocabulary)
+     return bundle, vocabulary, scoring, repository, verifier
+ ```
+ 
+ `with_valuation_adapter=True` 必须同时要求 manifest v2；其他组合明确报错。现有 scoring wrapper v2 fixture 继续使用九角色 manifest v1，不扩大本阶段改动面。
+ 
+-- [ ] **Step 4: 证明旧 v1 不能进入 Stage C。**
++- [x] **Step 4: 证明旧 v1 不能进入 Stage C。**
+ 
+ ```python
+ def test_v1_graph_cannot_load_a_formal_valuation_adapter(self):
+     bundle, vocabulary, scoring, _, _ = policy_graph(
+         manifest_version="formal-registry-manifest-v1")
+     policy = load_formal_policy_registry(bundle, scoring_registry=scoring,
+                                          feature_registry=vocabulary)
+     with self.assertRaisesRegex(ValueError, "valuation_adapter role is unavailable"):
+         load_formal_valuation_adapter_registry(bundle, scoring_registry=scoring,
+                                                policy_registry=policy)
+ ```
+ 
+-- [ ] **Step 5: 运行 GREEN 和注册表兼容回归。**
++- [x] **Step 5: 运行 GREEN 和注册表兼容回归。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_adapter_contract tests.test_formal_registry_manifest tests.test_formal_scoring_registry tests.test_formal_policy_registry tests.test_formal_policy_registry_guards -v`
+ 
+ Expected: 全部 PASS；现有 v1 policy/scoring 图不需要 adapter 即可继续通过旧测试。
+ 
+-- [ ] **Step 6: 提交 C2。**
++- [x] **Step 6: 提交 C2。**
+ 
+ ```powershell
+ git add ashare_pipeline/formal_valuation_adapter_contract.py ashare_pipeline/formal_metric_engine.py tests/test_formal_valuation_adapter_contract.py tests/test_formal_metric_engine.py tests/formal_policy_fixtures.py
+ git commit -m "feat: validate signed valuation adapter contracts"
+ ```
+ 
+ ### Task 3: Pure adjustment arithmetic and state machine
+ 
+ **Files:**
+ - Create: `ashare_pipeline/formal_valuation_adapter.py`
+ - Create: `tests/test_formal_valuation_adapter.py`
+ 
+ **Interfaces:**
+ - Consumes: detached canonical dicts for one base metric row, one policy result, one cyclic decision, one dependency and optional adapter definition。
+ - Produces: `profit_ratio_rescale(original_metric_value: Decimal, original_current_profit: Decimal, normalized_profit: Decimal) -> Decimal`；`evaluate_valuation_adjustment(*, metric: dict, policy_result: dict, cyclic_decision: dict, dependency: dict, adapter: dict | None) -> dict`。纯结果不能自称正式证明。
+ 
+-- [ ] **Step 1: 写数值与状态 RED 测试。**
++- [x] **Step 1: 写数值与状态 RED 测试。**
+ 
+ ```python
+ def test_matched_affected_uses_normalized_profit_ratio(self):
+     result = evaluate_valuation_adjustment(
+         metric=metric(value="0.20", unit="ratio"),
+         policy_result=policy_result(),
+         cyclic_decision=decision("matched", current="10", normalized="6"),
+         dependency=affected(), adapter=adapter())
+     self.assertEqual(result["status"], "adjusted")
+     self.assertEqual(result["adjusted_value"], "0.12")
+@@ -370,21 +370,21 @@ def test_pending_policy_blocks_only_affected_metric(self):
+     passed = evaluate_valuation_adjustment(
+         metric=metric(), policy_result=policy_result(), cyclic_decision=pending,
+         dependency=unaffected(), adapter=None)
+     self.assertEqual(blocked["status"], "pending_policy_evidence")
+     self.assertIsNone(blocked["adjusted_value"])
+     self.assertEqual(passed["status"], "passthrough_unaffected")
+ ```
+ 
+ 加入 clear、not_applicable、matched/unaffected、adjusted_no_numeric_change、错误模板/指标/利润语义、缺 normalization basis、多 basis、非 affected 却给 adapter 的精确测试。
+ 
+-- [ ] **Step 2: 写非法操作数 Review Focus 测试并运行 RED。**
++- [x] **Step 2: 写非法操作数 Review Focus 测试并运行 RED。**
+ 
+ ```python
+ def test_invalid_adapter_operands_fail_closed_without_numeric_output(self):
+     cases = (("0", "6", "original_current_profit_zero"),
+              ("NaN", "6", "metric_value_nonfinite"),
+              ("10", "Infinity", "normalized_profit_nonfinite"))
+     for current, normalized, reason in cases:
+         with self.subTest(reason=reason):
+             result = evaluate_valuation_adjustment(
+                 metric=metric(value="NaN" if reason == "metric_value_nonfinite" else "0.20"),
+@@ -393,62 +393,62 @@ def test_invalid_adapter_operands_fail_closed_without_numeric_output(self):
+                 dependency=affected(), adapter=adapter())
+             self.assertEqual(result["status"], "invalid_adapter_operand")
+             self.assertEqual(result["reason"], reason)
+             self.assertIsNone(result["adjusted_value"])
+ ```
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_adapter -v`
+ 
+ Expected: FAIL because the module does not exist。
+ 
+-- [ ] **Step 3: 实现固定 Decimal 内核。**
++- [x] **Step 3: 实现固定 Decimal 内核。**
+ 
+ ```python
+ def _arithmetic_context():
+     return Context(prec=50, rounding=ROUND_HALF_EVEN, Emin=-999999,
+                    Emax=999999, capitals=1, clamp=0, flags=[],
+                    traps=[InvalidOperation, DivisionByZero, Overflow])
+ 
+ def profit_ratio_rescale(original_metric_value, original_current_profit,
+                          normalized_profit):
+     values = (original_metric_value, original_current_profit, normalized_profit)
+     if any(type(value) is not Decimal or not value.is_finite() for value in values):
+         raise ValueError("valuation adapter requires finite exact Decimals")
+     if original_current_profit == 0:
+         raise ValueError("valuation adapter original profit cannot be zero")
+     with localcontext(_arithmetic_context()):
+         return original_metric_value * normalized_profit / original_current_profit
+ ```
+ 
+ 状态机先校验所有 detached dict 的精确 keys 和跨对象身份，再根据 decision/dependency 选择透传、待补或 adjustment。输出 Decimal 使用规范字符串，并包含 operation、输入、结果、reason、decision_hash、result_hash、adapter definition hash；不接受调用者提供 status 或 adjusted_value。
+ 
+-- [ ] **Step 4: 验证全局 Decimal 污染和确定性。**
++- [x] **Step 4: 验证全局 Decimal 污染和确定性。**
+ 
+ ```python
+ def test_ambient_decimal_context_cannot_change_adjustment(self):
+     with localcontext() as ambient:
+         ambient.prec = 2
+         ambient.rounding = ROUND_DOWN
+         first = profit_ratio_rescale(Decimal("0.2"), Decimal("3"), Decimal("2"))
+     with localcontext() as ambient:
+         ambient.prec = 28
+         second = profit_ratio_rescale(Decimal("0.2"), Decimal("3"), Decimal("2"))
+     self.assertEqual(first, second)
+ ```
+ 
+-- [ ] **Step 5: 运行 GREEN。**
++- [x] **Step 5: 运行 GREEN。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_adapter tests.test_formal_policy_evaluator tests.test_formal_metric_engine -v`
+ 
+ Expected: 全部 PASS。
+ 
+-- [ ] **Step 6: 提交 C3。**
++- [x] **Step 6: 提交 C3。**
+ 
+ ```powershell
+ git add ashare_pipeline/formal_valuation_adapter.py tests/test_formal_valuation_adapter.py
+ git commit -m "feat: evaluate deterministic valuation policy adjustments"
+ ```
+ 
+ ### Task 4: Complete adjusted valuation batch and atomic publication
+ 
+ **Files:**
+ - Create: `ashare_pipeline/formal_valuation_engine.py`
+@@ -456,67 +456,67 @@ git commit -m "feat: evaluate deterministic valuation policy adjustments"
+ - Create: `tests/test_formal_valuation_batch.py`
+ - Create: `tests/test_formal_valuation_batch_guards.py`
+ - Modify: `tests/formal_metric_fixtures.py:39-76`
+ - Modify: `tests/formal_metric_feature_fixtures.py:32-67`
+ - Modify: `tests/formal_policy_runtime_fixtures.py:125-213`
+ 
+ **Interfaces:**
+ - Consumes: exact `FormalFeatureRepository`、`FormalContextRepository`、`FormalRangeStore`、签名 verifier、`FormalScoringRegistry`、`FormalPolicyRegistry`、`FormalValuationAdapterRegistry`。
+ - Produces: `FormalValuationRepository(feature_repository, context_repository, range_store, *, registry_signature_verifier)`；`.build_batch(frozen_input_hash, *, scoring_registry, policy_registry, valuation_adapter_registry) -> PolicyAdjustedValuationBatch`；`PolicyAdjustedValuationInput`；batch `.input_for(security_id, metric_id)`、`.require_verified()`、`.canonical_bytes()`、`.to_dict()`。闭包私有 `prepare_adjusted_rows(base_batch, policy_batch, adapter_registry) -> tuple[dict, ...]` 只组装规范行，不发布证明。
+ 
+-- [ ] **Step 1: 建立 20 人十角色真实 fixture。**
++- [x] **Step 1: 建立 20 人十角色真实 fixture。**
+ 
+ ```python
+ class ValuationRuntimeFixture(PolicyRuntimeFixture):
+     def __init__(self):
+         securities = {"BJ430001": "general_nonfinancial"}
+         securities.update({f"SH{600000 + index}": "general_nonfinancial"
+                            for index in range(19)})
+         super().__init__(range_enabled=True, templates=securities, cyclic=True,
+                          noncyclic_ids=tuple(sorted(set(securities) - {"BJ430001"})),
+                          valuation_adapter=True)
+         self.templates = securities
+         self.valuation_registry = load_formal_valuation_adapter_registry(
+             self.bundle, scoring_registry=self.scoring,
+             policy_registry=self.policy_registry)
+ ```
+ 
+ fixture 的 `populate_valuation_inputs()` 必须通过现有 `put_financial`、`policy_financial_values`、`persist_features`、Context 和 range producer 写入真实证据；焦点证券原始 earnings yield 为 `0.20`、原利润 `10`、五年中位数 `6`，其余 19 人为非周期透传且值唯一。不得直接 mint `MetricInput` 或 `PolicyResult`。
+ 
+ 为支持该 fixture，给 `MetricFixture.__init__`、`FinancialFixture.__init__` 增加默认 `manifest_version="formal-registry-manifest-v1"` 并原样向下传递；给 `PolicyRuntimeFixture.__init__` 增加默认 `valuation_adapter=False`。只有该值为 true 时，configure 在 `add_policy_documents` 之后调用 `add_valuation_adapter_document(documents)`，并以 manifest v2 构图。所有现有调用因默认值继续使用 v1。
+ 
+-- [ ] **Step 2: 写完整批次 RED 测试。**
++- [x] **Step 2: 写完整批次 RED 测试。**
+ 
+ ```python
+ def test_complete_batch_contains_every_security_and_three_v_metrics(self):
+     batch = self.fixture.repository.build_batch(
+         self.fixture.frozen.frozen_input_hash,
+         scoring_registry=self.fixture.scoring,
+         policy_registry=self.fixture.policy_registry,
+         valuation_adapter_registry=self.fixture.valuation_registry)
+     batch.require_verified()
+     self.assertEqual(batch.security_ids, tuple(sorted(self.fixture.templates)))
+     self.assertEqual(len(batch.inputs), len(batch.security_ids) * 3)
+     focal = batch.input_for("BJ430001", "V.normalized_earnings_yield")
+     self.assertEqual(focal.status, "adjusted")
+     self.assertEqual(focal.adjusted_value, Decimal("0.12"))
+ ```
+ 
+ 加入：原始指标不合格保留行、pending affected 保留行、pending unaffected 透传、无模板/行业仍枚举、证券/指标顺序规范、base/policy/adapter hash 全绑定、原始 base 和 policy 规范字节构建前后相同。
+ 
+-- [ ] **Step 3: 运行 RED。**
++- [x] **Step 3: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_batch -v`
+ 
+ Expected: FAIL with missing `formal_valuation_engine`。
+ 
+-- [ ] **Step 4: 实现仓库、证明和外层 guard。**
++- [x] **Step 4: 实现仓库、证明和外层 guard。**
+ 
+ ```python
+ _V_METRICS = (
+     "V.enterprise_value_or_sustainable_roe",
+     "V.normalized_earnings_yield",
+     "V.normalized_free_cash_flow_yield",
+ )
+ 
+ class FormalValuationRepository:
+     def build_batch(self, frozen_input_hash, *, scoring_registry,
+@@ -538,21 +538,21 @@ class FormalValuationRepository:
+                 base.require_verified()
+                 policy.require_verified()
+                 valuation_adapter_registry.require_official(self._bundle)
+                 publication_for(prepared)[0] = True
+                 return prepared
+             return guard.finalize(publish)
+ ```
+ 
+ `mint_complete_batch`、`publication_for`、`dependencies` 和 bundle 记录均在 `_install_valuation_engine()` 闭包内定义并捕获；示例中的 `self._bundle` 在实际实现中从闭包 repository record 取出，不能成为可替换实例属性。构造器拒绝外部调用，records 以 weakref 身份登记，payload 深冻结，规范字节只含确定性字段，所有 child 共用外层 `[False]` publication capability。内部创建真实 metric/policy repository并验证它们与同一个 feature provider/store、Context、range store 和 verifier 绑定。nested guard 只允许相同 owner。
+ 
+-- [ ] **Step 5: 写 guard、篡改和恢复测试。**
++- [x] **Step 5: 写 guard、篡改和恢复测试。**
+ 
+ ```python
+ def test_outer_finalization_failure_revokes_only_adjusted_children(self):
+     captured = {"adjusted": [], "base": [], "policy": []}
+     closed = []
+     def hook(frame, event, result):
+         if event == "return" and frame.f_code.co_name == "mint":
+             filename = frame.f_code.co_filename
+             if filename.endswith("formal_valuation_engine.py"):
+                 captured["adjusted"].append(result)
+@@ -570,93 +570,93 @@ def test_outer_finalization_failure_revokes_only_adjusted_children(self):
+     self.assertEqual(closed, [True])
+     self.assertTrue(captured["adjusted"])
+     with self.assertRaisesRegex(ValueError, "unpublished or revoked"):
+         captured["adjusted"][-1].require_verified()
+     captured["base"][-1].require_verified()
+     captured["policy"][-1].require_verified()
+ ```
+ 
+ `run_with_trace` 按现有 batch-guard 测试的 `sys.settrace`/`sys.setprofile` 配对实现，并在 `finally` 中恢复原 hook；它只观察真实闭包 mint 和 guard frame，不改变生产依赖。生产对象不得公开 base/policy 私有属性。另测 provider reentrant publication、数据库 data_version 改变、注册表替换、range selection 更正、final rollback/close 异常、跨根批次、伪造/复制/继承/方法替换，以及失败后下一次干净构建可恢复。
+ 
+-- [ ] **Step 6: 运行 GREEN 和 Stage B/metric guard 回归。**
++- [x] **Step 6: 运行 GREEN 和 Stage B/metric guard 回归。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_batch tests.test_formal_valuation_batch_guards tests.test_formal_metric_batch_guard tests.test_formal_policy_batch_guards tests.test_formal_policy_repository -v`
+ 
+ Expected: 全部 PASS；任何失败路径都无可用的部分调整证明。
+ 
+-- [ ] **Step 7: 提交 C4。**
++- [x] **Step 7: 提交 C4。**
+ 
+ ```powershell
+ git add ashare_pipeline/formal_valuation_engine.py tests/formal_valuation_fixtures.py tests/test_formal_valuation_batch.py tests/test_formal_valuation_batch_guards.py
+ git commit -m "feat: publish complete policy-adjusted valuation batches"
+ ```
+ 
+ ### Task 5: Full-universe peer reranking, diagnostics and acceptance
+ 
+ **Files:**
+ - Modify: `ashare_pipeline/formal_valuation_engine.py`
+ - Create: `tests/test_formal_valuation_ranking.py`
+ - Create: `tests/test_formal_valuation_integration.py`
+ - Modify: `docs/superpowers/plans/2026-09-25-formal-valuation-policy-adapter-stage-c.md`
+ 
+ **Interfaces:**
+ - Consumes: genuine published `PolicyAdjustedValuationBatch`。
+ - Produces: `PolicyAdjustedValuationPeerContext`；`PolicyAdjustedValuationScore`；`valuation_peer_eligible(item) -> bool`；`build_valuation_peer_context(batch, *, metric_id, security_id)`；`score_valuation_percentile(batch, context)`；`FormalValuationRepository.diagnostic_report(batch) -> MappingProxyType`。
+ 
+-- [ ] **Step 1: 写同行语义 RED 测试。**
++- [x] **Step 1: 写同行语义 RED 测试。**
+ 
+ ```python
+ def test_one_adjustment_reranks_every_member_in_the_cohort(self):
+     batch = self.fixture.build_adjusted_batch()
+     before = self.fixture.base_percentiles("V.normalized_earnings_yield")
+     after = {}
+     for security_id in batch.security_ids:
+         context = build_valuation_peer_context(
+             batch, security_id=security_id,
+             metric_id="V.normalized_earnings_yield")
+         after[security_id] = score_valuation_percentile(batch, context).percentile
+     self.assertNotEqual(after["BJ430001"], before["BJ430001"])
+     changed_peers = [sid for sid in batch.security_ids
+                      if sid != "BJ430001" and after[sid] != before[sid]]
+     self.assertTrue(changed_peers)
+ ```
+ 
+ 加入：二级 20、二级 19 回退一级 20、一级仍 19、焦点入样、并列平均秩、lower 只反转分位数、负/零/极值、pending affected 排除、pending unaffected 保留、跨批次 context 拒绝、同 cohort context 共享同一不可变同行 tuple。
+ 
+-- [ ] **Step 2: 写确定性计数和一次排序测试。**
++- [x] **Step 2: 写确定性计数和一次排序测试。**
+ 
+ ```python
+ def test_each_cohort_is_grouped_and_sorted_once(self):
+     batch = self.fixture.build_adjusted_batch()
+     for security_id in batch.security_ids:
+         context = build_valuation_peer_context(
+             batch, security_id=security_id,
+             metric_id="V.normalized_earnings_yield")
+         score_valuation_percentile(batch, context)
+     counts = self.fixture.repository.diagnostic_report(batch)
+     self.assertEqual(counts["group_index_builds"], 1)
+     self.assertEqual(counts["sorts_by_cohort"][context.cohort_hash], 1)
+     self.assertEqual(counts["full_financial_rederivations"], 0)
+     self.assertEqual(counts["registry_full_parses"], 1)
+     self.assertEqual(counts["base_batch_full_validations"], 1)
+     self.assertEqual(counts["policy_batch_full_validations"], 1)
+ ```
+ 
+ 规范 payload 只保存确定性计数；墙钟耗时由 `repository.diagnostic_report(batch)` 的非规范、只读报告返回，并绑定 `batch_hash`。测试不得对毫秒阈值作脆弱断言。
+ 
+-- [ ] **Step 3: 运行 RED。**
++- [x] **Step 3: 运行 RED。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_ranking -v`
+ 
+ Expected: peer/score API 尚不存在或没有 cohort cache，测试失败。
+ 
+-- [ ] **Step 4: 实现一次分组、一次排序和独立证明。**
++- [x] **Step 4: 实现一次分组、一次排序和独立证明。**
+ 
+ ```python
+ def build_groups(rows):
+     groups = {}
+     for item in rows:
+         if not valuation_peer_eligible(item):
+             continue
+         for scope, industry_id in (
+                 ("template_secondary_industry", item.secondary_industry),
+                 ("template_primary_industry", item.primary_industry)):
+@@ -676,47 +676,47 @@ def rank_values(values, direction):
+             rank = (Decimal(first + 1) + Decimal(last)) / 2
+             percentile = Decimal(100) * (rank - Decimal("0.5")) / len(ordered)
+             ranks[ordered[first]] = (rank, Decimal(100) - percentile
+                                      if direction == "lower" else percentile)
+             first = last
+     return MappingProxyType(ranks)
+ ```
+ 
+ cohort hash 必须覆盖 adjusted batch hash、metric、definition、adapter registry、direction、scope 和同行 ID；score hash 覆盖焦点 adjusted input hash、平均秩、分位数和完整 peer context。所有证明复用 batch publication capability，不能脱离所属 batch 使用。
+ 
+-- [ ] **Step 5: 写端到端与诊断验收。**
++- [x] **Step 5: 写端到端与诊断验收。**
+ 
+ ```python
+ def test_signed_policy_to_adjusted_value_to_peer_score_is_replayable(self):
+     first = self.fixture.build_adjusted_batch()
+     score1 = self.fixture.score(first, "BJ430001",
+                                 "V.normalized_earnings_yield")
+     second = self.fixture.build_adjusted_batch()
+     score2 = self.fixture.score(second, "BJ430001",
+                                 "V.normalized_earnings_yield")
+     self.assertEqual(first.canonical_bytes(), second.canonical_bytes())
+     self.assertEqual(score1.canonical_bytes(), score2.canonical_bytes())
+     report = self.fixture.repository.diagnostic_report(second)
+     self.assertEqual(report["batch_hash"], second.batch_hash)
+     self.assertEqual(report["security_count"], 20)
+     self.assertEqual(report["valuation_row_count"], 60)
+ ```
+ 
+ 集成测试还要从 score 反向核对 peer context、adjusted row、policy decision、normalization basis、base metric input、adapter definition 和根角色哈希；证明没有 G/M cap、Sc/B/R、eligibility 或 pool 字段。
+ 
+-- [ ] **Step 6: 运行 Stage C GREEN。**
++- [x] **Step 6: 运行 Stage C GREEN。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_valuation_adapter_contract tests.test_formal_valuation_adapter tests.test_formal_valuation_batch tests.test_formal_valuation_batch_guards tests.test_formal_valuation_ranking tests.test_formal_valuation_integration -v`
+ 
+ Expected: 全部 PASS，0 failure，0 error。
+ 
+-- [ ] **Step 7: 运行受影响完整回归并保存诊断。**
++- [x] **Step 7: 运行受影响完整回归并保存诊断。**
+ 
+ Run: `& D:/Projects/AShareQiheng/.venv/Scripts/python.exe -m unittest tests.test_formal_registry_manifest tests.test_formal_scoring_registry tests.test_formal_policy_contract tests.test_formal_policy_registry tests.test_formal_policy_registry_guards tests.test_formal_policy_evaluator tests.test_formal_policy_repository tests.test_formal_policy_batch_guards tests.test_formal_policy_integration tests.test_formal_metric_context tests.test_formal_metric_features tests.test_formal_metric_engine tests.test_formal_metric_batch_guard tests.test_formal_score_inputs tests.test_formal_scoring tests.test_formal_valuation_adapter_contract tests.test_formal_valuation_adapter tests.test_formal_valuation_batch tests.test_formal_valuation_batch_guards tests.test_formal_valuation_ranking tests.test_formal_valuation_integration -v`
+ 
+ Expected: 全部 PASS；把模块数、测试数、耗时、失败/错误/跳过、五个分阶段耗时、cohort/排序/待补计数写入 `.superpowers/sdd/2026-09-25-formal-valuation-policy-adapter-stage-c/task-C5-report.md`。报告不纳入正式证明哈希。
+ 
+ - [ ] **Step 8: 独立审查、修复并作根级新鲜复验。**
+ 
+ 审查白名单为本计划列出的生产、测试、fixture、spec 和 plan 文件。审查必须核对：v1/v2 兼容边界、证明伪造面、跨根/跨批次、pending affected/unaffected、Decimal 失败关闭、整组重排、缓存失效、外层回滚和无最终评分越界。每个审查发现用单独失败测试复现后修复；修复后重跑 Step 6、Step 7，并在最终 HEAD 上由根代理再跑 Stage C 六模块验收。
+ 
+ - [ ] **Step 9: 更新计划证据并提交 C5。**
+diff --git a/tests/test_formal_policy_market_binding_lease.py b/tests/test_formal_policy_market_binding_lease.py
+index 414ce45..c0236dd 100644
+--- a/tests/test_formal_policy_market_binding_lease.py
++++ b/tests/test_formal_policy_market_binding_lease.py
+@@ -136,20 +136,21 @@ class MarketBindingLeaseTests(unittest.TestCase):
+         fresh = FormalBatchReadJournal.open(
+             repository,
+             registry_manifest_hash=fixture.graph.manifest.manifest_hash,
+             as_of_utc=FREEZE, population=("SH600000",), required_keys=(("SH",),))
+         self.assertIsNotNone(repository.select_calendar_batch_ticket(
+             fresh, fixture.binding, FREEZE))
+         fresh.close()
+ 
+     def test_signed_sibling_binding_reuses_one_exact_calendar_request_lineage(self):
+         from contextlib import closing
++        from ashare_pipeline import formal_range_contract as contract
+         from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+         from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
+         from tests.test_formal_policy_market import FREEZE
+ 
+         templates = {
+             "BJ430001": "general_nonfinancial",
+             "SH600000": "bank",
+             "SH600002": "broker",
+             "SZ000001": "real_estate",
+         }
+@@ -182,22 +183,72 @@ class MarketBindingLeaseTests(unittest.TestCase):
+         bank_calendar = repository.select_calendar(bank, FREEZE)
+         calendar_scope = FormalBatchReadJournal.open(
+             repository,
+             registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
+             as_of_utc=FREEZE,
+             population=("SH600000", "SH600002"),
+             required_keys=(("SH",),),
+         )
+         bank_calendar_ticket = repository.select_calendar_batch_ticket(
+             calendar_scope, bank, FREEZE)
+-        broker_calendar_ticket = repository.select_calendar_batch_ticket(
+-            calendar_scope, broker, FREEZE)
++        open_lease, close_lease = contract._range_binding_read_lease_authority()
++        (install_sibling, open_sibling, open_record, open_ticket, close_sibling,
++         enter_target, close_target, enter_exact,
++         close_exact) = contract._range_binding_sibling_read_authority()
++        del install_sibling
++        copied = {"lease": [], "sibling": [], "target": [], "exact": []}
++        tokens = {"lease": [], "sibling": [], "target": [], "exact": []}
++        copied_close_failures = []
++        openings = {
++            open_lease.__code__: ("lease", close_lease),
++            open_sibling.__code__: ("sibling", close_sibling),
++            open_record.__code__: ("sibling", close_sibling),
++            open_ticket.__code__: ("sibling", close_sibling),
++            enter_target.__code__: ("target", close_target),
++            enter_exact.__code__: ("exact", close_exact),
++        }
++
++        def capture_capability_context(frame, event, arg):
++            entry = openings.get(frame.f_code) if event == "return" else None
++            if entry is None or arg is None:
++                return
++            label, close = entry
++            copied[label].append(copy_context())
++            tokens[label].append((close, arg))
++            try:
++                copy_context().run(close, arg)
++            except ValueError:
++                copied_close_failures.append(label)
++
++        sys.setprofile(capture_capability_context)
++        try:
++            broker_calendar_ticket = repository.select_calendar_batch_ticket(
++                calendar_scope, broker, FREEZE)
++        finally:
++            sys.setprofile(None)
++        self.assertTrue(all(copied.values()), copied)
++        self.assertTrue(set(copied) <= set(copied_close_failures),
++                        copied_close_failures)
++        for entries in tokens.values():
++            for close, capability in entries:
++                with self.assertRaisesRegex(ValueError, "closed"):
++                    close(capability)
++        for context in copied["lease"]:
++            with self.assertRaisesRegex(ValueError, "closed|stale|unpublished"):
++                context.run(broker.require_current)
++        for label in ("sibling", "target"):
++            for context in copied[label]:
++                with self.assertRaisesRegex(ValueError, "closed|stale|unpublished"):
++                    context.run(bank.require_current)
++        for context in copied["exact"]:
++            with self.assertRaisesRegex(ValueError, "closed|stale|unpublished"):
++                context.run(broker.require_current)
+         self.assertEqual(
+             bank_calendar_ticket.selected().coverage.lineage,
+             broker_calendar_ticket.selected().coverage.lineage,
+         )
+         broker_calendar = broker_calendar_ticket.selected()
+         self.assertIsNotNone(broker_calendar.coverage)
+         self.assertEqual(bank_calendar.coverage.lineage, broker_calendar.coverage.lineage)
+         calendar_scope.close()
+ 
+         market_scope = FormalBatchReadJournal.open(

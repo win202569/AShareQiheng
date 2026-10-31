@@ -1,0 +1,409 @@
+# Review package: 1d46d4e..77b6706
+
+## Commits
+77b6706 fix: bind coverage to durable WAL and signed selectors
+
+## Files changed
+ ashare_pipeline/formal_coverage_manifest.py | 47 +++++++++++++++++---
+ tests/test_formal_coverage_guards.py        | 67 ++++++++++++++++++++++++++---
+ 2 files changed, 101 insertions(+), 13 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_coverage_manifest.py b/ashare_pipeline/formal_coverage_manifest.py
+index 1a56270..8ccbc66 100644
+--- a/ashare_pipeline/formal_coverage_manifest.py
++++ b/ashare_pipeline/formal_coverage_manifest.py
+@@ -83,21 +83,22 @@ def _aware(value: Any) -> datetime | None:
+     try:
+         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+     except ValueError:
+         return None
+     return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+ 
+ 
+ _CONTRACT_FIELDS = frozenset({
+     "schema_version", "purpose", "approval_id", "signing_identity",
+     "registry_manifest_hash", "frozen_input_hash", "requirements",
+-    "domain_owners", "expected_schema_version", "report_period", "query_version",
++    "domain_owners", "selector_descriptors", "expected_schema_version",
++    "report_period", "query_version",
+ })
+ 
+ 
+ def _official_inputs(contract: Any, verifier: Any, bundle: Any, loader: Any, frozen: Any,
+                      reqs: Sequence[Mapping[str, Any]], db_path: Any,
+                      snapshot_repository: Any) -> dict[str, Any] | None:
+     """Accept only a signed requirement catalog tied to genuine root proofs."""
+     if not isinstance(contract, Mapping) or "canonical_json" not in contract:
+         return None
+     if type(bundle) is not VerifiedRegistryBundle:
+@@ -158,20 +159,47 @@ def _official_inputs(contract: Any, verifier: Any, bundle: Any, loader: Any, fro
+                    or members.get(row["security_id"]) != row["exchange"] for row in catalog)):
+         raise ValueError("coverage contract must enumerate every frozen member")
+     if any(row.get("frozen_input_hash") != frozen.frozen_input_hash for row in reqs):
+         raise ValueError("coverage requirements do not match frozen root")
+     if sorted(catalog, key=_key) != sorted(reqs, key=_key):
+         raise ValueError("coverage requirements do not match signed catalog")
+     owners = wire["domain_owners"]
+     if (type(owners) is not dict or set(owners) != {row["domain"] for row in catalog}
+             or any(type(owner) is not str or not owner for owner in owners.values())):
+         raise ValueError("coverage contract repository owners are incomplete")
++    descriptors = wire["selector_descriptors"]
++    owner_fields = {
++        "formal_snapshot_repository": {"source", "dataset"},
++        "formal_context_repository": {"context_kind", "scope_key", "as_of_utc"},
++        "formal_feature_repository": {"input_hash", "slot_id"},
++        "formal_policy_repository": {"batch_hash", "rule_id"},
++    }
++    common_fields = {"owner", "domain", "security_id", "exchange", "period_or_window"}
++    if type(descriptors) is not dict or set(descriptors) != {row["selector_hash"] for row in catalog}:
++        raise ValueError("coverage contract selector catalog is incomplete")
++    for row in catalog:
++        selector = descriptors[row["selector_hash"]]
++        owner = owners[row["domain"]]
++        if (owner not in owner_fields or type(selector) is not dict
++                or set(selector) != common_fields | owner_fields[owner]
++                or _digest(selector) != row["selector_hash"]
++                or selector["owner"] != owner
++                or any(selector[field] != row[field] for field in
++                       ("domain", "security_id", "exchange", "period_or_window"))
++                or any(type(value) is not str or not value for value in selector.values())):
++            raise ValueError("coverage contract selector descriptor or owner mismatch")
++        if ((owner == "formal_context_repository" and _aware(selector["as_of_utc"]) is None)
++                or (owner == "formal_feature_repository" and
++                    _SHA256.fullmatch(selector["input_hash"]) is None)
++                or (owner == "formal_policy_repository" and
++                    _SHA256.fullmatch(selector["batch_hash"]) is None)):
++            raise ValueError("coverage contract selector descriptor is invalid")
+     if (type(wire["expected_schema_version"]) is not int
+             or wire["expected_schema_version"] <= 0
+             or any(type(wire[field]) is not str or not wire[field]
+                    for field in ("report_period", "query_version"))):
+         raise ValueError("coverage contract audit identity is invalid")
+     return wire
+ 
+ 
+ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
+                       expected_schema_version: int) -> dict[str, Any]:
+@@ -233,44 +261,48 @@ def _read_environment(workspace_root: Any, db_path: Any, status_path: Any,
+             _state_schema.StateStore._assert_schema_ddl(
+                 connection, {"schema_migration": _state_schema._MIGRATION_TABLE_DDL},
+                 {}, "migration ledger")
+             if tables != expected_tables:
+                 raise ValueError("official coverage database schema tables mismatch")
+         finally:
+             connection.close()
+         status_wire = json.loads(status.read_text(encoding="utf-8"))
+     except (sqlite3.Error, OSError, RuntimeError) as exc:
+         raise ValueError("official coverage database schema or status could not be read") from exc
+-    if db_hashes() != before:
++    # SHM read marks are transient SQLite coordination bytes. Only main DB
++    # and committed WAL bytes identify the durable generation.
++    material = lambda hashes: {suffix: hashes[suffix] for suffix in ("", "-wal")}
++    if material(db_hashes()) != material(before):
+         raise ValueError("official coverage database changed during identity read")
+     status_schema_version = status_wire.get("schema_version") if type(status_wire) is dict else None
+     if status_schema_version != expected_schema_version:
+         raise ValueError("official coverage database schema version mismatch")
+     if (type(status_wire) is not dict or status_wire.get("db_sha256") != db_sha256
+-            or status_wire.get("db_generation_hash") != _digest(before)
++            or status_wire.get("db_generation_hash") != _digest(material(before))
+             or status_wire.get("schema_versions") != list(versions)
+             or _aware(status_wire.get("generated_at_utc")) is None):
+         raise ValueError("official coverage database status identity mismatch")
+     return {"workspace_revision": revision.stdout.strip(), "db_path": str(db),
+             "db_sha256": db_sha256,
+-            "db_sidecar_sha256": {suffix: before[suffix] for suffix in ("-wal", "-shm")},
++            "db_sidecar_sha256": {"-wal": before["-wal"]},
+             "db_schema_versions": {"user_version": version,
+                                    "migrations": list(versions),
+                                    "status_schema_version": status_schema_version},
+             "expected_schema_version": expected_schema_version,
+             "status_generated_at_utc": status_wire["generated_at_utc"],
+             "status_path": str(status)}
+ 
+ 
+ def _repository_provenance(req: Mapping[str, Any], source: Any,
+                            owner: str, validator: Callable[..., Any],
+-                           snapshots: FormalSnapshotRepository) -> dict[str, Any]:
++                           snapshots: FormalSnapshotRepository,
++                           selector: Mapping[str, Any]) -> dict[str, Any]:
+     if owner != "formal_snapshot_repository":
+         raise ValueError("official coverage repository owner has no authenticated adapter")
+     if not isinstance(source, Mapping) or source.get("coverage_class") not in {
+             "verified_complete", "verified_partial", "verified_no_coverage"}:
+         raise ValueError("official coverage requires verified source repository evidence")
+     try:
+         ref = snapshots.get_verified_by_manifest(source["manifest_sha256"])
+         raw = snapshots.read_verified_raw(ref)
+     except Exception as exc:
+         raise ValueError("official coverage source repository evidence is missing") from exc
+@@ -282,21 +314,22 @@ def _repository_provenance(req: Mapping[str, Any], source: Any,
+         "parser_id": "parser_id", "parser_version": "parser_version",
+         "mapping_version": "mapping_version", "published_at_utc": "published_at_utc",
+         "effective_at_utc": "effective_at_utc", "captured_at_utc": "captured_at_utc",
+         "source_updated_at_utc": "source_updated_at_utc",
+         "refresh_generation": "refresh_generation", "producing_task_id": "task_id",
+     }
+     if (any(getattr(ref, attribute) != source.get(field) if field not in req
+             else getattr(ref, attribute) != req[field]
+             for attribute, field in bindings.items())
+             or ref.verification_status != "verified"
+-            or hashlib.sha256(raw).hexdigest() != ref.content_sha256):
++            or hashlib.sha256(raw).hexdigest() != ref.content_sha256
++            or ref.source != selector["source"] or ref.dataset != selector["dataset"]):
+         raise ValueError("official coverage source repository lineage mismatch")
+     facts = tuple(fact for fact in snapshots._state_store.list_formal_financial_facts(
+         security_id=req["security_id"])
+         if fact.source_snapshot_id == ref.snapshot_id
+         and fact.period_end == req["period_or_window"])
+     actual_units = {fact.unit for fact in facts}
+     if (source.get("coverage_class") != "verified_complete"
+             or not facts
+             or actual_units != set(source.get("observed_units", ()))
+             or not set(req.get("expected_units", ())) <= actual_units):
+@@ -557,20 +590,21 @@ class FormalCoverageAuditor:
+                         try:
+                             result = validator(req, source)
+                         except Exception:
+                             result = False
+                         if result is not True:
+                             cls = "blocked_integrity"; reasons.append("repository_validation_failed")
+             if official_wire is not None:
+                 row["repository_provenance"] = _repository_provenance(
+                     req, source, official_wire["domain_owners"][req["domain"]],
+                     callback_map[str(req["domain"])], snapshot_repository,
++                    official_wire["selector_descriptors"][req["selector_hash"]],
+                 )
+             row["coverage_class"] = cls
+             row["reason_codes"] = tuple(sorted(set(str(x) for x in reasons)))
+             row["evidence_hashes"] = dict(source.get("evidence_hashes", {})) if source else {}
+             row["missing_units"] = sorted(set(req.get("expected_units", ())) -
+                                           set(row.get("observed_units") or ()))
+             rows.append(row)
+             if cls.startswith("blocked") or cls in {"missing", "pending", "retryable_failed", "terminal_failed"}:
+                 blockers.add(f"{req['security_id']}:{req['domain']}:{cls}")
+             if cls == "verified_partial" and row["missing_units"]:
+@@ -676,20 +710,21 @@ def _install_coverage_authority() -> None:
+                                 context["bundle"], context["registry_loader"],
+                                 context["frozen"], context["requirements"],
+                                 context["db_path"], context["snapshot_repository"])
+         if wire is None:
+             raise ValueError("official coverage authenticated contract was revoked")
+         for row, req, source in zip(data["rows"], context["requirements"],
+                                     context["sources"], strict=True):
+             provenance = _repository_provenance(
+                 req, source, wire["domain_owners"][req["domain"]],
+                 context["validators"][req["domain"]], context["snapshot_repository"],
++                wire["selector_descriptors"][req["selector_hash"]],
+             )
+             if row.get("repository_provenance") != provenance:
+                 raise ValueError("official coverage repository provenance changed")
+ 
+     type.__setattr__(_Proof, "_data", read)
+     type.__setattr__(VerifiedCoverageManifest, "require_official_ready", official_gate)
+     FormalCoverageAuditor.audit = audit
+     FormalCoverageAuditor.revoke = staticmethod(revoke)
+ 
+ 
+diff --git a/tests/test_formal_coverage_guards.py b/tests/test_formal_coverage_guards.py
+index 0231464..dcfd75a 100644
+--- a/tests/test_formal_coverage_guards.py
++++ b/tests/test_formal_coverage_guards.py
+@@ -29,21 +29,21 @@ def canonical(value):
+                       separators=(",", ":"), allow_nan=False).encode()
+ 
+ 
+ def digest(value):
+     return hashlib.sha256(canonical(value)).hexdigest()
+ 
+ 
+ def db_generation(path):
+     return {suffix: (hashlib.sha256(candidate.read_bytes()).hexdigest()
+                      if candidate.is_file() else None)
+-            for suffix in ("", "-wal", "-shm")
++            for suffix in ("", "-wal")
+             for candidate in (path.with_name(path.name + suffix),)}
+ 
+ 
+ class CoverageGuardTests(unittest.TestCase):
+     def setUp(self):
+         self.r = CoverageRequirement("f", "SH600000", "financial", "s", "2025", "SH")
+         self.a = FormalCoverageAuditor(production_contract={"approved": True}, repository_validators={"financial": lambda *_: True})
+         self.row = dict(self.r.to_dict(), coverage_class="verified_complete", authenticated=True,
+                         units_ok=True, parser_mapping_ok=True, signature_ok=True,
+                         hash_ok=True, evidence_hashes={"content": "4" * 64},
+@@ -224,23 +224,33 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
+         for blob in repository.blobs.values():
+             self.registry_repository.put_formal_registry_blob(blob)
+         self.registry_repository.put_formal_registry_manifest(manifest)
+         self.registry_loader = FormalRegistryBundleLoader(self.registry_repository, self.verifier)
+         self.bundle = self.registry_loader.load(manifest.manifest_hash)
+         self.snapshot_repository = FormalSnapshotRepository(self.raw_store.root, self.registry_repository)
+         self.frozen = FormalUniverseIngestor().build(
+             "2026-08-31T07:00:00+00:00", manifest.manifest_hash,
+             verified_listing_documents("SH", "SZ", "BJ"),
+         )
+-        self.requirements = [CoverageRequirement(self.frozen.frozen_input_hash, member.security_id,
+-                                                 "financial", "selector", "2025-12-31", member.exchange,
+-                                                 ("CNY",)) for member in self.frozen.members]
++        self.selector_descriptors = {}
++        self.requirements = []
++        for member in self.frozen.members:
++            descriptor = {"owner": "formal_snapshot_repository", "domain": "financial",
++                          "security_id": member.security_id, "exchange": member.exchange,
++                          "period_or_window": "2025-12-31", "source": "cninfo",
++                          "dataset": "annual_report"}
++            selector_hash = digest(descriptor)
++            self.selector_descriptors[selector_hash] = descriptor
++            self.requirements.append(CoverageRequirement(
++                self.frozen.frozen_input_hash, member.security_id,
++                "financial", selector_hash, "2025-12-31", member.exchange,
++                ("CNY",)))
+         self.records = []
+         for req in self.requirements:
+             key = req.security_id
+             generation = f"coverage-{key}"
+             task_id = self.registry_repository.enqueue_formal_task(
+                 "formal_statement", key, generation, {"key": key})
+             leased = self.registry_repository.lease_next_formal_task(
+                 ("formal_statement",), f"worker-{key}", 300)
+             self.assertEqual(leased["id"], task_id)
+             fetch = cninfo_fetch(
+@@ -291,20 +301,21 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
+             "schema_versions": [2, 3, 4, 5, 6, 7],
+         }), encoding="utf-8")
+         self.contract_wire = {
+             "schema_version": "formal-coverage-contract-v1",
+             "purpose": "official", "approval_id": manifest.approval_id,
+             "signing_identity": manifest.key_id,
+             "registry_manifest_hash": manifest.manifest_hash,
+             "frozen_input_hash": self.frozen.frozen_input_hash,
+             "requirements": [req.to_dict() for req in self.requirements],
+             "domain_owners": {"financial": "formal_snapshot_repository"},
++            "selector_descriptors": self.selector_descriptors,
+             "expected_schema_version": 7, "report_period": "2025",
+             "query_version": "coverage-v1",
+         }
+         self.contract = self.signed_contract(self.contract_wire)
+         self.calls = []
+ 
+     @staticmethod
+     def signed_contract(wire, signature="fixture-signature"):
+         return {"canonical_json": canonical(wire), "signature": signature,
+                 "key_id": "fixture-key"}
+@@ -359,20 +370,32 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
+             self.audit(requirements=self.requirements[:-1])
+         wrong = [CoverageRequirement("f" * 64, req.security_id, req.domain,
+                                      req.selector_hash, req.period_or_window,
+                                      req.exchange, req.expected_units) for req in self.requirements]
+         with self.assertRaisesRegex(ValueError, "frozen"):
+             self.audit(requirements=wrong)
+         incomplete = dict(self.contract_wire, requirements=[self.requirements[0].to_dict()])
+         with self.assertRaisesRegex(ValueError, "member"):
+             self.audit(contract=self.signed_contract(incomplete))
+ 
++    def test_signed_selector_descriptor_must_match_canonical_hash_and_owner(self):
++        bad = dict(self.contract_wire, selector_descriptors={
++            key: dict(value, source="fabricated")
++            for key, value in self.selector_descriptors.items()})
++        with self.assertRaisesRegex(ValueError, "selector"):
++            self.audit(contract=self.signed_contract(bad))
++        wrong_owner = dict(self.contract_wire, selector_descriptors={
++            key: dict(value, owner="formal_context_repository")
++            for key, value in self.selector_descriptors.items()})
++        with self.assertRaisesRegex(ValueError, "selector"):
++            self.audit(contract=self.signed_contract(wrong_owner))
++
+     def test_plain_or_unapproved_registry_and_unsigned_contract_cannot_authorize_official(self):
+         with self.assertRaisesRegex(ValueError, "registry"):
+             self.audit(registry_bundle={"approved": True, "purpose": "official"})
+         with self.assertRaisesRegex(ValueError, "signature"):
+             self.audit(contract=self.signed_contract(self.contract_wire, signature="invalid"))
+         raw = dict(self.contract_wire, purpose="test")
+         with self.assertRaisesRegex(ValueError, "purpose"):
+             self.audit(contract=self.signed_contract(raw))
+         test_repository, test_manifest, _ = fixture_repository(purpose="test")
+         test_bundle = FormalRegistryBundleLoader(test_repository, AcceptingVerifier()).load(test_manifest.manifest_hash)
+@@ -385,27 +408,37 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
+         def wrong_owner(req, record):
+             return dict(self.validate(req, record), owner="wrong_repository")
+         with self.assertRaisesRegex(ValueError, "provenance"):
+             self.audit(validators={"financial": wrong_owner})
+         def wrong_record(req, record):
+             return dict(self.validate(req, record), record_hash="b" * 64)
+         with self.assertRaisesRegex(ValueError, "provenance"):
+             self.audit(validators={"financial": wrong_record})
+ 
+     def test_signed_catalog_enumerates_each_domain_and_invokes_each_owner(self):
+-        extra = [CoverageRequirement(self.frozen.frozen_input_hash, member.security_id,
+-                                     "context", "context-selector", "2025", member.exchange)
+-                 for member in self.frozen.members]
++        extra_descriptors = {}
++        extra = []
++        for member in self.frozen.members:
++            descriptor = {"owner": "formal_context_repository", "domain": "context",
++                          "security_id": member.security_id, "exchange": member.exchange,
++                          "period_or_window": "2025", "context_kind": "security_state",
++                          "scope_key": "fixture-state", "as_of_utc": self.frozen.as_of_utc}
++            selector_hash = digest(descriptor)
++            extra_descriptors[selector_hash] = descriptor
++            extra.append(CoverageRequirement(self.frozen.frozen_input_hash,
++                                             member.security_id, "context",
++                                             selector_hash, "2025", member.exchange))
+         requirements = self.requirements + extra
+         records = self.records + [good(req) for req in extra]
+         contract = dict(self.contract_wire,
+                         requirements=[req.to_dict() for req in requirements],
++                        selector_descriptors=dict(self.selector_descriptors, **extra_descriptors),
+                         domain_owners={"financial": "formal_snapshot_repository",
+                                        "context": "formal_context_repository"})
+         calls = []
+         def context_validator(req, record):
+             calls.append(req["security_id"])
+             return {"domain": "context", "owner": "formal_context_repository",
+                     "requirement_hash": digest(req),
+                     "record_hash": digest({key: value for key, value in record.items()
+                                            if key not in {"rechecked_at_utc", "timing_diagnostics"}}),
+                     "evidence_hash": "b" * 64}
+@@ -479,20 +512,40 @@ class OfficialCoverageBoundaryTests(unittest.TestCase):
+             status = json.loads(self.status_path.read_text(encoding="utf-8"))
+             status["db_sha256"] = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+             status["db_generation_hash"] = digest(db_generation(self.db_path))
+             self.status_path.write_text(json.dumps(status), encoding="utf-8")
+             with self.assertRaisesRegex(ValueError, "schema"):
+                 coverage_module._read_environment(
+                     Path(__file__).resolve().parents[1], self.db_path, self.status_path, 7)
+         finally:
+             writer.close()
+ 
++    def test_valid_writer_open_wal_read_does_not_reject_transient_shm_marks(self):
++        writer = sqlite3.connect(self.db_path)
++        try:
++            writer.execute("PRAGMA journal_mode=WAL")
++            writer.execute("PRAGMA wal_autocheckpoint=0")
++            writer.execute("UPDATE schema_migration SET version=version WHERE version=7")
++            writer.commit()
++            self.assertTrue(self.db_path.with_name(self.db_path.name + "-wal").is_file())
++            status = json.loads(self.status_path.read_text(encoding="utf-8"))
++            status["db_sha256"] = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
++            status["db_generation_hash"] = digest(db_generation(self.db_path))
++            self.status_path.write_text(json.dumps(status), encoding="utf-8")
++            first = coverage_module._read_environment(
++                Path(__file__).resolve().parents[1], self.db_path, self.status_path, 7)
++            second = coverage_module._read_environment(
++                Path(__file__).resolve().parents[1], self.db_path, self.status_path, 7)
++            self.assertEqual(first, second)
++        finally:
++            writer.close()
++
+     def test_recheck_timestamp_is_noncanonical_even_in_repository_receipt(self):
+         early = [dict(row, rechecked_at_utc="2026-10-01T00:00:00+00:00") for row in self.records]
+         late = [dict(row, rechecked_at_utc="2026-10-02T00:00:00+00:00") for row in self.records]
+         self.assertEqual(self.audit(records=early).manifest_hash,
+                          self.audit(records=late).manifest_hash)
+ 
+     def test_fabricated_callback_and_empty_database_cannot_grant_official(self):
+         fabricated = [dict(row, selected_snapshot_id="fabricated") for row in self.records]
+         with self.assertRaisesRegex(ValueError, "repository|schema|authority"):
+             self.audit(records=fabricated).require_official_ready()

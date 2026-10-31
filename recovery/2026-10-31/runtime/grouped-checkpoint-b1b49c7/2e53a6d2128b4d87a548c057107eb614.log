@@ -1,0 +1,12 @@
+TEST_STARTED test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_frozen_feature_job_rebuilds_with_online_false
+test_frozen_feature_job_rebuilds_with_online_false (test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_frozen_feature_job_rebuilds_with_online_false) ... ok
+TEST_STARTED test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_three_security_replay_is_traceable_deterministic_and_nonformal
+test_three_security_replay_is_traceable_deterministic_and_nonformal (test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_three_security_replay_is_traceable_deterministic_and_nonformal) ... ok
+TEST_STARTED test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_unclassified_and_balance_mismatch_are_blocked
+test_unclassified_and_balance_mismatch_are_blocked (test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_unclassified_and_balance_mismatch_are_blocked) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 6.189s
+
+OK
+GROUP_SUMMARY {"ids": ["test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_frozen_feature_job_rebuilds_with_online_false", "test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_three_security_replay_is_traceable_deterministic_and_nonformal", "test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_unclassified_and_balance_mismatch_are_blocked"], "passed": ["test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_frozen_feature_job_rebuilds_with_online_false", "test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_three_security_replay_is_traceable_deterministic_and_nonformal", "test_feature_foundation_e2e.FeatureFoundationEndToEndTests.test_unclassified_and_balance_mismatch_are_blocked"], "tests_run": 3, "failures": 0, "errors": 0, "skipped": 0}

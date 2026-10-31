@@ -1,0 +1,216 @@
+# Review package: ae3828d..237b907
+
+## Commits
+237b907 Keep journal revocation trusted under thread tamper
+
+## Files changed
+ ashare_pipeline/formal_batch_read_journal.py     | 13 ++++++++---
+ tests/test_formal_policy_market_binding_lease.py | 28 ++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_batch_read_journal.py b/ashare_pipeline/formal_batch_read_journal.py
+index 1fa77a6..e247a60 100644
+--- a/ashare_pipeline/formal_batch_read_journal.py
++++ b/ashare_pipeline/formal_batch_read_journal.py
+@@ -8,20 +8,25 @@ and result evidence. A checkpoint only rereads that evidence.
+ from __future__ import annotations
+ 
+ import threading
+ import sys
+ import weakref
+ 
+ 
+ def _install_journal():
+     scopes = {}
+     tickets = {}
++    get_thread_identity = threading.get_ident
++
++    def _check_runtime_dependencies():
++        if vars(threading).get("get_ident") is not get_thread_identity:
++            raise ValueError("batch journal dependency changed")
+ 
+     def _methods(instance):
+         target = instance if isinstance(instance, type) else type(instance)
+         return tuple((cls, name, value) for cls in target.__mro__
+                      if cls is not object for name, value in vars(cls).items()
+                      if callable(value) or isinstance(value, (staticmethod, classmethod)))
+ 
+     def _owner_state(owner):
+         from .formal_context_repository import FormalContextRepository, _require_authentic_context_repository
+         from .formal_feature_repository import FormalFeatureRepository, _require_authentic_metric_feature_repository
+@@ -79,30 +84,31 @@ def _install_journal():
+         expanded = tuple(reference for child in children
+                          for reference in _owner_state(child)[2])
+         allowed = {kind: owner, **{_owner_state(child)[0]: child for child in children}}
+         if kind == "financial" and "feature" in allowed:
+             allowed["policy_feature"] = allowed["feature"]
+         if kind == "market":
+             allowed["calendar"] = owner
+         return kind, state, refs + expanded, allowed
+ 
+     def _scope(scope, *, active=True):
++        _check_runtime_dependencies()
+         if (globals().get("_issue_current_ticket") is not issue
+                 or globals().get("_require_current_scope") is not require_scope
+                 or globals().get("_require_current_ticket") is not require_ticket):
+             raise ValueError("batch journal issuing authority changed")
+         record = scopes.get(id(scope))
+         if type(scope) is not FormalBatchReadJournal or record is None or record[0]() is not scope:
+             raise ValueError("batch scope is forged or copied")
+         if active and record[1] != "active":
+             raise ValueError("batch scope is closed")
+-        if threading.get_ident() != record[2]:
++        if get_thread_identity() != record[2]:
+             raise ValueError("batch scope belongs to a different thread")
+         owner, kind, state, refs, signatures = record[3:8]
+         current_kind, current_state, current_refs, current_allowed = _chain(owner)
+         if (current_kind != kind or current_state is not state or len(current_refs) != len(refs)
+                 or any(a is not b for a, b in zip(current_refs, refs, strict=True))
+                 or current_allowed != record[16]):
+             raise ValueError("batch owner dependencies changed")
+         if str(state.db_path.resolve()) != record[8]:
+             raise ValueError("batch StateStore path changed")
+         for cls, name, method in signatures:
+@@ -143,20 +149,21 @@ def _install_journal():
+ 
+         def __copy__(self):
+             raise TypeError("batch scope cannot be copied")
+ 
+         def __deepcopy__(self, memo):
+             raise TypeError("batch scope cannot be copied")
+ 
+         @classmethod
+         def open(cls, owner, *, registry_manifest_hash, as_of_utc, population, required_keys,
+                  frozen_input_hash=None):
++            _check_runtime_dependencies()
+             if cls is not FormalBatchReadJournal:
+                 raise ValueError("batch scope type must be exact")
+             if (globals().get("_issue_current_ticket") is not issue
+                     or globals().get("_require_current_scope") is not require_scope
+                     or globals().get("_require_current_ticket") is not require_ticket):
+                 raise ValueError("batch journal issuing authority changed")
+             if (type(registry_manifest_hash) is not str or len(registry_manifest_hash) != 64
+                     or any(c not in "0123456789abcdef" for c in registry_manifest_hash)):
+                 raise ValueError("batch scope requires canonical signed root hash")
+             if type(as_of_utc) is not str or not as_of_utc:
+@@ -180,21 +187,21 @@ def _install_journal():
+                 raise ValueError("batch scope requires mandatory coverage")
+             if kind == "valuation":
+                 from .formal_valuation_engine import FormalValuationRepository
+                 if sys._getframe(1).f_code is not vars(FormalValuationRepository)["build_batch"].__code__:
+                     raise ValueError("valuation scope opens only inside its authentic owner build")
+             signatures = tuple(item for instance in (owner, state, *refs) if instance is not None
+                                for item in _methods(instance))
+             result = object.__new__(FormalBatchReadJournal)
+             scope_id = id(result)
+             scopes[scope_id] = [weakref.ref(result, lambda _, key=scope_id: scopes.pop(key, None)),
+-                "active", threading.get_ident(), owner, kind, state, refs, signatures,
++                "active", get_thread_identity(), owner, kind, state, refs, signatures,
+                 str(state.db_path.resolve()), registry_manifest_hash, as_of_utc, population,
+                 frozenset(required_keys), {}, 0, {}, allowed, frozen_input_hash, object()]
+             return result
+ 
+         def checkpoint(self):
+             record = _scope(self)
+             phase = record[14]
+             try:
+                 ticket_records = tuple((ticket, _ticket(ticket, self))
+                     for ticket in record[13].values())
+@@ -256,21 +263,21 @@ def _install_journal():
+         def next_phase(self):
+             record = _scope(self)
+             record[14] += 1
+ 
+         def close(self):
+             # Revocation must still work when the owner graph is no longer
+             # valid; ordinary scope reads intentionally reject that graph.
+             record = scopes.get(id(self))
+             if (type(self) is not FormalBatchReadJournal or record is None
+                     or record[0]() is not self or record[1] != "active"
+-                    or threading.get_ident() != record[2]):
++                    or get_thread_identity() != record[2]):
+                 raise ValueError("batch scope is closed, forged, or cross-thread")
+             record[1] = "consumed"
+ 
+         def finalize(self):
+             record = _scope(self)
+             record[1] = "finalizing"
+             try:
+                 coverage = set()
+                 for ticket in record[13].values():
+                     coverage.update(_ticket(ticket, self)[5])
+diff --git a/tests/test_formal_policy_market_binding_lease.py b/tests/test_formal_policy_market_binding_lease.py
+index 02f3ec1..b7872d6 100644
+--- a/tests/test_formal_policy_market_binding_lease.py
++++ b/tests/test_formal_policy_market_binding_lease.py
+@@ -1,20 +1,21 @@
+ """Operation-scoped current-binding lease regressions for market tickets."""
+ 
+ from __future__ import annotations
+ 
+ from contextvars import copy_context
+ from datetime import date, timedelta
+ from pathlib import Path
+ from types import FunctionType
+ import sqlite3
+ import sys
++import threading
+ import unittest
+ 
+ from ashare_pipeline.formal_batch_read_journal import FormalBatchReadJournal
+ from ashare_pipeline import formal_policy_market as market_module
+ from tests.formal_range_fixtures import RangeStoreFixture
+ from tests.test_formal_policy_market import FREEZE, quiet_row
+ 
+ 
+ def _trading_days(count: int) -> tuple[str, ...]:
+     end = date(2026, 8, 31)
+@@ -375,20 +376,47 @@ class MarketBindingLeaseTests(unittest.TestCase):
+             sys.setprofile(None)
+         self.assertEqual(market_issues, [])
+         with self.assertRaisesRegex(ValueError, "closed"):
+             journal.checkpoint()
+ 
+         fresh = self._journal(fixture, repository)
+         repository.select_current_batch_ticket(
+             fresh, "SH600000", FREEZE, binding=fixture.binding)
+         fresh.close()
+ 
++    def test_replaced_thread_identity_cannot_leave_rejected_owner_scope_replayable(self):
++        fixture = self._fixture()
++        days = _trading_days(20)
++        fixture.put_window("SH600000", trading_days=days,
++                           rows={day: quiet_row() for day in days})
++        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
++        journal = self._journal(fixture, repository)
++        genuine_get_ident = threading.get_ident
++        threading.get_ident = lambda: -1
++        try:
++            with self.assertRaisesRegex(ValueError, "dependency changed"):
++                repository.select_current_batch_ticket(
++                    journal, "SH600000", FREEZE, binding=fixture.binding)
++        finally:
++            threading.get_ident = genuine_get_ident
++
++        with self.assertRaisesRegex(ValueError, "closed"):
++            journal.checkpoint()
++        with self.assertRaisesRegex(ValueError, "closed"):
++            repository.select_current_batch_ticket(
++                journal, "SH600000", FREEZE, binding=fixture.binding)
++
++        fresh = self._journal(fixture, repository)
++        repository.select_current_batch_ticket(
++            fresh, "SH600000", FREEZE, binding=fixture.binding)
++        fresh.close()
++
+     def test_owner_entry_keys_recursion_and_calendar_child_depth_are_closed(self):
+         from ashare_pipeline import formal_range_contract as contract
+ 
+         fixture = self._fixture()
+         days = _trading_days(20)
+         fixture.put_window("SH600000", trading_days=days,
+                            rows={day: quiet_row() for day in days})
+         repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
+         open_lease, close_lease = contract._range_binding_read_lease_authority()
+ 

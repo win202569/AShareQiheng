@@ -1,0 +1,553 @@
+# A3 task review package
+Base: 6ea72c16ba206cdf69f5f1ac6aaaa9a1258fd670
+Head: staged frozen two-file snapshot (not committed)
+Commits: none yet; parent owns reviewed commit.
+
+ ashare_pipeline/formal_policy_registry.py   | 233 +++++++++++++++++++++++-
+ tests/test_formal_policy_registry_guards.py | 270 ++++++++++++++++++++++++++++
+ 2 files changed, 502 insertions(+), 1 deletion(-)
+
+diff --git a/ashare_pipeline/formal_policy_registry.py b/ashare_pipeline/formal_policy_registry.py
+index e0205fb..b18d64b 100644
+--- a/ashare_pipeline/formal_policy_registry.py
++++ b/ashare_pipeline/formal_policy_registry.py
+@@ -1,19 +1,26 @@
+-"""Static same-root policy definitions; returned bytes are not policy proofs."""
++"""Authenticated same-root policy definitions, without runtime policy authority."""
+ 
+ from __future__ import annotations
+ 
+ import hashlib
+ import json
++import weakref
+ from decimal import Decimal
+ from types import MappingProxyType
+ 
++from . import formal_context_schema as context_module
++from . import formal_feature_contract as feature_module
++from . import formal_policy_contract as contract_module
++from . import formal_registry_manifest as manifest_module
++from . import formal_scoring_registry as scoring_module
++from . import formal_sources as sources_module
+ from .formal_context_schema import _canonical as _context_canonical, _descriptor
+ from .formal_feature_contract import SignedFormalFeatureRegistry
+ from .formal_policy_contract import PolicyContractError, parse_policy_contract
+ from .formal_registry_manifest import VerifiedRegistryBundle
+ from .formal_scoring_registry import FormalScoringRegistry, _formula_requirements
+ 
+ 
+ _POLICY_ROLES = ("cyclic", "redline", "status", "event")
+ _ROLES = ("source", "mapping", "feature", "scoring", "industry", *_POLICY_ROLES)
+ _TEMPLATES = ("general_nonfinancial", "bank", "broker", "insurance", "real_estate")
+@@ -270,10 +277,234 @@ def _install_binder():
+                 children[rule.role]["rules"][rule.rule_id]["parameters"]["valuation_dependencies"]
+                 for rule in parsed.rules if rule.kind == "cyclic_protection"},
+             cyclic_secondary_industries=sorted(scoring_registry.cyclic_secondary_industries),
+             binding_manifest=binding_manifest))
+ 
+     return bind
+ 
+ 
+ _bind_policy_contract = _install_binder()
+ del _install_binder
++
++
++def _freeze(value):
++    if type(value) is dict:
++        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
++    if type(value) is list:
++        return tuple(_freeze(item) for item in value)
++    if type(value) not in (str, int, bool, type(None)):
++        raise ValueError("policy definition contains a non-JSON value")
++    return value
++
++
++def _install_policy_registry():
++    records = {}
++    module_globals = globals()
++    bundle_type, scoring_type, feature_type = VerifiedRegistryBundle, FormalScoringRegistry, SignedFormalFeatureRegistry
++    require_bundle, blob_for = bundle_type.require_official, bundle_type.blob
++    require_scoring, require_feature = scoring_type.require_official, feature_type.require_release_eligible
++    bind, encode, freeze = _bind_policy_contract, _canonical, _freeze
++    loads, sha256, weak_ref = json.loads, hashlib.sha256, weakref.ref
++    fields = frozenset(("schema_version", "contract_version", "registry_manifest_hash", "role_hashes",
++        "role_versions", "source_evidence_categories", "rules", "valuation_dependencies",
++        "cyclic_secondary_industries", "binding_manifest"))
++    public_fields = fields | {"contract_hash"}
++
++    # Explicit call-path inventory, without inferring a dependency graph or
++    # running a second policy parser. Check owner bindings and imported aliases.
++    binding_names = (
++        (module_globals, "context_module feature_module contract_module manifest_module scoring_module sources_module "
++            "VerifiedRegistryBundle FormalScoringRegistry SignedFormalFeatureRegistry PolicyContractError "
++            "parse_policy_contract _bind_policy_contract _canonical _freeze _signed_periods _context_index "
++            "_source_index _bind_context _bind_selectors _require_coverage _context_canonical _descriptor "
++            "_formula_requirements json hashlib weakref MappingProxyType Decimal _POLICY_ROLES _ROLES _TEMPLATES"),
++        (vars(contract_module), "parse_policy_contract parse_policy_rule _canonical _load _exact_keys _text "
++            "_identifier _decimal_parameter _algorithm_identifier _ordered_texts _text_array _feature_selector "
++            "_context_selector _selector _valuation_dependencies _validate_parameters _validate_effect "
++            "_validate_outcomes _frozen PolicyRule ParsedPolicyContract PolicyContractError Decimal InvalidOperation "
++            "MappingProxyType json _ROLES _TEMPLATES _FY_ENDS _RULE_KINDS _CONTEXT_FIELDS _SHA256 _IDENTIFIER "
++            "_DECIMAL _DIMENSIONS _LISTING_VALUES"),
++        (vars(scoring_module), "_graph _feature_slots _formula_requirements VerifiedRegistryBundle "
++            "SignedFormalFeatureRegistry FormalScoringRegistry RegistryApproval TemplateDefinition MetricDefinition "
++            "RedlineDefinition StatusRule RegistryValidationError fields Decimal MappingProxyType hashlib _ROLES _TEMPLATES"),
++        (vars(feature_module), "SignedFormalFeatureRegistry FormalFeatureSlot FormulaNode _parse_registry_bytes "
++            "_load_canonical_object _canonical_json_bytes _unique_json_object _reject_json_constant _DuplicateJsonKey "
++            "_require_text _require_hash _require_exact_keys _snapshot_json _parse_formula _formula_to_dict "
++            "_slot_to_dict _SHA256 _IDENTIFIER _TEMPLATES _DIMENSIONS _UNITS _FORMULA_OPS _REGISTRY_KEYS "
++            "_SLOT_KEYS json hashlib math"),
++        (vars(manifest_module), "VerifiedRegistryBundle FormalRegistryManifest VerifiedRegistryBlob "
++            "_require_trimmed_text _VERSION_IDENTIFIER _ROLE_FIELDS Mapping"),
++        (vars(context_module), "_descriptor _canonical _json_tree _keys _text _exchange _ordered _selector "
++            "CalendarSelector CONTEXT_KINDS _DESCRIPTOR_FIELDS _ROLES json math re"),
++        (vars(sources_module), "CalendarSelector _require_trimmed_text _require_exchange _VERSION_IDENTIFIER"),
++        (vars(json), "loads dumps"), (vars(hashlib), "sha256"), (vars(weakref), "ref"),
++        (vars(feature_module.math), "isfinite"), (vars(context_module.re), "fullmatch"),
++    )
++    bindings = tuple((owner, name, owner[name]) for owner, names in binding_names for name in names.split())
++    source_interfaces = (
++        (bundle_type, "require_official blob"), (scoring_type, "require_official"),
++        (feature_type, "require_release_eligible slots_for_template"),
++        (manifest_module.FormalRegistryManifest, ""), (manifest_module.VerifiedRegistryBlob, ""),
++        (feature_module.FormalFeatureSlot, "__init__ __post_init__ from_dict to_dict"),
++        (feature_module.FormulaNode, "__init__ __post_init__ from_dict"),
++        (scoring_module.RegistryApproval, ""), (scoring_module.TemplateDefinition, ""),
++        (scoring_module.MetricDefinition, ""), (scoring_module.RedlineDefinition, ""),
++        (scoring_module.StatusRule, ""), (contract_module.PolicyRule, "__init__"),
++        (contract_module.ParsedPolicyContract, "__init__"),
++        (sources_module.CalendarSelector, "__init__ __post_init__"),
++    )
++
++    def resolved_member(cls, name):
++        return next((vars(base)[name] for base in cls.__mro__ if name in vars(base)), None)
++
++    # Upstream records are inspected through these exact lookup methods and
++    # dataclass fields; unrelated convenience methods are not dependencies.
++    source_members = tuple((cls, name, resolved_member(cls, name))
++        for cls, methods in source_interfaces
++        for name in (*methods.split(), "__getattribute__", "__getattr__", "__dataclass_fields__",
++            *cls.__dataclass_fields__))
++    source_bases = tuple((cls, cls.__bases__, cls.__mro__) for cls, _ in source_interfaces)
++
++    def class_snapshot(classes):
++        return tuple((cls, tuple(vars(cls).items()), cls.__bases__, cls.__mro__) for cls in classes)
++
++    def dependencies():
++        if any(owner.get(name) is not expected for owner, name, expected in bindings):
++            raise ValueError("policy proof dependency changed")
++        if (module_globals.get("FormalPolicyRegistry") is not proof_type
++                or module_globals.get("load_formal_policy_registry") is not load):
++            raise ValueError("policy proof entry point changed")
++        if (any(resolved_member(cls, name) is not expected for cls, name, expected in source_members)
++                or any(cls.__bases__ != bases or cls.__mro__ != mro for cls, bases, mro in source_bases)):
++            raise ValueError("policy proof source interface changed")
++        for cls, expected, bases, mro in own_members:
++            current = vars(cls)
++            if (cls.__bases__ != bases or cls.__mro__ != mro
++                    or set(current) != {name for name, _ in expected}
++                    or any(current[name] is not value for name, value in expected)):
++                raise ValueError("policy proof class member or inheritance changed")
++
++    def verify_sources(bundle, scoring, feature):
++        if type(bundle) is not bundle_type or type(scoring) is not scoring_type or type(feature) is not feature_type:
++            raise ValueError("policy proof requires exact genuine registry sources")
++        require_bundle(bundle)
++        require_scoring(scoring, bundle)
++        require_feature(feature)
++        blobs = {role: blob_for(bundle, role) for role in _ROLES}
++        hashes = {role: sha256(blob.canonical_json).hexdigest() for role, blob in blobs.items()}
++        root_hash = sha256(bundle.manifest.canonical_json).hexdigest()
++        if (root_hash != bundle.manifest.manifest_hash
++                or any(hashes[role] != blobs[role].registry_hash
++                    or hashes[role] != getattr(bundle.manifest, role + "_registry_hash") for role in _ROLES)):
++            raise ValueError("policy proof actual root or child bytes changed")
++        # The original feature verifier just checked its complete sealed record.
++        # Read those actual fields without repeating its expensive slot reparse
++        # for each scalar. Scoring already checks all five template slot sets.
++        read = object.__getattribute__
++        if (read(feature, "canonical_json") != blobs["feature"].canonical_json
++                or read(feature, "registry_hash") != hashes["feature"]
++                or read(feature, "source_registry_hash") != hashes["source"]
++                or read(feature, "mapping_registry_hash") != hashes["mapping"]):
++            raise ValueError("policy proof feature/source/mapping differs from current root")
++        return root_hash, hashes
++
++    def proof_record(proof):
++        dependencies()
++        record = records.get(id(proof))
++        if type(proof) is not proof_type or record is None or record[0]() is not proof:
++            raise ValueError("policy proof is forged, copied or unregistered")
++        root_hash, hashes = verify_sources(record[3], record[4], record[5])
++        if root_hash != record[6] or hashes != record[7]:
++            raise ValueError("policy proof source identity changed")
++        return record
++
++    class ProofMeta(type):
++        def __setattr__(cls, name, value):
++            if name in ("__getattribute__", "__bases__"):
++                raise TypeError("policy proof lookup or inheritance cannot be replaced")
++            return super().__setattr__(name, value)
++
++        def __delattr__(cls, name):
++            if name in ("__getattribute__", "__bases__"):
++                raise TypeError("policy proof lookup or inheritance cannot be removed")
++            return super().__delattr__(name)
++
++    class Proof(metaclass=ProofMeta):
++        __slots__ = ("__weakref__",)
++
++        def __init__(self, *args, **kwargs):
++            raise TypeError("policy proofs require load_formal_policy_registry")
++
++        def __getattribute__(self, name):
++            proof_record(self)
++            return object.__getattribute__(self, name)
++
++        def __getattr__(self, name):
++            record = proof_record(self)
++            if name not in public_fields:
++                raise AttributeError(name)
++            return record[1][name]
++
++        def require_verified(self):
++            """Authenticate the definition and its historical registry sources."""
++            proof_record(self)
++
++        def canonical_bytes(self):
++            """Return A2's bound bytes, excluding the derived contract_hash."""
++            return proof_record(self)[2]
++
++        def to_dict(self):
++            record = proof_record(self)
++            return dict(loads(record[2]), contract_hash=record[1]["contract_hash"])
++
++        def __copy__(self):
++            raise TypeError("policy proofs cannot be copied")
++
++        def __deepcopy__(self, memo):
++            raise TypeError("policy proofs cannot be copied")
++
++        def __reduce__(self):
++            raise TypeError("policy proofs cannot be serialized for reconstruction")
++
++        def __reduce_ex__(self, protocol):
++            raise TypeError("policy proofs cannot be serialized for reconstruction")
++
++    class FormalPolicyRegistry(Proof):
++        """Immutable policy definitions; no security evidence or scoring readiness."""
++        __slots__ = ()
++
++    proof_type = FormalPolicyRegistry
++
++    def load(bundle: VerifiedRegistryBundle, *, scoring_registry: FormalScoringRegistry,
++            feature_registry: SignedFormalFeatureRegistry) -> FormalPolicyRegistry:
++        """Authenticate and bind one complete signed graph without executing it."""
++        dependencies()
++        root_hash, hashes = verify_sources(bundle, scoring_registry, feature_registry)
++        canonical = bind(bundle, scoring_registry=scoring_registry, feature_registry=feature_registry)
++        payload = loads(canonical)
++        if type(canonical) is not bytes or type(payload) is not dict or set(payload) != fields or encode(payload) != canonical:
++            raise ValueError("policy binder returned a noncanonical definition")
++        frozen_payload = freeze(dict(payload, contract_hash=sha256(canonical).hexdigest()))
++        dependencies()
++        if verify_sources(bundle, scoring_registry, feature_registry) != (root_hash, hashes):
++            raise ValueError("policy proof sources changed during loading")
++        result = object.__new__(proof_type)
++        identity = id(result)
++
++        def forget(reference):
++            record = records.get(identity)
++            if record is not None and record[0] is reference:
++                records.pop(identity, None)
++
++        records[identity] = (weak_ref(result, forget), frozen_payload, canonical,
++            bundle, scoring_registry, feature_registry, root_hash, hashes)
++        return result
++
++    own_members = class_snapshot((ProofMeta, Proof, proof_type))
++    return proof_type, load
++
++
++FormalPolicyRegistry, load_formal_policy_registry = _install_policy_registry()
++del _install_policy_registry
++
++
++__all__ = ["FormalPolicyRegistry", "load_formal_policy_registry"]
+diff --git a/tests/test_formal_policy_registry_guards.py b/tests/test_formal_policy_registry_guards.py
+new file mode 100644
+index 0000000..8861535
+--- /dev/null
++++ b/tests/test_formal_policy_registry_guards.py
+@@ -0,0 +1,270 @@
++"""Real signed graphs exercise definition proof ownership, never runtime evidence."""
++
++import copy
++import gc
++import hashlib
++import json
++import pickle
++import sys
++import unittest
++import weakref
++from unittest.mock import patch
++
++from ashare_pipeline import formal_context_schema as context_module
++from ashare_pipeline import formal_feature_contract as feature_module
++from ashare_pipeline import formal_policy_contract as contract_module
++from ashare_pipeline import formal_policy_registry as policy_module
++from ashare_pipeline import formal_registry_manifest as manifest_module
++from ashare_pipeline import formal_scoring_registry as scoring_module
++from ashare_pipeline.formal_policy_registry import (
++    FormalPolicyRegistry, load_formal_policy_registry,
++)
++from ashare_pipeline.formal_scoring import calculate_pre_policy_score
++from tests.formal_policy_fixtures import policy_graph
++
++
++class _PolicyGraphTestCase(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.bundle, cls.feature, cls.scoring, _, _ = policy_graph()
++
++    def load(self, **overrides):
++        arguments = dict(bundle=self.bundle, scoring_registry=self.scoring,
++            feature_registry=self.feature)
++        arguments.update(overrides)
++        return load_formal_policy_registry(**arguments)
++
++
++class PolicyProofTests(_PolicyGraphTestCase):
++    def test_loaded_contract_is_immutable_but_does_not_grant_runtime_readiness(self):
++        proof = self.load()
++        proof.require_verified()
++        raw = proof.canonical_bytes()
++        self.assertEqual(proof.contract_hash, hashlib.sha256(raw).hexdigest())
++        self.assertNotIn("contract_hash", json.loads(raw))
++        self.assertEqual(proof.to_dict()["contract_hash"], proof.contract_hash)
++        self.assertEqual(proof.to_dict()["role_hashes"], dict(self.scoring.role_hashes))
++        self.assertEqual(len(proof.rules), 80)
++        self.assertEqual(len(proof.binding_manifest), 170)
++        for forbidden in ("pool_eligible", "policy_ready", "evaluate", "apply", "score",
++                "security_id", "market_window", "adapter", "__dict__"):
++            with self.subTest(name=forbidden), self.assertRaises(AttributeError):
++                getattr(proof, forbidden)
++        changed = proof.to_dict()
++        changed["role_hashes"]["status"] = "0" * 64
++        changed["rules"][0]["inputs"].clear()
++        proof.require_verified()
++        self.assertNotEqual(proof.to_dict(), changed)
++        with self.assertRaises(AttributeError):
++            proof.contract_hash = "0" * 64
++        with self.assertRaises(TypeError):
++            proof.rules[0]["inputs"]["current_roe"]["period_keys"] = ()
++        with self.assertRaises(TypeError):
++            proof.rules[0]["outcomes"]["on_match"][0]["maximum"] = "100"
++
++    def test_direct_and_unregistered_proofs_are_rejected(self):
++        with self.assertRaises(TypeError):
++            FormalPolicyRegistry()
++        forged = object.__new__(FormalPolicyRegistry)
++        for access in (lambda: forged.require_verified(), lambda: forged.contract_hash,
++                lambda: forged.canonical_bytes(), lambda: forged.to_dict()):
++            with self.assertRaises(ValueError):
++                access()
++
++    def test_bound_bytes_remain_identical_and_loads_are_deterministic(self):
++        proof = self.load()
++        expected = policy_module._bind_policy_contract(self.bundle,
++            scoring_registry=self.scoring, feature_registry=self.feature)
++        self.assertEqual(proof.canonical_bytes(), expected)
++        self.assertEqual(self.load().canonical_bytes(), expected)
++
++
++class PolicyProofGuardTests(_PolicyGraphTestCase):
++    def assert_rejected(self, proof):
++        for access in (lambda: proof.require_verified(), lambda: proof.contract_hash,
++                lambda: proof.rules, lambda: proof.canonical_bytes(), lambda: proof.to_dict(),
++                lambda: self.load()):
++            with self.assertRaises(ValueError):
++                access()
++
++    def test_copied_inputs_are_not_authenticated(self):
++        proof = self.load()
++        for name, original in (("bundle", self.bundle), ("feature_registry", self.feature),
++                ("scoring_registry", self.scoring)):
++            with self.subTest(name=name), self.assertRaises(ValueError):
++                self.load(**{name: copy.copy(original)})
++        proof.require_verified()
++
++    def test_copied_pickled_and_subclass_proofs_cannot_acquire_ownership(self):
++        proof = self.load()
++        for clone in (copy.copy, copy.deepcopy, pickle.dumps,
++                lambda p: p.__reduce__(), lambda p: p.__reduce_ex__(4)):
++            with self.subTest(clone=clone), self.assertRaises(TypeError):
++                clone(proof)
++        class Derived(FormalPolicyRegistry):
++            __slots__ = ()
++        forged = object.__new__(Derived)
++        with self.assertRaises(ValueError):
++            forged.require_verified()
++        proof.require_verified()
++
++    def test_other_roots_and_changed_feature_content_are_rejected(self):
++        proof = self.load()
++        def change(documents):
++            next(s for s in documents["feature"]["slots"]
++                if s["slot_id"] == "bank.policy.equity")["formula"]["fact_key"] = "fixture.changed"
++        bundle, feature, scoring, _, _ = policy_graph(mutate=change)
++        load_formal_policy_registry(bundle, scoring_registry=scoring, feature_registry=feature).require_verified()
++        for overrides in (dict(bundle=bundle), dict(scoring_registry=scoring), dict(feature_registry=feature)):
++            with self.subTest(overrides=tuple(overrides)), self.assertRaises(ValueError):
++                self.load(**overrides)
++        proof.require_verified()
++
++    def test_mutated_source_fields_invalidate_existing_proof_and_loader(self):
++        proof = self.load()
++        for source, name, replacement in (
++                (self.feature, "registry_hash", "0" * 64),
++                (self.feature, "slots", ()),
++                (self.scoring, "content_sha256", "0" * 64),
++                (self.bundle.manifest, "canonical_json", b"{}"),
++                (self.bundle.blob("event"), "canonical_json", b"{}")):
++            original = object.__getattribute__(source, name)
++            try:
++                object.__setattr__(source, name, replacement)
++                with self.subTest(name=name):
++                    self.assert_rejected(proof)
++            finally:
++                object.__setattr__(source, name, original)
++        proof.require_verified()
++
++    def test_replaced_module_types_and_module_aliases_fail_closed(self):
++        proof = self.load()
++        for module, name in (
++                (policy_module, "VerifiedRegistryBundle"), (policy_module, "FormalScoringRegistry"),
++                (policy_module, "SignedFormalFeatureRegistry"), (policy_module, "FormalPolicyRegistry"),
++                (manifest_module, "VerifiedRegistryBundle"), (manifest_module, "FormalRegistryManifest"),
++                (manifest_module, "VerifiedRegistryBlob"), (feature_module, "SignedFormalFeatureRegistry"),
++                (feature_module, "FormalFeatureSlot"), (feature_module, "FormulaNode"),
++                (scoring_module, "FormalScoringRegistry"), (scoring_module, "SignedFormalFeatureRegistry"),
++                (scoring_module, "VerifiedRegistryBundle"), (contract_module, "PolicyRule"),
++                (contract_module, "ParsedPolicyContract"), (policy_module, "json"),
++                (policy_module, "hashlib")):
++            with self.subTest(module=module.__name__, name=name), patch.object(module, name, object()):
++                self.assert_rejected(proof)
++        proof.require_verified()
++
++    def test_replaced_parser_binder_encoder_and_owner_helpers_fail_closed(self):
++        proof = self.load()
++        for module, name in (
++                (policy_module, "parse_policy_contract"), (contract_module, "parse_policy_contract"),
++                (contract_module, "parse_policy_rule"), (contract_module, "_validate_outcomes"),
++                (policy_module, "_bind_policy_contract"), (policy_module, "_bind_selectors"),
++                (policy_module, "_require_coverage"), (policy_module, "_canonical"),
++                (policy_module, "_freeze"), (policy_module, "load_formal_policy_registry"),
++                (scoring_module, "_graph"), (scoring_module, "_feature_slots"),
++                (scoring_module, "_formula_requirements"), (feature_module, "_parse_registry_bytes"),
++                (feature_module, "_formula_to_dict"), (context_module, "_descriptor"),
++                (context_module, "_canonical")):
++            with self.subTest(module=module.__name__, name=name), patch.object(module, name, lambda *a, **k: None):
++                self.assert_rejected(proof)
++        proof.require_verified()
++
++    def test_replaced_hash_json_freeze_and_weakref_dependencies_fail_closed(self):
++        proof = self.load()
++        for module, name in ((hashlib, "sha256"), (json, "loads"), (json, "dumps"),
++                (weakref, "ref"), (policy_module, "MappingProxyType")):
++            with self.subTest(name=name), patch.object(module, name, lambda *a, **k: None):
++                self.assert_rejected(proof)
++        proof.require_verified()
++
++    def test_replaced_upstream_verifiers_and_slots_fail_closed(self):
++        proof = self.load()
++        for cls, method in ((type(self.bundle), "require_official"), (type(self.bundle), "blob"),
++                (type(self.scoring), "require_official"), (type(self.feature), "require_release_eligible"),
++                (type(self.feature), "slots_for_template"), (type(self.feature), "__getattribute__"),
++                (feature_module.FormalFeatureSlot, "to_dict")):
++            with self.subTest(method=method), patch.object(cls, method, lambda *a: None):
++                self.assert_rejected(proof)
++        proof.require_verified()
++
++    def test_replacing_class_verifier_or_shadowing_field_cannot_bypass_lookup(self):
++        proof = self.load()
++        for cls in (FormalPolicyRegistry, FormalPolicyRegistry.__bases__[0]):
++            for name, replacement in (("require_verified", lambda self: None),
++                    ("contract_hash", "0" * 64), ("to_dict", lambda self: {})):
++                with self.subTest(cls=cls.__name__, name=name), patch.object(cls, name, replacement, create=True):
++                    self.assert_rejected(proof)
++        proof.require_verified()
++
++    def test_lookup_and_inheritance_cannot_be_replaced_or_deleted(self):
++        proof = self.load()
++        for cls in (FormalPolicyRegistry, FormalPolicyRegistry.__bases__[0]):
++            for name, value in (("__getattribute__", lambda *a: True), ("__bases__", (object,))):
++                with self.subTest(name=name), self.assertRaises(TypeError):
++                    setattr(cls, name, value)
++                with self.assertRaises(TypeError):
++                    delattr(cls, name)
++        proof.require_verified()
++
++    def test_definition_reads_do_not_reparse_or_rebind_policy(self):
++        proof = self.load()
++        forbidden_codes = {policy_module._bind_policy_contract.__code__,
++            contract_module.parse_policy_contract.__code__, contract_module.parse_policy_rule.__code__}
++        calls = []
++        previous = sys.getprofile()
++        def trace(frame, event, arg):
++            if event == "call" and frame.f_code in forbidden_codes:
++                calls.append(frame.f_code.co_name)
++        try:
++            sys.setprofile(trace)
++            proof.require_verified()
++            proof.contract_hash
++            proof.canonical_bytes()
++            proof.to_dict()
++        finally:
++            sys.setprofile(previous)
++        self.assertEqual(calls, [])
++
++    def test_source_changed_during_binding_cannot_publish_proof(self):
++        self.load().require_verified()
++        previous = sys.getprofile()
++        original = object.__getattribute__(self.feature, "registry_hash")
++        bind_code = policy_module._bind_policy_contract.__code__
++        def trace(frame, event, arg):
++            if event == "return" and frame.f_code is bind_code:
++                object.__setattr__(self.feature, "registry_hash", "0" * 64)
++        try:
++            sys.setprofile(trace)
++            with self.assertRaises(ValueError):
++                self.load()
++        finally:
++            sys.setprofile(previous)
++            object.__setattr__(self.feature, "registry_hash", original)
++        self.load().require_verified()
++
++    def test_discarded_proof_is_not_kept_alive_by_ownership_table(self):
++        proof, survivor = self.load(), self.load()
++        reference = weakref.ref(proof)
++        del proof
++        gc.collect()
++        self.assertIsNone(reference())
++        survivor.require_verified()
++
++    def test_declarations_and_detached_values_are_not_score_inputs(self):
++        proof = self.load()
++        rules = proof.rules
++        market = next(r for r in rules if r["kind"] == "market_liquidity")
++        self.assertEqual(market["parameters"]["required_evidence_capability"], "verified_market_window_v1")
++        self.assertEqual(market["inputs"]["market"]["expected_type"], "market_record")
++        self.assertNotIn("value", market["inputs"]["market"])
++        affected = next(d for d in proof.valuation_dependencies["bank"] if d["policy_dependency"] == "affected")
++        self.assertEqual(affected["adapter_id"], "fixture_profit_adapter")
++        parsed = contract_module.parse_policy_contract({role: self.bundle.blob(role).canonical_json
++            for role in ("cyclic", "redline", "status", "event")})
++        for value in (proof, parsed, parsed.rules[0], proof.canonical_bytes(), proof.to_dict()):
++            with self.subTest(kind=type(value)), self.assertRaises(ValueError):
++                calculate_pre_policy_score(value)
++
++
++if __name__ == "__main__":
++    unittest.main()
+

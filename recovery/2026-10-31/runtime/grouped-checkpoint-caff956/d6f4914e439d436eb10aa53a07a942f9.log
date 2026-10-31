@@ -1,0 +1,8 @@
+TEST_STARTED test_formal_final_score_inputs.FinalScoreInputCanonicalDecodeTests.test_detached_source_payload_preserves_fractional_lexemes_without_float
+test_detached_source_payload_preserves_fractional_lexemes_without_float (test_formal_final_score_inputs.FinalScoreInputCanonicalDecodeTests.test_detached_source_payload_preserves_fractional_lexemes_without_float) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.006s
+
+OK
+GROUP_SUMMARY {"ids": ["test_formal_final_score_inputs.FinalScoreInputCanonicalDecodeTests.test_detached_source_payload_preserves_fractional_lexemes_without_float"], "passed": ["test_formal_final_score_inputs.FinalScoreInputCanonicalDecodeTests.test_detached_source_payload_preserves_fractional_lexemes_without_float"], "tests_run": 1, "failures": 0, "errors": 0, "skipped": 0}

@@ -1,0 +1,365 @@
+R3 fix round 1
+FIX_BASE e6c551d7e36819d38563511fd139ecdaa7a01e58
+HEAD ca71683561c96dea1d1eb3f1e6e34624fb4e2284
+
+ca71683 fix: fence range lease and parent evidence at mutation time
+
+
+ ashare_pipeline/formal_range_store.py | 54 +++++++++++++---------
+ tests/test_formal_range_store.py      | 87 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 120 insertions(+), 21 deletions(-)
+
+
+diff --git a/ashare_pipeline/formal_range_store.py b/ashare_pipeline/formal_range_store.py
+index b63c731..678c036 100644
+--- a/ashare_pipeline/formal_range_store.py
++++ b/ashare_pipeline/formal_range_store.py
+@@ -148,29 +148,29 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
+         request = value["request"]
+         for key in ("registry_manifest_hash", "range_config_id"):
+             if row[key] != request[key]:
+                 raise ValueError("range task identity mismatch")
+         if row["request_fingerprint"] != _digest(request) or row["refresh_generation"] != value["refresh_generation"]:
+             raise ValueError("range task request or generation changed")
+         if row["id"] != _digest(value):
+             raise ValueError("range task ID mismatch")
+         return value
+ 
+-    def request_for(store, row, seen, *, execution=False):
++    def request_for(store, row, seen, *, execution=False, evidence=None):
+         payload = task_payload(row)
+         binding, source = load_binding(store, payload)
+         parent = payload["parent"]
+         previous = None
+         if parent is not None:
+             if type(parent) is not dict or set(parent) != {"task_id", "observation_hash", "mode"}:
+                 raise ValueError("range parent identity invalid")
+-            previous = read(store, parent["task_id"], historical=not execution, seen=seen)
++            previous = read(store, parent["task_id"], historical=not execution, seen=seen, evidence=evidence)
+             if observation_wire(previous)[1] != parent["observation_hash"]:
+                 raise ValueError("range parent changed")
+         request = restore_request(source, payload["request"], previous, None if parent is None else parent["mode"])
+         actual = describe_request(request)
+         if any(_canonical(actual[key]) != _canonical(payload[key]) for key in ("request", "config", "source_registry_hash", "binding_hash")):
+             raise ValueError("range task no longer matches genuine request")
+         if execution:
+             require_execution(request, store)
+         return request, source
+ 
+@@ -188,21 +188,37 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
+         expected = dict(task_id=task_id, attempt_no=row["attempt_no"], worker_id=worker_id, task_payload_hash=row["payload_hash"])
+         if (row["status"] != "leased" or row["worker_id"] != worker_id
+                 or _time(row["lease_expires_at"]) <= _time(now) or attempt is None
+                 or attempt["task_id"] != task_id or attempt["attempt_no"] != row["attempt_no"]
+                 or attempt["worker_id"] != worker_id or attempt["finished_at"] is not None
+                 or attempt["outcome"] is not None or attempt["lease_expires_at"] != row["lease_expires_at"]
+                 or _canonical(_row_payload(attempt)) != _canonical(expected)):
+             raise ValueError("range producer lease lost or expired")
+         return row, attempt
+ 
+-    def read(store, task_id, *, historical=False, seen=()):
++    def check_read_evidence(connection, root, authenticated):
++        task, snapshot, receipt, attempt, raw, manifest_bytes = authenticated
++        task_id = task["id"]
++        for table, key, expected in (("formal_range_task", "id", task),
++                                    ("formal_range_snapshot", "task_id", snapshot),
++                                    ("formal_range_normalization_receipt", "task_id", receipt)):
++            row = connection.execute(f"SELECT * FROM {table} WHERE {key}=?", (task_id,)).fetchone()
++            if row is None or dict(row) != expected:
++                raise ValueError("range records changed during verification")
++        producers = connection.execute("SELECT * FROM formal_range_attempt WHERE task_id=? AND outcome='verified'", (task_id,)).fetchall()
++        if len(producers) != 1 or dict(producers[0]) != attempt:
++            raise ValueError("range producer changed during verification")
++        if (_read_content(root, snapshot["content_path"], snapshot["content_sha256"], ".raw") != raw
++                or _read_content(root, snapshot["manifest_path"], snapshot["manifest_sha256"], ".json") != manifest_bytes):
++            raise ValueError("range raw files changed during verification")
++
++    def read(store, task_id, *, historical=False, seen=(), evidence=None):
+         state, root, _, _, _ = record(store)
+         _text(task_id)
+         if task_id in seen:
+             raise ValueError("range parent cycle")
+         with transaction(state) as connection:
+             task = connection.execute("SELECT * FROM formal_range_task WHERE id=?", (task_id,)).fetchone()
+             payload = task_payload(task)
+             if task["status"] != "verified":
+                 raise ValueError("range task is not verified")
+             snapshot = connection.execute("SELECT * FROM formal_range_snapshot WHERE task_id=?", (task_id,)).fetchone()
+@@ -234,43 +250,36 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
+             if manifest_bytes != _canonical(manifest):
+                 raise ValueError("range manifest payload mismatch")
+             if set(manifest) != {"schema_version", "task_payload", "task_id", "attempt_id", "worker_id", "fetch"}:
+                 raise ValueError("range manifest fields invalid")
+             if (manifest["schema_version"] != "formal-range-snapshot-v1" or _canonical(manifest["task_payload"]) != _canonical(payload)
+                     or manifest["task_id"] != task_id or manifest["attempt_id"] != attempt["id"]
+                     or manifest["worker_id"] != attempt["worker_id"]):
+                 raise ValueError("range manifest producer mismatch")
+             task_copy, snapshot_copy, receipt_copy = dict(task), dict(snapshot), dict(receipt)
+             attempt_copy = dict(attempt)
+-        request, source = request_for(store, task_copy, (*seen, task_id))
++        request, source = request_for(store, task_copy, (*seen, task_id), evidence=evidence)
+         document = source_parse(source, request, raw_bytes=raw, manifest=manifest["fetch"]).to_dict()
+         expected_receipt = dict(schema_version="formal-range-normalization-receipt-v1", task_id=task_id,
+             snapshot_id=snapshot_copy["id"], attempt_id=attempt["id"], worker_id=attempt["worker_id"],
+             task_payload_hash=task_copy["payload_hash"], manifest_sha256=snapshot_copy["manifest_sha256"],
+             content_sha256=snapshot_copy["content_sha256"], normalization_hash=_digest(document),
+             fetch=manifest["fetch"], refresh_generation=task_copy["refresh_generation"])
+         if _canonical(receipt_wire) != _canonical(expected_receipt) or receipt_copy["normalization_hash"] != _digest(document):
+             raise ValueError("range normalization receipt differs from actual output")
+         if task_copy["result_json"] != _canonical(dict(snapshot_id=snapshot_copy["id"], receipt_hash=receipt_copy["payload_hash"])).decode():
+             raise ValueError("range verified result differs")
++        authenticated = (task_copy, snapshot_copy, receipt_copy, attempt_copy, raw, manifest_bytes)
+         with transaction(state) as connection:
+-            for table, key, value in (("formal_range_task", "id", task_copy), ("formal_range_snapshot", "task_id", snapshot_copy),
+-                                      ("formal_range_normalization_receipt", "task_id", receipt_copy)):
+-                row = connection.execute(f"SELECT * FROM {table} WHERE {key}=?", (task_id,)).fetchone()
+-                if row is None or dict(row) != value:
+-                    raise ValueError("range records changed during verification")
+-            current_attempts = connection.execute("SELECT * FROM formal_range_attempt WHERE task_id=? AND outcome='verified'", (task_id,)).fetchall()
+-            if len(current_attempts) != 1 or dict(current_attempts[0]) != attempt_copy:
+-                raise ValueError("range producer changed during verification")
+-            if (_read_content(root, snapshot_copy["content_path"], snapshot_copy["content_sha256"], ".raw") != raw
+-                    or _read_content(root, snapshot_copy["manifest_path"], snapshot_copy["manifest_sha256"], ".json") != manifest_bytes):
+-                raise ValueError("range raw files changed during verification")
++            check_read_evidence(connection, root, authenticated)
++        if evidence is not None:
++            evidence.append(authenticated)
+         wire = dict(request=payload["request"], document=document, receipt=dict(receipt_wire, recorded_at=receipt_copy["recorded_at"]),
+             snapshot=dict(manifest, **{key: snapshot_copy[key] for key in ("id", "content_path", "manifest_path", "content_sha256", "manifest_sha256")}),
+             task=public(task_copy, attempt), generation=dict(refresh_generation=task_copy["refresh_generation"], upstream_generation=document["upstream_generation"]))
+         return mint_observation(store, wire, historical)
+ 
+     def candidate_snapshot(connection, fingerprint):
+         rows = connection.execute("SELECT * FROM formal_range_task WHERE request_fingerprint=? AND status='verified' ORDER BY id", (fingerprint,)).fetchall()
+         return tuple(_canonical(dict(row)) for row in rows)
+ 
+     def check_candidate_snapshots(connection, snapshots):
+@@ -429,38 +438,38 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
+                     insert(connection, "formal_range_attempt", attempt)
+                     connection.execute("UPDATE formal_range_task SET status='leased', worker_id=?,lease_expires_at=?,attempt_no=?,next_retry_at=NULL,error_json=NULL,updated_at=? WHERE id=?",
+                         (worker_id, expires, number, now, row["id"]))
+                     result = public(connection.execute("SELECT * FROM formal_range_task WHERE id=?", (row["id"],)).fetchone(), attempt)
+                 return dict(result, request=request, binding=source_binding(source))
+ 
+         def renew(self, task_id, worker_id, attempt_id, *, lease_seconds):
+             state, _, _, _, _ = record(self)
+             if type(lease_seconds) is not int or lease_seconds <= 0:
+                 raise ValueError("lease duration must be positive exact integer")
+-            now = _utc_now()
+-            expires = (_time(now) + timedelta(seconds=lease_seconds)).isoformat()
+             with transaction(state, immediate=True) as connection:
++                now = _utc_now()
++                expires = (_time(now) + timedelta(seconds=lease_seconds)).isoformat()
+                 _, attempt = owner(connection, task_id, worker_id, attempt_id, now)
+                 connection.execute("UPDATE formal_range_task SET lease_expires_at=?,updated_at=? WHERE id=?", (expires, now, task_id))
+                 connection.execute("UPDATE formal_range_attempt SET lease_expires_at=? WHERE id=?", (expires, attempt_id))
+                 return public(connection.execute("SELECT * FROM formal_range_task WHERE id=?", (task_id,)).fetchone(), attempt)
+ 
+         def fail(self, task_id, worker_id, attempt_id, *, code, retryable, next_retry_at):
+             state, _, _, _, _ = record(self)
+             _text(code)
+             if type(retryable) is not bool or (retryable and next_retry_at is None) or (not retryable and next_retry_at is not None):
+                 raise ValueError("range failure retry shape invalid")
+-            now = _utc_now()
+-            if retryable and _time(next_retry_at) <= _time(now):
+-                raise ValueError("retry must be in future")
+             status = "retryable_failed" if retryable else "terminal_failed"
+             with transaction(state, immediate=True) as connection:
++                now = _utc_now()
++                if retryable and _time(next_retry_at) <= _time(now):
++                    raise ValueError("retry must be in future")
+                 _, attempt = owner(connection, task_id, worker_id, attempt_id, now)
+                 connection.execute("UPDATE formal_range_attempt SET outcome=?,finished_at=? WHERE id=?", (status, now, attempt_id))
+                 connection.execute("UPDATE formal_range_task SET status=?,worker_id=NULL,lease_expires_at=NULL,next_retry_at=?,error_json=?,updated_at=? WHERE id=?",
+                     (status, next_retry_at, _canonical(dict(code=code, retryable=retryable)).decode(), now, task_id))
+                 return public(connection.execute("SELECT * FROM formal_range_task WHERE id=?", (task_id,)).fetchone(), attempt)
+ 
+         def persist(self, task_id, worker_id, attempt_id, *, fetch):
+             state, root, _, _, _ = record(self)
+             if type(fetch) is not fetch_type:
+                 raise ValueError("range persistence requires genuine fetch")
+@@ -471,39 +480,42 @@ def _build_range_store_type(*, describe_request, restore_request, source_type,
+                 task_payload(row)
+                 task = dict(row)
+                 parent_snapshots = parent_candidate_snapshots(connection, task)
+             if task["status"] == "verified":
+                 replay = read(self, task_id)
+                 wire, _ = observation_wire(replay)
+                 if (wire["receipt"]["attempt_id"] != attempt_id or wire["receipt"]["worker_id"] != worker_id
+                         or _canonical(wire["snapshot"]["fetch"]) != _canonical(fetch_wire)):
+                     raise ValueError("range verified task cannot be claimed by another producer")
+                 return replay
+-            request, source = request_for(self, task, (), execution=True)
++            parent_evidence = []
++            request, source = request_for(self, task, (), execution=True, evidence=parent_evidence)
+             document = source_parse(source, request, raw_bytes=raw_bytes, manifest=fetch_wire).to_dict()
+             manifest = dict(schema_version="formal-range-snapshot-v1", task_payload=task_payload(task),
+                 task_id=task_id, attempt_id=attempt_id, worker_id=worker_id, fetch=fetch_wire)
+             content_hash, content_path = _write_content(root, raw_bytes, ".raw")
+             manifest_hash, manifest_path = _write_content(root, _canonical(manifest), ".json")
+             receipt_wire = dict(schema_version="formal-range-normalization-receipt-v1", task_id=task_id,
+                 snapshot_id=manifest_hash, attempt_id=attempt_id, worker_id=worker_id, task_payload_hash=task["payload_hash"],
+                 manifest_sha256=manifest_hash, content_sha256=content_hash, normalization_hash=_digest(document),
+                 fetch=fetch_wire, refresh_generation=task["refresh_generation"])
+             now = _utc_now()
+             identity = {key: task[key] for key in ("request_fingerprint", "registry_manifest_hash", "range_config_id", "refresh_generation")}
+             snapshot = dict(id=manifest_hash, task_id=task_id, **identity, content_sha256=content_hash, content_path=content_path,
+                 manifest_sha256=manifest_hash, manifest_path=manifest_path, **_payload(manifest), created_at=now)
+             receipt = dict(task_id=task_id, snapshot_id=manifest_hash, attempt_id=attempt_id, **identity,
+                 manifest_sha256=manifest_hash, content_sha256=content_hash, normalization_hash=_digest(document), **_payload(receipt_wire), recorded_at=now)
+             with transaction(state, immediate=True) as connection:
+                 owner(connection, task_id, worker_id, attempt_id, now)
+                 check_candidate_snapshots(connection, parent_snapshots)
++                for authenticated in parent_evidence:
++                    check_read_evidence(connection, root, authenticated)
+                 _read_content(root, content_path, content_hash, ".raw")
+                 _read_content(root, manifest_path, manifest_hash, ".json")
+                 insert(connection, "formal_range_snapshot", snapshot)
+                 insert(connection, "formal_range_normalization_receipt", receipt)
+                 finished = _utc_now()
+                 owner(connection, task_id, worker_id, attempt_id, finished)
+                 connection.execute("UPDATE formal_range_attempt SET outcome='verified',finished_at=? WHERE id=?", (finished, attempt_id))
+                 connection.execute("UPDATE formal_range_task SET status='verified',worker_id=NULL,lease_expires_at=NULL,result_json=?,error_json=NULL,updated_at=? WHERE id=?",
+                     (_canonical(dict(snapshot_id=manifest_hash, receipt_hash=receipt["payload_hash"])).decode(), finished, task_id))
+             return read(self, task_id)
+diff --git a/tests/test_formal_range_store.py b/tests/test_formal_range_store.py
+index ec94560..434a5a1 100644
+--- a/tests/test_formal_range_store.py
++++ b/tests/test_formal_range_store.py
+@@ -1,27 +1,72 @@
+ """Real range persistence and producer fencing regressions."""
+ import unittest
+ import copy
+ import sqlite3
+ import subprocess
+ import sys
+ from concurrent.futures import ThreadPoolExecutor
+ from contextlib import closing
+ from datetime import datetime, timedelta, timezone
+ from pathlib import Path
++from threading import Event
+ from unittest.mock import patch
+ 
+ FREEZE = "2026-08-31T07:00:00+00:00"
+ NOW = "2026-09-01T00:00:00+00:00"
+ 
+ 
+ class FormalRangeStoreTests(unittest.TestCase):
++    def test_writer_lock_wait_cannot_extend_expired_lease_or_retry_deadline(self):
++        for operation in ("renew", "fail", "retry_deadline"):
++            with self.subTest(operation=operation):
++                fixture = self.fixture()
++                _, task = self.task(fixture)
++                clock = [NOW]
++                sampled = Event()
++
++                def now():
++                    value = clock[0]
++                    sampled.set()
++                    return value
++
++                with patch("ashare_pipeline.formal_range_store._utc_now", side_effect=now):
++                    lease = fixture.range_store.lease_next("worker", lease_seconds=60)
++                    sampled.clear()
++
++                    def update():
++                        if operation == "renew":
++                            return fixture.range_store.renew(task["id"], "worker", lease["attempt_id"], lease_seconds=90)
++                        return fixture.range_store.fail(task["id"], "worker", lease["attempt_id"],
++                            code="timeout", retryable=operation == "retry_deadline",
++                            next_retry_at="2026-09-01T00:00:30+00:00" if operation == "retry_deadline" else None)
++
++                    with closing(sqlite3.connect(fixture.store.db_path)) as blocker:
++                        blocker.execute("BEGIN IMMEDIATE")
++                        with ThreadPoolExecutor(max_workers=1) as executor:
++                            future = executor.submit(update)
++                            # The real SQLite writer lock stays held while the
++                            # worker samples the old time (buggy version), or
++                            # waits before sampling at all (correct version).
++                            sampled.wait(0.2)
++                            self.assertFalse(future.done())
++                            clock[0] = ("2026-09-01T00:00:30+00:00" if operation == "retry_deadline"
++                                        else "2026-09-01T00:01:00+00:00")
++                            blocker.commit()
++                            with self.assertRaises(ValueError):
++                                future.result(timeout=10)
++                with closing(sqlite3.connect(fixture.store.db_path)) as connection:
++                    self.assertEqual(connection.execute("SELECT status,lease_expires_at,next_retry_at FROM formal_range_task WHERE id=?",
++                        (task["id"],)).fetchone(), ("leased", "2026-09-01T00:01:00+00:00", None))
++                    self.assertEqual(connection.execute("SELECT outcome,finished_at FROM formal_range_attempt WHERE id=?",
++                        (lease["attempt_id"],)).fetchone(), (None, None))
++
+     def fixture(self, **kwargs):
+         from tests import formal_range_fixtures
+         self.assertTrue(hasattr(formal_range_fixtures, "RangeStoreFixture"))
+         fixture = formal_range_fixtures.RangeStoreFixture(**kwargs)
+         self.addCleanup(fixture.close)
+         return fixture
+ 
+     def task(self, fixture, generation="g1"):
+         request = fixture.source.first_calendar_request(FREEZE)
+         return request, fixture.range_store.enqueue(request, refresh_generation=generation)
+@@ -369,20 +414,62 @@ with tempfile.TemporaryDirectory() as directory:
+         correction_lease = fixture.range_store.lease_next("worker", lease_seconds=3600)
+         correction_fetch = fixture.source.fetch_verified(request)
+         parser.target = child_request.end_date
+         parser.action = lambda: fixture.range_store.persist(correction["id"], "worker", correction_lease["attempt_id"], fetch=correction_fetch)
+         with self.assertRaises(ValueError):
+             fixture.range_store.persist(child_task["id"], "worker", child_lease["attempt_id"], fetch=child_fetch)
+         with closing(sqlite3.connect(fixture.store.db_path)) as connection:
+             self.assertEqual(connection.execute("SELECT status FROM formal_range_task WHERE id=?", (child_task["id"],)).fetchone()[0], "leased")
+             self.assertEqual(connection.execute("SELECT count(*) FROM formal_range_snapshot WHERE task_id=?", (child_task["id"],)).fetchone()[0], 0)
+ 
++    def test_parent_raw_mutation_during_child_parse_cannot_commit_child(self):
++        import json
++        from ashare_pipeline.formal_sources import FormalTerminalSourceError
++        from tests.test_formal_range_source import document_wire
++
++        class InterleavingParser:
++            action = None
++            target = None
++
++            def parse(self, raw_bytes, *, request, config):
++                if self.action is not None and request["end_date"] == self.target:
++                    action, self.action = self.action, None
++                    action()
++                return json.loads(raw_bytes)
++
++        class Normalizer:
++            def normalize(self, value, *, request, config):
++                return value
++
++        parser = InterleavingParser()
++        key = ("fixture-range-parser", "fixture-range-v1", "fixture-range-map-v1", "fixture-range-normalizer-v1", "formal-range-request-v1")
++        fixture = self.fixture(implementations={key: (parser, Normalizer())})
++        parent = fixture.produce_calendar(days={"2026-08-31": True})[0]
++        request = fixture.source.previous_calendar_request(parent)
++        task = fixture.range_store.enqueue(request, refresh_generation="g1")
++        fixture.reply(document_wire(request))
++        lease = fixture.range_store.lease_next("worker", lease_seconds=3600)
++        fetch = fixture.source.fetch_verified(request)
++        path = Path(parent.snapshot["content_path"])
++        parent_bytes = path.read_bytes()
++        parser.target = request.end_date
++        parser.action = lambda: path.write_bytes(parent_bytes + b" ")
++        try:
++            fixture.range_store.persist(task["id"], "worker", lease["attempt_id"], fetch=fetch)
++        except (ValueError, FormalTerminalSourceError):
++            pass
++        with closing(sqlite3.connect(fixture.store.db_path)) as connection:
++            self.assertEqual(connection.execute("SELECT status FROM formal_range_task WHERE id=?", (task["id"],)).fetchone()[0], "leased")
++            self.assertEqual(connection.execute("SELECT count(*) FROM formal_range_snapshot WHERE task_id=?", (task["id"],)).fetchone()[0], 0)
++            self.assertEqual(connection.execute("SELECT count(*) FROM formal_range_normalization_receipt WHERE task_id=?", (task["id"],)).fetchone()[0], 0)
++            self.assertEqual(connection.execute("SELECT outcome FROM formal_range_attempt WHERE id=?", (lease["attempt_id"],)).fetchone()[0], None)
++
+     def test_parent_correction_during_fetch_rejects_standalone_continuation(self):
+         import json
+         from tests.test_formal_range_source import document_wire
+ 
+         class InterleavingParser:
+             action = None
+             target = None
+ 
+             def parse(self, raw_bytes, *, request, config):
+                 if self.action is not None and request["end_date"] == self.target:
+

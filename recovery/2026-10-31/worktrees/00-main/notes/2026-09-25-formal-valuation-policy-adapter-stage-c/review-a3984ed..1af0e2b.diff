@@ -1,0 +1,161 @@
+# Review package: a3984ed9035c1f346c47ae0d3c41ae7845125c25..1af0e2bae2cf9819e963532cfdbcb1e34b693cfe
+
+## Commits
+1af0e2b Optimize policy market binding wire reads
+
+## Files changed
+ ashare_pipeline/formal_policy_market.py | 28 +++++++++++----------
+ tests/test_formal_policy_market.py      | 43 +++++++++++++++++++++++++++++++++
+ 2 files changed, 58 insertions(+), 13 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_policy_market.py b/ashare_pipeline/formal_policy_market.py
+index b3562a1..d45901b 100644
+--- a/ashare_pipeline/formal_policy_market.py
++++ b/ashare_pipeline/formal_policy_market.py
+@@ -840,30 +840,31 @@ class _MarketRepositoryImplementation:
+                 "lineage": [sealed.observation_to_dict(item)["observation_hash"]
+                             for item in observations]})).hexdigest()
+             return _seal_selection(_calendar_selection_type(None, pending,
+                 tuple(sealed.observation_to_dict(item)["observation_hash"]
+                       for item in observations), identity,
+                 lambda: tuple(sealed.observation_require_current(item)
+                               for item in observations)))
+         if as_of.date().isoformat() not in by_date or by_date[as_of.date().isoformat()]["is_open"] is not True:
+             raise ValueError("formal freeze is not proven as a trading day")
+         trading = tuple(day for day in expected_dates if by_date[day]["is_open"])[-250:]
+-        config = _read_binding(owned_binding)["calendar_config"]
++        view = _read_binding(owned_binding)
++        config = view["calendar_config"]
+         lineage = tuple(sealed.observation_to_dict(item)["observation_hash"]
+                         for item in observations)
+         wire = {
+             "schema_version": "formal-calendar-coverage-v1",
+-            "registry_manifest_hash": _read_binding(owned_binding)["registry_manifest_hash"],
+-            "source_registry_hash": _read_binding(owned_binding)["source_registry_hash"],
+-            "binding_hash": _read_binding(owned_binding)["binding_hash"],
+-            "rule_id": _read_binding(owned_binding)["rule_id"],
+-            "exchange": _read_binding(owned_binding)["exchange"],
++            "registry_manifest_hash": view["registry_manifest_hash"],
++            "source_registry_hash": view["source_registry_hash"],
++            "binding_hash": view["binding_hash"],
++            "rule_id": view["rule_id"],
++            "exchange": view["exchange"],
+             "as_of_utc": as_of_utc,
+             "calendar_descriptor_id": config.calendar_descriptor_id,
+             "calendar_config_id": config.entry_id,
+             "request_version": config.request_version,
+             "parser_id": config.parser_id,
+             "parser_version": config.parser_version,
+             "mapping_version": config.mapping_version,
+             "normalizer_version": config.normalizer_version,
+             "request_start": min(item["start_date"] for item in request_ranges),
+             "request_end": max(item["end_date"] for item in request_ranges),
+@@ -976,31 +977,32 @@ class _MarketRepositoryImplementation:
+                         ("coverage", "exchange_allows_trading", "volume", "turnover", "close")}
+                 daily_records.append(dict(date=day, **rows[day]))
+             else:
+                 reason = missing_reasons.get(day, "market_coverage_missing")
+                 algorithm_rows[day] = {"coverage": "missing", "reason": reason}
+                 daily_records.append({"date": day, "coverage": "missing", "reason": reason})
+         result = evaluate_window(days, algorithm_rows)
+         pending = set(result["pending"])
+         lineage = tuple(sealed.observation_to_dict(item)["observation_hash"]
+                         for item in observations)
+-        market_config = _read_binding(owned_binding)["market_config"]
+-        calendar_config = _read_binding(owned_binding)["calendar_config"]
++        view = _read_binding(owned_binding)
++        market_config = view["market_config"]
++        calendar_config = view["calendar_config"]
+         wire = {
+             "schema_version": "verified-market-window-v1",
+             "security_id": security_id,
+-            "exchange": _read_binding(owned_binding)["exchange"],
++            "exchange": view["exchange"],
+             "as_of_utc": as_of_utc,
+-            "registry_manifest_hash": _read_binding(owned_binding)["registry_manifest_hash"],
+-            "source_registry_hash": _read_binding(owned_binding)["source_registry_hash"],
+-            "binding_hash": _read_binding(owned_binding)["binding_hash"],
+-            "rule_id": _read_binding(owned_binding)["rule_id"],
++            "registry_manifest_hash": view["registry_manifest_hash"],
++            "source_registry_hash": view["source_registry_hash"],
++            "binding_hash": view["binding_hash"],
++            "rule_id": view["rule_id"],
+             "market_descriptor_id": market_config.anchor_descriptor_id,
+             "calendar_descriptor_id": calendar_config.calendar_descriptor_id,
+             "market_config_id": market_config.entry_id,
+             "calendar_config_id": calendar_config.entry_id,
+             "request_version": market_config.request_version,
+             "parser_id": market_config.parser_id,
+             "parser_version": market_config.parser_version,
+             "mapping_version": market_config.mapping_version,
+             "normalizer_version": market_config.normalizer_version,
+             "request_ranges": [{"start_date": item.start_date, "end_date": item.end_date,
+diff --git a/tests/test_formal_policy_market.py b/tests/test_formal_policy_market.py
+index 38c3d3d..a61c481 100644
+--- a/tests/test_formal_policy_market.py
++++ b/tests/test_formal_policy_market.py
+@@ -167,20 +167,63 @@ class MarketRepositoryTests(unittest.TestCase):
+         declared = {"start_date": start.isoformat(), "end_date": end.isoformat(),
+                     "complete": True}
+         return document_wire(request, rows=rows, record_count=len(rows),
+             page_record_count=len(rows), coverage=declared,
+             upstream_generation=upstream_generation,
+             parser_id=config.parser_id, parser_version=config.parser_version,
+             mapping_version=config.mapping_version,
+             normalizer_version=config.normalizer_version,
+             request_version=config.request_version)
+ 
++    def test_successful_wire_assembly_reads_each_owned_binding_once(self):
++        from ashare_pipeline import formal_policy_market as market_module
++
++        fixture = self.fixture()
++        days = trading_days(20)
++        fixture.put_window("SH600000", trading_days=days,
++                           rows={day: quiet_row() for day in days})
++        repository = market_module.FormalPolicyMarketRepository(fixture.range_store)
++        reader_code = market_module._read_binding.__code__
++        calls = {"select_calendar": [], "select": []}
++
++        tool_id = next(identifier for identifier in range(6)
++                       if sys.monitoring.get_tool(identifier) is None)
++        sys.monitoring.use_tool_id(tool_id, "market-binding-read-test")
++
++        def monitor(code, instruction_offset):
++            self.assertIs(code, reader_code)
++            caller_frame = sys._getframe(2)
++            caller = caller_frame.f_code.co_name
++            if caller in calls:
++                for recorded in calls[caller]:
++                    if recorded[0] is caller_frame:
++                        recorded[1] += 1
++                        break
++                else:
++                    calls[caller].append([caller_frame, 1])
++
++        sys.monitoring.register_callback(tool_id, sys.monitoring.events.PY_START, monitor)
++        sys.monitoring.set_local_events(tool_id, reader_code, sys.monitoring.events.PY_START)
++        try:
++            calendar = repository.select_calendar(fixture.binding, FREEZE)
++            window = repository.select("SH600000", FREEZE, binding=fixture.binding)
++        finally:
++            sys.monitoring.set_local_events(tool_id, reader_code, 0)
++            sys.monitoring.free_tool_id(tool_id)
++
++        self.assertIsNotNone(calendar.coverage)
++        self.assertIsNotNone(window.window)
++        for operation in ("select_calendar", "select"):
++            with self.subTest(operation=operation):
++                self.assertTrue(calls[operation])
++                self.assertEqual({recorded[1] for recorded in calls[operation]}, {1})
++
+     def test_no_module_global_proof_mint_survives_either_import_order(self):
+         script = textwrap.dedent("""
+             import importlib
+             import sys
+             order = sys.argv[1]
+             if order == "source-first":
+                 importlib.import_module("ashare_pipeline.formal_range_source")
+             market = importlib.import_module("ashare_pipeline.formal_policy_market")
+             if order == "market-first":
+                 importlib.import_module("ashare_pipeline.formal_range_source")

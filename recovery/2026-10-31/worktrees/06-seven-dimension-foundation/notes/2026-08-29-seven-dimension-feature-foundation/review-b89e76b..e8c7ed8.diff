@@ -1,0 +1,580 @@
+# Review package: b89e76b42a1be355cb92a0ccf3e293a81652cd38..e8c7ed8fdca882275c53fe9af9332629403e1060
+
+## Commits
+e8c7ed8 fix: close global financial namespace
+
+## Files changed
+ ashare_pipeline/feature_contract.py | 53 ++++++++++++++++++++++---
+ ashare_pipeline/state_store.py      | 18 ++++++++-
+ progress.md                         |  2 +-
+ tests/test_feature_contract.py      | 78 +++++++++++++++++++++++++++++++++++++
+ tests/test_orchestrator.py          | 69 +++++++++++++++++++++++++++++++-
+ tests/test_state_store.py           | 50 ++++++++++++++++++++++++
+ 6 files changed, 260 insertions(+), 10 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/feature_contract.py b/ashare_pipeline/feature_contract.py
+index f7be096..abf1ebc 100644
+--- a/ashare_pipeline/feature_contract.py
++++ b/ashare_pipeline/feature_contract.py
+@@ -238,20 +238,64 @@ class DimensionInput:
+             value, frozenset({"status", "values"}), "dimension input"
+         )
+         if not isinstance(data["values"], (list, tuple)):
+             raise ValueError("dimension values must be a list")
+         return cls(
+             data["status"],
+             tuple(FeatureValue.from_dict(x) for x in data["values"]),
+         )
+ 
+ 
++def financial_projection_values(
++    dimension_inputs: Mapping[str, DimensionInput],
++) -> tuple[tuple[str, FeatureValue], ...]:
++    """Return the globally recognized financial namespace across all dimensions."""
++    from .financial_formulas import (
++        DERIVED_FORMULA_SPECS,
++        DERIVED_FORMULA_VERSION,
++    )
++    from .financial_schema import raw_financial_slot_descriptor
++    from .industry_templates import TEMPLATES
++
++    raw_metrics = frozenset(
++        slot
++        for template in TEMPLATES.values()
++        for slot in template.financial_slots
++    )
++    raw_versions = frozenset(
++        raw_financial_slot_descriptor(metric).formula_version
++        for metric in raw_metrics
++    )
++    formula_slots = frozenset(
++        (spec.metric_key, spec.period_key) for spec in DERIVED_FORMULA_SPECS
++    )
++    financial_versions = raw_versions | {DERIVED_FORMULA_VERSION}
++    recognized: list[tuple[str, FeatureValue]] = []
++    for dimension_name in DIMENSIONS:
++        for value in dimension_inputs[dimension_name].values:
++            parts = value.key.split(".")
++            metric_key = parts[1] if len(parts) == 3 else None
++            registered_alias = (
++                metric_key in raw_metrics
++                and value.period_key in FINANCIAL_PERIOD_KEYS
++            )
++            formula_alias = (metric_key, value.period_key) in formula_slots
++            if (
++                dimension_name in FINANCIAL_DIMENSIONS
++                or value.formula_version in financial_versions
++                or registered_alias
++                or formula_alias
++            ):
++                recognized.append((dimension_name, value))
++    return tuple(recognized)
++
++
+ @dataclass(frozen=True)
+ class IndustryContext:
+     source: str
+     code: str | None
+     name: str
+     template_id: str
+     template_version: str
+     formal_industry_ready: bool
+ 
+     def __post_init__(self) -> None:
+@@ -478,29 +522,26 @@ class FeatureBundle:
+                     descriptor.dimension,
+                     descriptor.canonical_key(period_key),
+                     period_key,
+                 )
+                 expected_projection[identity] = ("raw", descriptor)
+         if descriptors:
+             for spec in DERIVED_FORMULA_SPECS:
+                 identity = (spec.dimension, spec.canonical_key, spec.period_key)
+                 expected_projection[identity] = ("formula", spec)
+ 
++        supplied_entries = financial_projection_values(self.dimension_inputs)
+         supplied_projection = {
+             (dimension_name, value.key, value.period_key): value
+-            for dimension_name in FINANCIAL_DIMENSIONS
+-            for value in self.dimension_inputs[dimension_name].values
++            for dimension_name, value in supplied_entries
+         }
+-        supplied_count = sum(
+-            len(self.dimension_inputs[dimension_name].values)
+-            for dimension_name in FINANCIAL_DIMENSIONS
+-        )
++        supplied_count = len(supplied_entries)
+         if (
+             supplied_count != len(expected_projection)
+             or set(supplied_projection) != set(expected_projection)
+         ):
+             raise ValueError("financial projection must contain the exact registered slots")
+ 
+         for identity, (kind, authority) in expected_projection.items():
+             value = supplied_projection[identity]
+             if kind == "raw":
+                 descriptor = authority
+diff --git a/ashare_pipeline/state_store.py b/ashare_pipeline/state_store.py
+index 2b2ec42..58256ba 100644
+--- a/ashare_pipeline/state_store.py
++++ b/ashare_pipeline/state_store.py
+@@ -6,23 +6,25 @@ import json
+ import sqlite3
+ import uuid
+ from contextlib import closing, contextmanager
+ from dataclasses import dataclass, field
+ from datetime import datetime, timezone
+ from pathlib import Path, PurePosixPath, PureWindowsPath
+ from typing import Iterable, Iterator, Mapping, Sequence
+ 
+ from ashare_pipeline.feature_contract import (
+     DIMENSIONS,
++    FINANCIAL_DIMENSIONS,
+     FINANCIAL_PERIODS,
+     EvidenceRef,
+     FeatureBundle,
++    financial_projection_values,
+ )
+ from ashare_pipeline.financial_formulas import (
+     DERIVED_FORMULA_SPECS,
+     FormulaFact,
+     evaluate_derived_financial,
+ )
+ from ashare_pipeline.financial_schema import (
+     FinancialFact,
+     raw_financial_slot_descriptor,
+ )
+@@ -802,20 +804,33 @@ class StateStore:
+         """Revalidate one bundle against the canonical facts in this store."""
+         bundle.validate()
+         with self._transaction() as connection:
+             self._validate_feature_bundle_evidence(connection, bundle)
+ 
+     @staticmethod
+     def _validate_feature_bundle_evidence(
+         connection: sqlite3.Connection,
+         bundle: FeatureBundle,
+     ) -> None:
++        from ashare_pipeline.industry_templates import TEMPLATES
++
++        projection_entries = financial_projection_values(bundle.dimension_inputs)
++        template = TEMPLATES[bundle.industry.template_id]
++        if (
++            (not template.financial_slots and projection_entries)
++            or any(
++                dimension_name not in FINANCIAL_DIMENSIONS
++                for dimension_name, _value in projection_entries
++            )
++        ):
++            raise ValueError("financial projection has a noncanonical container")
++
+         evidence_by_id: dict[str, EvidenceRef] = {}
+         for dimension in bundle.dimension_inputs.values():
+             for value in dimension.values:
+                 for evidence in value.evidence:
+                     existing = evidence_by_id.get(evidence.financial_fact_id)
+                     if existing is not None and existing != evidence:
+                         raise ValueError("feature evidence metadata conflicts for one fact")
+                     evidence_by_id[evidence.financial_fact_id] = evidence
+         if not evidence_by_id:
+             return
+@@ -917,22 +932,21 @@ class StateStore:
+                     fact.unit,
+                     fact.id,
+                 )
+ 
+         formula_identities = {
+             (spec.dimension, spec.canonical_key, spec.period_key)
+             for spec in DERIVED_FORMULA_SPECS
+         }
+         formula_values = {
+             (dimension_name, value.key, value.period_key): value
+-            for dimension_name, dimension in bundle.dimension_inputs.items()
+-            for value in dimension.values
++            for dimension_name, value in projection_entries
+             if (dimension_name, value.key, value.period_key) in formula_identities
+         }
+         if formula_values:
+             expected_results = evaluate_derived_financial(formula_inputs)
+             if len(formula_values) != len(expected_results):
+                 raise ValueError("derived financial projection does not match canonical facts")
+             for result in expected_results:
+                 identity = (
+                     result.spec.dimension,
+                     result.spec.canonical_key,
+diff --git a/progress.md b/progress.md
+index 42beed4..e9cfff6 100644
+--- a/progress.md
++++ b/progress.md
+@@ -69,13 +69,13 @@
+ - 后续修复波次已收紧公共合约与真实持久化边界：所有证据的生效时点不得晚于 bundle `as_of_utc`；`unclassified` 模板只能保持 `blocked`、零财务覆盖率并携带 `industry_template_unclassified`。上述 PIT cutoff 与 unclassified blocked 不变量均由隔离测试覆盖。
+ - DB-backed 财务证据存在性、字段一致性以及 canonical source snapshot 参照核验仍在 StateStore 事务与 verified progress 读取路径中强制执行；本轮完整 `unittest` 回归为 370/370 通过。
+ - 后续独立 scoped review 与 fresh whole-branch review 仍是必须完成的门闸；本记录不预判其结论。
+ - 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
+ - `formal_score_ready=false`，未发布 formal scores；正式等待价格池与正式强烈关注池均保持关闭且为空。
+ 
+ ## 七维派生公式与 DB 镜像认证（2026-08-31）
+ 
+ - `financial-derived-v1` 的 90 个派生逻辑输出现由单一中立公式目录与 evaluator 生成并按 canonical raw facts 重算认证；公共合约同时强制 common template 的完整 raw + formula 闭集、元数据与覆盖率，无输出模板仍保持空财务命名空间。
+ - verified artifact 与 SQLite `feature_set` header 及完整 `feature_value` child set 现按 canonical 标量/JSON 精确比较；首写、幂等复用和 progress 共用同一 validator，progress 在一个 read transaction 内保持 newest-only、no-fallback 与每候选至多一个 bounded unknown。
+-- 本轮 fresh full `unittest` 回归为 386/386 通过；后续独立 scoped review 与 fresh whole-branch review 仍是必须门闸，本记录不预判结论。
++- V/T 维容器现同样参与全局财务命名空间认证，common template 的财务公式/原始槽位不能通过复制到非财务容器绕过闭集，无输出模板也拒绝该类值；本轮 fresh full `unittest` 回归为 391/391 通过。后续独立 scoped review 与 fresh whole-branch review 仍是必须门闸，本记录不预判结论。
+ - 尚未执行真实 bounded network smoke，也未按 exact operational denominator/numerator `120/114` 完成线上验收。
+ - `formal_score_ready=false`，未发布 formal scores；正式等待价格池与正式强烈关注池继续关闭且为空。
+diff --git a/tests/test_feature_contract.py b/tests/test_feature_contract.py
+index bd3377a..f4707d4 100644
+--- a/tests/test_feature_contract.py
++++ b/tests/test_feature_contract.py
+@@ -54,20 +54,60 @@ def real_specialized_bundle(industry_name):
+ 
+     return build_bundle_with_overrides(source_industry_name=industry_name)
+ 
+ 
+ def real_unclassified_bundle():
+     from tests.test_financial_features import build_bundle_with_overrides
+ 
+     return build_bundle_with_overrides(source_industry_name="不存在行业")
+ 
+ 
++def copy_financial_value_into_dimension_payload(
++    payload,
++    target_dimension,
++    *,
++    source_payload=None,
++    source_dimension="M",
++    feature_key="m.gross_profit.FY2021",
++):
++    source = source_payload or payload
++    copied = copy.deepcopy(next(
++        value
++        for value in source["dimension_inputs"][source_dimension]["values"]
++        if value["key"] == feature_key
++    ))
++    payload["dimension_inputs"][target_dimension] = {
++        "status": "input_ready",
++        "values": [copied],
++    }
++    return payload
++
++
++def bundle_with_copied_financial_value(
++    candidate,
++    target_dimension,
++    *,
++    source_dimension="M",
++    feature_key="m.gross_profit.FY2021",
++):
++    copied = next(
++        value
++        for value in candidate.dimension_inputs[source_dimension].values
++        if value.key == feature_key
++    )
++    forged = copy.copy(candidate)
++    forged_dimensions = dict(candidate.dimension_inputs)
++    forged_dimensions[target_dimension] = DimensionInput("input_ready", (copied,))
++    object.__setattr__(forged, "dimension_inputs", forged_dimensions)
++    return forged
++
++
+ def retag_missing_revenue_slot(payload, attack):
+     dimensions = payload["dimension_inputs"]
+     target = next(
+         value
+         for value in dimensions["G"]["values"]
+         if value["key"] == "g.revenue.FY2021"
+     )
+     dimensions["G"]["values"].remove(target)
+     if attack == "derived_wrong_dimension":
+         replacement = copy.deepcopy(next(
+@@ -372,20 +412,43 @@ class FeatureContractTests(unittest.TestCase):
+             "wrong_dimension": move_wrong_dimension,
+             "cross_dimension_copy": copy_cross_dimension,
+         }
+         for case, attack in attacks.items():
+             with self.subTest(case=case):
+                 payload = copy.deepcopy(baseline)
+                 attack(payload)
+                 with self.assertRaisesRegex(ValueError, "financial projection"):
+                     FeatureBundle.from_dict(payload)
+ 
++    def test_public_parse_rejects_financial_projection_copies_in_v_and_t(self):
++        sources = (
++            ("formula", "M", "m.gross_profit.FY2021"),
++            ("raw", "G", "g.revenue.FY2021"),
++        )
++        for case, source_dimension, feature_key in sources:
++            for target_dimension in ("V", "T"):
++                with self.subTest(
++                    case=case, target_dimension=target_dimension
++                ):
++                    payload = copy_financial_value_into_dimension_payload(
++                        real_general_ready_bundle().to_dict(),
++                        target_dimension,
++                        source_dimension=source_dimension,
++                        feature_key=feature_key,
++                    )
++                    with self.assertRaisesRegex(ValueError, "financial projection"):
++                        FeatureBundle.from_dict(payload)
++
++        restored = FeatureBundle.from_dict(bundle().to_dict())
++        self.assertEqual(restored.dimension_inputs["V"].values[0].key, "v.market_cap")
++        self.assertEqual(restored.dimension_inputs["T"].values[0].key, "t.sample")
++
+     def test_exact_formula_set_applies_to_partial_and_blocked_common_templates(self):
+         from tests.test_financial_features import build_bundle_with_overrides
+ 
+         candidates = (
+             build_bundle_with_overrides(facts=()),
+             real_specialized_bundle("房地产开发"),
+         )
+         self.assertEqual(
+             tuple(candidate.financial_status for candidate in candidates),
+             ("partial", "blocked"),
+@@ -429,20 +492,35 @@ class FeatureContractTests(unittest.TestCase):
+                             "status": "missing",
+                             "formula_version": "financial-derived-v1",
+                             "evidence": [],
+                             "missing_reason": "missing_operand:unknown_formula",
+                         }
+                     ],
+                 }
+                 with self.assertRaisesRegex(ValueError, "financial projection"):
+                     FeatureBundle.from_dict(payload)
+ 
++    def test_no_output_templates_reject_financial_formula_values_in_v_and_t(self):
++        financial_source = real_general_ready_bundle().to_dict()
++        for industry_name in ("银行", "不存在行业"):
++            for target_dimension in ("V", "T"):
++                with self.subTest(
++                    industry=industry_name, target_dimension=target_dimension
++                ):
++                    payload = copy_financial_value_into_dimension_payload(
++                        real_specialized_bundle(industry_name).to_dict(),
++                        target_dimension,
++                        source_payload=financial_source,
++                    )
++                    with self.assertRaisesRegex(ValueError, "financial projection"):
++                        FeatureBundle.from_dict(payload)
++
+     def test_public_parse_rejects_registered_raw_slot_retag_substitutions(self):
+         attacks = (
+             "derived_wrong_dimension",
+             "derived_correct_dimension",
+             "observed_wrong_dimension",
+             "observed_wrong_formula",
+             "other_observed_raw_slot",
+         )
+         for attack in attacks:
+             with self.subTest(attack=attack):
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+index 4244e73..b27dae4 100644
+--- a/tests/test_orchestrator.py
++++ b/tests/test_orchestrator.py
+@@ -29,21 +29,24 @@ from ashare_pipeline.feature_contract import (
+     IndustryContext,
+     canonical_json_bytes,
+     canonical_sha256,
+ )
+ from ashare_pipeline.financial_schema import FINANCIAL_REQUEST_VERSION
+ from ashare_pipeline.snapshot_repository import SnapshotRepository
+ from ashare_pipeline.snapshot_store import SnapshotStore
+ from ashare_pipeline.sources import FetchBatch, SourceBlocked
+ from ashare_pipeline.state_store import StateStore
+ from ashare_pipeline import orchestrator
+-from tests.test_feature_contract import retag_missing_revenue_slot
++from tests.test_feature_contract import (
++    bundle_with_copied_financial_value,
++    retag_missing_revenue_slot,
++)
+ from tests.test_financial_features import build_bundle_with_overrides, rebuild_fact
+ from tests.test_state_store import installed_ready_bundle
+ 
+ 
+ def batch(source, dataset, records, request=None, fetched_at="2026-08-29T12:00:00+00:00"):
+     return FetchBatch(source, dataset, request or {}, records, fetched_at, "test", {})
+ 
+ 
+ def records_hash(records):
+     payload = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+@@ -1358,20 +1361,84 @@ class OrchestratorTestCase(unittest.TestCase):
+             {"partial": 0, "financial_ready": 0, "blocked": 0},
+         )
+         self.assertEqual(status["deep"]["unknown_failure_count"], 1)
+         self.assertFalse(status["formal_score_ready"])
+         self.assertFalse(status["seven_dimension_ready"])
+         self.assertEqual(
+             status["official_pool_counts"],
+             {"waiting_price": 0, "strong_attention": 0},
+         )
+ 
++    def test_progress_rejects_newest_financial_formula_copy_in_t_without_fallback(self):
++        store, newer, newer_path, _newer_hash, newer_id = self.install_ready_history(
++            "formula-copy-t"
++        )
++        forged = bundle_with_copied_financial_value(newer, "T")
++        forged_bytes = forged.canonical_bytes()
++        forged_hash = forged.bundle_hash()
++        copied = forged.dimension_inputs["T"].values[0]
++        (self.base / newer_path).write_bytes(forged_bytes)
++        dimension_status_json = canonical_json_bytes({
++            dimension: forged.dimension_inputs[dimension].status
++            for dimension in DIMENSIONS
++        }).decode("utf-8")
++        evidence_json = canonical_json_bytes(
++            [evidence.to_dict() for evidence in copied.evidence]
++        ).decode("utf-8")
++        with closing(sqlite3.connect(store.db_path)) as connection:
++            connection.execute(
++                "UPDATE feature_set SET bundle_hash=?,dimension_status_json=? WHERE id=?",
++                (forged_hash, dimension_status_json, newer_id),
++            )
++            cursor = connection.execute(
++                """INSERT INTO feature_value
++                (feature_set_id,dimension,feature_key,period_key,value,unit,status,
++                 formula_version,evidence_json,missing_reason)
++                VALUES (?,?,?,?,?,?,?,?,?,?)""",
++                (
++                    newer_id,
++                    "T",
++                    copied.key,
++                    copied.period_key,
++                    copied.value,
++                    copied.unit,
++                    copied.status,
++                    copied.formula_version,
++                    evidence_json,
++                    copied.missing_reason,
++                ),
++            )
++            self.assertEqual(cursor.rowcount, 1)
++            connection.commit()
++        self.assertEqual((self.base / newer_path).read_bytes(), forged_bytes)
++
++        status, exit_code = orchestrator.run_command(
++            self.root,
++            store.db_path,
++            "status",
++            now_cn="2026-08-29T20:00:00+08:00",
++        )
++        self.assertEqual(exit_code, 0)
++        self.assertEqual(
++            status["deep"]["feature_set_counts"],
++            {"partial": 0, "financial_ready": 0, "blocked": 0},
++        )
++        self.assertEqual(status["deep"]["template_counts"], {})
++        self.assertEqual(status["deep"]["missing_reason_counts"], {})
++        self.assertEqual(status["deep"]["unknown_failure_count"], 1)
++        self.assertFalse(status["formal_score_ready"])
++        self.assertFalse(status["seven_dimension_ready"])
++        self.assertEqual(
++            status["official_pool_counts"],
++            {"waiting_price": 0, "strong_attention": 0},
++        )
++
+     def test_progress_rejects_deleted_newest_feature_child_without_fallback(self):
+         self.assert_newest_child_corruption_is_bounded_unknown("deleted")
+ 
+     def test_progress_rejects_updated_newest_feature_child_without_fallback(self):
+         self.assert_newest_child_corruption_is_bounded_unknown("updated")
+ 
+     def test_progress_rejects_extra_newest_feature_child_without_fallback(self):
+         self.assert_newest_child_corruption_is_bounded_unknown("extra")
+ 
+     def test_equal_effective_instant_persists_reads_and_counts_ready(self):
+diff --git a/tests/test_state_store.py b/tests/test_state_store.py
+index dc10667..f67c5c0 100644
+--- a/tests/test_state_store.py
++++ b/tests/test_state_store.py
+@@ -20,20 +20,21 @@ from ashare_pipeline.feature_contract import (
+     IndustryContext,
+     canonical_sha256,
+ )
+ from ashare_pipeline.financial_schema import MAPPING_VERSION, FinancialFact
+ from ashare_pipeline.state_store import FinalizationBlocked, JobSpec, StateStore
+ from tests.test_financial_features import (
+     build_bundle_with_overrides,
+     complete_general_facts,
+     rebuild_fact,
+ )
++from tests.test_feature_contract import bundle_with_copied_financial_value
+ 
+ 
+ UTC = timezone.utc
+ 
+ 
+ def utc_at(seconds: int) -> str:
+     return (datetime(2026, 8, 31, tzinfo=UTC) + timedelta(seconds=seconds)).isoformat()
+ 
+ 
+ def financial_fact(
+@@ -908,20 +909,69 @@ class StateStoreTestCase(unittest.TestCase):
+                             f"derived-{case}.json"
+                         ),
+                         bundle_hash=forged.bundle_hash(),
+                     )
+                 with closing(sqlite3.connect(case_store.db_path)) as connection:
+                     self.assertEqual(
+                         connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
+                         0,
+                     )
+ 
++    def test_first_persistence_rejects_financial_formula_copy_in_t(self) -> None:
++        honest, _facts, _snapshots = self.installed_ready_bundle(
++            self.store, snapshot_tag="formula-copy-first"
++        )
++        forged = bundle_with_copied_financial_value(honest, "T")
++
++        with self.assertRaisesRegex(ValueError, "financial projection"):
++            self.store.put_feature_bundle(
++                forged,
++                bundle_path=(
++                    "data/curated/formal_features/2026-06-30/SH600001/"
++                    "formula-copy-first.json"
++                ),
++                bundle_hash=forged.bundle_hash(),
++            )
++
++        with closing(sqlite3.connect(self.db_path)) as connection:
++            self.assertEqual(
++                connection.execute("SELECT COUNT(*) FROM feature_set").fetchone()[0],
++                0,
++            )
++
++    def test_evidence_authority_rejects_financial_formula_aliases_in_v_and_t(self) -> None:
++        honest, _facts, _snapshots = self.installed_ready_bundle(
++            self.store, snapshot_tag="formula-copy-evidence"
++        )
++        sources = (
++            ("formula", "M", "m.gross_profit.FY2021"),
++            ("raw", "G", "g.revenue.FY2021"),
++        )
++        for case, source_dimension, feature_key in sources:
++            for target_dimension in ("V", "T"):
++                with self.subTest(
++                    case=case, target_dimension=target_dimension
++                ):
++                    forged = bundle_with_copied_financial_value(
++                        honest,
++                        target_dimension,
++                        source_dimension=source_dimension,
++                        feature_key=feature_key,
++                    )
++                    with self.store._transaction() as connection:
++                        with self.assertRaisesRegex(
++                            ValueError, "financial projection"
++                        ):
++                            self.store._validate_feature_bundle_evidence(
++                                connection, forged
++                            )
++
+     def test_idempotent_put_reauthenticates_derived_numeric_projection(self) -> None:
+         honest, _facts, _snapshots = self.installed_ready_bundle(
+             self.store, snapshot_tag="derived-idempotent"
+         )
+         path = "data/curated/formal_features/2026-06-30/SH600001/derived-idempotent.json"
+         feature_id, created = self.store.put_feature_bundle(
+             honest, bundle_path=path, bundle_hash=honest.bundle_hash()
+         )
+         self.assertTrue(created)
+         payload = honest.to_dict()

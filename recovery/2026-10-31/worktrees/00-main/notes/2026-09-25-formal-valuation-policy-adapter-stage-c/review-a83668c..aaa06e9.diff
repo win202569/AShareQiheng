@@ -1,0 +1,190 @@
+# Review package: a83668c..aaa06e9
+
+## Commits
+aaa06e9 fix: seal metric definition JSON encoder primitives
+
+## Files changed
+ ashare_pipeline/formal_metric_engine.py         | 29 +++++++++++-
+ tests/test_formal_valuation_adapter_contract.py | 63 +++++++++++++++++++++++++
+ 2 files changed, 90 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_metric_engine.py b/ashare_pipeline/formal_metric_engine.py
+index fc7b3ac..a652846 100644
+--- a/ashare_pipeline/formal_metric_engine.py
++++ b/ashare_pipeline/formal_metric_engine.py
+@@ -47,20 +47,34 @@ def _freeze(value):
+         return value if type(value) is tuple and all(a is b for a, b in zip(value, result, strict=True)) else result
+     return value
+ 
+ 
+ def _install_metric_definition_producer():
+     """Close the complete metric-definition encoding chain over original dependencies."""
+     owner = globals()
+     mapping_type, decimal_type, field_reader = MappingProxyType, Decimal, fields
+     json_module, hash_module, scoring_type = json, hashlib, FormalScoringRegistry
+     dumps, sha256, template_for = json_module.dumps, hash_module.sha256, scoring_type.template_for
++    encoder_module, encoder_type = json_module.encoder, json_module.JSONEncoder
++    encoder_bindings = (
++        (vars(json_module), "encoder", encoder_module),
++        (vars(json_module), "JSONEncoder", encoder_type),
++        (vars(encoder_module), "JSONEncoder", encoder_type),
++        *((vars(encoder_type), name, vars(encoder_type)[name])
++            for name in ("__init__", "encode", "iterencode", "default")),
++        *((vars(encoder_module), name, vars(encoder_module)[name])
++            for name in ("encode_basestring", "encode_basestring_ascii",
++                "c_make_encoder", "_make_iterencode", "INFINITY", "ESCAPE", "ESCAPE_DCT")),
++    )
++    encoder_bases, encoder_mro = encoder_type.__bases__, encoder_type.__mro__
++    encoder_members = tuple(vars(encoder_type).items())
++    escape_values = tuple(sorted(encoder_module.ESCAPE_DCT.items()))
+     dict_type, tuple_type, list_type = dict, tuple, list
+     type_of, is_instance, as_text, read_field = type, isinstance, str, getattr
+ 
+     def plain(value):
+         if is_instance(value, (dict_type, mapping_type)):
+             return {key: plain(item) for key, item in value.items()}
+         if type_of(value) in (tuple_type, list_type):
+             return [plain(item) for item in value]
+         return as_text(value) if type_of(value) is decimal_type else value
+ 
+@@ -92,23 +106,34 @@ def _install_metric_definition_producer():
+     def dependency_changes():
+         bindings = (
+             (owner, "MappingProxyType", mapping_type), (owner, "Decimal", decimal_type),
+             (owner, "fields", field_reader), (owner, "json", json_module),
+             (owner, "hashlib", hash_module), (owner, "FormalScoringRegistry", scoring_type),
+             (owner, "_plain", plain), (owner, "_canonical", canonical),
+             (owner, "_digest", digest), (owner, "_scoring_metric_definitions", definitions),
+             (owner, "_metric_definition_dependency_changes", dependency_changes),
+             (vars(json_module), "dumps", dumps), (vars(hash_module), "sha256", sha256),
+             (vars(scoring_type), "template_for", template_for),
++            *encoder_bindings,
+         )
+-        return tuple(name for source, name, original in bindings
+-            if source.get(name) is not original)
++        changed = [name for source, name, original in bindings
++            if source.get(name) is not original]
++        if encoder_type.__bases__ != encoder_bases or encoder_type.__mro__ != encoder_mro:
++            changed.append("JSONEncoder inheritance")
++        current_encoder_members = vars(encoder_type)
++        if (set(current_encoder_members) != {name for name, _ in encoder_members}
++                or any(current_encoder_members[name] is not original
++                    for name, original in encoder_members)):
++            changed.append("JSONEncoder members")
++        if tuple(sorted(encoder_module.ESCAPE_DCT.items())) != escape_values:
++            changed.append("ESCAPE_DCT values")
++        return tuple(changed)
+ 
+     return plain, canonical, digest, definitions, dependency_changes
+ 
+ 
+ (_plain, _canonical, _digest, _scoring_metric_definitions,
+  _metric_definition_dependency_changes) = _install_metric_definition_producer()
+ del _install_metric_definition_producer
+ 
+ 
+ def _install_engine():
+diff --git a/tests/test_formal_valuation_adapter_contract.py b/tests/test_formal_valuation_adapter_contract.py
+index 6079b34..9c8de6c 100644
+--- a/tests/test_formal_valuation_adapter_contract.py
++++ b/tests/test_formal_valuation_adapter_contract.py
+@@ -1,14 +1,15 @@
+ """Signed valuation adapter definitions bind exactly to same-root policy and metrics."""
+ 
+ import copy
+ from dataclasses import asdict, replace
++import json
+ from types import SimpleNamespace
+ import unittest
+ from unittest.mock import patch
+ 
+ import ashare_pipeline.formal_valuation_adapter_contract as adapter_module
+ import ashare_pipeline.formal_metric_engine as metric_engine
+ from ashare_pipeline.formal_policy_registry import load_formal_policy_registry
+ from ashare_pipeline.formal_valuation_adapter_contract import (
+     FormalValuationAdapterRegistry, load_formal_valuation_adapter_registry,
+ )
+@@ -269,20 +270,82 @@ class ValuationAdapterContractTests(unittest.TestCase):
+     def test_existing_registry_rejects_every_active_definition_dependency_swap(self):
+         bundle, scoring, policy = load_graph()
+         registry = load_formal_valuation_adapter_registry(bundle,
+             scoring_registry=scoring, policy_registry=policy)
+         for name, replacement in self._metric_dependency_substitutions():
+             with self.subTest(dependency=name), patch.object(metric_engine, name, replacement):
+                 with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
+                     registry.require_official(bundle)
+         registry.require_official(bundle)
+ 
++    def _poisoned_json_encoder(self):
++        original = json.JSONEncoder
++
++        class PoisonedEncoder(original):
++            def encode(self, value):
++                if type(value) is dict and "definition" in value:
++                    return '"poisoned-metric-definition"'
++                return super().encode(value)
++
++        return PoisonedEncoder
++
++    def test_public_loader_rejects_a_replaced_json_encoder(self):
++        bundle, scoring, policy = load_graph()
++        with patch.object(json, "JSONEncoder", self._poisoned_json_encoder()):
++            with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
++                load_formal_valuation_adapter_registry(bundle,
++                    scoring_registry=scoring, policy_registry=policy)
++
++    def test_existing_registry_reads_reject_an_active_json_encoder_swap(self):
++        bundle, scoring, policy = load_graph()
++        registry = load_formal_valuation_adapter_registry(bundle,
++            scoring_registry=scoring, policy_registry=policy)
++        with patch.object(json, "JSONEncoder", self._poisoned_json_encoder()):
++            with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
++                registry.to_dict()
++        registry.require_official(bundle)
++
++    def test_json_encoder_swap_cannot_publish_a_proof_official_after_restore(self):
++        bundle, scoring, policy = load_graph()
++        try:
++            with patch.object(json, "JSONEncoder", self._poisoned_json_encoder()):
++                registry = load_formal_valuation_adapter_registry(bundle,
++                    scoring_registry=scoring, policy_registry=policy)
++        except ValueError as error:
++            self.assertRegex(str(error), "valuation adapter.*definition dependencies")
++        else:
++            with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
++                registry.require_official(bundle)
++
++    def test_json_encoder_methods_and_both_encoding_branches_are_sealed(self):
++        bundle, scoring, policy = load_graph()
++        registry = load_formal_valuation_adapter_registry(bundle,
++            scoring_registry=scoring, policy_registry=policy)
++        for owner, name in ((json.JSONEncoder, "__init__"),
++                (json.JSONEncoder, "encode"), (json.JSONEncoder, "iterencode"),
++                (json.encoder, "encode_basestring"), (json.encoder, "c_make_encoder"),
++                (json.encoder, "_make_iterencode")):
++            original = getattr(owner, name)
++            replacement = lambda *args, _original=original, **kwargs: _original(*args, **kwargs)
++            with self.subTest(owner=owner, name=name), patch.object(owner, name, replacement):
++                with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
++                    registry.require_official(bundle)
++
++    def test_json_encoder_rejects_new_attribute_lookup_method(self):
++        bundle, scoring, policy = load_graph()
++        registry = load_formal_valuation_adapter_registry(bundle,
++            scoring_registry=scoring, policy_registry=policy)
++        with patch.object(json.JSONEncoder, "__getattribute__",
++                lambda self, name: object.__getattribute__(self, name)):
++            with self.assertRaisesRegex(ValueError, "valuation adapter.*definition dependencies"):
++                registry.require_official(bundle)
++
+     def test_v1_graph_cannot_load_a_formal_valuation_adapter(self):
+         bundle, vocabulary, scoring, _, _ = policy_graph(
+             manifest_version="formal-registry-manifest-v1")
+         policy = load_formal_policy_registry(bundle, scoring_registry=scoring,
+             feature_registry=vocabulary)
+         with self.assertRaisesRegex(ValueError, "valuation_adapter role is unavailable"):
+             load_formal_valuation_adapter_registry(bundle, scoring_registry=scoring,
+                 policy_registry=policy)
+ 
+     def test_fixture_requires_a_stage_c_root_for_adapter_document(self):

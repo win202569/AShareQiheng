@@ -1,0 +1,491 @@
+# Review package: 7dd8139..f196952
+
+## Commits
+f196952 Retire copied binding lease contexts
+
+## Files changed
+ ashare_pipeline/formal_range_contract.py         | 94 ++++++++++++++++++++----
+ tests/test_formal_policy_market_binding_lease.py | 55 +++++++++++++-
+ 2 files changed, 133 insertions(+), 16 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_range_contract.py b/ashare_pipeline/formal_range_contract.py
+index 3433e10..58e18f6 100644
+--- a/ashare_pipeline/formal_range_contract.py
++++ b/ashare_pipeline/formal_range_contract.py
+@@ -492,39 +492,54 @@ def _build_range_bindings_contract():
+ 
+     def _binding_record(value: object, *, current: bool = False) -> _BindingRecord:
+         record = _binding_records.get(id(value))
+         if type(value) is not RangeBinding or record is None or record.reference() is not value:
+             raise ValueError("range binding is forged, copied, or unregistered")
+         parent = record.parent()
+         if parent is None or object.__getattribute__(value, "_RangeBinding__parent") is not parent:
+             raise ValueError("range binding parent changed")
+         lease = _binding_read_lease.get() if current else None
+         if lease is not None:
++            _require_live_lease(lease)
+             parent_record = _bindings_record(parent)
+             identity = (parent_record.snapshot.root_hash, record.binding_hash, record.key)
+             exact_binding = identity == lease[2]
++            exact_only = _sibling_exact_only.get()
++            if exact_only is not None:
++                _require_live_context(_exact_records, exact_only, 2, 3,
++                                      "exact sibling mask")
++                if exact_only[1] is not lease:
++                    raise ValueError("exact sibling mask belongs to another owner lease")
+             sibling = (_sibling_request_read.get()
+-                       if not exact_binding and _sibling_exact_only.get() is None else None)
++                       if not exact_binding and exact_only is None else None)
++            if sibling is not None:
++                _require_live_context(_sibling_records, sibling, 12, 13,
++                                      "sibling request read")
+             target = _sibling_target_read.get() if sibling is not None else None
++            if target is not None:
++                _require_live_context(_target_records, target, 6, 7,
++                                      "sibling target read")
+             sibling_matches = (
+                 sibling is not None
+                 and target is not None
+                 and sibling[0] is lease
+                 and sibling[1] == get_thread_identity()
+                 and sibling[2] is lease[1]
+                 and sibling[3:5] == tuple(lease[7:9])
+                 and parent_record.snapshot == lease[5]
+                 and parent_record.snapshot.root_hash == sibling[7]
+                 and next(digest for role, _, digest in parent_record.snapshot.roles
+                          if role == "source") == sibling[6]
+                 and record.key[1] == sibling[8]
+                 and target[0] == get_thread_identity()
++                and target[3] is lease
++                and target[4:6] == tuple(lease[7:9])
+                 and (target[1] == sibling[9]
+                      or (type(sibling[11]) is dict
+                          and sibling[11].get("task_id") == target[2]))
+                 and (record.calendar_bytes if sibling[10] == "calendar_range"
+                      else record.market_bytes) == sibling[5]
+             )
+             if (get_thread_identity() != lease[0]
+                     or parent_record.snapshot != lease[5]
+                     or (not exact_binding and not sibling_matches)):
+                 raise ValueError("range binding lease is cross-thread, cross-binding, or stale")
+@@ -593,20 +608,45 @@ def _build_range_bindings_contract():
+             raise TypeError("sibling targets require their sealed range Store")
+ 
+ 
+     class _SiblingExactOnly:
+         __slots__ = ("__weakref__",)
+ 
+         def __init__(self, *_args, **_kwargs):
+             raise TypeError("exact sibling masks require their sealed range Store")
+ 
+ 
++    def _require_live_lease(state):
++        if type(state) is not list or len(state) != 14:
++            raise ValueError("range binding read lease is unpublished or stale")
++        capability, generation = state[12:14]
++        saved = _lease_records.get(id(capability))
++        if (type(capability) is not _BindingReadLease or saved is None
++                or saved[0]() is not capability or saved[1] is not state
++                or saved[3] is not False or saved[4] is not True
++                or saved[5] is not generation):
++            raise ValueError("range binding read lease is unpublished or stale")
++        return saved
++
++
++    def _require_live_context(records, state, capability_index, generation_index, label):
++        if type(state) is not tuple or len(state) <= generation_index:
++            raise ValueError(label + " is unpublished or stale")
++        capability = state[capability_index]
++        generation = state[generation_index]
++        saved = records.get(id(capability))
++        if (saved is None or saved[0]() is not capability or saved[1] is not state
++                or saved[3] is not True or saved[4] is not generation):
++            raise ValueError(label + " is unpublished or stale")
++        return saved
++
++
+     def install_sibling_request_read(
+             prover, selector_code, read_code, current_code, recheck_code):
+         caller = get_frame(1)
+         if (caller.f_code.co_name != "_build_range_store_type"
+                 or caller.f_globals.get("__name__") != "ashare_pipeline.formal_range_store"
+                 or _sibling_request_prover[0] is not None
+                 or not callable(prover)
+                 or type(selector_code) is not type(install_sibling_request_read.__code__)
+                 or type(read_code) is not type(install_sibling_request_read.__code__)
+                 or type(current_code) is not type(install_sibling_request_read.__code__)
+@@ -627,84 +667,99 @@ def _build_range_bindings_contract():
+     def enter_sibling_target_read(request_fingerprint, task_id):
+         codes = _sibling_store_codes[0]
+         caller = get_frame(1)
+         if codes is None or caller.f_code not in (codes[1], codes[3]):
+             raise ValueError("sibling targets require their fixed range Store entry")
+         if (type(request_fingerprint) is not str or len(request_fingerprint) != 64
+                 or any(character not in "0123456789abcdef"
+                        for character in request_fingerprint)
+                 or type(task_id) is not str or not task_id):
+             raise ValueError("sibling target identity is invalid")
+-        state = (get_thread_identity(), request_fingerprint, task_id)
+-        context_token = _sibling_target_read.set(state)
++        lease = _binding_read_lease.get()
++        if lease is not None:
++            _require_live_lease(lease)
+         result = object.__new__(_SiblingTargetRead)
++        generation = object()
++        state = (get_thread_identity(), request_fingerprint, task_id,
++                 lease, None if lease is None else lease[7],
++                 None if lease is None else lease[8], result, generation)
++        context_token = _sibling_target_read.set(state)
+         identity = id(result)
+         reference = weakref.ref(result, lambda ref, key=identity:
+             _target_records.pop(key, None)
+             if _target_records.get(key) is not None
+             and _target_records[key][0] is ref else None)
+-        _target_records[identity] = [reference, state, context_token, True]
++        _target_records[identity] = [reference, state, context_token, True, generation]
+         return result
+ 
+ 
+     def close_sibling_target_read(capability):
+         saved = _target_records.get(id(capability))
+         if (type(capability) is not _SiblingTargetRead or saved is None
+                 or saved[0]() is not capability or saved[3] is not True):
+             raise ValueError("sibling target read is forged, copied, or closed")
+         state, token = saved[1:3]
+         if (get_thread_identity() != state[0]
+                 or _sibling_target_read.get() is not state):
+             raise ValueError("sibling target read is cross-thread or out of order")
+         _sibling_target_read.reset(token)
+         saved[3] = False
++        _target_records.pop(id(capability), None)
+ 
+ 
+     def enter_sibling_exact_only():
+         codes = _sibling_store_codes[0]
+         caller = get_frame(1)
+         if codes is None or caller.f_code not in (codes[0], codes[3]):
+             raise ValueError("exact sibling masks require their fixed range Store entry")
+-        state = (get_thread_identity(), _binding_read_lease.get())
+-        context_token = _sibling_exact_only.set(state)
++        lease = _binding_read_lease.get()
++        if lease is not None:
++            _require_live_lease(lease)
+         result = object.__new__(_SiblingExactOnly)
++        generation = object()
++        state = (get_thread_identity(), lease, result, generation)
++        context_token = _sibling_exact_only.set(state)
+         identity = id(result)
+         reference = weakref.ref(result, lambda ref, key=identity:
+             _exact_records.pop(key, None)
+             if _exact_records.get(key) is not None
+             and _exact_records[key][0] is ref else None)
+-        _exact_records[identity] = [reference, state, context_token, True]
++        _exact_records[identity] = [reference, state, context_token, True, generation]
+         return result
+ 
+ 
+     def close_sibling_exact_only(capability):
+         saved = _exact_records.get(id(capability))
+         if (type(capability) is not _SiblingExactOnly or saved is None
+                 or saved[0]() is not capability or saved[3] is not True):
+             raise ValueError("exact sibling mask is forged, copied, or closed")
+         state, token = saved[1:3]
+         if (get_thread_identity() != state[0]
+                 or _sibling_exact_only.get() is not state
+                 or _binding_read_lease.get() is not state[1]):
+             raise ValueError("exact sibling mask is cross-thread or out of order")
+         _sibling_exact_only.reset(token)
+         saved[3] = False
++        _exact_records.pop(id(capability), None)
+ 
+ 
+     def _open_sibling_description(
+             request_description, request_fingerprint, *, require_owner_binding):
+         lease = _binding_read_lease.get()
+         if lease is None:
+             return None
++        _require_live_lease(lease)
+         prior = _sibling_request_read.get()
+         prior_capability = None
+         if prior is not None:
++            _require_live_context(_sibling_records, prior, 12, 13,
++                                  "sibling request read")
+             if prior[0] is not lease:
+                 raise ValueError("sibling request read belongs to another owner lease")
+             prior_capability = lease[11]
+         current_owner, current_epoch, current_phase = validate_lease_scope(lease[1])
+         if ((current_owner, current_epoch, current_phase) != tuple(lease[6:9])
+                 or get_thread_identity() != lease[0]):
+             raise ValueError("sibling request read owner phase changed")
+         if (type(request_description) is not dict
+                 or set(request_description) != {"request", "config", "source_registry_hash",
+                                                 "binding_hash", "parent"}
+@@ -743,32 +798,34 @@ def _build_range_bindings_contract():
+              and request_description["binding_hash"] != owner_record.binding_hash),
+             ("source", request_description["source_registry_hash"] != source_hash),
+             ("root", request.get("registry_manifest_hash") != lease[2][0]),
+             ("exchange", request.get("exchange") != owner_record.key[1]),
+             ("range_config", request.get("range_config_id") != expected_config.entry_id),
+         ) if changed)
+         if differences:
+             raise ValueError(
+                 "sibling request differs from owner binding contract: "
+                 + ",".join(differences))
++        result = object.__new__(_SiblingRequestRead)
++        generation = object()
+         state = (lease, get_thread_identity(), lease[1], current_epoch, current_phase,
+                  config_bytes, source_hash, lease[2][0], owner_record.key[1],
+-                 request_fingerprint, kind, request_description["parent"])
++                 request_fingerprint, kind, request_description["parent"],
++                 result, generation)
+         context_token = _sibling_request_read.set(state)
+-        result = object.__new__(_SiblingRequestRead)
+         identity = id(result)
+         reference = weakref.ref(result, lambda ref, key=identity:
+             _sibling_records.pop(key, None)
+             if _sibling_records.get(key) is not None
+             and _sibling_records[key][0] is ref else None)
+         _sibling_records[identity] = [
+-            reference, state, context_token, True, prior_capability]
++            reference, state, context_token, True, generation, prior_capability]
+         lease[11] = result
+         return result
+ 
+ 
+     def open_sibling_request_read(request_value, request_fingerprint):
+         """Authorize one genuine request to read an identical persisted sibling."""
+         _check_dependencies()
+         _require_sibling_store_entry(0)
+         prover = _sibling_request_prover[0]
+         if prover is None:
+@@ -815,21 +872,22 @@ def _build_range_bindings_contract():
+         if (type(capability) is not _SiblingRequestRead or saved is None
+                 or saved[0]() is not capability or saved[3] is not True):
+             raise ValueError("sibling request read is forged, copied, or closed")
+         state, token = saved[1:3]
+         if (get_thread_identity() != state[1]
+                 or _sibling_request_read.get() is not state
+                 or _binding_read_lease.get() is not state[0]):
+             raise ValueError("sibling request read is cross-thread or out of order")
+         _sibling_request_read.reset(token)
+         saved[3] = False
+-        state[0][11] = saved[4]
++        state[0][11] = saved[5]
++        _sibling_records.pop(id(capability), None)
+ 
+ 
+     def open_current_binding_read_lease(value, owner_scope, operation_key):
+         """Open one bounded owner operation; the returned token has no public behavior."""
+         _check_dependencies()
+         caller = get_frame(1)
+         owner, epoch, phase = validate_lease_scope(owner_scope)
+         owner_type = type(owner)
+         calendar_code = vars(owner_type).get("select_calendar_batch_ticket")
+         market_code = vars(owner_type).get("select_current_batch_ticket")
+@@ -840,20 +898,21 @@ def _build_range_bindings_contract():
+             raise ValueError("range binding lease cannot be nested, copied, or unbound")
+         expected_key = (("calendar", caller.f_locals.get("as_of_utc"))
+                         if caller.f_code is calendar_code else
+                         ("market", caller.f_locals.get("security_id"),
+                          caller.f_locals.get("as_of_utc")))
+         if (operation_key != expected_key or any(type(item) is not str or not item
+                                                   for item in expected_key)):
+             raise ValueError("range binding lease operation key is not owner-derived")
+         active = _binding_read_lease.get()
+         if active is not None:
++            _require_live_lease(active)
+             _binding_record(value, current=True)
+             nested = (caller.f_code is calendar_code and active[1] is owner_scope
+                       and active[3][0] == "market"
+                       and operation_key == ("calendar", active[3][-1])
+                       and active[6] is owner and active[7] is epoch
+                       and active[8] == phase and active[9] is False
+                       and active[10] is False)
+             if not nested:
+                 raise ValueError("range binding lease cannot be nested, copied, or unbound")
+             active[9] = True
+@@ -865,31 +924,36 @@ def _build_range_bindings_contract():
+             parent = child.parent()
+             parent_record = _bindings_record(parent)
+             entry = _capture_graph_snapshot(
+                 parent_record.bundle, parent_record.scoring_registry,
+                 parent_record.policy_registry
+             )
+             if entry != parent_record.snapshot:
+                 raise ValueError("range binding sources changed before owner operation")
+             _lightweight_current(parent_record)
+             identity = (parent_record.snapshot.root_hash, child.binding_hash, child.key)
++            lease = object.__new__(_BindingReadLease)
++            generation = object()
+             state = [get_thread_identity(), owner_scope, identity, operation_key,
+-                     parent_record, entry, owner, epoch, phase, False, False, None]
++                     parent_record, entry, owner, epoch, phase, False, False, None,
++                     lease, generation]
+             token = _binding_read_lease.set(state)
+             nested = False
+-        lease = object.__new__(_BindingReadLease)
++        if nested:
++            lease = object.__new__(_BindingReadLease)
++            generation = object()
+         identity = id(lease)
+         reference = weakref.ref(lease, lambda ref, key=identity:
+             _lease_records.pop(key, None)
+             if _lease_records.get(key) is not None
+             and _lease_records[key][0] is ref else None)
+-        _lease_records[identity] = [reference, state, token, nested, True]
++        _lease_records[identity] = [reference, state, token, nested, True, generation]
+         return lease
+ 
+ 
+     def close_current_binding_read_lease(lease):
+         saved = _lease_records.get(id(lease))
+         if (type(lease) is not _BindingReadLease or saved is None
+                 or saved[0]() is not lease or saved[4] is not True):
+             raise ValueError("range binding read lease is forged, copied, or closed")
+         state, token, nested = saved[1:4]
+         if get_thread_identity() != state[0] or _binding_read_lease.get() is not state:
+@@ -902,40 +966,42 @@ def _build_range_bindings_contract():
+         except BaseException as error:
+             pending = error
+         if nested:
+             if state[10] is not True:
+                 raise ValueError("range binding calendar child lease is out of order")
+             while state[11] is not None:
+                 close_sibling_request_read(state[11])
+             _binding_read_lease.reset(token)
+             state[10] = False
+             saved[4] = False
++            _lease_records.pop(id(lease), None)
+             if pending is not None:
+                 raise pending
+             return
+         if state[10] is not False:
+             raise ValueError("range binding outer lease still owns a calendar child")
+         while state[11] is not None:
+             close_sibling_request_read(state[11])
+         parent_record, entry = state[4:6]
+         try:
+             exit_snapshot = _capture_graph_snapshot(
+                 parent_record.bundle, parent_record.scoring_registry,
+                 parent_record.policy_registry
+             )
+             if exit_snapshot != entry or exit_snapshot != parent_record.snapshot:
+                 raise ValueError("range binding sources changed during owner operation")
+         except BaseException as error:
+             if pending is None:
+                 pending = error
+         _binding_read_lease.reset(token)
+         saved[4] = False
++        _lease_records.pop(id(lease), None)
+         if pending is not None:
+             raise pending
+ 
+ 
+     class RangeBinding:
+         """A current, same-root M/C/Bx configuration authorization."""
+ 
+         __slots__ = ("__parent", "__weakref__")
+ 
+         def __init__(self, *_args: object, **_kwargs: object) -> None:
+diff --git a/tests/test_formal_policy_market_binding_lease.py b/tests/test_formal_policy_market_binding_lease.py
+index 414ce45..c0236dd 100644
+--- a/tests/test_formal_policy_market_binding_lease.py
++++ b/tests/test_formal_policy_market_binding_lease.py
+@@ -136,20 +136,21 @@ class MarketBindingLeaseTests(unittest.TestCase):
+         fresh = FormalBatchReadJournal.open(
+             repository,
+             registry_manifest_hash=fixture.graph.manifest.manifest_hash,
+             as_of_utc=FREEZE, population=("SH600000",), required_keys=(("SH",),))
+         self.assertIsNotNone(repository.select_calendar_batch_ticket(
+             fresh, fixture.binding, FREEZE))
+         fresh.close()
+ 
+     def test_signed_sibling_binding_reuses_one_exact_calendar_request_lineage(self):
+         from contextlib import closing
++        from ashare_pipeline import formal_range_contract as contract
+         from ashare_pipeline.formal_range_contract import load_policy_range_bindings
+         from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
+         from tests.test_formal_policy_market import FREEZE
+ 
+         templates = {
+             "BJ430001": "general_nonfinancial",
+             "SH600000": "bank",
+             "SH600002": "broker",
+             "SZ000001": "real_estate",
+         }
+@@ -182,22 +183,72 @@ class MarketBindingLeaseTests(unittest.TestCase):
+         bank_calendar = repository.select_calendar(bank, FREEZE)
+         calendar_scope = FormalBatchReadJournal.open(
+             repository,
+             registry_manifest_hash=fixture.bundle.manifest.manifest_hash,
+             as_of_utc=FREEZE,
+             population=("SH600000", "SH600002"),
+             required_keys=(("SH",),),
+         )
+         bank_calendar_ticket = repository.select_calendar_batch_ticket(
+             calendar_scope, bank, FREEZE)
+-        broker_calendar_ticket = repository.select_calendar_batch_ticket(
+-            calendar_scope, broker, FREEZE)
++        open_lease, close_lease = contract._range_binding_read_lease_authority()
++        (install_sibling, open_sibling, open_record, open_ticket, close_sibling,
++         enter_target, close_target, enter_exact,
++         close_exact) = contract._range_binding_sibling_read_authority()
++        del install_sibling
++        copied = {"lease": [], "sibling": [], "target": [], "exact": []}
++        tokens = {"lease": [], "sibling": [], "target": [], "exact": []}
++        copied_close_failures = []
++        openings = {
++            open_lease.__code__: ("lease", close_lease),
++            open_sibling.__code__: ("sibling", close_sibling),
++            open_record.__code__: ("sibling", close_sibling),
++            open_ticket.__code__: ("sibling", close_sibling),
++            enter_target.__code__: ("target", close_target),
++            enter_exact.__code__: ("exact", close_exact),
++        }
++
++        def capture_capability_context(frame, event, arg):
++            entry = openings.get(frame.f_code) if event == "return" else None
++            if entry is None or arg is None:
++                return
++            label, close = entry
++            copied[label].append(copy_context())
++            tokens[label].append((close, arg))
++            try:
++                copy_context().run(close, arg)
++            except ValueError:
++                copied_close_failures.append(label)
++
++        sys.setprofile(capture_capability_context)
++        try:
++            broker_calendar_ticket = repository.select_calendar_batch_ticket(
++                calendar_scope, broker, FREEZE)
++        finally:
++            sys.setprofile(None)
++        self.assertTrue(all(copied.values()), copied)
++        self.assertTrue(set(copied) <= set(copied_close_failures),
++                        copied_close_failures)
++        for entries in tokens.values():
++            for close, capability in entries:
++                with self.assertRaisesRegex(ValueError, "closed"):
++                    close(capability)
++        for context in copied["lease"]:
++            with self.assertRaisesRegex(ValueError, "closed|stale|unpublished"):
++                context.run(broker.require_current)
++        for label in ("sibling", "target"):
++            for context in copied[label]:
++                with self.assertRaisesRegex(ValueError, "closed|stale|unpublished"):
++                    context.run(bank.require_current)
++        for context in copied["exact"]:
++            with self.assertRaisesRegex(ValueError, "closed|stale|unpublished"):
++                context.run(broker.require_current)
+         self.assertEqual(
+             bank_calendar_ticket.selected().coverage.lineage,
+             broker_calendar_ticket.selected().coverage.lineage,
+         )
+         broker_calendar = broker_calendar_ticket.selected()
+         self.assertIsNotNone(broker_calendar.coverage)
+         self.assertEqual(bank_calendar.coverage.lineage, broker_calendar.coverage.lineage)
+         calendar_scope.close()
+ 
+         market_scope = FormalBatchReadJournal.open(

@@ -1,0 +1,189 @@
+# Review package: 6078c5f..68bfe6e
+
+## Commits
+68bfe6e fix: validate closed W2 market inputs
+
+## Files changed
+ ashare_pipeline/formal_policy_evaluator.py | 34 ++++++++++++++++-------
+ tests/test_formal_policy_evaluator.py      | 44 ++++++++++++++++++++++++++++++
+ 2 files changed, 68 insertions(+), 10 deletions(-)
+
+## Diff
+diff --git a/ashare_pipeline/formal_policy_evaluator.py b/ashare_pipeline/formal_policy_evaluator.py
+index 4bc21fa..cff21d3 100644
+--- a/ashare_pipeline/formal_policy_evaluator.py
++++ b/ashare_pipeline/formal_policy_evaluator.py
+@@ -9,20 +9,24 @@ from .formal_policy_contract import parse_policy_rule
+ from .formal_policy_values import PolicyValue, canonical_bytes, decimal_context, digest
+ 
+ 
+ _APPLICABILITY = frozenset(("applicable", "not_applicable", "unresolved"))
+ _DECISION_STATES = frozenset(("matched", "clear", "not_applicable", "pending_evidence"))
+ _DECISION_FIELDS = frozenset((
+     "rule_id", "role", "semantic_id", "template_id", "security_id",
+     "definition_hash", "input_references", "operands", "parameters",
+     "evaluation_state", "proven_effects", "pending_requirements", "trace",
+ ))
++_MARKET_FIELDS = (
++    "price_state", "price", "price_date", "stale_days", "stale_at_least",
++    "veto_state", "pending",
++)
+ 
+ 
+ def _decimal_text(value: Decimal) -> str:
+     if type(value) is not Decimal or not value.is_finite():
+         raise ValueError("finite Decimal required")
+     if value.is_zero():
+         return "0"
+     fixed = format(value, "f")
+     return fixed.rstrip("0").rstrip(".") if "." in fixed else fixed
+ 
+@@ -222,20 +226,34 @@ def _market_reference(rule, market):
+     return [{
+         "input_name": name,
+         "selector_hash": digest(rule["inputs"][name]),
+         "state": "value",
+         "value_type": "market_window",
+         "unit": None,
+         "evidence_hashes": evidence,
+     } for name in sorted(rule["inputs"])]
+ 
+ 
++def _closed_market_payload(market):
++    if any(field not in market for field in _MARKET_FIELDS):
++        raise ValueError("market input lacks a closed W1 result axis")
++    parsed = PolicyValue.from_dict({
++        "state": "value",
++        "value": {field: copy.deepcopy(market[field]) for field in _MARKET_FIELDS},
++        "value_type": "market_window",
++        "unit": None,
++        "evidence_hashes": [],
++        "pending": [],
++    })
++    return parsed.to_dict()["value"]
++
++
+ def _signed_pending(effect, rule, evidence_hashes):
+     return {
+         "origin": "signed_policy",
+         "code": effect["reason_code"],
+         "rule_id": rule["rule_id"],
+         "evidence_hashes": list(evidence_hashes),
+         "input_name": "on_match",
+         "selector_hash": None,
+     }
+ 
+@@ -368,38 +386,34 @@ def evaluate_rule(rule: dict, *, security_id: str, applicability: str,
+     elif rule["kind"] == "market_liquidity":
+         if market is None:
+             pending.append(_runtime_pending(
+                 "market_coverage_missing", input_name="market", selector_hash=None
+             ))
+             state = "pending_evidence"
+             operands.update(price_state=None, veto_state=None)
+         else:
+             if type(market) is not dict:
+                 raise ValueError("market must be a detached object or None")
+-            required = {"price_state", "veto_state", "pending"}
+-            if not required <= set(market):
+-                raise ValueError("market input lacks a W1 result axis")
++            payload = _closed_market_payload(market)
+             references.extend(_market_reference(rule, market))
+             evidence_hashes = sorted({value for item in references
+                                       for value in item["evidence_hashes"]})
+-            if type(market["pending"]) not in (list, tuple):
+-                raise ValueError("market pending reasons must be an array")
+-            for code in market["pending"]:
++            for code in payload["pending"]:
+                 pending.append(_runtime_pending(
+                     code, input_name="market", selector_hash=None,
+                     evidence_hashes=evidence_hashes,
+                 ))
+-            price_state, veto_state = market["price_state"], market["veto_state"]
++            price_state, veto_state = payload["price_state"], payload["veto_state"]
+             operands.update(price_state=price_state, veto_state=veto_state,
+-                            price=market.get("price"), price_date=market.get("price_date"),
+-                            stale_days=market.get("stale_days"),
+-                            stale_at_least=market.get("stale_at_least"))
++                            price=payload["price"], price_date=payload["price_date"],
++                            stale_days=payload["stale_days"],
++                            stale_at_least=payload["stale_at_least"])
+             if veto_state == "proven" and price_state == "incomplete":
+                 state = "pending_evidence"
+                 proven, signed_pending = _match_effects(
+                     rule, evidence_hashes, pool_only=True
+                 )
+                 pending.extend(signed_pending)
+             elif veto_state == "pending" or price_state == "incomplete":
+                 state = "pending_evidence"
+                 if not pending:
+                     pending.append(_runtime_pending(
+diff --git a/tests/test_formal_policy_evaluator.py b/tests/test_formal_policy_evaluator.py
+index 6a27ac1..4603d6d 100644
+--- a/tests/test_formal_policy_evaluator.py
++++ b/tests/test_formal_policy_evaluator.py
+@@ -317,20 +317,64 @@ class MarketRuleTests(unittest.TestCase):
+ 
+         from ashare_pipeline.formal_policy_evaluator import aggregate_decisions
+ 
+         aggregate = aggregate_decisions((result,))
+         self.assertEqual(set(aggregate["pool_prohibitions"]), {"strong", "wait"})
+         self.assertEqual(len(aggregate["pool_prohibitions"]["strong"]), 1)
+         self.assertEqual(len(aggregate["pool_prohibitions"]["wait"]), 1)
+         self.assertEqual(aggregate["evidence_state"], "pending_evidence")
+ 
+ 
++class MarketRuleValidationTests(unittest.TestCase):
++    def setUp(self):
++        self.rule = parsed_rule(market_rule(), "status", "bank_market")
++
++    @staticmethod
++    def market(**changes):
++        result = {
++            "price_state": "incomplete",
++            "price": None,
++            "price_date": None,
++            "stale_days": None,
++            "stale_at_least": None,
++            "veto_state": "proven",
++            "pending": ["market_coverage_missing"],
++            "window_hash": HASHES[5],
++        }
++        result.update(changes)
++        return result
++
++    def test_unknown_price_state_cannot_release_signed_effects(self):
++        malformed = self.market(price_state="unknown", pending=[])
++        with self.assertRaises(ValueError):
++            decision(self.rule, market=malformed)
++
++    def test_confirmed_no_price_cannot_erase_market_evidence_missing(self):
++        malformed = self.market(
++            price_state="confirmed_no_price_250",
++            stale_at_least=250,
++            pending=[],
++        )
++        with self.assertRaises(ValueError):
++            decision(self.rule, market=malformed)
++
++    def test_incomplete_proven_veto_requires_an_explicit_pending_reason(self):
++        malformed = self.market(pending=[])
++        with self.assertRaises(ValueError):
++            decision(self.rule, market=malformed)
++
++    def test_invented_runtime_market_pending_code_is_rejected(self):
++        malformed = self.market(pending=["invented_reason"])
++        with self.assertRaises(ValueError):
++            decision(self.rule, market=malformed)
++
++
+ class AggregationTests(unittest.TestCase):
+     def test_caps_take_minimum_pool_union_and_every_effect_trace_is_preserved(self):
+         wire = cyclic_rule()
+         wire["outcomes"]["on_match"].extend((
+             {"kind": "dimension_cap", "dimension": "G", "maximum": "70"},
+             {"kind": "pool_prohibition", "pool": "strong"},
+         ))
+         wire["outcomes"]["on_match"].sort(key=canonical)
+         rule = parsed_rule(wire, "cyclic", "bank_cyclic_top")
+         values, annual = cyclic_inputs(rule)
