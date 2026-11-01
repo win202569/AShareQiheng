@@ -16,7 +16,7 @@ class PolicyBatchGuardTests(unittest.TestCase):
         self.assertIsNotNone(importlib.util.find_spec("ashare_pipeline.formal_policy_repository"),
                              "W3 atomic policy publication is missing")
         self.api = importlib.import_module("ashare_pipeline.formal_policy_repository")
-        self.fixture = PolicyRuntimeFixture(range_enabled=True)
+        self.fixture = PolicyRuntimeFixture(range_enabled=True, valuation_adapter=True)
         self.addCleanup(self.fixture.close)
 
     def run_hook(self, hook):

@@ -325,6 +325,7 @@ class PolicyRuntimeFixtureTests(unittest.TestCase):
     def fixture(self, **kwargs):
         from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
 
+        kwargs.setdefault("valuation_adapter", True)
         fixture = PolicyRuntimeFixture(**kwargs)
         self.addCleanup(fixture.close)
         return fixture

@@ -11,7 +11,7 @@ from tests.formal_policy_runtime_fixtures import PolicyRuntimeFixture
 
 class PolicyFinancialTicketTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = PolicyRuntimeFixture()
+        self.fixture = PolicyRuntimeFixture(valuation_adapter=True)
         self.addCleanup(self.fixture.close)
 
     def test_absent_receipt_is_current_and_checkpoint_does_not_rebuild(self):

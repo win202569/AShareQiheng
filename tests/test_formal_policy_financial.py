@@ -40,6 +40,7 @@ def quarter_equity_formula(documents, quarter="Q1"):
 
 class PolicyFinancialTests(unittest.TestCase):
     def fixture(self, **kwargs):
+        kwargs.setdefault("valuation_adapter", True)
         fixture = PolicyRuntimeFixture(**kwargs)
         self.addCleanup(fixture.close)
         return fixture
