@@ -121,7 +121,8 @@ class PolicyProofTests(_PolicyGraphTestCase):
     def test_bound_bytes_remain_identical_and_loads_are_deterministic(self):
         proof = self.load()
         expected = policy_module._bind_policy_contract(self.bundle,
-            scoring_registry=self.scoring, feature_registry=self.feature)
+            scoring_registry=self.scoring, feature_registry=self.feature,
+            expected_purpose="official")
         self.assertEqual(proof.canonical_bytes(), expected)
         self.assertEqual(self.load().canonical_bytes(), expected)
 

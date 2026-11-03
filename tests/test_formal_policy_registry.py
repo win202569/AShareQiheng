@@ -14,7 +14,7 @@ from tests.test_formal_scoring_registry import canonical
 
 def bind_graph(**kwargs):
     bundle, feature, scoring, _, _ = policy_graph(**kwargs)
-    return json.loads(_bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature))
+    return json.loads(_bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature, expected_purpose="official"))
 
 
 def rule_for(documents, semantic="cyclic_top", role="cyclic", template="bank"):
@@ -145,7 +145,7 @@ class PolicySelectorBindingTests(unittest.TestCase):
 
     def test_manifest_preserves_full_signed_context_entry_and_identity(self):
         bundle, feature, scoring, _, _ = policy_graph()
-        wire = json.loads(_bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature))
+        wire = json.loads(_bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature, expected_purpose="official"))
         entry = json.loads(bundle.blob("scoring").canonical_json)["descriptors"][0]
         match = next(b for b in wire["binding_manifest"] if b["rule_id"] == "bank_st")
         self.assertEqual(match["descriptor"], entry)
@@ -157,7 +157,7 @@ class PolicyBindingTests(unittest.TestCase):
         # Loading the existing official registries succeeds before the new API is exercised.
         bundle, feature, scoring, _, _ = policy_graph()
         from ashare_pipeline.formal_policy_registry import _bind_policy_contract
-        raw = _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature)
+        raw = _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature, expected_purpose="official")
         wire = json.loads(raw)
         self.assertEqual(wire["registry_manifest_hash"], bundle.manifest.manifest_hash)
         self.assertEqual(set(wire["role_hashes"]), set(scoring.role_hashes))
@@ -282,7 +282,7 @@ class PolicyCompatibilityTests(unittest.TestCase):
             with self.subTest(version=version):
                 bundle, feature, scoring, _, _ = policy_graph(version=version)
                 wrapper = json.loads(bundle.blob("scoring").canonical_json)
-                wire = json.loads(_bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature))
+                wire = json.loads(_bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature, expected_purpose="official"))
                 self.assertIn(descriptor(), wrapper["descriptors"])
                 self.assertEqual(wire["registry_manifest_hash"], bundle.manifest.manifest_hash)
                 self.assertEqual(wire["cyclic_secondary_industries"], ["fixture-cyclic"])
@@ -302,32 +302,32 @@ class PolicyCompatibilityTests(unittest.TestCase):
             bundle.manifest.approval_id), feature_registry=feature)
         scoring.require_official(bundle)
         with self.assertRaisesRegex(PolicyContractError, "execution_contract"):
-            _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature)
+            _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature, expected_purpose="official")
 
     def test_changed_signed_definition_changes_root_bytes_and_rejects_old_scoring(self):
         bundle, feature, scoring, _, _ = policy_graph()
         def mutate(d):
             rule_for(d)["parameters"]["valuation_dependencies"][0]["definition_basis"] = "revised fixture-only basis"
         changed, changed_feature, changed_scoring, _, _ = policy_graph(mutate=mutate)
-        first = _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature)
-        second = _bind_policy_contract(changed, scoring_registry=changed_scoring, feature_registry=changed_feature)
+        first = _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature, expected_purpose="official")
+        second = _bind_policy_contract(changed, scoring_registry=changed_scoring, feature_registry=changed_feature, expected_purpose="official")
         self.assertNotEqual(bundle.manifest.manifest_hash, changed.manifest.manifest_hash)
         self.assertNotEqual(first, second)
-        self.assertEqual(second, _bind_policy_contract(changed, scoring_registry=changed_scoring, feature_registry=changed_feature))
+        self.assertEqual(second, _bind_policy_contract(changed, scoring_registry=changed_scoring, feature_registry=changed_feature, expected_purpose="official"))
         with self.assertRaisesRegex(ValueError, "manifest"):
-            _bind_policy_contract(changed, scoring_registry=scoring, feature_registry=changed_feature)
+            _bind_policy_contract(changed, scoring_registry=scoring, feature_registry=changed_feature, expected_purpose="official")
         # The old feature's genuine bytes still belong to the second graph.
         self.assertEqual(feature.canonical_json, changed_feature.canonical_json)
-        self.assertEqual(second, _bind_policy_contract(changed, scoring_registry=changed_scoring, feature_registry=feature))
+        self.assertEqual(second, _bind_policy_contract(changed, scoring_registry=changed_scoring, feature_registry=feature, expected_purpose="official"))
 
     def test_old_feature_content_cannot_be_mixed_into_changed_feature_graph(self):
         _, old_feature, _, _, _ = policy_graph()
         def mutate(d):
             next(s for s in d["feature"]["slots"] if s["slot_id"] == "bank.policy.equity")["formula"]["fact_key"] = "fixture.revised_equity"
         bundle, feature, scoring, _, _ = policy_graph(mutate=mutate)
-        _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature)
+        _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature, expected_purpose="official")
         with self.assertRaisesRegex(PolicyContractError, "feature"):
-            _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=old_feature)
+            _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=old_feature, expected_purpose="official")
 
     def test_exact_objects_and_copies_cannot_replace_verified_inputs(self):
         bundle, feature, scoring, _, _ = policy_graph()
@@ -336,7 +336,7 @@ class PolicyCompatibilityTests(unittest.TestCase):
                 args = dict(bundle=bundle, scoring_registry=scoring, feature_registry=feature)
                 args[{"bundle": "bundle", "feature": "feature_registry", "scoring": "scoring_registry"}[which]] = value
                 with self.subTest(which=which, value=type(value)), self.assertRaises(ValueError):
-                    _bind_policy_contract(**args)
+                    _bind_policy_contract(expected_purpose="official", **args)
 
     def test_original_verifiers_cannot_be_shadowed_to_accept_copies(self):
         bundle, feature, scoring, _, _ = policy_graph()
@@ -348,13 +348,13 @@ class PolicyCompatibilityTests(unittest.TestCase):
                 args = dict(bundle=bundle, scoring_registry=scoring, feature_registry=feature)
                 args[argument] = copied
                 with self.assertRaises(ValueError):
-                    _bind_policy_contract(**args)
+                    _bind_policy_contract(expected_purpose="official", **args)
 
     def test_mutated_verified_child_bytes_are_rejected(self):
         bundle, feature, scoring, _, _ = policy_graph()
         object.__setattr__(bundle.blob("event"), "canonical_json", b"{}")
         with self.assertRaises(ValueError):
-            _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature)
+            _bind_policy_contract(bundle, scoring_registry=scoring, feature_registry=feature, expected_purpose="official")
 
     def test_legacy_policy_metadata_mismatch_errors_are_preserved(self):
         from ashare_pipeline.formal_scoring_registry import RegistryApproval, load_formal_registry, RegistryValidationError
