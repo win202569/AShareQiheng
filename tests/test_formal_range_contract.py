@@ -24,7 +24,7 @@ class FormalRangeContractTests(unittest.TestCase):
     def test_current_authenticates_each_original_source_once_per_snapshot(self):
         bindings, *_ = self._load()
         binding = bindings.for_rule("bank_no_effective_trade_20d", "SH")
-        counts = {"proof_record": 0, "scoring_fingerprint": 0,
+        counts = {"proof_record": 0, "scoring_snapshot_check": 0,
                   "feature_fingerprint": 0}
 
         def profile(frame, event, _arg):
@@ -33,9 +33,9 @@ class FormalRangeContractTests(unittest.TestCase):
             name, path = frame.f_code.co_name, frame.f_code.co_filename
             if name == "proof_record" and path.endswith("formal_policy_registry.py"):
                 counts["proof_record"] += 1
-            elif (name == "fingerprint" and path.endswith("formal_scoring_registry.py")
+            elif (name == "matches_snapshot" and path.endswith("formal_scoring_registry.py")
                     and frame.f_back.f_code.co_name == "sealed"):
-                counts["scoring_fingerprint"] += 1
+                counts["scoring_snapshot_check"] += 1
             elif name == "fingerprint" and path.endswith("formal_feature_contract.py"):
                 counts["feature_fingerprint"] += 1
 
@@ -46,7 +46,7 @@ class FormalRangeContractTests(unittest.TestCase):
         finally:
             sys.setprofile(None)
         self.assertEqual(counts, {"proof_record": 2,
-                                  "scoring_fingerprint": 2,
+                                  "scoring_snapshot_check": 2,
                                   "feature_fingerprint": 4})
 
     def test_equal_identity_replacement_of_legacy_fields_before_load_is_rejected(self):
