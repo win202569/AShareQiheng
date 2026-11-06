@@ -585,7 +585,8 @@ class ValuationBatchGuardTests(unittest.TestCase):
                         return
                     scope = result
                     _, (metric, _) = fixture.repository._batch_journal_identity()
-                    request = dict(scoring_registry=fixture.scoring, metric_ids=metric_ids)
+                    request = dict(scoring_registry=fixture.scoring, metric_ids=metric_ids,
+                                   expected_purpose="official")
                     fake = object.__new__(FormalBatchReadJournal)
                     try:
                         metric._build_batch_in_owner_scope(fixture.frozen.frozen_input_hash,
