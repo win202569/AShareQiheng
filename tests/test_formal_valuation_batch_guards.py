@@ -832,7 +832,12 @@ class ValuationSourceClosureTests(unittest.TestCase):
                 kind = checkers[code]
                 evidence = frame.f_locals["evidence"]
                 if kind != "market" or evidence[0] == "market":
-                    sid = evidence[0]["security_id"] if kind == "feature" else evidence[-1][0]
+                    if kind == "feature":
+                        sid = evidence[0]["security_id"]
+                    else:
+                        # State and market tickets append purpose after the request.
+                        request = evidence[-1] if kind == "financial" else evidence[-2]
+                        sid = request[0]
                     checked.setdefault((len(checkpoints) - 1, kind), []).append(sid)
             if code in banned_codes:
                 cursor = frame.f_back
