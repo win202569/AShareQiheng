@@ -68,6 +68,28 @@ def canonical_release_bytes(value):
         separators=(',', ':'), allow_nan=False).encode('utf-8')
 
 
+def canonical_release_identity_bytes(*, contract_version, input_manifest_hash,
+                                     result_hash, renderer_version):
+    """Content identity only; callers cannot obtain publication authority here."""
+    _text(contract_version, 'contract version')
+    _text(renderer_version, 'renderer version')
+    _hash(input_manifest_hash, 'input manifest hash')
+    _hash(result_hash, 'result hash')
+    return canonical_release_bytes(dict(
+        schema='formal-release-identity-v1', contract_version=contract_version,
+        freeze_at_utc='2026-08-31T07:00:00+00:00',
+        input_manifest_hash=input_manifest_hash, result_hash=result_hash,
+        renderer_version=renderer_version))
+
+
+def release_id_for_content(*, contract_version, input_manifest_hash,
+                           result_hash, renderer_version):
+    raw = canonical_release_identity_bytes(
+        contract_version=contract_version, input_manifest_hash=input_manifest_hash,
+        result_hash=result_hash, renderer_version=renderer_version)
+    return '20260831-formal-v3-' + hashlib.sha256(raw).hexdigest()
+
+
 @dataclass(frozen=True)
 class ValidationGate:
     name: str
