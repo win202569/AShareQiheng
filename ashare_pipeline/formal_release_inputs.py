@@ -57,9 +57,16 @@ def _install_inputs():
     codes += tuple((method, method.__code__) for _, _, method in methods)
     history_codes = tuple((value, value.__code__) for _, value in history_bindings
                           if hasattr(value, '__code__'))
+    transaction_wrapper = StateStore._transaction
+    transaction_body = inspect.getclosurevars(transaction_wrapper).nonlocals['func']
+    transaction_code = transaction_body.__code__
+    transaction_cell = transaction_wrapper.__closure__[
+        transaction_wrapper.__code__.co_freevars.index('func')]
 
     def interfaces():
-        if (any(owner.get(name) is not value for name, value in bindings)
+        if (transaction_cell.cell_contents is not transaction_body
+                or transaction_body.__code__ is not transaction_code
+                or any(owner.get(name) is not value for name, value in bindings)
                 or any(vars(history_module).get(name) is not value for name, value in history_bindings)
                 or any(vars(history_module).get(name) is not value for name, value in history_constants)
                 or owner.get('_ReleaseInputRefresh') is not refresh_type

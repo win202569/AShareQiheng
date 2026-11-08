@@ -52,6 +52,26 @@ class ReleaseInputRefreshTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'official.*preview_ready'):
             self.service().refresh('test')
 
+    def test_old_code_history_is_rejected_before_coverage_refresh(self):
+        from tests.formal_release_refresh_fixtures import put_storage_only_history
+        run_id = put_storage_only_history(self.fixture, code_version='b' * 40)
+        before = self.runs.get_run(run_id)
+        with self.assertRaisesRegex(ValueError, 'candidate_changed'):
+            self.service().refresh(run_id)
+        self.assertEqual(self.runs.get_run(run_id), before)
+        self.assertFalse(self.configuration['status_path'].exists())
+
+    def test_mismatched_contract_history_is_rejected_before_coverage_refresh(self):
+        from tests.formal_release_refresh_fixtures import put_storage_only_history
+        run_id = put_storage_only_history(self.fixture, code_version='a' * 40)
+        runs = FormalFinalRunRepository(self.fixture.store, code_version='a' * 40,
+                                       contract_version='different-contract')
+        before = runs.get_run(run_id)
+        with self.assertRaisesRegex(ValueError, 'contract_version'):
+            self.service(run_repository=runs).refresh(run_id)
+        self.assertEqual(runs.get_run(run_id), before)
+        self.assertFalse(self.configuration['status_path'].exists())
+
     def test_selector_is_only_nonempty_run_id_and_has_no_evidence_overrides(self):
         service = self.service()
         for selector in ('', ' ', object(), {'run_id': 'original'}):
@@ -100,6 +120,36 @@ class ReleaseInputRefreshTests(unittest.TestCase):
                 service.refresh('absent')
         finally:
             method.__code__ = original
+
+    def test_wrapped_transaction_code_replacement_is_rejected_before_read(self):
+        from ashare_pipeline.state_store import StateStore
+        service = self.service()
+        transaction = StateStore._transaction.__wrapped__
+        original = transaction.__code__
+        def counterfeit(self, *args, **kwargs):
+            raise AssertionError("counterfeit transaction executed")
+            yield
+        try:
+            transaction.__code__ = counterfeit.__code__.replace(co_freevars=original.co_freevars)
+            with self.assertRaisesRegex(ValueError, 'authority|entry point'):
+                service.refresh('absent')
+        finally:
+            transaction.__code__ = original
+
+    def test_transaction_wrapped_function_rebinding_is_rejected(self):
+        from ashare_pipeline.state_store import StateStore
+        service = self.service()
+        wrapper = StateStore._transaction
+        cell = wrapper.__closure__[wrapper.__code__.co_freevars.index('func')]
+        original = cell.cell_contents
+        def counterfeit(*args, **kwargs):
+            raise AssertionError("counterfeit transaction executed")
+        try:
+            cell.cell_contents = counterfeit
+            with self.assertRaisesRegex(ValueError, 'authority|entry point'):
+                service.refresh('absent')
+        finally:
+            cell.cell_contents = original
 
     def test_configured_verifier_replacement_is_rejected(self):
         service = self.service()
