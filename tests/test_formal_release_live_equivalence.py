@@ -13,7 +13,6 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
         from ashare_pipeline.formal_final_score_inputs import FormalFinalScoreInputRepository
         from ashare_pipeline.formal_final_repository import FormalFinalRunRepository
         from ashare_pipeline.formal_release_inputs import _ReleaseInputRefresh
-        from ashare_pipeline.formal_release_validation import _hold_official_candidate
         from tests.formal_final_scoring_fixtures import FinalScoringFixture
         from tests.test_formal_final_integration import (
             complete_score_history, official_context_coverage,
@@ -39,21 +38,19 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
         self.assertEqual(before.mode, 'official_candidate')
         self.assertTrue(all(row['state'] in ('formal_scored', 'pool_vetoed')
                             for row in before.statuses))
-        phase('reload configured inputs and fresh coverage')
+        phase('configure trusted input refresh and held replay')
         inputs = FormalFinalScoreInputRepository(f.feature_repository, f.context,
             f.range_store, registry_signature_verifier=f.verifier)
         fresh_runs = FormalFinalRunRepository(f.store, code_version=code)
         _, contract, status_path = official_context_coverage_configuration(f)
-        snapshot, scoring, policy, adapter, coverage = _ReleaseInputRefresh(
+        service = _ReleaseInputRefresh(
             state_store=f.store, input_repository=inputs, run_repository=fresh_runs,
             registry_signature_verifier=f.verifier, coverage_contract=contract,
-            coverage_contract_verifier=f.verifier, status_path=status_path).refresh(receipt.run_id)
-        self.assertIsNot(coverage, original_coverage)
-        phase('recompute genuine D1, D2, D3 and pool without persistence')
-        with _hold_official_candidate(snapshot, run_id=receipt.run_id,
-                input_repository=inputs, scoring_registry=scoring, policy_registry=policy,
-                valuation_adapter_registry=adapter, coverage_manifest=coverage) as (raw, changed):
-            self.assertEqual(changed, ())
+            coverage_contract_verifier=f.verifier, status_path=status_path)
+        phase('refresh official coverage and recompute D1, D2, D3 and pool without persistence')
+        with service.hold_replay(receipt.run_id) as (raw, job_evidence):
+            import json
+            self.assertEqual(json.loads(job_evidence)['schema'], 'formal-release-job-evidence-v1')
             self.assertEqual(set(raw), {'score_input_batch', 'scorecard_batch',
                                         'eligibility_batch', 'pool_selection_batch'})
             for name, payload in raw.items():
@@ -72,10 +69,7 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
         source_change_committed = False
         try:
             with self.assertRaisesRegex(ValueError, 'changed|revoked'):
-                with _hold_official_candidate(snapshot, run_id=receipt.run_id,
-                        input_repository=inputs, scoring_registry=scoring,
-                        policy_registry=policy, valuation_adapter_registry=adapter,
-                        coverage_manifest=coverage):
+                with service.hold_replay(receipt.run_id):
                     with closing(f.store._connect()) as connection:
                         connection.execute('CREATE TABLE release_guard_source_probe(value TEXT)')
                         connection.commit()

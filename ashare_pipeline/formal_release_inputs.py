@@ -5,6 +5,7 @@ repositories/auditor own authentication. Returned history remains detached
 data; refreshed registry/coverage proofs are not a release capability.
 """
 import inspect
+from contextlib import closing, contextmanager
 import json
 from pathlib import Path
 from types import MethodType
@@ -20,7 +21,9 @@ from .formal_policy_registry import load_formal_policy_registry
 from .formal_valuation_adapter_contract import load_formal_valuation_adapter_registry
 from .formal_coverage_manifest import FormalCoverageAuditor
 from .formal_release_types import canonical_release_bytes
-from .formal_release_validation import _check_candidate_binding
+from .formal_release_validation import _check_candidate_binding, _hold_official_candidate
+from . import formal_release_jobs as jobs_module
+from .formal_release_jobs import _read_job_quiescence
 from .state_store import StateStore
 
 
@@ -30,6 +33,7 @@ def _install_inputs():
     input_dependencies = inspect.getclosurevars(_prepare_final_inputs).nonlocals['dependencies']
     registered_runs = inspect.getclosurevars(_register_publication_owner).nonlocals['repositories']
     registry = FormalFeatureRepository._registry
+    replay_hold, read_jobs, connect = _hold_official_candidate, _read_job_quiescence, StateStore._connect
     read_run = FormalFinalRunRepository.get_run
     get_frozen = StateStore.get_verified_formal_frozen_universe
     scoring_load, policy_load, valuation_load = (
@@ -52,9 +56,11 @@ def _install_inputs():
                              if callable(value))
     history_constants = tuple((name, vars(history_module)[name]) for name in
                               ('ARTIFACT_KINDS', '_TABLES', '_BATCH_TYPES'))
-    functions = (input_dependencies, scoring_load, policy_load, valuation_load, check, encode, decode)
+    job_bindings = tuple((name, value) for name, value in vars(jobs_module).items() if callable(value))
+    functions = (replay_hold, read_jobs, input_dependencies, scoring_load, policy_load, valuation_load, check, encode, decode)
     codes = tuple((function, function.__code__) for function in functions if hasattr(function, '__code__'))
     codes += tuple((method, method.__code__) for _, _, method in methods)
+    codes += tuple((value, value.__code__) for _, value in job_bindings if hasattr(value, "__code__"))
     history_codes = tuple((value, value.__code__) for _, value in history_bindings
                           if hasattr(value, '__code__'))
     transaction_wrapper = StateStore._transaction
@@ -66,6 +72,9 @@ def _install_inputs():
     def interfaces():
         if (transaction_cell.cell_contents is not transaction_body
                 or transaction_body.__code__ is not transaction_code
+                or any(cell.cell_contents is not body or body.__code__ is not code
+                       for cell, body, code in wrapped_bodies)
+                or any(vars(jobs_module).get(name) is not value for name, value in job_bindings)
                 or any(owner.get(name) is not value for name, value in bindings)
                 or any(vars(history_module).get(name) is not value for name, value in history_bindings)
                 or any(vars(history_module).get(name) is not value for name, value in history_constants)
@@ -134,6 +143,16 @@ def _install_inputs():
                     or getattr(function, '__code__', None) is not code_object):
                 raise ValueError('release input configured verifier changed')
         return saved[1], feature, context
+
+    def job_snapshot(instance):
+        config, _, _ = record(instance)
+        with closing(connect(config[0])) as connection:
+            connection.execute('BEGIN')
+            raw, blockers = read_jobs(connection)
+        record(instance)
+        if blockers:
+            raise ValueError('job_quiescence: ' + '; '.join(blockers))
+        return raw
 
     class Sealed(type):
         def __setattr__(cls, name, value):
@@ -232,6 +251,38 @@ def _install_inputs():
             coverage.require_official_ready()
             return snapshot, scoring, policy, valuation, coverage
 
+        @contextmanager
+        def hold_replay(self, run_id):
+            """Configured held replay; yield detached computation and job bytes only.
+
+            This is not the complete 12-gate validator or publication permission.
+            Only a future trusted publisher can act under live pre-write checks.
+            """
+            config, _, _ = record(self)
+            if type(run_id) is not str or not run_id or run_id.strip() != run_id:
+                raise ValueError('release replay accepts only an exact nonempty run id')
+            initial_jobs = job_snapshot(self)
+            snapshot, scoring, policy, valuation, coverage = self.refresh(run_id)
+            record(self)
+            with replay_hold(snapshot, run_id=run_id, input_repository=config[1],
+                    scoring_registry=scoring, policy_registry=policy,
+                    valuation_adapter_registry=valuation, coverage_manifest=coverage,
+                    contract_version=config[7]) as (raw, changed):
+                if changed:
+                    raise ValueError('candidate_changed: replay differs: ' + ', '.join(changed))
+                if job_snapshot(self) != initial_jobs:
+                    raise ValueError('candidate_changed: job evidence changed during replay')
+                try:
+                    yield dict(raw), initial_jobs
+                finally:
+                    record(self)
+                    if job_snapshot(self) != initial_jobs:
+                        raise ValueError('candidate_changed: job evidence changed during held replay')
+                    current = read_run(config[2], run_id)
+                    if current is None or current.header != snapshot.header or current.artifacts != snapshot.artifacts:
+                        raise ValueError('candidate_changed: V8 history changed during held replay')
+                    record(self)
+
         def __copy__(self):
             raise TypeError('release input configuration cannot be copied')
 
@@ -245,6 +296,12 @@ def _install_inputs():
     own_members = tuple(vars(refresh_type).items())
     own_codes = tuple((function, function.__code__) for _, function in own_members
                       if hasattr(function, '__code__'))
+    wrapped_bodies = []
+    for wrapper in (replay_hold, refresh_type.hold_replay):
+        cell = wrapper.__closure__[wrapper.__code__.co_freevars.index('func')]
+        body = cell.cell_contents
+        wrapped_bodies.append((cell, body, body.__code__))
+    wrapped_bodies = tuple(wrapped_bodies)
     return refresh_type, reload
 
 
