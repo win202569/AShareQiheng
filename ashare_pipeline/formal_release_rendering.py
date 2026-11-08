@@ -265,4 +265,52 @@ def _render_computation_payloads(computation_bytes):
         raise ValueError('incomplete or malformed computation render data') from exc
 
 
+
+_RENDERER_VERSION = 'formal-release-renderer-v1'
+
+
+def _render_release_package(computation_bytes, *, candidate_identity):
+    """Detached deterministic package, not a signed preparation or publish grant.
+
+    The trusted caller must obtain candidate identity from verified history and
+    compare replay bytes before calling. This helper neither trusts caller hashes
+    as authentication nor changes the V8 input/result hash definitions.
+    """
+    import hashlib
+    from .formal_release_types import canonical_release_identity_bytes, ReleaseFile
+    keys = ('contract_version','input_manifest_hash','result_hash',
+            'registry_manifest_hash','frozen_input_hash','universe_hash')
+    if type(candidate_identity) is not dict or set(candidate_identity) != set(keys):
+        raise ValueError('render requires exact candidate identity fields')
+    identity = dict(candidate_identity)
+    for key in keys[1:]:
+        if type(identity[key]) is not str or re.fullmatch('[0-9a-f]{64}',identity[key]) is None:
+            raise ValueError('render candidate identity hash is invalid')
+    raw_identity = canonical_release_identity_bytes(contract_version=identity['contract_version'],
+        input_manifest_hash=identity['input_manifest_hash'],result_hash=identity['result_hash'],
+        renderer_version=_RENDERER_VERSION)
+    digest = hashlib.sha256(raw_identity).hexdigest()
+    files = _render_computation_payloads(computation_bytes)
+    evidence = json.loads(files['evidence_manifest.json'])
+    inputs, scores, eligibility, pools = (evidence[key] for key in
+        ('score_inputs','scorecards','classifications','pool_selection'))
+    if (any(inputs.get(key) != identity[key] for key in keys[3:])
+            or inputs.get('as_of_utc') not in ('2026-08-31T07:00:00+00:00','2026-08-31T15:00:00+08:00')):
+        raise ValueError('render candidate frozen source identity differs')
+    file_rows = []
+    for path, raw in sorted(files.items()):
+        item = ReleaseFile(path, hashlib.sha256(raw).hexdigest(), len(raw))
+        file_rows.append(dict(path=item.path,sha256=item.sha256,byte_size=item.byte_size))
+    counts = dict(universe=len(inputs['security_ids']),scorecards=len(scores['cards']),
+        formal_scored=sum(row['state']=='formal_scored' for row in eligibility['eligibilities']),
+        pool_vetoed=sum(row['state']=='pool_vetoed' for row in eligibility['eligibilities']),
+        strong=pools['counts']['strong'],wait=pools['counts']['wait'],payload_files=len(files))
+    manifest = dict(schema='formal-release-manifest-v1',release_identity_hash=digest,
+        release_id='20260831-formal-v3-'+digest,renderer_version=_RENDERER_VERSION,
+        freeze_at_utc='2026-08-31T07:00:00+00:00',**identity,counts=counts,files=file_rows)
+    # Last insertion intentionally excludes the manifest's own hash from itself.
+    files['release_manifest.json'] = canonical_release_bytes(manifest)
+    return files
+
+
 __all__ = []

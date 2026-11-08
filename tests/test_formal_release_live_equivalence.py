@@ -55,6 +55,27 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
                                         'eligibility_batch', 'pool_selection_batch'})
             for name, payload in raw.items():
                 self.assertEqual(payload, before.artifacts[name], name)
+            phase('render complete deterministic package from genuine replay bytes')
+            import hashlib
+            from ashare_pipeline.formal_release_rendering import _render_release_package
+            from ashare_pipeline.formal_release_types import canonical_release_bytes
+            identity = {key: before.header[key] for key in ('contract_version',
+                'input_manifest_hash','result_hash','registry_manifest_hash',
+                'frozen_input_hash','universe_hash')}
+            package = _render_release_package(raw, candidate_identity=identity)
+            manifest = json.loads(package['release_manifest.json'])
+            self.assertEqual(list(package)[-1], 'release_manifest.json')
+            self.assertEqual(manifest['counts']['universe'], 20)
+            self.assertEqual(manifest['counts']['payload_files'], len(package)-1)
+            self.assertEqual({item['path'] for item in manifest['files']},
+                             set(package)-{'release_manifest.json'})
+            for item in manifest['files']:
+                self.assertEqual(item['sha256'], hashlib.sha256(package[item['path']]).hexdigest())
+                self.assertEqual(item['byte_size'], len(package[item['path']]))
+            for card in json.loads(raw['scorecard_batch'])['cards']:
+                self.assertEqual(package['audit_cards/'+card['security_id']+'.json'],
+                                 canonical_release_bytes(card))
+            phase('rendered payload hashes and complete audit-card lineage verified')
             # Returned data must not alias the private baseline used on exit.
             raw.clear()
         self.assertEqual(fresh_runs.get_run(receipt.run_id), before)
