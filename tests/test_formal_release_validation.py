@@ -150,6 +150,26 @@ class CandidateComparisonTests(unittest.TestCase):
 
 
 class OfficialReplayBoundaryTests(unittest.TestCase):
+    def test_held_replay_rejects_fake_sources_on_entry(self):
+        import ashare_pipeline.formal_release_validation as module
+        with self.assertRaisesRegex(ValueError, 'genuine'):
+            with module._hold_official_candidate(candidate(), run_id='original',
+                    input_repository=object(), scoring_registry=object(),
+                    policy_registry=object(), valuation_adapter_registry=object(),
+                    coverage_manifest=object()):
+                self.fail('fake sources entered retained replay')
+
+    def test_held_replay_detects_authority_change_between_creation_and_entry(self):
+        import ashare_pipeline.formal_release_validation as module
+        from unittest.mock import patch
+        guard = module._hold_official_candidate(candidate(), run_id='original',
+            input_repository=object(), scoring_registry=object(), policy_registry=object(),
+            valuation_adapter_registry=object(), coverage_manifest=object())
+        with patch.object(module, 'build_final_score_card_batch', lambda *args: None):
+            with self.assertRaisesRegex(ValueError, 'authority changed'):
+                with guard:
+                    self.fail('changed producer entered retained replay')
+
     def test_real_preview_coverage_cannot_enter_official_replay(self):
         import ashare_pipeline.formal_release_validation as module
         from ashare_pipeline.formal_final_score_inputs import FormalFinalScoreInputRepository

@@ -13,7 +13,7 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
         from ashare_pipeline.formal_final_score_inputs import FormalFinalScoreInputRepository
         from ashare_pipeline.formal_final_repository import FormalFinalRunRepository
         from ashare_pipeline.formal_release_inputs import _ReleaseInputRefresh
-        from ashare_pipeline.formal_release_validation import _replay_official_candidate
+        from ashare_pipeline.formal_release_validation import _hold_official_candidate
         from tests.formal_final_scoring_fixtures import FinalScoringFixture
         from tests.test_formal_final_integration import (
             complete_score_history, official_context_coverage,
@@ -50,14 +50,16 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
             coverage_contract_verifier=f.verifier, status_path=status_path).refresh(receipt.run_id)
         self.assertIsNot(coverage, original_coverage)
         phase('recompute genuine D1, D2, D3 and pool without persistence')
-        raw, changed = _replay_official_candidate(snapshot, run_id=receipt.run_id,
-            input_repository=inputs, scoring_registry=scoring, policy_registry=policy,
-            valuation_adapter_registry=adapter, coverage_manifest=coverage)
-        self.assertEqual(changed, ())
-        self.assertEqual(set(raw), {'score_input_batch', 'scorecard_batch',
-                                    'eligibility_batch', 'pool_selection_batch'})
-        for name, payload in raw.items():
-            self.assertEqual(payload, before.artifacts[name], name)
+        with _hold_official_candidate(snapshot, run_id=receipt.run_id,
+                input_repository=inputs, scoring_registry=scoring, policy_registry=policy,
+                valuation_adapter_registry=adapter, coverage_manifest=coverage) as (raw, changed):
+            self.assertEqual(changed, ())
+            self.assertEqual(set(raw), {'score_input_batch', 'scorecard_batch',
+                                        'eligibility_batch', 'pool_selection_batch'})
+            for name, payload in raw.items():
+                self.assertEqual(payload, before.artifacts[name], name)
+            # Returned data must not alias the private baseline used on exit.
+            raw.clear()
         self.assertEqual(fresh_runs.get_run(receipt.run_id), before)
         with closing(f.store._connect()) as connection:
             self.assertEqual(connection.execute('SELECT count(*) FROM formal_final_run').fetchone()[0], 1)
@@ -65,6 +67,26 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
                           'formal_release_preparation', 'formal_release_file', 'formal_release_event'):
                 self.assertEqual(connection.execute('SELECT count(*) FROM ' + table).fetchone()[0], 0)
         phase('exact four-artifact equivalence; unchanged V8; no V9 authority minted')
+
+        phase('retained source guard rejects a database change before leaving')
+        source_change_committed = False
+        try:
+            with self.assertRaisesRegex(ValueError, 'changed|revoked'):
+                with _hold_official_candidate(snapshot, run_id=receipt.run_id,
+                        input_repository=inputs, scoring_registry=scoring,
+                        policy_registry=policy, valuation_adapter_registry=adapter,
+                        coverage_manifest=coverage):
+                    with closing(f.store._connect()) as connection:
+                        connection.execute('CREATE TABLE release_guard_source_probe(value TEXT)')
+                        connection.commit()
+                    source_change_committed = True
+        finally:
+            with closing(f.store._connect()) as connection:
+                connection.execute('DROP TABLE IF EXISTS release_guard_source_probe')
+                connection.commit()
+        self.assertTrue(source_change_committed, 'must reject on exit after source mutation')
+        self.assertEqual(fresh_runs.get_run(receipt.run_id), before)
+
 
 
 if __name__ == '__main__':

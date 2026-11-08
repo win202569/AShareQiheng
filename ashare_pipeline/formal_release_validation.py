@@ -6,6 +6,7 @@ sources, replay genuine producers and recheck all live gates. Passing these
 comparisons is neither authentication nor permission to publish.
 """
 import re
+from contextlib import contextmanager
 import inspect
 from pathlib import Path
 from types import MethodType
@@ -142,10 +143,11 @@ def _install_official_replay():
                 or any(function.__code__ is not code for function, code in codes)):
             raise ValueError('official replay producer authority changed')
 
-    def replay(snapshot, *, run_id, input_repository, scoring_registry,
+    @contextmanager
+    def hold(snapshot, *, run_id, input_repository, scoring_registry,
                policy_registry, valuation_adapter_registry, coverage_manifest,
                contract_version='formal-final-v1'):
-        """Recompute four batches without V8 writes; return only bytes and diff.
+        """Hold source protection around replay and the caller; yield bytes and diff.
 
         Internal building block. Coverage is a genuine freshly audited proof
         supplied by the future configured validator, never a public override.
@@ -212,29 +214,43 @@ def _install_official_replay():
             raw = dict(zip(_COMPUTATION_KINDS,
                            (batch.canonical_bytes() for batch in batches), strict=True))
             changed = compare(snapshot, raw)
-            # Recheck all retained dependencies, not a cached "valid" verdict.
-            interfaces()
-            dependencies(input_repository)
-            if verify_sources(retention[1]) != source_bytes:
-                raise ValueError('candidate_changed: official replay sources changed')
-            for proof in retention[2]:
-                proof.require_verified()
-            _, current_registry = registry_snapshot(feature, verifier, frozen.registry_manifest_hash,
-                scoring_registry, policy_registry, valuation_adapter_registry, expected_purpose='official')
-            if current_registry != registry_bytes:
-                raise ValueError('candidate_changed: official replay registry changed')
-            for name, batch in zip(_COMPUTATION_KINDS, batches, strict=True):
-                batch.require_verified()
-                if batch.canonical_bytes() != raw[name]:
-                    raise ValueError('candidate_changed: official replay batch changed')
-            checkpoint.recheck()
-            coverage_manifest.require_official_ready()
-            return raw, changed
+            def recheck():
+                interfaces()
+                dependencies(input_repository)
+                if verify_sources(retention[1]) != source_bytes:
+                    raise ValueError('candidate_changed: official replay sources changed')
+                for proof in retention[2]:
+                    proof.require_verified()
+                _, current_registry = registry_snapshot(feature, verifier, frozen.registry_manifest_hash,
+                    scoring_registry, policy_registry, valuation_adapter_registry, expected_purpose='official')
+                if current_registry != registry_bytes:
+                    raise ValueError('candidate_changed: official replay registry changed')
+                for name, batch in zip(_COMPUTATION_KINDS, batches, strict=True):
+                    batch.require_verified()
+                    if batch.canonical_bytes() != raw[name]:
+                        raise ValueError('candidate_changed: official replay batch changed')
+                checkpoint.recheck()
+                coverage_manifest.require_official_ready()
+            recheck()
+            try:
+                # The caller receives detached bytes, never mutable baselines or proofs.
+                yield dict(raw), changed
+            finally:
+                recheck()
 
-    return replay
+    def replay(snapshot, *, run_id, input_repository, scoring_registry,
+               policy_registry, valuation_adapter_registry, coverage_manifest,
+               contract_version='formal-final-v1'):
+        with hold(snapshot, run_id=run_id, input_repository=input_repository,
+                  scoring_registry=scoring_registry, policy_registry=policy_registry,
+                  valuation_adapter_registry=valuation_adapter_registry,
+                  coverage_manifest=coverage_manifest, contract_version=contract_version) as result:
+            return result
+
+    return replay, hold
 
 
-_replay_official_candidate = _install_official_replay()
+_replay_official_candidate, _hold_official_candidate = _install_official_replay()
 del _install_official_replay
 
 __all__ = []
