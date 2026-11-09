@@ -6,6 +6,8 @@ sources, replay genuine producers and recheck all live gates. Passing these
 comparisons is neither authentication nor permission to publish.
 """
 import re
+from hashlib import sha256
+from .formal_release_types import canonical_release_bytes
 from contextlib import contextmanager
 import inspect
 from pathlib import Path
@@ -107,6 +109,32 @@ def _compare_candidate_replay(snapshot, computation_bytes):
     return tuple(changed)
 
 
+def _canonical_replay_evidence(*, source_bytes, registry_bytes, computation_bytes, coverage_bytes):
+    """Data-only commitment; callers cannot turn fabricated bytes into live proof."""
+    def digest(raw):
+        if type(raw) is not bytes:
+            raise ValueError('replay evidence requires immutable bytes')
+        return sha256(raw).hexdigest()
+    if (type(source_bytes) is not tuple or len(source_bytes) != 3
+            or type(registry_bytes) is not tuple or len(registry_bytes) != 4
+            or type(computation_bytes) is not dict or set(computation_bytes) != set(_COMPUTATION_KINDS)):
+        raise ValueError('replay evidence requires complete source and computation sets')
+    roles = registry_bytes[1]
+    if type(roles) is not tuple or any(type(row) is not tuple or len(row) != 2
+            or type(row[0]) is not str or not row[0] for row in roles):
+        raise ValueError('replay registry roles malformed')
+    if len({row[0] for row in roles}) != len(roles):
+        raise ValueError('replay registry roles duplicated')
+    sources = dict(schema='formal-release-source-evidence-v1',
+        upstream={role:digest(raw) for role,raw in zip(('base','policy','valuation'),source_bytes,strict=True)},
+        registry=dict(root=digest(registry_bytes[0]),roles={role:digest(raw) for role,raw in roles},
+                      policy=digest(registry_bytes[2]),valuation_adapter=digest(registry_bytes[3])),
+        computation={name:digest(raw) for name,raw in computation_bytes.items()})
+    return canonical_release_bytes(dict(schema='formal-release-replay-evidence-v1',
+        sources=sources,source_dependency_hash=digest(canonical_release_bytes(sources)),
+        coverage_manifest_hash=digest(coverage_bytes)))
+
+
 def _install_official_replay():
     """Capture producers; expose a data-only replay, not their private proofs."""
     authority = inspect.getclosurevars(_prepare_final_inputs).nonlocals
@@ -116,6 +144,7 @@ def _install_official_replay():
     build_scores, build_eligibility, build_pools = (
         build_final_score_card_batch, build_formal_eligibility_batch, select_formal_pools)
     check, compare = _check_candidate_binding, _compare_candidate_replay
+    evidence_bytes = _canonical_replay_evidence
     owner = globals()
     bindings = tuple((name, owner[name]) for name in (
         'FormalFinalRunSnapshot', 'FormalFinalScoreInputRepository',
@@ -124,6 +153,7 @@ def _install_official_replay():
         'FormalValuationAdapterRegistry', 'VerifiedCoverageManifest',
         'build_final_score_card_batch', 'build_formal_eligibility_batch',
         'select_formal_pools', '_check_candidate_binding', '_compare_candidate_replay',
+        '_canonical_replay_evidence', 'canonical_release_bytes', 'sha256',
         'Path', 'MethodType', 'StateStore', '_COMPUTATION_KINDS', '_FREEZE', '_FREEZE_REPRESENTATIONS',
         '_HASH', '_CODE', '_SECURITY'))
     methods = tuple((cls, name, getattr(cls, name)) for cls, names in (
@@ -133,7 +163,7 @@ def _install_official_replay():
         (StateStore, ('get_verified_formal_frozen_universe',)),
     ) for name in names)
     functions = (build_inputs, build_scores, build_eligibility, build_pools,
-                 check, compare, record, dependencies, verify_sources, registry_snapshot)
+                 evidence_bytes, canonical_release_bytes, check, compare, record, dependencies, verify_sources, registry_snapshot)
     codes = tuple((function, function.__code__) for function in functions) + tuple(
         (method, method.__code__) for _, _, method in methods)
 
@@ -144,7 +174,7 @@ def _install_official_replay():
             raise ValueError('official replay producer authority changed')
 
     @contextmanager
-    def hold(snapshot, *, run_id, input_repository, scoring_registry,
+    def hold_evidence(snapshot, *, run_id, input_repository, scoring_registry,
                policy_registry, valuation_adapter_registry, coverage_manifest,
                contract_version='formal-final-v1'):
         """Hold source protection around replay and the caller; yield bytes and diff.
@@ -232,11 +262,26 @@ def _install_official_replay():
                 checkpoint.recheck()
                 coverage_manifest.require_official_ready()
             recheck()
+            fresh_coverage_bytes = coverage_manifest.canonical_bytes()
+            evidence = evidence_bytes(source_bytes=source_bytes, registry_bytes=registry_bytes,
+                computation_bytes=raw, coverage_bytes=fresh_coverage_bytes)
             try:
                 # The caller receives detached bytes, never mutable baselines or proofs.
-                yield dict(raw), changed
+                yield dict(raw), changed, evidence
             finally:
                 recheck()
+                if coverage_manifest.canonical_bytes() != fresh_coverage_bytes:
+                    raise ValueError('candidate_changed: fresh coverage commitment changed')
+
+    @contextmanager
+    def hold(snapshot, *, run_id, input_repository, scoring_registry,
+             policy_registry, valuation_adapter_registry, coverage_manifest,
+             contract_version='formal-final-v1'):
+        with hold_evidence(snapshot, run_id=run_id, input_repository=input_repository,
+                scoring_registry=scoring_registry, policy_registry=policy_registry,
+                valuation_adapter_registry=valuation_adapter_registry,
+                coverage_manifest=coverage_manifest, contract_version=contract_version) as result:
+            yield result[0], result[1]
 
     def replay(snapshot, *, run_id, input_repository, scoring_registry,
                policy_registry, valuation_adapter_registry, coverage_manifest,
@@ -247,10 +292,10 @@ def _install_official_replay():
                   coverage_manifest=coverage_manifest, contract_version=contract_version) as result:
             return result
 
-    return replay, hold
+    return replay, hold, hold_evidence
 
 
-_replay_official_candidate, _hold_official_candidate = _install_official_replay()
+_replay_official_candidate, _hold_official_candidate, _hold_official_evidence = _install_official_replay()
 del _install_official_replay
 
 __all__ = []

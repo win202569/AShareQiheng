@@ -114,3 +114,17 @@ class ConfiguredReleaseReplayTests(unittest.TestCase):
         with patch.object(self.module.jobs_module, 'canonical_release_bytes', return_value=b'{}'):
             with self.assertRaisesRegex(ValueError, 'authority|entry point'):
                 service.hold_replay('absent')
+
+    def test_evidence_channel_accepts_only_run_id_and_rejects_missing_history(self):
+        service = self.service()
+        with self.assertRaises(TypeError):
+            service.hold_evidence('absent', source_dependency_hash='a'*64)
+        with self.assertRaisesRegex(ValueError, 'candidate.*not found'):
+            with service.hold_evidence('absent'):
+                self.fail('missing candidate entered evidence channel')
+
+    def test_evidence_producer_replacement_is_rejected(self):
+        service = self.service()
+        with patch.object(self.module, '_hold_official_evidence', return_value=None):
+            with self.assertRaisesRegex(ValueError, 'authority|entry point'):
+                service.hold_evidence('absent')

@@ -5,6 +5,7 @@ repositories/auditor own authentication. Returned history remains detached
 data; refreshed registry/coverage proofs are not a release capability.
 """
 import inspect
+from hashlib import sha256
 from contextlib import closing, contextmanager
 import json
 from pathlib import Path
@@ -21,7 +22,8 @@ from .formal_policy_registry import load_formal_policy_registry
 from .formal_valuation_adapter_contract import load_formal_valuation_adapter_registry
 from .formal_coverage_manifest import FormalCoverageAuditor
 from .formal_release_types import canonical_release_bytes
-from .formal_release_validation import _check_candidate_binding, _hold_official_candidate
+from .formal_release_validation import (
+    _check_candidate_binding, _hold_official_candidate, _hold_official_evidence)
 from . import formal_release_jobs as jobs_module
 from .formal_release_jobs import _read_job_quiescence
 from .state_store import StateStore
@@ -33,7 +35,7 @@ def _install_inputs():
     input_dependencies = inspect.getclosurevars(_prepare_final_inputs).nonlocals['dependencies']
     registered_runs = inspect.getclosurevars(_register_publication_owner).nonlocals['repositories']
     registry = FormalFeatureRepository._registry
-    replay_hold, read_jobs, connect = _hold_official_candidate, _read_job_quiescence, StateStore._connect
+    replay_hold, read_jobs, connect = _hold_official_evidence, _read_job_quiescence, StateStore._connect
     read_run = FormalFinalRunRepository.get_run
     get_frozen = StateStore.get_verified_formal_frozen_universe
     scoring_load, policy_load, valuation_load = (
@@ -57,7 +59,7 @@ def _install_inputs():
     history_constants = tuple((name, vars(history_module)[name]) for name in
                               ('ARTIFACT_KINDS', '_TABLES', '_BATCH_TYPES'))
     job_bindings = tuple((name, value) for name, value in vars(jobs_module).items() if callable(value))
-    functions = (replay_hold, read_jobs, input_dependencies, scoring_load, policy_load, valuation_load, check, encode, decode)
+    functions = (replay_hold, _hold_official_candidate, read_jobs, input_dependencies, scoring_load, policy_load, valuation_load, check, encode, decode)
     codes = tuple((function, function.__code__) for function in functions if hasattr(function, '__code__'))
     codes += tuple((method, method.__code__) for _, _, method in methods)
     codes += tuple((value, value.__code__) for _, value in job_bindings if hasattr(value, "__code__"))
@@ -252,8 +254,8 @@ def _install_inputs():
             return snapshot, scoring, policy, valuation, coverage
 
         @contextmanager
-        def hold_replay(self, run_id):
-            """Configured held replay; yield detached computation and job bytes only.
+        def hold_evidence(self, run_id):
+            """Configured evidence channel; detached computation and diagnostic bytes only.
 
             This is not the complete 12-gate validator or publication permission.
             Only a future trusted publisher can act under live pre-write checks.
@@ -267,13 +269,28 @@ def _install_inputs():
             with replay_hold(snapshot, run_id=run_id, input_repository=config[1],
                     scoring_registry=scoring, policy_registry=policy,
                     valuation_adapter_registry=valuation, coverage_manifest=coverage,
-                    contract_version=config[7]) as (raw, changed):
+                    contract_version=config[7]) as (raw, changed, replay_evidence):
                 if changed:
                     raise ValueError('candidate_changed: replay differs: ' + ', '.join(changed))
                 if job_snapshot(self) != initial_jobs:
                     raise ValueError('candidate_changed: job evidence changed during replay')
+                replay_wire = decode(replay_evidence)
+                coverage_hash = sha256(coverage.canonical_bytes()).hexdigest()
+                if replay_wire['coverage_manifest_hash'] != coverage_hash:
+                    raise ValueError('candidate_changed: replay coverage commitment differs')
+                source_commitment = dict(schema='formal-release-configured-sources-v1',
+                    replay_source_dependency_hash=replay_wire['source_dependency_hash'],
+                    job_evidence_hash=sha256(initial_jobs).hexdigest())
+                evidence = encode(dict(schema='formal-release-configured-evidence-v1',
+                    candidate={key:snapshot.header[key] for key in ('run_id','code_version',
+                        'contract_version','input_manifest_hash','result_hash','coverage_manifest_hash',
+                        'registry_manifest_hash','frozen_input_hash','universe_hash')},
+                    coverage_manifest_hash=coverage_hash,
+                    source_dependency_hash=sha256(encode(source_commitment)).hexdigest(),
+                    source_commitment=source_commitment, replay_evidence=replay_wire,
+                    job_evidence=decode(initial_jobs)))
                 try:
-                    yield dict(raw), initial_jobs
+                    yield dict(raw), evidence
                 finally:
                     record(self)
                     if job_snapshot(self) != initial_jobs:
@@ -282,6 +299,12 @@ def _install_inputs():
                     if current is None or current.header != snapshot.header or current.artifacts != snapshot.artifacts:
                         raise ValueError('candidate_changed: V8 history changed during held replay')
                     record(self)
+
+        @contextmanager
+        def hold_replay(self, run_id):
+            """Compatibility view; returned computation/job bytes are not authority."""
+            with self.hold_evidence(run_id) as (raw, evidence):
+                yield raw, encode(decode(evidence)['job_evidence'])
 
         def __copy__(self):
             raise TypeError('release input configuration cannot be copied')
@@ -297,7 +320,7 @@ def _install_inputs():
     own_codes = tuple((function, function.__code__) for _, function in own_members
                       if hasattr(function, '__code__'))
     wrapped_bodies = []
-    for wrapper in (replay_hold, refresh_type.hold_replay):
+    for wrapper in (replay_hold, _hold_official_candidate, refresh_type.hold_evidence, refresh_type.hold_replay):
         cell = wrapper.__closure__[wrapper.__code__.co_freevars.index('func')]
         body = cell.cell_contents
         wrapped_bodies.append((cell, body, body.__code__))

@@ -48,9 +48,30 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
             registry_signature_verifier=f.verifier, coverage_contract=contract,
             coverage_contract_verifier=f.verifier, status_path=status_path)
         phase('refresh official coverage and recompute D1, D2, D3 and pool without persistence')
-        with service.hold_replay(receipt.run_id) as (raw, job_evidence):
+        with service.hold_evidence(receipt.run_id) as (raw, evidence_bytes):
             import json
-            self.assertEqual(json.loads(job_evidence)['schema'], 'formal-release-job-evidence-v1')
+            import hashlib
+            from ashare_pipeline.formal_release_types import canonical_release_bytes
+            evidence = json.loads(evidence_bytes)
+            self.assertEqual(evidence['schema'], 'formal-release-configured-evidence-v1')
+            self.assertEqual(evidence['job_evidence']['schema'], 'formal-release-job-evidence-v1')
+            self.assertEqual(evidence['candidate']['run_id'], receipt.run_id)
+            self.assertEqual(evidence['candidate']['coverage_manifest_hash'], before.header['coverage_manifest_hash'])
+            replay = evidence['replay_evidence']
+            self.assertEqual(evidence['coverage_manifest_hash'], replay['coverage_manifest_hash'])
+            self.assertEqual(replay['source_dependency_hash'], hashlib.sha256(
+                canonical_release_bytes(replay['sources'])).hexdigest())
+            self.assertEqual(set(replay['sources']['upstream']), {'base','policy','valuation'})
+            self.assertEqual(len(replay['sources']['registry']['roles']), 10)
+            self.assertEqual(evidence['source_commitment']['replay_source_dependency_hash'],
+                             replay['source_dependency_hash'])
+            self.assertEqual(evidence['source_commitment']['job_evidence_hash'], hashlib.sha256(
+                canonical_release_bytes(evidence['job_evidence'])).hexdigest())
+            self.assertEqual(evidence['source_dependency_hash'], hashlib.sha256(
+                canonical_release_bytes(evidence['source_commitment'])).hexdigest())
+            for name, payload in raw.items():
+                self.assertEqual(replay['sources']['computation'][name], hashlib.sha256(payload).hexdigest())
+            phase('fresh coverage and complete source commitments verified')
             self.assertEqual(set(raw), {'score_input_batch', 'scorecard_batch',
                                         'eligibility_batch', 'pool_selection_batch'})
             for name, payload in raw.items():
