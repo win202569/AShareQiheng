@@ -21,7 +21,10 @@ from .formal_scoring_registry import RegistryApproval, load_formal_registry
 from .formal_policy_registry import load_formal_policy_registry
 from .formal_valuation_adapter_contract import load_formal_valuation_adapter_registry
 from .formal_coverage_manifest import FormalCoverageAuditor
-from .formal_release_types import canonical_release_bytes
+from .formal_release_types import (canonical_release_bytes, canonical_validation_bytes,
+    ReleaseValidationPayload, ValidationGate, REQUIRED_RELEASE_GATE_NAMES)
+from . import formal_release_types as value_module
+from . import formal_release_rendering as render_module
 from .formal_release_validation import (
     _check_candidate_binding, _hold_official_candidate, _hold_official_evidence)
 from . import formal_release_jobs as jobs_module
@@ -31,6 +34,8 @@ from .state_store import StateStore
 
 def _install_inputs():
     configurations = {}
+    render = render_module._render_release_package
+    gate_names = REQUIRED_RELEASE_GATE_NAMES
     owner = globals()
     input_dependencies = inspect.getclosurevars(_prepare_final_inputs).nonlocals['dependencies']
     registered_runs = inspect.getclosurevars(_register_publication_owner).nonlocals['repositories']
@@ -45,6 +50,8 @@ def _install_inputs():
     policy_build = FormalPolicyRepository.build_batch
     check, encode, decode, reference = _check_candidate_binding, canonical_release_bytes, json.loads, ref
     methods = tuple((cls, name, getattr(cls, name)) for cls, names in (
+        (ReleaseValidationPayload, ('__init__', '__post_init__')),
+        (ValidationGate, ('__init__', '__post_init__')),
         (FormalFinalRunRepository, ('__init__', 'get_run', '_read_run')),
         (StateStore, ('__init__', '_connect', '_transaction', 'get_verified_formal_frozen_universe')),
         (FormalFeatureRepository, ('_registry',)),
@@ -59,10 +66,13 @@ def _install_inputs():
     history_constants = tuple((name, vars(history_module)[name]) for name in
                               ('ARTIFACT_KINDS', '_TABLES', '_BATCH_TYPES'))
     job_bindings = tuple((name, value) for name, value in vars(jobs_module).items() if callable(value))
-    functions = (replay_hold, _hold_official_candidate, read_jobs, input_dependencies, scoring_load, policy_load, valuation_load, check, encode, decode)
+    render_bindings = tuple((module,name,value) for module in (render_module,value_module)
+        for name,value in vars(module).items() if callable(value) or name.isupper())
+    functions = (render, canonical_validation_bytes, replay_hold, _hold_official_candidate, read_jobs, input_dependencies, scoring_load, policy_load, valuation_load, check, encode, decode)
     codes = tuple((function, function.__code__) for function in functions if hasattr(function, '__code__'))
     codes += tuple((method, method.__code__) for _, _, method in methods)
     codes += tuple((value, value.__code__) for _, value in job_bindings if hasattr(value, "__code__"))
+    codes += tuple((value,value.__code__) for _,_,value in render_bindings if hasattr(value,'__code__'))
     history_codes = tuple((value, value.__code__) for _, value in history_bindings
                           if hasattr(value, '__code__'))
     transaction_wrapper = StateStore._transaction
@@ -76,6 +86,7 @@ def _install_inputs():
                 or transaction_body.__code__ is not transaction_code
                 or any(cell.cell_contents is not body or body.__code__ is not code
                        for cell, body, code in wrapped_bodies)
+                or any(vars(module).get(name) is not value for module,name,value in render_bindings)
                 or any(vars(jobs_module).get(name) is not value for name, value in job_bindings)
                 or any(owner.get(name) is not value for name, value in bindings)
                 or any(vars(history_module).get(name) is not value for name, value in history_bindings)
@@ -155,6 +166,16 @@ def _install_inputs():
         if blockers:
             raise ValueError('job_quiescence: ' + '; '.join(blockers))
         return raw
+
+    def schema_version(instance):
+        config, _, _ = record(instance)
+        with closing(connect(config[0])) as connection:
+            connection.execute('BEGIN')
+            versions = tuple(row[0] for row in connection.execute('SELECT version FROM schema_migration ORDER BY version'))
+        record(instance)
+        if versions != tuple(range(2,10)) or any(type(value) is not int for value in versions):
+            raise ValueError('release validation requires complete schema version 9 ledger')
+        return versions[-1]
 
     class Sealed(type):
         def __setattr__(cls, name, value):
@@ -305,6 +326,61 @@ def _install_inputs():
             """Compatibility view; returned computation/job bytes are not authority."""
             with self.hold_evidence(run_id) as (raw, evidence):
                 yield raw, encode(decode(evidence)['job_evidence'])
+
+        def validate(self, run_id):
+            """Run all checks for an unsigned audit result; never return live authority.
+
+            Only this configured path assembles successful diagnostics. A failure
+            raises before a result is returned; no signing or persistence occurs.
+            """
+            version = schema_version(self)
+            with self.hold_evidence(run_id) as (raw, evidence_bytes):
+                record(self)
+                evidence = decode(evidence_bytes)
+                candidate = evidence['candidate']
+                identity = {key:candidate[key] for key in ('contract_version',
+                    'input_manifest_hash','result_hash','registry_manifest_hash',
+                    'frozen_input_hash','universe_hash')}
+                package = render(raw, candidate_identity=identity)
+                record(self)
+                if schema_version(self) != version:
+                    raise ValueError('candidate_changed: release schema changed')
+                manifest = decode(package['release_manifest.json'])
+                sources = evidence['replay_evidence']['sources']
+                batches = sources['computation']
+                references = dict(
+                    candidate_identity=(candidate['input_manifest_hash'],candidate['result_hash']),
+                    official_registry=(sha256(encode(sources['registry'])).hexdigest(),),
+                    workspace_identity=(sha256(encode(dict(code_version=candidate['code_version'],schema_version=version))).hexdigest(),
+                                        evidence['coverage_manifest_hash']),
+                    frozen_universe=(candidate['frozen_input_hash'],candidate['universe_hash']),
+                    official_coverage=(evidence['coverage_manifest_hash'],),
+                    source_identity_temporal=(evidence['source_dependency_hash'],),
+                    replay_equivalence=tuple(batches[name] for name in sorted(batches)),
+                    classification_complete=(batches['eligibility_batch'],),
+                    score_formula=(batches['score_input_batch'],batches['scorecard_batch']),
+                    pool_selection=(batches['pool_selection_batch'],),
+                    job_quiescence=(evidence['source_commitment']['job_evidence_hash'],),
+                    artifact_renderability=(sha256(package['release_manifest.json']).hexdigest(),))
+                # Reaching here requires the genuine configured refresh, producer
+                # replay, strict classifications/jobs, and bound renderer above.
+                # Merely supplying a similarly shaped evidence dict cannot enter.
+                gates = tuple(ValidationGate(name,True,(),tuple(dict.fromkeys(references[name])))
+                              for name in gate_names)
+                payload = ReleaseValidationPayload(run_id=candidate['run_id'],
+                    release_identity_hash=manifest['release_identity_hash'],
+                    input_manifest_hash=candidate['input_manifest_hash'],result_hash=candidate['result_hash'],
+                    coverage_manifest_hash=evidence['coverage_manifest_hash'],
+                    source_dependency_hash=evidence['source_dependency_hash'],
+                    registry_manifest_hash=candidate['registry_manifest_hash'],
+                    frozen_input_hash=candidate['frozen_input_hash'],universe_hash=candidate['universe_hash'],
+                    code_version=candidate['code_version'],contract_version=candidate['contract_version'],
+                    schema_version=version,purpose='audit',gates=gates)
+                canonical_validation_bytes(payload)
+                record(self)
+            # The context has rechecked and closed. This DTO cannot authorize a
+            # later write and is deliberately not signed or treated as a lease.
+            return payload
 
         def __copy__(self):
             raise TypeError('release input configuration cannot be copied')
