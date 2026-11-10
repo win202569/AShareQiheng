@@ -136,6 +136,10 @@ def _canonical_replay_evidence(*, source_bytes, registry_bytes, computation_byte
 
 
 def _install_official_replay():
+    from threading import get_ident
+    active_scopes = {}
+    token_type = object
+
     """Capture producers; expose a data-only replay, not their private proofs."""
     authority = inspect.getclosurevars(_prepare_final_inputs).nonlocals
     record, dependencies = authority['record'], authority['dependencies']
@@ -168,13 +172,16 @@ def _install_official_replay():
         (method, method.__code__) for _, _, method in methods)
 
     def interfaces():
-        if (any(owner.get(name) is not original for name, original in bindings)
+        if (any(owner.get(name) is not original for name, original in live_bindings)
+                or any(function.__code__ is not code for function, code in live_codes)
+                or any(cell.cell_contents is not body for cell, body in live_cells)
+                or any(owner.get(name) is not original for name, original in bindings)
                 or any(getattr(cls, name) is not original for cls, name, original in methods)
                 or any(function.__code__ is not code for function, code in codes)):
             raise ValueError('official replay producer authority changed')
 
     @contextmanager
-    def hold_evidence(snapshot, *, run_id, input_repository, scoring_registry,
+    def hold_live_evidence(snapshot, *, run_id, input_repository, scoring_registry,
                policy_registry, valuation_adapter_registry, coverage_manifest,
                contract_version='formal-final-v1'):
         """Hold source protection around replay and the caller; yield bytes and diff.
@@ -265,13 +272,46 @@ def _install_official_replay():
             fresh_coverage_bytes = coverage_manifest.canonical_bytes()
             evidence = evidence_bytes(source_bytes=source_bytes, registry_bytes=registry_bytes,
                 computation_bytes=raw, coverage_bytes=fresh_coverage_bytes)
-            try:
-                # The caller receives detached bytes, never mutable baselines or proofs.
-                yield dict(raw), changed, evidence
-            finally:
+            def recheck_current():
                 recheck()
                 if coverage_manifest.canonical_bytes() != fresh_coverage_bytes:
                     raise ValueError('candidate_changed: fresh coverage commitment changed')
+
+            token = token_type()
+            active_scopes[id(token)] = (token, run_id, input_repository, get_ident(), recheck_current)
+            try:
+                # Opaque identity permits only a current source recheck, never a write.
+                yield dict(raw), changed, evidence, token
+            finally:
+                active_scopes.pop(id(token), None)
+                recheck_current()
+
+    def recheck_live(token, *, run_id, input_repository):
+        try:
+            interfaces()
+        except BaseException:
+            active_scopes.pop(id(token), None)
+            raise
+        saved = active_scopes.get(id(token))
+        if (saved is None or saved[0] is not token or type(run_id) is not str
+                or saved[1] != run_id or saved[2] is not input_repository
+                or saved[3] != get_ident()):
+            raise ValueError('live replay scope is absent, expired or belongs to another owner')
+        try:
+            saved[4]()
+        except BaseException:
+            active_scopes.pop(id(token), None)
+            raise
+
+    @contextmanager
+    def hold_evidence(snapshot, *, run_id, input_repository, scoring_registry,
+                      policy_registry, valuation_adapter_registry, coverage_manifest,
+                      contract_version='formal-final-v1'):
+        with hold_live_evidence(snapshot, run_id=run_id, input_repository=input_repository,
+                scoring_registry=scoring_registry, policy_registry=policy_registry,
+                valuation_adapter_registry=valuation_adapter_registry,
+                coverage_manifest=coverage_manifest, contract_version=contract_version) as result:
+            yield result[:3]
 
     @contextmanager
     def hold(snapshot, *, run_id, input_repository, scoring_registry,
@@ -292,10 +332,20 @@ def _install_official_replay():
                   coverage_manifest=coverage_manifest, contract_version=contract_version) as result:
             return result
 
-    return replay, hold, hold_evidence
+    live_bindings = tuple(zip(('_replay_official_candidate', '_hold_official_candidate',
+        '_hold_official_evidence', '_hold_official_live_evidence', '_recheck_official_live_evidence'),
+        (replay, hold, hold_evidence, hold_live_evidence, recheck_live), strict=True))
+    live_cells = tuple((function.__closure__[function.__code__.co_freevars.index('func')],
+                        inspect.getclosurevars(function).nonlocals['func'])
+                       for function in (hold, hold_evidence, hold_live_evidence))
+    live_codes = tuple((function, function.__code__)
+        for function in (replay, hold, hold_evidence, hold_live_evidence, recheck_live,
+                         *(body for _, body in live_cells)))
+    return replay, hold, hold_evidence, hold_live_evidence, recheck_live
 
 
-_replay_official_candidate, _hold_official_candidate, _hold_official_evidence = _install_official_replay()
+(_replay_official_candidate, _hold_official_candidate, _hold_official_evidence,
+ _hold_official_live_evidence, _recheck_official_live_evidence) = _install_official_replay()
 del _install_official_replay
 
 __all__ = []

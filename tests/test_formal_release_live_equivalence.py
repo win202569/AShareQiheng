@@ -47,8 +47,19 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
             state_store=f.store, input_repository=inputs, run_repository=fresh_runs,
             registry_signature_verifier=f.verifier, coverage_contract=contract,
             coverage_contract_verifier=f.verifier, status_path=status_path)
+        import inspect
+        from ashare_pipeline.formal_release_validation import _recheck_official_live_evidence
+        # Test-only observation of a token minted by genuine replay, not a fixture token.
+        active_scopes = inspect.getclosurevars(_recheck_official_live_evidence).nonlocals['active_scopes']
+        def owned_token():
+            matches = [row[0] for row in active_scopes.values()
+                       if row[1] == receipt.run_id and row[2] is inputs]
+            self.assertEqual(len(matches), 1)
+            return matches[0]
         phase('refresh official coverage and recompute D1, D2, D3 and pool without persistence')
         with service.hold_evidence(receipt.run_id) as (raw, evidence_bytes):
+            live_token = owned_token()
+            _recheck_official_live_evidence(live_token, run_id=receipt.run_id, input_repository=inputs)
             import json
             import hashlib
             from ashare_pipeline.formal_release_types import canonical_release_bytes
@@ -99,6 +110,8 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
             phase('rendered payload hashes and complete audit-card lineage verified')
             # Returned data must not alias the private baseline used on exit.
             raw.clear()
+        with self.assertRaisesRegex(ValueError, 'live replay'):
+            _recheck_official_live_evidence(live_token, run_id=receipt.run_id, input_repository=inputs)
         self.assertEqual(fresh_runs.get_run(receipt.run_id), before)
         with closing(f.store._connect()) as connection:
             self.assertEqual(connection.execute('SELECT count(*) FROM formal_final_run').fetchone()[0], 1)
@@ -109,6 +122,7 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
 
         phase('retained source guard rejects a database change before leaving')
         source_change_committed = False
+        precheck_rejected = False
         try:
             with self.assertRaisesRegex(ValueError, 'changed|revoked'):
                 with service.hold_replay(receipt.run_id):
@@ -116,11 +130,19 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
                         connection.execute('CREATE TABLE release_guard_source_probe(value TEXT)')
                         connection.commit()
                     source_change_committed = True
+                    changed_token = owned_token()
+                    with self.assertRaisesRegex(ValueError, 'changed|revoked'):
+                        _recheck_official_live_evidence(changed_token, run_id=receipt.run_id,
+                                                       input_repository=inputs)
+                    precheck_rejected = True
         finally:
             with closing(f.store._connect()) as connection:
                 connection.execute('DROP TABLE IF EXISTS release_guard_source_probe')
                 connection.commit()
         self.assertTrue(source_change_committed, 'must reject on exit after source mutation')
+        self.assertTrue(precheck_rejected, 'must reject before caller can perform a side effect')
+        with self.assertRaisesRegex(ValueError, 'live replay'):
+            _recheck_official_live_evidence(changed_token, run_id=receipt.run_id, input_repository=inputs)
         self.assertEqual(fresh_runs.get_run(receipt.run_id), before)
 
 
