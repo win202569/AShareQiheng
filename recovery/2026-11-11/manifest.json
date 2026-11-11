@@ -1,0 +1,131 @@
+{
+  "code_revision": "61292071a1fe901d1f808600f3ea6b909ddeb1fb",
+  "current_acceptance": "RUNNING snapshot; not a passing result",
+  "entries": [
+    {
+      "path": "grouped-checkpoint-6129207/dae7179503824f5696a626187f2d37a0.json",
+      "byte_size": 245,
+      "sha256": "9875794239838cc80d9d6f1f525d23b89bd55201b39581bc4069ffa6218c66af"
+    },
+    {
+      "path": "grouped-checkpoint-6129207/dae7179503824f5696a626187f2d37a0.log",
+      "byte_size": 664,
+      "sha256": "e5a29674c97d13097bd671cbf4e2c7a55f6455c5594debef6319a41d2c1f603f"
+    },
+    {
+      "path": "grouped-checkpoint-6129207/journal.jsonl",
+      "byte_size": 949,
+      "sha256": "e91d9d57e5491eb269ed652d360e757470c995206fe8ec2a41516f102e7b8274"
+    },
+    {
+      "path": "grouped-checkpoint-7105dd2/d6ed49c2aebc4bed94e6c11c3aafeb9c.json",
+      "byte_size": 229,
+      "sha256": "b9704faaac46786fcb842e273fc588c31bd844811342f402b04ac9022d487be1"
+    },
+    {
+      "path": "grouped-checkpoint-7105dd2/d6ed49c2aebc4bed94e6c11c3aafeb9c.log",
+      "byte_size": 1881,
+      "sha256": "607aceddacbbda03b3d13912179f45ecf61ef3db774d47742aa33201b09de81a"
+    },
+    {
+      "path": "grouped-checkpoint-7105dd2/journal.jsonl",
+      "byte_size": 40546,
+      "sha256": "48c1a32d5cb07b5713727213c5c0533f928ac4709c7b784de2929d666928b00b"
+    },
+    {
+      "path": "grouped-checkpoint-ddba789/f1cfb72aedc447b1a9ef2e95ed88308b.json",
+      "byte_size": 220,
+      "sha256": "4d6e1fadb377d1b1a249b249fd145be70adc78616c7810728efbc407778b442d"
+    },
+    {
+      "path": "grouped-checkpoint-ddba789/f1cfb72aedc447b1a9ef2e95ed88308b.log",
+      "byte_size": 2144,
+      "sha256": "a766817fffe36262fe29329f62ab4d475179254f530a8f8cad192b2753a69c65"
+    },
+    {
+      "path": "grouped-checkpoint-ddba789/journal.jsonl",
+      "byte_size": 114804,
+      "sha256": "b074a3f7bb93816ace4142d13f2fe800f04728901aaa80d861559f5a21229d9f"
+    },
+    {
+      "path": "grouped_regression_6129207.py",
+      "byte_size": 10200,
+      "sha256": "1538eb55424c6f761f0e79fa5194b5ce15d0ce4af9abeda21030248aefaa14cf"
+    },
+    {
+      "path": "grouped_regression_7105dd2.py",
+      "byte_size": 10196,
+      "sha256": "e641f94c452f2fbb3061f7374ac024660b4d1c8b922efa939f2391f9304d8e22"
+    },
+    {
+      "path": "grouped_regression_ddba789.py",
+      "byte_size": 10198,
+      "sha256": "13fdeae9bbe1811743aecba63f7905b8347d562dab05a257e57e981418b9f919"
+    },
+    {
+      "path": "independent-verification-6129207-signed-audit/output.log",
+      "byte_size": 579,
+      "sha256": "7fbf223a4c0f2241d62551482ea3bb95eea2defb1aee00adb2801b3b83e5f603"
+    },
+    {
+      "path": "independent-verification-6129207-signed-audit/status.json",
+      "byte_size": 197,
+      "sha256": "1356296a55e11e521879067a49ad6ed75392ec12a6a295b64e5fc36609647e57"
+    },
+    {
+      "path": "independent-verification-7105dd2-audit/output.log",
+      "byte_size": 1437,
+      "sha256": "9c2c952c1c9c34008eec17032d402f36e3dd21701fd05a39371a7743098055c9"
+    },
+    {
+      "path": "independent-verification-7105dd2-audit/status.json",
+      "byte_size": 247,
+      "sha256": "977dda6713476bce65eb814bab6e0e2a30039bf816c4775516fe78826727ac85"
+    },
+    {
+      "path": "independent-verification-ddba789-recheck/output.log",
+      "byte_size": 1401,
+      "sha256": "5a01e3a9623061284155cb63add66e938b6f13e81ef2775f1c7d89e45fd3290a"
+    },
+    {
+      "path": "independent-verification-ddba789-recheck/status.json",
+      "byte_size": 249,
+      "sha256": "d6adb2d09e346e32f26ae6af1eebfa20c06ecf426c35f56d201e68845baad620"
+    },
+    {
+      "path": "independent_audit_7105dd2.ps1",
+      "byte_size": 2451,
+      "sha256": "8b36ad2874c9212fcad515b6423fc477358ade416fa45a92100adc9139a151ee"
+    },
+    {
+      "path": "independent_recheck_ddba789.ps1",
+      "byte_size": 2444,
+      "sha256": "20e6b31166b5be89238872c60156cadcc1a3440863be4ecfdccbb867edd5c541"
+    },
+    {
+      "path": "independent_signed_audit_6129207.ps1",
+      "byte_size": 2471,
+      "sha256": "e89bb79f92e1a80f6ac5b2b50f0d3af34c650b52c89643c75eb2b13d3bf36ea6"
+    },
+    {
+      "path": "live-recheck-genuine-rejection-20261110.log",
+      "byte_size": 230,
+      "sha256": "46483398daac39f2a0e77844ecab1aa4f9c93c77b7f530bd665e95aef013bfcb"
+    },
+    {
+      "path": "signed-audit-focused-20261111.log",
+      "byte_size": 229,
+      "sha256": "49ffdd7ca81a0163a805d34dc82be46ae95bb17e834d6c23448daf220e8571c7"
+    },
+    {
+      "path": "v9-post-audit-next-7105dd2.md",
+      "byte_size": 2529,
+      "sha256": "ff36a62249c76ca92bf42b87a03b063d0cad33422f0d168b7b9472fb2e795a70"
+    },
+    {
+      "path": "v9-release-progress.md",
+      "byte_size": 88892,
+      "sha256": "fcb1a8c4c01d78ef256bda43d44bcf968c548588c2a203e5ddee34e2e01acd84"
+    }
+  ]
+}
