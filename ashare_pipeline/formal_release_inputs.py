@@ -1,10 +1,11 @@
-"""Private read-only refresh of release inputs; not publication authority.
+"""Configured input refresh, validation and signed audit; no publication authority.
 
 This component owns configuration and accepts only a run selector. Existing
 repositories/auditor own authentication. Returned history remains detached
 data; refreshed registry/coverage proofs are not a release capability.
 """
 import inspect
+from datetime import datetime, timezone
 from hashlib import sha256
 from contextlib import closing, contextmanager
 import json
@@ -22,7 +23,8 @@ from .formal_policy_registry import load_formal_policy_registry
 from .formal_valuation_adapter_contract import load_formal_valuation_adapter_registry
 from .formal_coverage_manifest import FormalCoverageAuditor
 from .formal_release_types import (canonical_release_bytes, canonical_validation_bytes,
-    ReleaseValidationPayload, ValidationGate, REQUIRED_RELEASE_GATE_NAMES)
+    ReleaseValidationPayload, ValidationGate, REQUIRED_RELEASE_GATE_NAMES,
+    signature_message, verify_release_signature, VALIDATION_DOMAIN)
 from . import formal_release_types as value_module
 from . import formal_release_rendering as render_module
 from .formal_release_validation import (
@@ -30,10 +32,19 @@ from .formal_release_validation import (
 from . import formal_release_jobs as jobs_module
 from .formal_release_jobs import _read_job_quiescence
 from .state_store import StateStore
+from . import state_store as state_module
 
 
 def _install_inputs():
     configurations = {}
+    schema_members = tuple((name, vars(StateStore)[name]) for name in
+        ('_assert_v9_objects', '_assert_schema_ddl', '_normalized_ddl'))
+    schema_codes = tuple((descriptor.__func__, descriptor.__func__.__code__) for _, descriptor in schema_members)
+    assert_objects = vars(StateStore)['_assert_v9_objects'].__func__
+    assert_ddl = vars(StateStore)['_assert_schema_ddl'].__func__
+    schema_definitions = tuple((name, value, tuple(value.items())) for name, value in
+        (('_V9_TABLE_DDL', state_module._V9_TABLE_DDL), ('_V9_INDEX_DDL', state_module._V9_INDEX_DDL)))
+    migration_ddl = state_module._MIGRATION_TABLE_DDL
     render = render_module._render_release_package
     gate_names = REQUIRED_RELEASE_GATE_NAMES
     owner = globals()
@@ -82,7 +93,12 @@ def _install_inputs():
         transaction_wrapper.__code__.co_freevars.index('func')]
 
     def interfaces():
-        if (transaction_cell.cell_contents is not transaction_body
+        if (any(vars(StateStore).get(name) is not descriptor for name, descriptor in schema_members)
+                or any(function.__code__ is not code for function, code in schema_codes)
+                or any(getattr(state_module, name) is not original or tuple(original.items()) != values
+                       for name, original, values in schema_definitions)
+                or state_module._MIGRATION_TABLE_DDL != migration_ddl
+                or transaction_cell.cell_contents is not transaction_body
                 or transaction_body.__code__ is not transaction_code
                 or any(cell.cell_contents is not body or body.__code__ is not code
                        for cell, body, code in wrapped_bodies)
@@ -155,6 +171,12 @@ def _install_inputs():
             if (verifier_binding(current)[1:] != (function, code_object)
                     or getattr(function, '__code__', None) is not code_object):
                 raise ValueError('release input configured verifier changed')
+        signing = saved[3]
+        if signing is not None:
+            for instance, name, function, code_object in signing[1]:
+                bound(instance, name, function)
+                if getattr(function, '__code__', None) is not code_object:
+                    raise ValueError('release audit signing implementation changed')
         return saved[1], feature, context
 
     def job_snapshot(instance):
@@ -177,6 +199,20 @@ def _install_inputs():
             raise ValueError('release validation requires complete schema version 9 ledger')
         return versions[-1]
 
+    def audit_schema(connection):
+        interfaces()
+        try:
+            assert_ddl(StateStore, connection, {'schema_migration':migration_ddl}, {}, 'release audit schema')
+            versions = tuple(row[0] for row in connection.execute('SELECT version FROM schema_migration ORDER BY version'))
+            if versions != tuple(range(2, 10)) or any(type(value) is not int for value in versions):
+                raise ValueError('release audit schema requires complete version 9 ledger')
+            assert_objects(StateStore, connection, applied=True)
+            assert_ddl(StateStore, connection, dict(schema_definitions[0][2]), dict(schema_definitions[1][2]),
+                       'release audit schema')
+        except RuntimeError as exc:
+            raise ValueError('release audit schema rejected: ' + str(exc)) from exc
+        interfaces()
+
     class Sealed(type):
         def __setattr__(cls, name, value):
             raise TypeError('release input configuration methods are immutable')
@@ -196,7 +232,8 @@ def _install_inputs():
 
         def __init__(self, *, state_store, input_repository, run_repository,
                      registry_signature_verifier, coverage_contract,
-                     coverage_contract_verifier, status_path):
+                     coverage_contract_verifier, status_path, release_signer=None,
+                     release_signature_verifier=None, release_key_id=None):
             interfaces()
             if type(self) is not refresh_type or id(self) in configurations:
                 raise ValueError('release input configuration requires exact single initialization')
@@ -218,12 +255,26 @@ def _install_inputs():
             detached = (raw, coverage_contract['signature'], coverage_contract['key_id'])
             verifiers = tuple(verifier_binding(item) for item in
                               (registry_signature_verifier, coverage_contract_verifier))
+            signing = None
+            if any(value is not None for value in
+                   (release_signer, release_signature_verifier, release_key_id)):
+                if (release_signer is None or release_signature_verifier is None
+                        or type(release_key_id) is not str or not release_key_id
+                        or release_key_id.strip() != release_key_id):
+                    raise ValueError('release audit requires complete explicit signing configuration')
+                signing_methods = []
+                for instance, name in ((release_signer, 'sign'), (release_signature_verifier, 'verify')):
+                    method = getattr(instance, name, None)
+                    if type(method) is not MethodType or method.__self__ is not instance:
+                        raise ValueError('release audit signing configuration requires fixed owned methods')
+                    signing_methods.append((instance, name, method.__func__, getattr(method.__func__, '__code__', None)))
+                signing = (release_key_id, tuple(signing_methods))
             key = id(self)
             configurations[key] = (reference(self, lambda _: configurations.pop(key, None)),
                 (state_store, input_repository, run_repository, registry_signature_verifier,
                  coverage_contract_verifier, Path(state_store.db_path).resolve(),
                  run_repository._code_version, run_repository._contract_version, detached,
-                 Path(status_path).resolve()), verifiers)
+                 Path(status_path).resolve()), verifiers, signing)
             try:
                 record(self)
             except BaseException:
@@ -381,6 +432,67 @@ def _install_inputs():
             # The context has rechecked and closed. This DTO cannot authorize a
             # later write and is deliberately not signed or treated as a lease.
             return payload
+
+        def audit(self, run_id):
+            """Persist a freshly produced signed audit; return only its content hash.
+
+            A signed audit is historical evidence, never publication authority.
+            Caller payloads, signing overrides and purpose overrides are absent.
+            """
+            config, _, _ = record(self)
+            signing = configurations[id(self)][3]
+            if signing is None:
+                raise ValueError('release audit requires explicit signing configuration')
+            if type(run_id) is not str or not run_id or run_id.strip() != run_id:
+                raise ValueError('release audit requires an exact run id')
+            with closing(connect(config[0])) as connection:
+                connection.execute('BEGIN')
+                audit_schema(connection)
+                if connection.execute("SELECT 1 FROM formal_release WHERE run_id=? AND status='publishing'",
+                                      (run_id,)).fetchone() is not None:
+                    raise ValueError('active publishing requires publication recovery')
+            payload = self.validate(run_id)
+            record(self)
+            if payload.purpose != 'audit' or not all(gate.passed for gate in payload.gates):
+                raise ValueError('release audit requires genuine successful audit validation')
+            raw = canonical_validation_bytes(payload)
+            key_id, signing_methods = signing
+            signer, _, sign, _ = signing_methods[0]
+            verifier = signing_methods[1][0]
+            signature = sign(signer, signature_message(VALIDATION_DOMAIN, key_id, raw), key_id=key_id)
+            record(self)
+            verify_release_signature(raw, signature=signature, key_id=key_id,
+                expected_key_id=key_id, domain=VALIDATION_DOMAIN, verifier=verifier)
+            record(self)
+            digest = sha256(raw).hexdigest()
+            with transaction_wrapper(config[0], immediate=True) as connection:
+                record(self)
+                audit_schema(connection)
+                if connection.execute("SELECT 1 FROM formal_release WHERE run_id=? AND status='publishing'",
+                                      (run_id,)).fetchone() is not None:
+                    raise ValueError('active publishing requires publication recovery')
+                current = FormalFinalRunRepository._read_run(config[2], connection, run_id)
+                if (current is None or current.mode != 'official_candidate' or current.status != 'preview_ready'
+                        or any(current.header.get(name) != getattr(payload, name) for name in
+                               ('run_id', 'input_manifest_hash', 'result_hash', 'registry_manifest_hash',
+                                'frozen_input_hash', 'universe_hash', 'code_version', 'contract_version'))):
+                    raise ValueError('candidate_changed: audit candidate changed before persistence')
+                expected = (digest, run_id, payload.release_identity_hash, 'audit', 1, raw.decode('utf-8'))
+                previous = connection.execute("""SELECT validation_hash,run_id,release_identity_hash,
+                    purpose,passed,payload_json,signature,key_id FROM formal_release_validation
+                    WHERE validation_hash=?""", (digest,)).fetchone()
+                if previous is None:
+                    connection.execute("""INSERT INTO formal_release_validation
+                        (validation_hash,run_id,release_identity_hash,purpose,passed,payload_json,
+                         signature,key_id,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+                        expected + (signature, key_id, datetime.now(timezone.utc).isoformat()))
+                else:
+                    if tuple(previous[:6]) != expected or previous[7] != key_id:
+                        raise ValueError('release audit record conflicts with immutable content')
+                    verify_release_signature(raw, signature=previous[6], key_id=previous[7],
+                        expected_key_id=key_id, domain=VALIDATION_DOMAIN, verifier=verifier)
+                record(self)
+            return digest
 
         def __copy__(self):
             raise TypeError('release input configuration cannot be copied')

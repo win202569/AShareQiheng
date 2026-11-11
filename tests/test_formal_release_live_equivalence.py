@@ -223,5 +223,110 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
         phase('all twelve audit gates verified; unchanged V8 and no V9 writes or publication grant')
 
 
+    def test_configured_audit_persists_independently_verified_signature_without_publication(self):
+        from ashare_pipeline.formal_final_score_inputs import FormalFinalScoreInputRepository
+        from ashare_pipeline.formal_final_repository import FormalFinalRunRepository
+        from ashare_pipeline.formal_release_validator import FormalReleaseValidator
+        from tests.formal_final_scoring_fixtures import FinalScoringFixture
+        from tests.test_formal_final_integration import (
+            complete_score_history, official_context_coverage,
+            official_context_coverage_configuration)
+        from tests.test_formal_final_runner import configured_runner, run_arguments, runner_module
+
+        phase('build signed 20-member official fixture')
+        f = FinalScoringFixture(peer_count=20, purpose='official', pending_ids=())
+        self.addCleanup(f.close)
+        phase('fixture database: ' + str(f.db_path))
+        f.populate_final_inputs()
+        phase('complete real histories and current feature evidence')
+        complete_score_history(f, sorted(f.templates))
+        phase('audit original official coverage')
+        original_coverage = official_context_coverage(f)
+        original_coverage.require_official_ready()
+        code = original_coverage.to_dict()['workspace_revision']
+        runner, runs = configured_runner(runner_module(self), f, code_version=code)
+        phase('produce and persist original Stage D official candidate')
+        receipt = runner.run_official_candidate(**run_arguments(f, original_coverage))
+        self.assertEqual(receipt.status, 'preview_ready')
+        before = runs.get_run(receipt.run_id)
+        self.assertEqual(before.mode, 'official_candidate')
+        self.assertTrue(all(row['state'] in ('formal_scored', 'pool_vetoed')
+                            for row in before.statuses))
+        phase('configure trusted input refresh and held replay')
+        inputs = FormalFinalScoreInputRepository(f.feature_repository, f.context,
+            f.range_store, registry_signature_verifier=f.verifier)
+        fresh_runs = FormalFinalRunRepository(f.store, code_version=code)
+        _, contract, status_path = official_context_coverage_configuration(f)
+        from tests.test_formal_release_audit import TriggerOnceAuditSigner, AuditVerifier
+        service = FormalReleaseValidator(
+            state_store=f.store, input_repository=inputs, run_repository=fresh_runs,
+            registry_signature_verifier=f.verifier, coverage_contract=contract,
+            coverage_contract_verifier=f.verifier, status_path=status_path,
+            release_signer=TriggerOnceAuditSigner(f.store), release_signature_verifier=AuditVerifier(),
+            release_key_id='isolated-audit')
+        phase('refresh official coverage and recompute D1, D2, D3 and pool without persistence')
+        phase('run configured signed audit and persist only audit evidence')
+        with self.assertRaisesRegex(ValueError, 'schema'):
+            service.audit(receipt.run_id)
+        with closing(f.store._connect()) as connection:
+            self.assertEqual(connection.execute('SELECT count(*) FROM formal_release_validation').fetchone()[0], 0)
+            self.assertIsNotNone(connection.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name='erase_audit'").fetchone())
+            connection.execute('DROP TRIGGER erase_audit')
+            connection.commit()
+        self.assertEqual(fresh_runs.get_run(receipt.run_id), before)
+        phase('signer-installed trigger rejected without audit/V8 writes; retry with fresh validation')
+        audit_hash = service.audit(receipt.run_id)
+        from ashare_pipeline.formal_release_types import (load_validation_bytes,
+            verify_release_signature, VALIDATION_DOMAIN)
+        with closing(f.store._connect()) as connection:
+            row = dict(connection.execute('SELECT * FROM formal_release_validation WHERE validation_hash=?',
+                                          (audit_hash,)).fetchone())
+        raw_audit = row['payload_json'].encode('utf-8')
+        import hashlib
+        self.assertEqual(hashlib.sha256(raw_audit).hexdigest(), audit_hash)
+        self.assertEqual(row['purpose'], 'audit')
+        self.assertEqual(row['passed'], 1)
+        self.assertEqual(row['run_id'], receipt.run_id)
+        self.assertTrue(row['created_at'])
+        verify_release_signature(raw_audit, signature=row['signature'], key_id=row['key_id'],
+            expected_key_id='isolated-audit', domain=VALIDATION_DOMAIN, verifier=AuditVerifier())
+        result = load_validation_bytes(raw_audit)
+        self.assertEqual(row['release_identity_hash'], result.release_identity_hash)
+        import hashlib
+        import json
+        from ashare_pipeline.formal_release_types import (
+            REQUIRED_RELEASE_GATE_NAMES, canonical_validation_bytes)
+        from ashare_pipeline.formal_release_rendering import _render_release_package
+        self.assertEqual(result.run_id, receipt.run_id)
+        self.assertEqual(result.purpose, 'audit')
+        self.assertEqual(result.schema_version, 9)
+        self.assertEqual(tuple(gate.name for gate in result.gates), REQUIRED_RELEASE_GATE_NAMES)
+        self.assertTrue(all(gate.passed and gate.evidence_hashes and not gate.reason_codes for gate in result.gates))
+        self.assertEqual(result.input_manifest_hash, before.header['input_manifest_hash'])
+        self.assertEqual(result.result_hash, before.header['result_hash'])
+        self.assertEqual(result.code_version, code)
+        diagnostics = json.loads(canonical_validation_bytes(result))
+        self.assertEqual(diagnostics['purpose'], 'audit')
+        self.assertNotIn('signature', diagnostics)
+        identity = {key:before.header[key] for key in ('contract_version','input_manifest_hash',
+            'result_hash','registry_manifest_hash','frozen_input_hash','universe_hash')}
+        package = _render_release_package({name:before.artifacts[name] for name in
+            ('score_input_batch','scorecard_batch','eligibility_batch','pool_selection_batch')},
+            candidate_identity=identity)
+        gates = {gate.name:gate for gate in result.gates}
+        self.assertEqual(gates['artifact_renderability'].evidence_hashes,
+            (hashlib.sha256(package['release_manifest.json']).hexdigest(),))
+        self.assertEqual(gates['official_coverage'].evidence_hashes, (result.coverage_manifest_hash,))
+        self.assertEqual(gates['source_identity_temporal'].evidence_hashes, (result.source_dependency_hash,))
+        self.assertEqual(fresh_runs.get_run(receipt.run_id), before)
+        with closing(f.store._connect()) as connection:
+            self.assertEqual(connection.execute('SELECT count(*) FROM formal_final_run').fetchone()[0],1)
+            self.assertEqual(connection.execute('SELECT count(*) FROM formal_release_validation').fetchone()[0],1)
+            for table in ('formal_release','formal_release_preparation',
+                          'formal_release_file','formal_release_event'):
+                self.assertEqual(connection.execute('SELECT count(*) FROM '+table).fetchone()[0],0)
+        phase('signed audit independently verified; unchanged V8; one audit row; zero publication rows')
+
+
 if __name__ == '__main__':
     unittest.main()
