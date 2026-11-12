@@ -274,7 +274,9 @@ class GenuineOfficialEquivalenceTests(unittest.TestCase):
             connection.execute('DROP TRIGGER erase_audit')
             connection.commit()
         self.assertEqual(fresh_runs.get_run(receipt.run_id), before)
-        phase('signer-installed trigger rejected without audit/V8 writes; retry with fresh validation')
+        from tests.formal_release_refresh_fixtures import refresh_status_after_audit_fixture_cleanup
+        refresh_status_after_audit_fixture_cleanup(f, contract=contract, status_path=status_path)
+        phase('signer-installed trigger rejected; fixture status refreshed after cleanup; retry with fresh validation')
         audit_hash = service.audit(receipt.run_id)
         from ashare_pipeline.formal_release_types import (load_validation_bytes,
             verify_release_signature, VALIDATION_DOMAIN)

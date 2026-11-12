@@ -153,3 +153,34 @@ class SignedAuditBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'schema'):
                 guard(connection)
             self.assertEqual(connection.execute('SELECT count(*) FROM formal_release_validation').fetchone()[0], 0)
+
+    def test_trigger_cleanup_requires_fresh_database_status_before_retry(self):
+        import json
+        from unittest.mock import patch
+        from pathlib import Path
+        from ashare_pipeline import formal_coverage_manifest as coverage
+        from tests import formal_release_refresh_fixtures as refresh_fixtures
+        from tests.test_formal_final_integration import official_context_coverage_configuration
+        _, contract, status = official_context_coverage_configuration(self.fixture)
+        original_status = json.loads(status.read_text(encoding='utf-8'))
+        root = Path(coverage.__file__).resolve().parent.parent
+        # Only Git identity is isolated; real schema, DB/WAL and status checks run.
+        def environment():
+            return coverage._read_environment(root, self.fixture.db_path, status, expected_schema_version=9)
+        with patch.object(coverage, '_read_workspace_git_identity', return_value={'workspace_revision':'a'*40}):
+            environment()
+            TriggerOnceAuditSigner(self.fixture.store).sign(b'isolated-test', key_id='isolated-audit')
+            with closing(self.fixture.store._connect()) as connection:
+                connection.execute('DROP TRIGGER erase_audit')
+                connection.commit()
+            with self.assertRaisesRegex(ValueError, 'database status identity mismatch'):
+                environment()
+            refresh = getattr(refresh_fixtures, 'refresh_status_after_audit_fixture_cleanup', None)
+            self.assertTrue(callable(refresh), 'explicit fixture status refresh is missing')
+            refresh(self.fixture, contract=contract, status_path=status)
+            environment()
+        updated = json.loads(status.read_text(encoding='utf-8'))
+        self.assertNotEqual(original_status['db_generation_hash'], updated['db_generation_hash'])
+        with closing(self.fixture.store._connect()) as connection:
+            for table in ('formal_final_run', 'formal_release_validation', 'formal_release'):
+                self.assertEqual(connection.execute('SELECT count(*) FROM '+table).fetchone()[0], 0)

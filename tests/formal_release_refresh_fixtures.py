@@ -71,3 +71,16 @@ def put_storage_only_history(fixture, *, code_version):
         return run_id
     finally:
         template.doCleanups()
+
+
+def refresh_status_after_audit_fixture_cleanup(fixture, *, contract, status_path):
+    """Resnapshot only the isolated fixture after deliberate schema mutation.
+
+    Dropping the injected trigger restores schema, not SQLite generation bytes.
+    This refresh is not a coverage proof: the next audit must reauthenticate all
+    evidence. Production validation must continue rejecting a stale status file.
+    """
+    from tests.test_formal_final_integration import official_context_coverage_configuration
+    _, current_contract, current_path = official_context_coverage_configuration(fixture)
+    if current_contract != contract or current_path != status_path:
+        raise AssertionError('audit fixture cleanup changed coverage configuration')
