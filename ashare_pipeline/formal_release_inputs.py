@@ -5,7 +5,8 @@ repositories/auditor own authentication. Returned history remains detached
 data; refreshed registry/coverage proofs are not a release capability.
 """
 import inspect
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from uuid import uuid4
 from hashlib import sha256
 from contextlib import closing, contextmanager
 import json
@@ -27,6 +28,8 @@ from .formal_release_types import (canonical_release_bytes, canonical_validation
     signature_message, verify_release_signature, VALIDATION_DOMAIN)
 from . import formal_release_types as value_module
 from . import formal_release_rendering as render_module
+from . import formal_release_recovery as recovery_module
+from . import formal_release_tree as tree_module
 from .formal_release_validation import (
     _check_candidate_binding, _hold_official_candidate, _hold_official_evidence)
 from . import formal_release_jobs as jobs_module
@@ -77,7 +80,7 @@ def _install_inputs():
     history_constants = tuple((name, vars(history_module)[name]) for name in
                               ('ARTIFACT_KINDS', '_TABLES', '_BATCH_TYPES'))
     job_bindings = tuple((name, value) for name, value in vars(jobs_module).items() if callable(value))
-    render_bindings = tuple((module,name,value) for module in (render_module,value_module)
+    render_bindings = tuple((module,name,value) for module in (render_module,value_module,recovery_module,tree_module)
         for name,value in vars(module).items() if callable(value) or name.isupper())
     functions = (render, canonical_validation_bytes, replay_hold, _hold_official_candidate, read_jobs, input_dependencies, scoring_load, policy_load, valuation_load, check, encode, decode)
     codes = tuple((function, function.__code__) for function in functions if hasattr(function, '__code__'))
@@ -233,7 +236,7 @@ def _install_inputs():
         def __init__(self, *, state_store, input_repository, run_repository,
                      registry_signature_verifier, coverage_contract,
                      coverage_contract_verifier, status_path, release_signer=None,
-                     release_signature_verifier=None, release_key_id=None):
+                     release_signature_verifier=None, release_key_id=None, release_root=None):
             interfaces()
             if type(self) is not refresh_type or id(self) in configurations:
                 raise ValueError('release input configuration requires exact single initialization')
@@ -269,12 +272,17 @@ def _install_inputs():
                         raise ValueError('release audit signing configuration requires fixed owned methods')
                     signing_methods.append((instance, name, method.__func__, getattr(method.__func__, '__code__', None)))
                 signing = (release_key_id, tuple(signing_methods))
+            target_root = None
+            if release_root is not None:
+                target_root = Path(release_root)
+                if not target_root.is_absolute() or target_root != target_root.resolve():
+                    raise ValueError('release root must be an absolute canonical path without aliases')
             key = id(self)
             configurations[key] = (reference(self, lambda _: configurations.pop(key, None)),
                 (state_store, input_repository, run_repository, registry_signature_verifier,
                  coverage_contract_verifier, Path(state_store.db_path).resolve(),
                  run_repository._code_version, run_repository._contract_version, detached,
-                 Path(status_path).resolve()), verifiers, signing)
+                 Path(status_path).resolve()), verifiers, signing, target_root)
             try:
                 record(self)
             except BaseException:
@@ -493,6 +501,97 @@ def _install_inputs():
                         expected_key_id=key_id, domain=VALIDATION_DOMAIN, verifier=verifier)
                 record(self)
             return digest
+
+        def recover(self, run_id):
+            """Complete only an already materialized, durably prepared release.
+
+            Missing targets require fresh publication, never a preparation-only
+            shortcut. No caller-supplied proofs, paths or verifier are accepted.
+            """
+            config, _, _ = record(self)
+            saved = configurations[id(self)]
+            signing, root = saved[3], saved[4]
+            if signing is None or root is None:
+                raise ValueError('recovery requires fixed signing configuration and release root')
+            if type(run_id) is not str or not run_id or run_id.strip() != run_id:
+                raise ValueError('recovery requires exact run id')
+            key_id, signing_methods = signing
+            verifier = signing_methods[1][0]
+            with transaction_wrapper(config[0], immediate=True) as connection:
+                audit_schema(connection)
+                record(self)
+                release, prepared = recovery_module._read_recovery_candidate(connection,
+                    run_id=run_id,release_root=root,verifier=verifier,key_id=key_id)
+                record(self)
+                current = FormalFinalRunRepository._read_run(config[2],connection,run_id)
+                if (current is None or current.mode != 'official_candidate' or current.status != 'preview_ready'
+                        or current.header['input_manifest_hash'] != prepared.input_manifest_hash
+                        or current.header['result_hash'] != prepared.result_hash):
+                    raise ValueError('recovery historical candidate binding differs')
+                manifest = decode(prepared.manifest_json)
+                cards = {'audit_cards/'+item['security_id']+'.json' for item in current.scorecards}
+                actual_cards = {item.path for item in prepared.files if item.path.startswith('audit_cards/')}
+                pools = decode(current.artifacts['pool_selection_batch'])
+                counts = dict(universe=len(current.security_ids),scorecards=len(current.scorecards),
+                    formal_scored=sum(row['state']=='formal_scored' for row in current.statuses),
+                    pool_vetoed=sum(row['state']=='pool_vetoed' for row in current.statuses),
+                    strong=pools['counts']['strong'],wait=pools['counts']['wait'],payload_files=len(prepared.files))
+                if actual_cards != cards or manifest['counts'] != counts:
+                    raise ValueError('recovery manifest cards or counts differ from candidate')
+                expected_files = tuple(sorted((item.path,item.sha256,item.byte_size) for item in prepared.files))
+                expected_rows = tuple((release['active_preparation_hash'],*item) for item in expected_files)
+                persisted = tuple(tuple(row) for row in connection.execute(
+                    'SELECT preparation_hash,path,sha256,byte_size FROM formal_release_file WHERE release_id=? ORDER BY path COLLATE BINARY',
+                    (release['release_id'],)))
+                if release['status'] == 'published':
+                    if (persisted != expected_rows or release['manifest_sha256'] != prepared.manifest_sha256
+                            or not release['published_at'] or release['attempt_token'] is not None):
+                        raise ValueError('published recovery metadata conflicts')
+                    tree_module._verify_release_tree(Path(prepared.target_path),prepared)
+                    record(self)
+                    return dict(status='already_published',release_id=release['release_id'])
+                if persisted:
+                    raise ValueError('publishing recovery contains premature file rows')
+                now = datetime.now(timezone.utc)
+                token, expiry = release['attempt_token'], release['attempt_expires_at']
+                if (token is None) != (expiry is None):
+                    raise ValueError('recovery lease is malformed')
+                if token is not None:
+                    try:
+                        expires = datetime.fromisoformat(expiry)
+                    except (TypeError,ValueError) as exc:
+                        raise ValueError('recovery lease expiry is malformed') from exc
+                    if type(token) is not str or not token or expires.tzinfo is None:
+                        raise ValueError('recovery lease is malformed')
+                    if expires > now:
+                        raise ValueError('recovery is blocked by an active publishing lease')
+                owner = uuid4().hex
+                generation = release['fencing_generation'] + 1
+                deadline = now + timedelta(minutes=5)
+                changed = connection.execute("""UPDATE formal_release SET attempt_token=?,attempt_expires_at=?,
+                    fencing_generation=? WHERE release_id=? AND status='publishing'
+                    AND fencing_generation=? AND attempt_token IS ?""",
+                    (owner,deadline.isoformat(),generation,release['release_id'],release['fencing_generation'],token))
+                if changed.rowcount != 1:
+                    raise ValueError('recovery lease ownership changed')
+                tree_module._verify_release_tree(Path(prepared.target_path),prepared)
+                record(self)
+                if datetime.now(timezone.utc) >= deadline:
+                    raise ValueError('recovery lease expired during tree verification')
+                audit_schema(connection)
+                for path,digest,size in expected_files:
+                    connection.execute('INSERT INTO formal_release_file VALUES(?,?,?,?,?)',
+                        (release['release_id'],release['active_preparation_hash'],path,digest,size))
+                changed = connection.execute("""UPDATE formal_release SET status='published',manifest_sha256=?,
+                    published_at=?,attempt_token=NULL,attempt_expires_at=NULL
+                    WHERE release_id=? AND status='publishing' AND attempt_token=? AND fencing_generation=?
+                    AND active_preparation_hash=?""",
+                    (prepared.manifest_sha256,datetime.now(timezone.utc).isoformat(),release['release_id'],owner,
+                     generation,release['active_preparation_hash']))
+                if changed.rowcount != 1:
+                    raise ValueError('recovery preparation or fencing ownership changed')
+                record(self)
+            return dict(status='recovered',release_id=release['release_id'])
 
         def __copy__(self):
             raise TypeError('release input configuration cannot be copied')
